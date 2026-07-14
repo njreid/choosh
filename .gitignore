@@ -1,0 +1,13 @@
+.DS_Store
+.idea/
+.gradle/
+build/
+target/
+local.properties
+*.iml
+*.jks
+*.keystore
+*.log
+*.swp
+*.tmp
+
