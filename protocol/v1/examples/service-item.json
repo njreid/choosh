@@ -1,0 +1,12 @@
+{
+  "id": "018f6f42-b4d4-7c90-8d57-52c8f13f7db1",
+  "workspace_id": "018f6f42-a542-7c90-8d57-52c8f13f7db1",
+  "kind": "service",
+  "name": "Web preview",
+  "status": "running",
+  "zellij_tab_id": 3,
+  "zellij_pane_id": "terminal_5",
+  "port": 3000,
+  "protocol": "http"
+}
+

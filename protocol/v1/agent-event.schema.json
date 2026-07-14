@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://choosh.dev/protocol/v1/agent-event.schema.json",
+  "title": "Normalized Choosh agent event payload",
+  "oneOf": [
+    { "$ref": "#/$defs/inputRequired" },
+    { "$ref": "#/$defs/turnCompleted" },
+    { "$ref": "#/$defs/filesChanged" },
+    { "$ref": "#/$defs/agentStatus" }
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": ["type", "item_id", "occurred_at"],
+      "properties": {
+        "type": { "type": "string" },
+        "item_id": { "type": "string", "format": "uuid" },
+        "occurred_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "inputRequired": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["type", "reason"],
+          "properties": {
+            "type": { "const": "input_required" },
+            "reason": { "enum": ["approval", "permission", "question", "elicitation", "next_prompt"] },
+            "summary": { "type": "string", "maxLength": 160 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "turnCompleted": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "type": "object", "properties": { "type": { "const": "turn_completed" } } }
+      ],
+      "unevaluatedProperties": false
+    },
+    "filesChanged": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["type", "paths"],
+          "properties": {
+            "type": { "const": "files_changed" },
+            "paths": {
+              "type": "array",
+              "maxItems": 1000,
+              "items": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "uniqueItems": true
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "agentStatus": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["type", "status"],
+          "properties": {
+            "type": { "const": "agent_status" },
+            "status": { "enum": ["starting", "busy", "waiting", "stopped", "failed"] },
+            "message": { "type": "string", "maxLength": 512 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}
+

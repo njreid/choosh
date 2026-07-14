@@ -1,0 +1,103 @@
+# Host protocol
+
+Status: Draft
+
+## Purpose
+
+The host protocol connects Android's Rust engine to `chooshd` without opening a host network port.
+
+```text
+Android Rust → SSH exec → choosh-host rpc → 0600 Unix socket → chooshd
+```
+
+## Transport
+
+The client executes `choosh-host rpc --stdio`. Standard input and output carry frames. Standard error is diagnostic only and MUST NOT contain protocol data or secrets.
+
+Each frame is:
+
+```text
+4-byte unsigned big-endian payload length
+UTF-8 JSON payload
+```
+
+- Maximum control-frame payload: 1 MiB.
+- A zero length is invalid.
+- Invalid UTF-8, malformed JSON, oversized frames, or unknown envelope kinds terminate the bridge.
+- The bridge MUST apply backpressure rather than buffering without bound.
+
+## Handshake
+
+The first client frame MUST be `hello`; the first daemon response MUST be `welcome` or `incompatible`.
+
+```json
+{
+  "kind": "hello",
+  "protocol": { "major": 1, "minor": 0 },
+  "client": { "name": "choosh-android", "version": "0.1.0" },
+  "capabilities": ["events", "git-blobs", "services"]
+}
+```
+
+`welcome` includes the selected version, daemon version, host identity, supported capabilities, and limits. Major versions MUST match. The selected minor version MUST be no greater than either peer's advertised minor version.
+
+## Envelopes
+
+After negotiation, every frame conforms to [the envelope schema](../../protocol/v1/envelope.schema.json).
+
+- `request`: client-generated UUID, method, and params.
+- `response`: matching UUID plus exactly one of `result` or `error`.
+- `event`: daemon-generated workspace sequence and payload.
+
+Requests MAY complete out of order. Events are ordered only within a workspace. Clients MUST deduplicate events by `(workspace_id, sequence)`.
+
+## Initial methods
+
+```text
+host.describe
+workspace.list
+workspace.register
+workspace.open
+workspace.terminate
+item.list
+agent.start
+agent.focus
+service.start
+service.stop
+git.status
+git.blob.prepare
+events.subscribe
+events.ack
+```
+
+Destructive methods require an explicit `confirmation` object tied to a short-lived daemon challenge.
+
+## Binary streams
+
+Large file versions are not base64-encoded into control frames. `git.blob.prepare` returns a single-use, short-lived capability and exact byte limit. Android opens a second SSH exec channel:
+
+```text
+choosh-host stream --capability <opaque-token>
+```
+
+That channel emits raw bytes and then exits. Capabilities are bound to the authenticated local user, workspace, object identity, and expiry; they MUST NOT appear in logs.
+
+## Errors
+
+Errors have stable machine codes and non-sensitive messages. Initial codes:
+
+```text
+invalid_request
+not_found
+already_exists
+conflict
+permission_denied
+stale_revision
+limit_exceeded
+unsupported
+host_unavailable
+internal
+```
+
+Unknown error codes are treated as `internal` while preserving the display message.
+

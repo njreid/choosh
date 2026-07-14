@@ -1,0 +1,12 @@
+{
+  "id": "018f6f42-ab28-7c90-8d57-52c8f13f7db1",
+  "workspace_id": "018f6f42-a542-7c90-8d57-52c8f13f7db1",
+  "kind": "agent",
+  "name": "Codex",
+  "status": "waiting",
+  "zellij_tab_id": 2,
+  "zellij_pane_id": "terminal_4",
+  "agent": "codex",
+  "adapter_version": "1.0.0"
+}
+

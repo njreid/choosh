@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://choosh.dev/protocol/v1/item.schema.json",
+  "title": "Choosh managed item",
+  "oneOf": [
+    { "$ref": "#/$defs/agent" },
+    { "$ref": "#/$defs/service" },
+    { "$ref": "#/$defs/terminal" }
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": ["id", "workspace_id", "kind", "name", "status", "zellij_tab_id"],
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "workspace_id": { "type": "string", "format": "uuid" },
+        "kind": { "enum": ["agent", "service", "terminal"] },
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "status": { "enum": ["starting", "running", "waiting", "stopped", "failed", "unknown"] },
+        "zellij_tab_id": { "type": "integer", "minimum": 0 },
+        "zellij_pane_id": { "type": ["string", "null"], "maxLength": 128 }
+      }
+    },
+    "agent": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["kind", "agent"],
+          "properties": {
+            "kind": { "const": "agent" },
+            "agent": { "enum": ["codex", "opencode", "claude"] },
+            "adapter_version": { "type": "string", "maxLength": 64 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "service": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["kind", "port", "protocol"],
+          "properties": {
+            "kind": { "const": "service" },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "protocol": { "const": "http" }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "terminal": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "const": "terminal" } }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}
+

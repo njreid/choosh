@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://choosh.dev/protocol/v1/envelope.schema.json",
+  "title": "Choosh protocol envelope",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/response" },
+    { "$ref": "#/$defs/event" }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "request": {
+      "type": "object",
+      "required": ["kind", "id", "method", "params"],
+      "properties": {
+        "kind": { "const": "request" },
+        "id": { "$ref": "#/$defs/id" },
+        "method": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "params": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "response": {
+      "type": "object",
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "const": "response" },
+        "id": { "$ref": "#/$defs/id" },
+        "result": {},
+        "error": { "$ref": "#/$defs/error" }
+      },
+      "oneOf": [
+        { "required": ["result"], "not": { "required": ["error"] } },
+        { "required": ["error"], "not": { "required": ["result"] } }
+      ],
+      "additionalProperties": false
+    },
+    "event": {
+      "type": "object",
+      "required": ["kind", "workspace_id", "sequence", "event", "payload"],
+      "properties": {
+        "kind": { "const": "event" },
+        "workspace_id": { "$ref": "#/$defs/id" },
+        "sequence": { "type": "integer", "minimum": 1 },
+        "event": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "payload": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_request", "not_found", "already_exists", "conflict",
+            "permission_denied", "stale_revision", "limit_exceeded",
+            "unsupported", "host_unavailable", "internal"
+          ]
+        },
+        "message": { "type": "string", "maxLength": 1024 },
+        "details": { "type": "object" },
+        "retryable": { "type": "boolean", "default": false }
+      },
+      "additionalProperties": false
+    }
+  }
+}
+

@@ -1,0 +1,14 @@
+{
+  "kind": "event",
+  "workspace_id": "018f6f42-a542-7c90-8d57-52c8f13f7db1",
+  "sequence": 42,
+  "event": "agent.input_required",
+  "payload": {
+    "type": "input_required",
+    "item_id": "018f6f42-ab28-7c90-8d57-52c8f13f7db1",
+    "occurred_at": "2026-07-14T12:00:00Z",
+    "reason": "approval",
+    "summary": "Codex requires approval"
+  }
+}
+
