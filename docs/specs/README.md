@@ -2,8 +2,11 @@
 
 These documents define the first implementable Choosh contracts.
 
+Delivery sequencing and exit gates are defined in the [milestone plan](../milestones/README.md).
+
 | Specification | Scope | Status |
 | --- | --- | --- |
+| [Android and Kotlin toolchain](android-toolchain.md) | Stable SDK/toolchain baseline, compatibility and update policy | Draft |
 | [Host protocol](host-protocol.md) | SSH stdio framing, handshake, RPC, events, errors | Draft |
 | [Workspace and item model](workspace-items.md) | Explicit workspaces and typed Zellij-backed items | Draft |
 | [Agent interoperability](agent-events.md) | Codex, OpenCode, Claude hooks and notifications | Draft |
@@ -18,4 +21,3 @@ The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are in
 ## Versioning
 
 The protocol starts at major version `1`. Additive fields are permitted within a major version and must be ignored by older readers. Removing or changing field semantics requires a new major version.
-

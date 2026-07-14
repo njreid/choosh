@@ -16,6 +16,7 @@
 - Agent hooks are observational and never approve, deny, or rewrite operations.
 - Zellij owns PTYs/process persistence; `chooshd` owns workspace and item metadata.
 - Android computes textual Git diffs; the host supplies bounded metadata and blob versions.
+- Android and Kotlin dependencies are pinned stable releases; preview SDKs run only in a separate compatibility lane.
 
 ## Documentation
 
@@ -30,4 +31,3 @@
 - JSON Schemas use draft 2020-12.
 - Markdown links should be relative for repository-owned documents.
 - Protocol examples must conform to their schemas once fixture validation is available.
-

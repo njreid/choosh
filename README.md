@@ -11,7 +11,7 @@ Choosh is in specification and risk-spike stage. No production APK or host daemo
 ## Core decisions
 
 - Android application ID: `ai.choosh`
-- Android UI: Jetpack Compose
+- Android UI: Jetpack Compose on the [latest mutually compatible stable Android/Kotlin toolchain](docs/specs/android-toolchain.md)
 - Source editor: [Sora Editor](https://github.com/Rosemoe/sora-editor)
 - Durable engines: Rust on Android and a small Rust `chooshd` on the host
 - Remote boundary: host-key-verified SSH only
@@ -26,6 +26,7 @@ Choosh is in specification and risk-spike stage. No production APK or host daemo
 
 - [System design and delivery plan](CHOOSH_DESIGN_PLAN.md)
 - [Specification index](docs/specs/README.md)
+- [Milestone plan](docs/milestones/README.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Threat model](docs/threat-model.md)
 
@@ -46,4 +47,3 @@ docs/                 Specifications, ADRs, and threat model
 ## Licence
 
 Choosh is intended to be distributed under Apache-2.0. Sora Editor remains an LGPL-2.1+ dependency and will be distributed with its required notices and replacement/relinking information.
-
