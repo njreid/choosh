@@ -7,6 +7,7 @@ Delivery sequencing and exit gates are defined in the [milestone plan](../milest
 | Specification | Scope | Status |
 | --- | --- | --- |
 | [Android and Kotlin toolchain](android-toolchain.md) | Stable SDK/toolchain baseline, compatibility and update policy | Draft |
+| [Terminal rendering and input](terminal-experience.md) | Zelland GPU port, Android IME, extra keys, gestures and recovery | Draft |
 | [Host protocol](host-protocol.md) | SSH stdio framing, handshake, RPC, events, errors | Draft |
 | [Workspace and item model](workspace-items.md) | Explicit workspaces and typed Zellij-backed items | Draft |
 | [Agent interoperability](agent-events.md) | Codex, OpenCode, Claude hooks and notifications | Draft |

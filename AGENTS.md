@@ -17,6 +17,7 @@
 - Zellij owns PTYs/process persistence; `chooshd` owns workspace and item metadata.
 - Android computes textual Git diffs; the host supplies bounded metadata and blob versions.
 - Android and Kotlin dependencies are pinned stable releases; preview SDKs run only in a separate compatibility lane.
+- Terminals use the native Rust GPU renderer; terminal modes and input encoding stay out of Compose and WebViews.
 
 ## Documentation
 

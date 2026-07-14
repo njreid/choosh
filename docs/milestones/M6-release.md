@@ -14,6 +14,7 @@ A signed, accessible, upgradeable release ships with supported host binaries and
 - **M6-R8:** Pass screen-reader, touch-target, contrast, keyboard, reduced-motion, low-memory, rotation, background, phone, and tablet tests.
 - **M6-R9:** Publish setup, adapter, service, security, backup, recovery, and troubleshooting docs.
 - **M6-R10:** Re-resolve the stable Android/Kotlin baseline, meet the current target-SDK release requirement, and close or explicitly time-box every dependency compatibility exception.
+- **M6-R11:** Pass the terminal correctness, IME/accessory, GPU recovery, performance, accessibility, and representative-device matrix defined by the terminal specification.
 
 ## Release gate
 All targets pass; a clean device reaches an agent and web preview from docs alone; no critical/high security issue remains; artifacts/checksums/SBOM/licences are public.

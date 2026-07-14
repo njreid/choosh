@@ -12,6 +12,7 @@ Choosh is in specification and risk-spike stage. No production APK or host daemo
 
 - Android application ID: `ai.choosh`
 - Android UI: Jetpack Compose on the [latest mutually compatible stable Android/Kotlin toolchain](docs/specs/android-toolchain.md)
+- Terminal: [Zelland-derived native wgpu/glyphon renderer](docs/specs/terminal-experience.md) with libghostty-vt and an Android IME extra-keys bar
 - Source editor: [Sora Editor](https://github.com/Rosemoe/sora-editor)
 - Durable engines: Rust on Android and a small Rust `chooshd` on the host
 - Remote boundary: host-key-verified SSH only

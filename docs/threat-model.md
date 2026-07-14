@@ -43,6 +43,8 @@ Status: Initial draft
 - Separate internal and development-service WebViews and cookie stores where platform support permits.
 - Bound frames, event spools, directory results, blobs, diffs, headers, tunnels, and logs.
 - Keep destructive stop/terminate operations separate from pin/unpin and require confirmation.
+- Route IME, hardware, accessory, touch, paste, and accessibility input through one active-terminal dispatcher; clear pending modifiers/composition on rebind.
+- Never log terminal text, keystrokes, composition, or clipboard contents; bound paste and warn before multiline paste.
 
 ## Initial abuse cases
 
@@ -56,12 +58,12 @@ Status: Initial draft
 | Hook automatically approves command | Adapters are observational; ignore decision output |
 | Replayed event creates stale notification | Per-workspace sequence, ack, item/status reconciliation |
 | Oversized diff exhausts memory | Negotiated byte/line/hunk/time limits |
+| Stale terminal binding sends input to another agent | Atomic renderer/input target generation; reject stale commands |
+| Malicious escape sequence abuses clipboard or device features | Keep OSC/device integration allowlisted; require explicit copy/paste actions |
 
 ## Open questions before release
 
 - Host binary update signing and rollback.
 - Unix socket peer credential verification on both host platforms.
 - WebView data-directory/profile isolation across supported Android versions.
-- Terminal escape-sequence filtering and clipboard policy.
 - Annotation export confidentiality and repository inclusion policy.
-

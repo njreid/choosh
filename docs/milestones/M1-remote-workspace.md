@@ -7,7 +7,7 @@ A clean Android install connects, registers a workspace, resumes one agent, brow
 - **M1-R1:** Host profiles use known-host verification and Keystore-backed credentials.
 - **M1-R2:** With consent, install/upgrade compatible host binaries and health-check `chooshd`.
 - **M1-R3:** List only explicit registrations; canonicalize a root and create/adopt the same-named Zellij session.
-- **M1-R4:** Start one agent in a managed tab and provide a complete interactive terminal.
+- **M1-R4:** Start one agent in a managed tab and provide the native GPU terminal with working IME, hardware keyboard, touch, clipboard, and an extra-keys bar immediately above the Android keyboard.
 - **M1-R5:** Browse/refresh/filter a root-confined SFTP tree.
 - **M1-R6:** Render remote Markdown with bounded, root-confined relative assets.
 - **M1-R7:** Reconnect after Android process death without stopping Zellij or the agent.
@@ -18,4 +18,3 @@ From a new install, register `/projects/choosh`, run an agent, kill/reopen Andro
 
 ## Excluded
 Notifications, multiple pins, services, editing, diffs, and annotations.
-

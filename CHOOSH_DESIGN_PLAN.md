@@ -203,7 +203,7 @@ CI builds Android arm64-v8a first, with x86_64 for emulators. GitHub Releases pu
 - Prove one normalized permission, idle and changed-file event from each supported agent.
 - Prove remote HEAD/index/worktree blob retrieval and a bounded client-side diff.
 - Prove a declared HTTP service through SSH `direct-tcpip`, including WebSockets.
-- Time-box terminal rendering: compare an embeddable Rust renderer with a proven Android terminal view behind a common interface.
+- Port and validate Zelland's native wgpu/glyphon + libghostty-vt terminal path without its Tauri/WebView coupling, including the Android IME extra-keys accessory.
 - Publish an unsigned/internal APK through GitHub Releases and confirm Obtainium detection.
 
 **Exit:** a reproducible app opens a local Sora document, calls Rust, and installs from a release URL.
@@ -290,7 +290,7 @@ CI builds Android arm64-v8a first, with x86_64 for emulators. GitHub Releases pu
 7. Explicit development-service launch and declared ports rather than process inference.
 8. Observational agent adapters with a shared event protocol.
 9. Host-supplied Git metadata/blobs with bounded client-side textual diff computation.
-10. Terminal renderer selected only after the Milestone 0 benchmark.
+10. Zelland-derived native GPU terminal behind an internal renderer interface, subject to the Milestone 0 licence, compatibility, correctness, and performance gate.
 
 ## Sources
 
