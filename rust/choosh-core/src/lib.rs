@@ -13,6 +13,7 @@ pub mod item;
 pub mod path;
 pub mod ports;
 pub mod runtime;
+pub mod service;
 pub mod terminal;
 pub mod text;
 pub mod workspace;
