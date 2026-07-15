@@ -6,6 +6,7 @@
 pub mod actor;
 pub mod backoff;
 pub mod connection;
+pub mod item;
 pub mod path;
 pub mod ports;
 pub mod runtime;
