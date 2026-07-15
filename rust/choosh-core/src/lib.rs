@@ -11,6 +11,7 @@ pub mod event_spool;
 pub mod gateway;
 pub mod item;
 pub mod path;
+pub mod pins;
 pub mod ports;
 pub mod runtime;
 pub mod service;
