@@ -6,3 +6,4 @@
 pub mod actor;
 pub mod ports;
 pub mod runtime;
+pub mod text;
