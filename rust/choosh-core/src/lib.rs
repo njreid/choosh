@@ -4,6 +4,7 @@
 //! outer adapter crates. Domain code receives these capabilities explicitly.
 
 pub mod actor;
+pub mod connection;
 pub mod ports;
 pub mod runtime;
 pub mod text;
