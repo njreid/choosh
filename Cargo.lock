@@ -7,6 +7,10 @@ name = "choosh-core"
 version = "0.0.0"
 
 [[package]]
+name = "choosh-host"
+version = "0.0.0"
+
+[[package]]
 name = "choosh-protocol"
 version = "0.0.0"
 
