@@ -1,5 +1,7 @@
 //! Shell-free command-line parsing for the Choosh host helper.
 
+pub mod bridge;
+
 use std::fmt;
 
 const MAX_VALUE_BYTES: usize = 1_024;
