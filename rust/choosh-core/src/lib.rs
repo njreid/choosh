@@ -7,6 +7,7 @@ pub mod actor;
 pub mod backoff;
 pub mod connection;
 pub mod diff;
+pub mod document;
 pub mod event_spool;
 pub mod gateway;
 pub mod item;
