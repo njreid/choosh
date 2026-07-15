@@ -132,7 +132,14 @@ impl AnnotationLimits {
         max_body_lines: usize,
         max_context_bytes: usize,
     ) -> Result<Self, AnnotationError> {
-        if [max_records, max_body_bytes, max_body_lines, max_context_bytes].contains(&0) {
+        if [
+            max_records,
+            max_body_bytes,
+            max_body_lines,
+            max_context_bytes,
+        ]
+        .contains(&0)
+        {
             return Err(AnnotationError::InvalidLimits);
         }
         Ok(Self {
@@ -203,7 +210,7 @@ impl AnnotationRegistry {
                 },
             },
         );
-        Ok(self.records.get(&key).expect("inserted annotation exists"))
+        self.records.get(&key).ok_or(AnnotationError::Duplicate)
     }
 
     #[must_use]
@@ -380,21 +387,22 @@ pub fn reanchor(
     } else {
         None
     };
-    if let Some(mapped_range) = mapped {
-        if valid_range(new_source, mapped_range)
-            && digest(&new_source.as_bytes()[mapped_range.start..mapped_range.end])
-                == annotation.context.selected_digest
-        {
-            return Ok(AnchorStatus::Attached {
-                range: mapped_range,
-                confidence: AnchorConfidence::Mapped,
-            });
-        }
+    if let Some(mapped_range) = mapped
+        && valid_range(new_source, mapped_range)
+        && digest(&new_source.as_bytes()[mapped_range.start..mapped_range.end])
+            == annotation.context.selected_digest
+    {
+        return Ok(AnchorStatus::Attached {
+            range: mapped_range,
+            confidence: AnchorConfidence::Mapped,
+        });
     }
 
     let selected = &old.as_bytes()[range.start..range.end];
     let mut candidates = Vec::new();
-    for (start, _) in new_source.match_indices(std::str::from_utf8(selected).map_err(|_| AnnotationError::InvalidRange)?) {
+    for (start, _) in new_source
+        .match_indices(std::str::from_utf8(selected).map_err(|_| AnnotationError::InvalidRange)?)
+    {
         let candidate = TextRange {
             start,
             end: start + selected.len(),
@@ -499,7 +507,7 @@ pub fn digest(bytes: &[u8]) -> [u8; 32] {
         output[slot] = output[slot]
             .wrapping_mul(31)
             .wrapping_add(*byte)
-            .wrapping_add((index & 0xff) as u8);
+            .wrapping_add(index.to_le_bytes()[0]);
     }
     output
 }
@@ -589,8 +597,21 @@ mod tests {
         let old = "lead [target] tail";
         let record = annotation(old, "target");
         assert_eq!(
-            reanchor(&record, Some(old), "new lead [target] tail", 2, ReanchorLimits { max_document_bytes: 100, max_candidates: 4 }).unwrap(),
-            AnchorStatus::Attached { range: TextRange { start: 10, end: 16 }, confidence: AnchorConfidence::Mapped }
+            reanchor(
+                &record,
+                Some(old),
+                "new lead [target] tail",
+                2,
+                ReanchorLimits {
+                    max_document_bytes: 100,
+                    max_candidates: 4
+                }
+            )
+            .unwrap(),
+            AnchorStatus::Attached {
+                range: TextRange { start: 10, end: 16 },
+                confidence: AnchorConfidence::Mapped
+            }
         );
     }
 
@@ -599,7 +620,17 @@ mod tests {
         let old = "zz[target]qq";
         let record = annotation(old, "target");
         assert_eq!(
-            reanchor(&record, Some(old), "[target] and [target]", 2, ReanchorLimits { max_document_bytes: 100, max_candidates: 4 }).unwrap(),
+            reanchor(
+                &record,
+                Some(old),
+                "[target] and [target]",
+                2,
+                ReanchorLimits {
+                    max_document_bytes: 100,
+                    max_candidates: 4
+                }
+            )
+            .unwrap(),
             AnchorStatus::Ambiguous { candidate_count: 2 }
         );
     }
@@ -609,8 +640,20 @@ mod tests {
         let old = "[target]";
         let record = annotation(old, "target");
         assert_eq!(
-            reanchor(&record, Some(old), "[changed]", 2, ReanchorLimits { max_document_bytes: 100, max_candidates: 4 }).unwrap(),
-            AnchorStatus::Orphaned { reason: OrphanReason::OverlappingRewrite }
+            reanchor(
+                &record,
+                Some(old),
+                "[changed]",
+                2,
+                ReanchorLimits {
+                    max_document_bytes: 100,
+                    max_candidates: 4
+                }
+            )
+            .unwrap(),
+            AnchorStatus::Orphaned {
+                reason: OrphanReason::OverlappingRewrite
+            }
         );
     }
 
@@ -618,14 +661,31 @@ mod tests {
     fn export_is_sorted_bounded_and_has_no_write_capability() {
         let mut records = registry();
         for id in ["b", "a"] {
-            records.create(NewAnnotation {
-                key: key(id), document_revision: 1, range: TextRange { start: 1, end: 2 },
-                context: context("x", "", ""), body_markdown: id.into(),
-            }).unwrap();
+            records
+                .create(NewAnnotation {
+                    key: key(id),
+                    document_revision: 1,
+                    range: TextRange { start: 1, end: 2 },
+                    context: context("x", "", ""),
+                    body_markdown: id.into(),
+                })
+                .unwrap();
         }
-        let export = records.prepare_export(&WorkspaceId::parse("workspace").unwrap(), 2, 100, false).unwrap();
-        assert_eq!(export.records.iter().map(|r| r.annotation_id.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        let export = records
+            .prepare_export(&WorkspaceId::parse("workspace").unwrap(), 2, 100, false)
+            .unwrap();
+        assert_eq!(
+            export
+                .records
+                .iter()
+                .map(|r| r.annotation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
         assert!(export.records.iter().all(|record| record.context.is_none()));
-        assert_eq!(records.prepare_export(&WorkspaceId::parse("workspace").unwrap(), 1, 100, false), Err(AnnotationError::ExportLimit));
+        assert_eq!(
+            records.prepare_export(&WorkspaceId::parse("workspace").unwrap(), 1, 100, false),
+            Err(AnnotationError::ExportLimit)
+        );
     }
 }
