@@ -19,6 +19,16 @@
 - Android and Kotlin dependencies are pinned stable releases; preview SDKs run only in a separate compatibility lane.
 - Terminals use the native Rust GPU renderer; terminal modes and input encoding stay out of Compose and WebViews.
 
+## Dependency injection and composition
+
+- Use explicit constructor injection and narrow capability interfaces to keep components independently implementable and headlessly testable.
+- Define injectable boundaries for time, ID generation, durable storage, SSH/SFTP transport, host RPC, Zellij control, Git data, notifications, loopback gateways, and process launch.
+- Rust code uses traits with generics or `Arc<dyn Trait>` as appropriate; assemble concrete implementations only in binary, JNI, or other outer composition roots.
+- Kotlin code uses constructor injection; keep application and Android component wiring in composition roots at the `android/app` boundary.
+- Prefer deterministic fakes over mocks that assert call order. Tests must be able to inject clocks, IDs, transports, storage, and fault behavior without wall-clock sleeps or external services.
+- Do not use service locators, mutable global singletons, or hidden ambient dependencies.
+- Do not introduce a DI framework during M0. If object-graph construction later justifies one, confine framework annotations and modules to `android/app`; shared and domain modules remain framework-agnostic.
+
 ## Documentation
 
 - Update the relevant specification before changing a protocol or trust boundary.
