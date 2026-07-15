@@ -3,6 +3,8 @@
 These documents define the first implementable Choosh contracts.
 
 Delivery sequencing and exit gates are defined in the [milestone plan](../milestones/README.md).
+Implementation-level state machines, failure semantics, fixtures, and headless
+acceptance harnesses are defined in the [detailed milestone designs](../design/README.md).
 
 | Specification | Scope | Status |
 | --- | --- | --- |
