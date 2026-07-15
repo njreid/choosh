@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "rust/choosh-core",
+    "rust/choosh-protocol",
     "rust/choosh-testkit",
 ]
 resolver = "3"
