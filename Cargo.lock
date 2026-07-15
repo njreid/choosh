@@ -20,3 +20,10 @@ version = "0.0.0"
 dependencies = [
  "choosh-core",
 ]
+
+[[package]]
+name = "chooshd"
+version = "0.0.0"
+dependencies = [
+ "choosh-core",
+]

@@ -4,6 +4,7 @@ members = [
     "rust/choosh-host",
     "rust/choosh-protocol",
     "rust/choosh-testkit",
+    "rust/chooshd",
 ]
 resolver = "3"
 
