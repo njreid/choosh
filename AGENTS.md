@@ -42,3 +42,11 @@
 - JSON Schemas use draft 2020-12.
 - Markdown links should be relative for repository-owned documents.
 - Protocol examples must conform to their schemas once fixture validation is available.
+
+## Increment workflow
+
+- Treat each independently working, verified slice as a commit boundary; do not accumulate unrelated implementation increments in one commit.
+- Before committing, run the checks relevant to the changed scope plus `git diff --check`, and review the staged file set for unrelated changes or sensitive data.
+- Use a focused commit message that states the working increment delivered.
+- Push each completed increment to the current tracked remote branch after committing, then verify the local and remote refs match and the worktree is clean.
+- Do not commit or push a broken increment merely to checkpoint it. If external access prevents a push, preserve the verified local commit and report the exact blocker.
