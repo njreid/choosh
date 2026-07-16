@@ -10,6 +10,7 @@ pub mod annotation_export;
 pub mod asset;
 pub mod backoff;
 pub mod bridge;
+pub mod conformance;
 pub mod connection;
 pub mod diff;
 pub mod diff_navigation;
