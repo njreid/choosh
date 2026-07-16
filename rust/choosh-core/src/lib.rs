@@ -9,6 +9,7 @@ pub mod annotation;
 pub mod annotation_export;
 pub mod asset;
 pub mod backoff;
+pub mod backup_restore;
 pub mod bridge;
 pub mod conformance;
 pub mod connection;
