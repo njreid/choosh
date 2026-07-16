@@ -19,6 +19,12 @@
 - Android and Kotlin dependencies are pinned stable releases; preview SDKs run only in a separate compatibility lane.
 - Terminals use the native Rust GPU renderer; terminal modes and input encoding stay out of Compose and WebViews.
 
+## Visual language
+
+- Use Geomini as the default typeface for general application UI.
+- Use Iosevka Charon Mono for terminal surfaces and headings.
+- Bundle or ship fonts only after recording their exact source, version, licence, redistribution obligations, and required notices. Define deterministic fallbacks for missing glyphs and verify layout without visual-only acceptance steps.
+
 ## Dependency injection and composition
 
 - Use explicit constructor injection and narrow capability interfaces to keep components independently implementable and headlessly testable.

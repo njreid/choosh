@@ -24,6 +24,8 @@ The first implementation MUST port as much of Zelland's proven Android terminal 
 
 The port MUST preserve upstream provenance and applicable notices. Before copying source, M0 MUST establish ownership or an explicit licence for Zelland code and audit the licences and distribution requirements of libghostty-vt, wgpu, glyphon, fonts, and transitive native libraries.
 
+The terminal typeface is Iosevka Charon Mono. Headings use the same family, while general application UI uses Geomini. The implementation MUST pin the distributed font artifacts, retain their licence and provenance, define deterministic missing-glyph fallbacks, and derive terminal cell metrics from the exact loaded face rather than hard-coded dimensions.
+
 ## Rendering architecture
 
 ```text
@@ -93,4 +95,3 @@ Correctness fixtures MUST cover ANSI/VT behavior used by Zellij, Codex, OpenCode
 - [Terminal engine integration](https://github.com/njreid/zelland/blob/8bf9cf55911588451804a39526f8ae869da021b6/src-tauri/src/terminal.rs)
 - [Android wgpu findings](https://github.com/njreid/zelland/blob/8bf9cf55911588451804a39526f8ae869da021b6/WGPU_FIXES.md)
 - [Native key-bar design](https://github.com/njreid/zelland/blob/8bf9cf55911588451804a39526f8ae869da021b6/docs/features/NATIVE_UX.md)
-
