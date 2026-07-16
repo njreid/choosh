@@ -17,6 +17,7 @@ pub mod document_format;
 pub mod document_save;
 pub mod event_spool;
 pub mod explorer;
+pub mod fault_campaign;
 pub mod gateway;
 pub mod gateway_stream;
 pub mod gesture;
