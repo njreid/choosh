@@ -27,6 +27,7 @@ pub mod pins;
 pub mod ports;
 pub mod readiness;
 pub mod release_evidence;
+pub mod renderer_binding;
 pub mod runtime;
 pub mod service;
 pub mod terminal;
