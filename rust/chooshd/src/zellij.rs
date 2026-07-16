@@ -130,9 +130,9 @@ pub fn create_tab(
         return Err(PlanError::EmptyCommand);
     }
     let mut args = strings([
-        "action",
         "--session",
         session.as_str(),
+        "action",
         "new-tab",
         "--name",
         tab,
@@ -153,9 +153,9 @@ pub fn create_tab(
 pub fn focus_tab(target: &ZellijTarget, limits: PlanLimits) -> Result<CommandPlan, PlanError> {
     plan(
         [
-            "action",
             "--session",
             target.session(),
+            "action",
             "go-to-tab-name",
             target.tab(),
         ],
@@ -172,10 +172,10 @@ pub fn focus_tab(target: &ZellijTarget, limits: PlanLimits) -> Result<CommandPla
 pub fn focus_pane(target: &ZellijTarget, limits: PlanLimits) -> Result<CommandPlan, PlanError> {
     plan(
         [
-            "action",
             "--session",
             target.session(),
-            "focus-pane-with-id",
+            "action",
+            "focus-pane-id",
             target.pane(),
         ],
         limits,
@@ -191,9 +191,9 @@ pub fn focus_pane(target: &ZellijTarget, limits: PlanLimits) -> Result<CommandPl
 pub fn stop_pane(target: &ZellijTarget, limits: PlanLimits) -> Result<CommandPlan, PlanError> {
     plan(
         [
-            "action",
             "--session",
             target.session(),
+            "action",
             "close-pane",
             "--pane-id",
             target.pane(),
@@ -388,9 +388,9 @@ mod tests {
         assert_eq!(
             argv(result),
             [
-                "action",
                 "--session",
                 "safe-session",
+                "action",
                 "new-tab",
                 "--name",
                 "tab name;data",
@@ -410,9 +410,9 @@ mod tests {
         assert_eq!(
             argv(focus_tab(&target(), PlanLimits::default()).unwrap()),
             [
-                "action",
                 "--session",
                 "session;still-data",
+                "action",
                 "go-to-tab-name",
                 "tab $(touch nope)"
             ]
@@ -420,9 +420,9 @@ mod tests {
         assert_eq!(
             argv(stop_pane(&target(), PlanLimits::default()).unwrap()),
             [
-                "action",
                 "--session",
                 "session;still-data",
+                "action",
                 "close-pane",
                 "--pane-id",
                 "pane`uname`"
