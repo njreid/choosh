@@ -7,6 +7,7 @@ pub mod actor;
 pub mod annotation;
 pub mod asset;
 pub mod backoff;
+pub mod bridge;
 pub mod connection;
 pub mod diff;
 pub mod document;
