@@ -12,6 +12,7 @@ pub mod diff;
 pub mod document;
 pub mod document_save;
 pub mod event_spool;
+pub mod explorer;
 pub mod gateway;
 pub mod gesture;
 pub mod http_gateway;
