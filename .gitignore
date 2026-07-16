@@ -3,6 +3,9 @@
 .gradle/
 build/
 target/
+.gradle-home/
+android/.gradle/
+android/**/build/
 local.properties
 *.iml
 *.jks
@@ -10,4 +13,3 @@ local.properties
 *.log
 *.swp
 *.tmp
-
