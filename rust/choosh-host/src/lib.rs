@@ -1,6 +1,7 @@
 //! Shell-free command-line parsing for the Choosh host helper.
 
 pub mod bridge;
+pub mod dispatch;
 
 use std::fmt;
 
