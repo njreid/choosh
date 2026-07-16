@@ -43,6 +43,7 @@ pub mod selection;
 pub mod service;
 pub mod terminal;
 pub mod text;
+pub mod toolchain_evidence;
 pub mod vt;
 pub mod waiting_notification;
 pub mod workspace;
