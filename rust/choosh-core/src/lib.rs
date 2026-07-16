@@ -10,6 +10,7 @@ pub mod backoff;
 pub mod connection;
 pub mod diff;
 pub mod document;
+pub mod document_save;
 pub mod event_spool;
 pub mod gateway;
 pub mod http_gateway;
