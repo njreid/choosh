@@ -6,6 +6,7 @@ pub mod project_fs;
 pub mod socket;
 pub mod state;
 pub mod storage;
+pub mod upgrade;
 pub mod zellij;
 
 pub use state::{CoordinatorError, CoordinatorLimits, DaemonCoordinator, WorkspaceStateSnapshot};
