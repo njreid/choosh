@@ -2,6 +2,7 @@
 
 pub mod adapters;
 pub mod blob;
+pub mod checkpoint;
 pub mod git;
 pub mod project_fs;
 pub mod socket;
