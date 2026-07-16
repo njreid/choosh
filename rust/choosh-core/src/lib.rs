@@ -32,6 +32,7 @@ pub mod release_evidence;
 pub mod release_update;
 pub mod renderer_binding;
 pub mod runtime;
+pub mod security_audit;
 pub mod selection;
 pub mod service;
 pub mod terminal;
