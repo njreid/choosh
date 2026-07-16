@@ -12,6 +12,7 @@ pub mod diff;
 pub mod document;
 pub mod event_spool;
 pub mod gateway;
+pub mod http_gateway;
 pub mod item;
 pub mod path;
 pub mod pins;
