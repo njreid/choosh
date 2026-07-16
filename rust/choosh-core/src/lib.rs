@@ -11,6 +11,7 @@ pub mod backoff;
 pub mod bridge;
 pub mod connection;
 pub mod diff;
+pub mod diff_navigation;
 pub mod document;
 pub mod document_format;
 pub mod document_save;
