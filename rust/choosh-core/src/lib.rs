@@ -32,6 +32,7 @@ pub mod path;
 pub mod performance;
 pub mod pins;
 pub mod ports;
+pub mod provenance;
 pub mod readiness;
 pub mod reconnect_recovery;
 pub mod release_evidence;
