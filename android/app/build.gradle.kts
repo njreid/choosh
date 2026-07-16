@@ -1,7 +1,15 @@
+import java.util.Properties
+
 plugins { alias(libs.plugins.android.application) }
+
+val localReleaseProperties = Properties().apply {
+    val source = rootProject.file("key.properties")
+    if (source.isFile) source.inputStream().use(::load)
+}
 
 fun releaseValue(name: String): String? = providers.environmentVariable(name).orNull
     ?: providers.gradleProperty(name).orNull
+    ?: localReleaseProperties.getProperty(name)
 
 val releaseVersionName = releaseValue("CHOOSH_VERSION_NAME") ?: "0.0.0"
 val releaseVersionCode = releaseValue("CHOOSH_VERSION_CODE")?.toIntOrNull() ?: 1

@@ -30,6 +30,7 @@ Choosh is in specification and risk-spike stage. No production APK or host daemo
 - [Milestone plan](docs/milestones/README.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Threat model](docs/threat-model.md)
+- [Android release and Obtainium distribution](docs/release-android.md)
 
 ## Planned repository layout
 

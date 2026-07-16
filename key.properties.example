@@ -1,0 +1,8 @@
+# Copy to key.properties for local release builds. Never commit either the
+# populated file or its referenced keystore.
+CHOOSH_KEYSTORE_FILE=/absolute/path/to/choosh-release.jks
+CHOOSH_KEYSTORE_PASSWORD=replace-locally
+CHOOSH_KEY_ALIAS=choosh-release
+CHOOSH_KEY_PASSWORD=replace-locally
+CHOOSH_VERSION_NAME=1.0.0
+CHOOSH_VERSION_CODE=1000000

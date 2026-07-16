@@ -1,0 +1,135 @@
+name: Android release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer without a leading v
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  signed-universal-apk:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_DIR: build/release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Resolve monotonic release version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${MANUAL_VERSION:-${TAG#v}}"
+          if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "version must be MAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          patch="${BASH_REMATCH[3]}"
+          if (( major > 2100 || minor > 999 || patch > 999 )); then
+            echo "version components exceed Android versionCode encoding" >&2
+            exit 1
+          fi
+          version_code=$((major * 1000000 + minor * 1000 + patch))
+          if (( version_code < 1 || version_code > 2100000000 )); then
+            echo "derived versionCode is outside the supported Android range" >&2
+            exit 1
+          fi
+          previous_tag="$(gh release list --limit 100 --json tagName --jq '.[].tagName' \
+            | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            | grep -Fvx "v${version}" | sort -V | tail -1 || true)"
+          if [[ -n "$previous_tag" ]]; then
+            IFS=. read -r previous_major previous_minor previous_patch <<< "${previous_tag#v}"
+            previous_code=$((previous_major * 1000000 + previous_minor * 1000 + previous_patch))
+            if (( version_code <= previous_code )); then
+              echo "versionCode must exceed latest published release ${previous_tag}" >&2
+              exit 1
+            fi
+          fi
+          printf 'name=%s\ncode=%s\n' "$version" "$version_code" >> "$GITHUB_OUTPUT"
+
+      - name: Materialize release keystore
+        env:
+          CHOOSH_KEYSTORE_BASE64: ${{ secrets.CHOOSH_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$CHOOSH_KEYSTORE_BASE64"
+          umask 077
+          printf '%s' "$CHOOSH_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/choosh-release.jks"
+
+      - name: Build signed universal APK, SBOM, and notices
+        env:
+          CHOOSH_KEYSTORE_FILE: ${{ runner.temp }}/choosh-release.jks
+          CHOOSH_KEYSTORE_PASSWORD: ${{ secrets.CHOOSH_KEYSTORE_PASSWORD }}
+          CHOOSH_KEY_ALIAS: ${{ secrets.CHOOSH_KEY_ALIAS }}
+          CHOOSH_KEY_PASSWORD: ${{ secrets.CHOOSH_KEY_PASSWORD }}
+          CHOOSH_VERSION_NAME: ${{ steps.version.outputs.name }}
+          CHOOSH_VERSION_CODE: ${{ steps.version.outputs.code }}
+        run: ./gradlew :app:assembleRelease :app:cyclonedxBom :app:generateReleaseLicenseReport --stacktrace
+
+      - name: Collect and verify release evidence
+        env:
+          VERSION: ${{ steps.version.outputs.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RELEASE_DIR"
+          mapfile -t apks < <(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print)
+          if (( ${#apks[@]} != 1 )); then
+            echo "expected exactly one universal release APK, found ${#apks[@]}" >&2
+            exit 1
+          fi
+          apk="$RELEASE_DIR/choosh-${VERSION}.apk"
+          cp "${apks[0]}" "$apk"
+          apksigner verify --verbose --print-certs "$apk"
+          cp android/app/build/reports/bom.json "$RELEASE_DIR/choosh-${VERSION}.cdx.json"
+          cp android/app/build/reports/licenses/NOTICE.txt "$RELEASE_DIR/choosh-${VERSION}-NOTICE.txt"
+          sha256sum "$RELEASE_DIR"/* > "$RELEASE_DIR/choosh-${VERSION}.sha256"
+
+      - name: Attest APK provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: build/release/choosh-${{ steps.version.outputs.name }}.apk
+
+      - name: Upload retained release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: choosh-${{ steps.version.outputs.name }}-release-evidence
+          path: build/release/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish exact release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --title "Choosh $TAG" --generate-notes
+          gh release upload "$TAG" build/release/* --clobber
