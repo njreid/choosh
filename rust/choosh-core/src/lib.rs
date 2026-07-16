@@ -16,6 +16,7 @@ pub mod gateway;
 pub mod gesture;
 pub mod http_gateway;
 pub mod item;
+pub mod markdown;
 pub mod path;
 pub mod pins;
 pub mod ports;
