@@ -28,6 +28,7 @@ pub mod path;
 pub mod pins;
 pub mod ports;
 pub mod readiness;
+pub mod reconnect_recovery;
 pub mod release_evidence;
 pub mod release_update;
 pub mod renderer_binding;
