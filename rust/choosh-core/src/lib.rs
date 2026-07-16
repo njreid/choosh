@@ -19,5 +19,6 @@ pub mod runtime;
 pub mod service;
 pub mod terminal;
 pub mod text;
+pub mod vt;
 pub mod waiting_notification;
 pub mod workspace;
