@@ -4,6 +4,7 @@ pub mod adapters;
 pub mod blob;
 pub mod checkpoint;
 pub mod git;
+pub mod health;
 pub mod lifecycle;
 pub mod project_fs;
 pub mod socket;
