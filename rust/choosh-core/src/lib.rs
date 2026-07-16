@@ -27,6 +27,7 @@ pub mod gesture;
 pub mod http_gateway;
 pub mod item;
 pub mod markdown;
+pub mod milestone_acceptance;
 pub mod notification_activation;
 pub mod path;
 pub mod performance;
