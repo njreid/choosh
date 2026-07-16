@@ -23,6 +23,7 @@ pub mod notification_activation;
 pub mod path;
 pub mod pins;
 pub mod ports;
+pub mod release_evidence;
 pub mod runtime;
 pub mod service;
 pub mod terminal;
