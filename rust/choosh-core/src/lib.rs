@@ -13,6 +13,7 @@ pub mod document;
 pub mod document_save;
 pub mod event_spool;
 pub mod gateway;
+pub mod gesture;
 pub mod http_gateway;
 pub mod item;
 pub mod path;
