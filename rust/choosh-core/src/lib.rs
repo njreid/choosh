@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod annotation;
+pub mod asset;
 pub mod backoff;
 pub mod connection;
 pub mod diff;
