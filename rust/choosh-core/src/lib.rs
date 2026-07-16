@@ -5,6 +5,7 @@
 
 pub mod actor;
 pub mod annotation;
+pub mod annotation_export;
 pub mod asset;
 pub mod backoff;
 pub mod bridge;
