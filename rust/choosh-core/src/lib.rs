@@ -25,6 +25,7 @@ pub mod item;
 pub mod markdown;
 pub mod notification_activation;
 pub mod path;
+pub mod performance;
 pub mod pins;
 pub mod ports;
 pub mod readiness;
