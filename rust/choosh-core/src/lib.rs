@@ -3,6 +3,7 @@
 //! Concrete Android, SSH, filesystem, and process implementations belong in
 //! outer adapter crates. Domain code receives these capabilities explicitly.
 
+pub mod accessibility_evidence;
 pub mod actor;
 pub mod annotation;
 pub mod annotation_export;
