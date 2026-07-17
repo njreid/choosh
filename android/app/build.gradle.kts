@@ -56,6 +56,42 @@ android {
 
 dependencies { testImplementation(libs.junit4) }
 
+val buildRustAndroid by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Build and ABI-check the Rust bridge for arm64-v8a and x86_64."
+    workingDir(rootProject.projectDir)
+    commandLine(rootProject.file("scripts/build-android-rust.sh").absolutePath)
+}
+
+val checkNativeAbiPackaging by tasks.registering {
+    group = "verification"
+    description = "Checks both Android ABIs once native bridge libraries are present."
+    inputs.dir(layout.projectDirectory.dir("src/main/jniLibs")).optional()
+    doLast {
+        val root = inputs.files.files.singleOrNull()
+        if (root == null) {
+            logger.lifecycle("Native bridge absent: arm64-v8a/x86_64 packaging gate is an explicit placeholder.")
+            return@doLast
+        }
+        val libraries = if (root.isDirectory) {
+            root.walkTopDown().filter { it.isFile && it.extension == "so" }.toList()
+        } else {
+            emptyList()
+        }
+        if (libraries.isEmpty()) {
+            logger.lifecycle("Native bridge absent: arm64-v8a/x86_64 packaging gate is an explicit placeholder.")
+            return@doLast
+        }
+        val byAbi = libraries.groupBy { it.parentFile.name }
+        val required = setOf("arm64-v8a", "x86_64")
+        check(byAbi.keys.containsAll(required)) { "Native bridge must package arm64-v8a and x86_64" }
+        val names = required.associateWith { abi -> byAbi.getValue(abi).map { it.name }.sorted() }
+        check(names.getValue("arm64-v8a") == names.getValue("x86_64")) {
+            "Native bridge library sets differ between required ABIs"
+        }
+    }
+}
+
 val validateReleaseEvidence by tasks.registering {
     group = "verification"
     doLast {

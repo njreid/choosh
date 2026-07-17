@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "rust/choosh-android-bridge",
     "rust/choosh-core",
     "rust/choosh-host",
     "rust/choosh-protocol",

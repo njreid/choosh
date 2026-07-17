@@ -6,6 +6,7 @@ target/
 .gradle-home/
 android/.gradle/
 android/**/build/
+android/app/src/main/jniLibs/
 local.properties
 *.iml
 *.jks
