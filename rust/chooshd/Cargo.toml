@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 choosh-core = { path = "../choosh-core" }
+choosh-protocol = { path = "../choosh-protocol" }
 
 [lints]
 workspace = true

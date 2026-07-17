@@ -344,12 +344,12 @@ mod tests {
         let bridge_handled = Arc::clone(&handled);
         let bridge_stopped = Arc::clone(&remote_process_stopped);
         let bridge = std::thread::spawn(move || {
-            let mut handler = DurableHandler {
+            let mut frame_handler = DurableHandler {
                 handled: bridge_handled,
                 remote_process_stopped: bridge_stopped,
             };
-            let result = run_bridge(server, server_output, &mut handler, limits(7));
-            assert!(!handler.remote_process_stopped.load(Ordering::SeqCst));
+            let result = run_bridge(server, server_output, &mut frame_handler, limits(7));
+            assert!(!frame_handler.remote_process_stopped.load(Ordering::SeqCst));
             result
         });
 

@@ -24,17 +24,25 @@ Audit date: 2026-07-17. This is an implementation evidence inventory, not an M0-
   for concurrent PTY, exec/RPC, SFTP, and direct-tcpip channels on one verified connection.
 - Host-key policy is a tested state machine, not yet connected to a cryptographic SSH library or a
   persisted known-host store.
-- There are library entry points but no composed `chooshd` and `choosh-host` binaries that connect
-  SSH stdio framing to the daemon Unix socket.
-- No single black-box test currently starts `chooshd`, inspects filesystem modes, invokes
-  `choosh-host rpc --stdio`, performs hello/welcome, issues parallel requests, and proves absence of
-  a TCP listener.
+- `chooshd` now has a minimal composition-root binary with mandatory injected
+  `--state-dir` and `--socket` paths. It binds the existing private Unix socket
+  lifecycle and exposes only bounded raw `health`/echo frames. This is a
+  black-box process seam, not the versioned JSON hello/welcome protocol.
+- `choosh-host rpc --stdio --socket <absolute-path>` now composes bounded stdio
+  framing with the injected daemon socket. The exact shell-free argument grammar
+  rejects relative, non-normal, and oversized paths without echoing them.
+- `scripts/test-rpc-socket.sh` starts both process roots, verifies the `0700`
+  state directory and `0600` socket, and round-trips framed raw
+  `health`/`healthy` evidence through `choosh-host` stdio. It does not claim
+  JSON hello/welcome, parallel requests, or TCP-listener enumeration.
 - The stdio bridge currently validates frame boundaries only. UTF-8, JSON, envelope kind, and
   negotiated-session enforcement live in separate protocol modules and are not composed behind the
   bridge handler.
 - PTY latency/fairness under throttled SFTP, disconnect injection for every channel type, and
   direct-tcpip HTTP/WebSocket/SSE fidelity remain unimplemented.
 
-Therefore M0-R5 and M0-R6 remain blocked. The next vertical gate should add composition-root
-binaries and a local process harness; only after that should the repository claim end-to-end SSH
+Therefore M0-R5 and M0-R6 remain blocked. The new local process harness proves
+the daemon's injected private-socket plus `choosh-host` stdio raw-frame seam.
+The next vertical gate must add the versioned JSON protocol and verified SSH
+transport; only after that should the repository claim end-to-end SSH
 stdio-to-`0600`-socket behavior.

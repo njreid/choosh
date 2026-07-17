@@ -37,4 +37,5 @@ name = "chooshd"
 version = "0.0.0"
 dependencies = [
  "choosh-core",
+ "choosh-protocol",
 ]

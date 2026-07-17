@@ -2,6 +2,8 @@
 
 pub mod bridge;
 pub mod dispatch;
+#[cfg(unix)]
+pub mod socket_relay;
 
 use std::fmt;
 

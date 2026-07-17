@@ -43,6 +43,9 @@ jobs:
       - name: Repository specifications
         if: matrix.host == 'linux-x86_64'
         run: ./scripts/check-specs.sh
+      - name: Local RPC process seam
+        if: matrix.host == 'linux-x86_64'
+        run: ./scripts/test-rpc-socket.sh
       - name: Rust formatting
         run: cargo fmt --all -- --check
       - name: Rust lint
