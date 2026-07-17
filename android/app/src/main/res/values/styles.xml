@@ -1,1 +1,16 @@
-<resources><style name="Theme.Choosh" parent="android:style/Theme.Material.Light.NoActionBar"><item name="android:fontFamily">sans</item></style></resources>
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Choosh" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">@font/choosh_ui</item>
+    </style>
+
+    <style name="Choosh.Text.Heading" parent="">
+        <item name="android:fontFamily">@font/choosh_terminal</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="Choosh.Text.Terminal" parent="">
+        <item name="android:fontFamily">@font/choosh_terminal</item>
+        <item name="android:textStyle">normal</item>
+    </style>
+</resources>
