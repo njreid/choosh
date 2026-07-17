@@ -13,7 +13,7 @@ The baseline resolved on 2026-07-16 is:
 | Component | Production baseline | Notes |
 | --- | --- | --- |
 | Android platform | `compileSdk = 37`, `targetSdk = 37` | Android 17 is the latest stable platform. |
-| Next-platform validation | Latest available preview SDK | Non-blocking and never required for production builds. |
+| Next-platform validation | No post-API-37 platform SDK published as of 2026-07-17 | The Android 17 QPR1 beta is a runtime quarterly preview, not a new platform API SDK. |
 | Android Gradle Plugin | 9.3.0 | Current stable minor release. |
 | Gradle wrapper | 9.6.1 | Current stable wrapper; checksum pinned. |
 | Kotlin | 2.4.10 | Current stable Kotlin bug-fix release. |
@@ -43,9 +43,22 @@ Sora Editor and the Kotlin/Rust bridge are release-critical dependencies. M0 MUS
 - New code MUST NOT introduce deprecated Android APIs unless no supported replacement exists and the exception is documented.
 - Each milestone start and release candidate MUST re-resolve this table against official release notes. Upgrades are reviewed changes, never dynamic resolution during a build.
 
+## Preview compatibility lane
+
+The `android-next-platform-preview` CI job queries the preview SDK channel for a
+nonnumeric `platforms;android-<codename>` package. If Google has not published a
+post-API-37 next-platform SDK, the job emits the stable
+`preview_sdk_status=no_next_platform_preview_available` evidence and succeeds
+without pretending that a QPR runtime image is a new compile SDK. When a preview
+package exists, the job installs that exact discovered package, changes only its
+ephemeral checkout to `compileSdkPreview`, and runs lint, unit tests, and debug
+assembly. It has `continue-on-error: true`, receives no publishing credentials,
+uploads no artifacts, and is not a dependency of production or release jobs.
+
 ## Sources
 
 - [Android 17 SDK setup](https://developer.android.com/about/versions/17/setup-sdk)
+- [Android 17 QPR1 beta overview](https://developer.android.com/about/versions/17/qpr1/overview)
 - [Android Gradle Plugin 9.3 release notes](https://developer.android.com/build/releases/agp-9-3-0-release-notes)
 - [Gradle 9.6.1 release notes](https://docs.gradle.org/9.6.1/release-notes.html)
 - [Kotlin releases](https://kotlinlang.org/docs/releases.html)

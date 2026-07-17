@@ -197,6 +197,13 @@ where
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+    #[cfg(unix)]
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     struct Echo;
 
@@ -305,5 +312,56 @@ mod tests {
             BridgeLimits::new(MAX_CONTROL_FRAME_BYTES + 1, 1, 1),
             Err(BridgeError::InvalidLimits)
         );
+    }
+
+    /// Models the SSH-exec stdio boundary with a local full-duplex stream. The handler's shared
+    /// state represents daemon/Zellij ownership and deliberately outlives this one bridge.
+    #[cfg(unix)]
+    #[test]
+    fn clean_stdio_eof_ends_bridge_without_stopping_daemon_owned_state() {
+        struct DurableHandler {
+            handled: Arc<AtomicUsize>,
+            remote_process_stopped: Arc<AtomicBool>,
+        }
+
+        impl FrameHandler for DurableHandler {
+            fn handle_frame<W: Write>(
+                &mut self,
+                frame: &[u8],
+                responses: &mut FrameWriter<'_, W>,
+            ) -> Result<(), HandlerFailure> {
+                self.handled.fetch_add(1, Ordering::SeqCst);
+                responses
+                    .write_frame(frame)
+                    .map_err(|_| HandlerFailure::Internal)
+            }
+        }
+
+        let handled = Arc::new(AtomicUsize::new(0));
+        let remote_process_stopped = Arc::new(AtomicBool::new(false));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let server_output = server.try_clone().unwrap();
+        let bridge_handled = Arc::clone(&handled);
+        let bridge_stopped = Arc::clone(&remote_process_stopped);
+        let bridge = std::thread::spawn(move || {
+            let mut handler = DurableHandler {
+                handled: bridge_handled,
+                remote_process_stopped: bridge_stopped,
+            };
+            let result = run_bridge(server, server_output, &mut handler, limits(7));
+            assert!(!handler.remote_process_stopped.load(Ordering::SeqCst));
+            result
+        });
+
+        let request = encode_frame(b"hello", 64).unwrap();
+        client.write_all(&request).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        assert_eq!(bridge.join().unwrap(), Ok(BridgeStats { input_frames: 1 }));
+        assert_eq!(response, request);
+        assert_eq!(handled.load(Ordering::SeqCst), 1);
+        assert!(!remote_process_stopped.load(Ordering::SeqCst));
     }
 }

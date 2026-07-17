@@ -81,3 +81,57 @@ jobs:
             android/app/build/outputs/apk/androidTest/debug/
           if-no-files-found: warn
           retention-days: 14
+
+  android-next-platform-preview:
+    name: Android next-platform preview (non-blocking)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: android-actions/setup-android@v3
+      - name: Discover latest next-platform preview SDK
+        id: preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$({ sdkmanager --list --channel=3 || true; } \
+            | awk -F'|' '/^  platforms;android-[[:alpha:]][^ ]* / { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1); print $1 }' \
+            | sort -V \
+            | tail -n 1)"
+          if [[ -z "$package" ]]; then
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'preview_sdk_status=no_next_platform_preview_available'
+            exit 0
+          fi
+          codename="${package#platforms;android-}"
+          echo 'available=true' >> "$GITHUB_OUTPUT"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
+          echo "codename=$codename" >> "$GITHUB_OUTPUT"
+          echo "preview_sdk_status=available package=$package"
+      - name: Install preview SDK
+        if: steps.preview.outputs.available == 'true'
+        run: sdkmanager --channel=3 "${{ steps.preview.outputs.package }}" "build-tools;36.0.0"
+      - name: Isolate preview compile configuration
+        if: steps.preview.outputs.available == 'true'
+        env:
+          PREVIEW_CODENAME: ${{ steps.preview.outputs.codename }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PREVIEW_CODENAME" =~ ^[[:alnum:]]+$ ]] || {
+            echo 'preview_codename_invalid' >&2
+            exit 1
+          }
+          test "$(grep -Fc '    compileSdk = 37' android/app/build.gradle.kts)" -eq 1 || {
+            echo 'preview_compile_baseline_mismatch' >&2
+            exit 1
+          }
+          sed -i "s/    compileSdk = 37/    compileSdkPreview = \"$PREVIEW_CODENAME\"/" android/app/build.gradle.kts
+      - name: Compile and test preview compatibility
+        if: steps.preview.outputs.available == 'true'
+        run: ./gradlew :app:lintDebug :app:testDebugUnitTest :app:assembleDebug --stacktrace
