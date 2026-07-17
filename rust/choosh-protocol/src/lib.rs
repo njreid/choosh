@@ -6,3 +6,4 @@ pub mod envelope;
 pub mod framing;
 pub mod handshake;
 pub mod session;
+pub mod wire;
