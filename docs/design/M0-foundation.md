@@ -69,7 +69,7 @@ Fixtures are immutable inputs under versioned directories. Golden-output updates
 ### Interface and decisions
 
 - Gradle wrapper, version catalog, dependency verification metadata, JDK, NDK and Rust toolchain are pinned.
-- Production builds use stable dependencies. The API 37 preview lane is non-blocking and cannot publish artifacts.
+- Production builds use stable dependencies. The latest available next-platform preview lane is non-blocking and cannot publish artifacts.
 - `minSdk` is selected from supported-device and required-API evidence, recorded in an ADR, and tested by lint; it is not inferred from `compileSdk`.
 - Before source is copied or an editor dependency becomes structural, ownership/licence findings for Zelland, Sora Editor, libghostty-vt, wgpu, glyphon, bundled fonts and native transitives are recorded. An unresolved redistribution obligation fails this spike.
 

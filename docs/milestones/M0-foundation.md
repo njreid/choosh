@@ -16,8 +16,8 @@ A reproducible skeleton proves every high-risk boundary before product work depe
 - **M0-R10:** Declared HTTP preview proves HTTP, WebSocket, SSE, and gateway authentication.
 - **M0-R11:** GitHub Releases publishes a signed development APK detected by Obtainium.
 - **M0-R12:** Decide and document `minSdk` from supported devices and required APIs; do not derive it from `compileSdk`.
-- **M0-R13:** Prove Kotlin 2.4.10, AGP 9.2.1, Compose BOM 2026.06.01, Sora Editor, and the Kotlin/Rust bridge are mutually compatible. Any temporary stable-version exception follows the toolchain compatibility rule.
-- **M0-R14:** CI builds the production API 36 target and runs a non-blocking Android 17/API 37 preview compatibility lane.
+- **M0-R13:** Prove Kotlin 2.4.10, AGP 9.3.0, Compose BOM 2026.06.01, Sora Editor, and the Kotlin/Rust bridge are mutually compatible. Any temporary stable-version exception follows the toolchain compatibility rule.
+- **M0-R14:** CI builds the production API 37 target and runs a non-blocking lane for the latest available next-platform preview SDK.
 - **M0-R15:** Establish Zelland source ownership or licence and audit libghostty-vt, wgpu, glyphon, bundled fonts, and transitive native distribution obligations before source is copied.
 
 ## Exit gate
