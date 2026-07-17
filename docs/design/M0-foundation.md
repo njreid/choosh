@@ -41,6 +41,14 @@ testkit            fake SSH, fake SFTP, RPC and terminal fixtures
 
 Android package and namespace are `ai.choosh`. Dependency and SDK policy follows the [Android toolchain specification](../specs/android-toolchain.md). Rust crates MUST deny unintentional platform coupling: host crates compile for Linux x86_64 and macOS arm64, while Android-facing crates compile for Android arm64-v8a and x86_64.
 
+The required host lanes run in the `host-rust` CI matrix on the explicit
+`ubuntu-24.04` (x86_64) and `macos-15` (arm64) GitHub-hosted runner labels.
+Each lane asserts `uname` identity and the exact Rust 1.96.1 compiler before
+running `cargo fmt --all -- --check`, strict workspace Clippy, and the complete
+workspace test suite. Specification syntax runs once in the Linux lane because
+it is platform-independent; it is not used as a substitute for either host
+compile/test lane.
+
 ## Common headless testkit
 
 M0 establishes a repository-owned testkit used by later milestones.

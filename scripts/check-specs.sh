@@ -16,5 +16,6 @@ do
   test -s "$required"
 done
 
-echo "Specification syntax checks passed."
+"$root/scripts/check-terminal-provenance.sh"
 
+echo "Specification syntax checks passed."

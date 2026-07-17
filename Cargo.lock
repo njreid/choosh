@@ -29,6 +29,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "choosh-web"
+version = "0.0.0"
+
+[[package]]
 name = "chooshd"
 version = "0.0.0"
 dependencies = [
