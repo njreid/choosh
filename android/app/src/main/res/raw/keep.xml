@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@font/choosh_terminal,@raw/geomini_ofl,@raw/iosevka_charon_mono_ofl,@style/Choosh_Text_Heading,@style/Choosh_Text_Terminal" />

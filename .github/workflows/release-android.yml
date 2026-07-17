@@ -32,9 +32,17 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.1
+          targets: aarch64-linux-android,x86_64-linux-android
+
       - uses: gradle/actions/setup-gradle@v4
 
       - uses: android-actions/setup-android@v3
+
+      - name: Install stable Android SDK
+        run: sdkmanager "platforms;android-37" "build-tools;36.0.0" "ndk;28.2.13676358"
 
       - name: Resolve monotonic release version
         id: version
@@ -91,7 +99,7 @@ jobs:
           CHOOSH_KEY_PASSWORD: ${{ secrets.CHOOSH_KEY_PASSWORD }}
           CHOOSH_VERSION_NAME: ${{ steps.version.outputs.name }}
           CHOOSH_VERSION_CODE: ${{ steps.version.outputs.code }}
-        run: ./gradlew :app:assembleRelease :app:cyclonedxBom :app:generateReleaseLicenseReport --stacktrace
+        run: ./gradlew :app:buildRustAndroid :app:assembleRelease :app:checkNativeAbiPackaging :app:cyclonedxBom :app:generateReleaseLicenseReport --stacktrace
 
       - name: Collect and verify release evidence
         env:

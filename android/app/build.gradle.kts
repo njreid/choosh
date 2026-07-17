@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.util.zip.ZipFile
 
 plugins { alias(libs.plugins.android.application) }
 
@@ -22,12 +23,12 @@ val signingNames = listOf(
 
 android {
     namespace = "ai.choosh"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "ai.choosh"
         minSdk = 26
-        targetSdk = 36
+        targetSdk = 37
         versionCode = releaseVersionCode
         versionName = releaseVersionName
         testInstrumentationRunner = "ai.choosh.SmokeInstrumentation"
@@ -52,47 +53,56 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     testOptions { unitTests.isIncludeAndroidResources = false }
+    lint {
+        abortOnError = true
+        warningsAsErrors = true
+        checkDependencies = true
+    }
 }
 
 dependencies { testImplementation(libs.junit4) }
 
-val buildRustAndroid by tasks.registering(Exec::class) {
+dependencyLocking { lockAllConfigurations() }
+
+val buildRustAndroid = tasks.register<Exec>("buildRustAndroid") {
     group = "build"
     description = "Build and ABI-check the Rust bridge for arm64-v8a and x86_64."
     workingDir(rootProject.projectDir)
     commandLine(rootProject.file("scripts/build-android-rust.sh").absolutePath)
 }
 
-val checkNativeAbiPackaging by tasks.registering {
+val checkNativeAbiPackaging = tasks.register("checkNativeAbiPackaging") {
     group = "verification"
-    description = "Checks both Android ABIs once native bridge libraries are present."
-    inputs.dir(layout.projectDirectory.dir("src/main/jniLibs")).optional()
+    description = "Builds and verifies both native bridge ABIs in the debug APK."
+    dependsOn(tasks.named("assembleDebug"))
+    val apk = layout.buildDirectory.file("outputs/apk/debug/app-debug.apk")
+    inputs.file(apk)
     doLast {
-        val root = inputs.files.files.singleOrNull()
-        if (root == null) {
-            logger.lifecycle("Native bridge absent: arm64-v8a/x86_64 packaging gate is an explicit placeholder.")
-            return@doLast
-        }
-        val libraries = if (root.isDirectory) {
-            root.walkTopDown().filter { it.isFile && it.extension == "so" }.toList()
-        } else {
-            emptyList()
-        }
-        if (libraries.isEmpty()) {
-            logger.lifecycle("Native bridge absent: arm64-v8a/x86_64 packaging gate is an explicit placeholder.")
-            return@doLast
-        }
-        val byAbi = libraries.groupBy { it.parentFile.name }
+        val apkFile = apk.get().asFile
+        check(apkFile.isFile) { "Debug APK was not created: ${apkFile.path}" }
         val required = setOf("arm64-v8a", "x86_64")
-        check(byAbi.keys.containsAll(required)) { "Native bridge must package arm64-v8a and x86_64" }
-        val names = required.associateWith { abi -> byAbi.getValue(abi).map { it.name }.sorted() }
+        val names = ZipFile(apkFile).use { archive ->
+            required.associateWith { abi ->
+                archive.entries().asSequence()
+                    .map { it.name }
+                    .filter { it.startsWith("lib/$abi/") && it.endsWith(".so") }
+                    .map { it.removePrefix("lib/$abi/") }
+                    .sorted()
+                    .toList()
+            }
+        }
+        check(names.values.all { it.isNotEmpty() }) { "Debug APK must package arm64-v8a and x86_64 native libraries" }
         check(names.getValue("arm64-v8a") == names.getValue("x86_64")) {
             "Native bridge library sets differ between required ABIs"
         }
     }
 }
 
-val validateReleaseEvidence by tasks.registering {
+tasks.matching { it.name == "assembleDebug" || it.name == "assembleRelease" }.configureEach {
+    dependsOn(buildRustAndroid)
+}
+
+val validateReleaseEvidence = tasks.register("validateReleaseEvidence") {
     group = "verification"
     doLast {
         val missing = signingNames.filter { releaseValue(it).isNullOrBlank() }
@@ -121,7 +131,7 @@ fun json(value: String): String = buildString {
     append('"')
 }
 
-val cyclonedxBom by tasks.registering {
+val cyclonedxBom = tasks.register("cyclonedxBom") {
     group = "reporting"
     val output = layout.buildDirectory.file("reports/bom.json")
     outputs.file(output)
@@ -140,7 +150,7 @@ val cyclonedxBom by tasks.registering {
     }
 }
 
-val generateReleaseLicenseReport by tasks.registering {
+val generateReleaseLicenseReport = tasks.register("generateReleaseLicenseReport") {
     group = "reporting"
     val output = layout.buildDirectory.file("reports/licenses/NOTICE.txt")
     outputs.file(output)

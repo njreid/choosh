@@ -8,18 +8,18 @@ Preview SDKs and pre-release libraries MAY be exercised in a non-blocking CI lan
 
 ## Baseline
 
-The baseline resolved on 2026-07-14 is:
+The baseline resolved on 2026-07-16 is:
 
 | Component | Production baseline | Notes |
 | --- | --- | --- |
-| Android platform | `compileSdk = 36`, `targetSdk = 36` | Android 16 is the latest stable platform; API 37 remains an Android 17 preview. |
-| Android 17 validation | API 37 | Non-blocking preview lane until Android 17 is stable. |
-| Android Gradle Plugin | 9.2.1 | Current stable patch release. |
-| Gradle wrapper | 9.4.1 | Required by AGP 9.2. |
+| Android platform | `compileSdk = 37`, `targetSdk = 37` | Android 17 is the latest stable platform. |
+| Next-platform validation | Latest available preview SDK | Non-blocking and never required for production builds. |
+| Android Gradle Plugin | 9.3.0 | Current stable minor release. |
+| Gradle wrapper | 9.6.1 | Current stable wrapper; checksum pinned. |
 | Kotlin | 2.4.10 | Current stable Kotlin bug-fix release. |
-| Java toolchain | JDK 17 | AGP 9.2 minimum and default. |
-| SDK Build Tools | 36.0.0 | AGP 9.2 default. |
-| NDK | 28.2.13676358 | AGP 9.2 default; required for the Rust Android bridge. |
+| Java toolchain | JDK 17 | AGP 9.3 minimum and default. |
+| SDK Build Tools | 36.0.0 | AGP 9.3 default. |
+| NDK | 28.2.13676358 | AGP 9.3 default; required for the Rust Android bridge. |
 | Compose BOM | 2026.06.01 | Latest stable BOM in the official mapping. |
 
 `minSdk` remains an M0 decision. It MUST be chosen from the actual requirements of Sora Editor, SSH, notifications, WebView security, storage, and the supported-device policy. Newer APIs MUST be guarded with AndroidX compatibility layers or explicit runtime SDK checks where the chosen `minSdk` requires them.
@@ -46,7 +46,7 @@ Sora Editor and the Kotlin/Rust bridge are release-critical dependencies. M0 MUS
 ## Sources
 
 - [Android 17 SDK setup](https://developer.android.com/about/versions/17/setup-sdk)
-- [Android Gradle Plugin 9.2 release notes](https://developer.android.com/build/releases/agp-9-2-0-release-notes)
+- [Android Gradle Plugin 9.3 release notes](https://developer.android.com/build/releases/agp-9-3-0-release-notes)
+- [Gradle 9.6.1 release notes](https://docs.gradle.org/9.6.1/release-notes.html)
 - [Kotlin releases](https://kotlinlang.org/docs/releases.html)
 - [Compose BOM mapping](https://developer.android.com/develop/ui/compose/bom/bom-mapping)
-
