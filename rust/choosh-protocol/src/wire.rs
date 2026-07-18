@@ -210,6 +210,34 @@ pub fn decode_envelope(payload: &[u8], max_bytes: usize) -> Result<WireEnvelope,
     }
 }
 
+/// Encodes one bounded terminal response with a stable envelope shape.
+///
+/// The terminal variant selects exactly one of `result` or `error`; caller
+/// payloads remain untrusted JSON values and cannot add or replace envelope
+/// fields.
+///
+/// # Errors
+///
+/// Rejects zero limits or encoded output above the caller's byte ceiling.
+pub fn encode_response(
+    response: &Response<Value, Value>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, WireError> {
+    let value = match &response.terminal {
+        Terminal::Result(result) => serde_json::json!({
+            "kind": "response",
+            "id": response.id.as_str(),
+            "result": result,
+        }),
+        Terminal::Error(error) => serde_json::json!({
+            "kind": "response",
+            "id": response.id.as_str(),
+            "error": error,
+        }),
+    };
+    encode_value(&value, max_bytes)
+}
+
 fn decode_response(object: &Map<String, Value>) -> Result<WireEnvelope, WireError> {
     let has_result = object.contains_key("result");
     let has_error = object.contains_key("error");
@@ -401,6 +429,53 @@ mod tests {
             decode_envelope(zero.as_bytes(), 1024),
             Err(WireError::Envelope(EnvelopeError::InvalidSequence))
         );
+    }
+
+    #[test]
+    fn response_terminals_encode_canonically_and_round_trip() {
+        let id = EnvelopeId::new(ID).unwrap();
+        let result = Response {
+            id: id.clone(),
+            terminal: Terminal::Result(serde_json::json!({"z": 2, "a": 1})),
+        };
+        let encoded = encode_response(&result, 1024).unwrap();
+        assert_eq!(
+            String::from_utf8(encoded.clone()).unwrap(),
+            format!(r#"{{"id":"{ID}","kind":"response","result":{{"a":1,"z":2}}}}"#)
+        );
+        assert_eq!(
+            decode_envelope(&encoded, 1024),
+            Ok(WireEnvelope::Response(result))
+        );
+
+        let error = Response {
+            id,
+            terminal: Terminal::Error(serde_json::json!({"message": "denied"})),
+        };
+        let encoded = encode_response(&error, 1024).unwrap();
+        assert_eq!(
+            String::from_utf8(encoded.clone()).unwrap(),
+            format!(r#"{{"error":{{"message":"denied"}},"id":"{ID}","kind":"response"}}"#)
+        );
+        assert_eq!(
+            decode_envelope(&encoded, 1024),
+            Ok(WireEnvelope::Response(error))
+        );
+    }
+
+    #[test]
+    fn response_encoding_enforces_zero_and_exact_byte_limits() {
+        let response = Response {
+            id: EnvelopeId::new(ID).unwrap(),
+            terminal: Terminal::Result(Value::Null),
+        };
+        let encoded = encode_response(&response, usize::MAX).unwrap();
+        assert_eq!(encode_response(&response, 0), Err(WireError::InvalidLimit));
+        assert_eq!(
+            encode_response(&response, encoded.len() - 1),
+            Err(WireError::PayloadTooLarge)
+        );
+        assert_eq!(encode_response(&response, encoded.len()), Ok(encoded));
     }
 
     #[test]

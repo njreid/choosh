@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 choosh-core = { path = "../choosh-core" }
 choosh-protocol = { path = "../choosh-protocol" }
+serde_json = "=1.0.150"
 
 [lints]
 workspace = true

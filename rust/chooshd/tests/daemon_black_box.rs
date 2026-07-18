@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
-use choosh_protocol::framing::{FrameDecoder, FrameLimits, encode_frame};
+use choosh_protocol::framing::encode_frame;
 
 struct ProcessFixture {
     child: Child,
@@ -61,18 +61,34 @@ fn composed_daemon_binds_privately_and_negotiates_typed_hello() {
     stream
         .write_all(&encode_frame(hello, 1024).unwrap())
         .unwrap();
-    let mut output = Vec::new();
-    stream.read_to_end(&mut output).unwrap();
-    let mut decoder = FrameDecoder::new(FrameLimits::new(1024 * 1024, 1).unwrap());
+    let welcome = read_frame(&mut stream);
     assert_eq!(
-        decoder.feed(&output).unwrap(),
-        [format!(
+        welcome,
+        format!(
             "{{\"capabilities\":[],\"daemon\":{{\"name\":\"chooshd\",\"version\":\"{}\"}},\"host\":{{\"name\":\"local-host\",\"version\":\"unknown\"}},\"kind\":\"welcome\",\"limits\":{{\"max_control_frame_bytes\":1048576,\"max_in_flight_requests\":64}},\"protocol\":{{\"major\":1,\"minor\":0}}}}",
             env!("CARGO_PKG_VERSION")
         )
-        .into_bytes()]
+        .into_bytes()
     );
-    decoder.finish().unwrap();
+    let request = br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000001","method":"host.describe","params":{}}"#;
+    stream
+        .write_all(&encode_frame(request, 1024).unwrap())
+        .unwrap();
+    let response = read_frame(&mut stream);
+    assert!(matches!(
+        choosh_protocol::wire::decode_envelope(&response, 1024 * 1024),
+        Ok(choosh_protocol::wire::WireEnvelope::Response(_))
+    ));
+}
+
+fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
+    let mut header = [0_u8; 4];
+    stream.read_exact(&mut header).unwrap();
+    let length = u32::from_be_bytes(header) as usize;
+    assert!(length <= 1024 * 1024);
+    let mut payload = vec![0; length];
+    stream.read_exact(&mut payload).unwrap();
+    payload
 }
 
 fn connect_bounded(path: &std::path::Path) -> Option<UnixStream> {

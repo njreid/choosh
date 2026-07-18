@@ -9,8 +9,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use choosh_protocol::framing::{FrameDecoder, FrameError, FrameLimits, encode_frame};
 use choosh_protocol::handshake::{
     Capability, HandshakeError, PeerIdentity, ProtocolLimits, ProtocolVersion, ServerNegotiator,
+    ServerReply,
 };
-use choosh_protocol::wire::{WireError, decode_hello, encode_server_reply};
+use choosh_protocol::wire::{
+    WireEnvelope, WireError, decode_envelope, decode_hello, encode_server_reply,
+};
+use serde_json::{Value, json};
 
 use crate::socket::{self, OwnedUnixListener, SocketError, SocketPlan};
 
@@ -47,6 +51,7 @@ pub enum DaemonError {
     Wire(WireError),
     Handshake(HandshakeError),
     ExpectedHello,
+    ExpectedRequest,
 }
 
 impl fmt::Display for DaemonError {
@@ -58,6 +63,7 @@ impl fmt::Display for DaemonError {
             Self::Wire(error) => write!(formatter, "daemon_wire_{}", error.code()),
             Self::Handshake(error) => write!(formatter, "daemon_handshake_{}", error.code()),
             Self::ExpectedHello => formatter.write_str("daemon_expected_hello"),
+            Self::ExpectedRequest => formatter.write_str("daemon_expected_request"),
         }
     }
 }
@@ -67,7 +73,11 @@ impl std::error::Error for DaemonError {
         match self {
             Self::Socket(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::Frame(_) | Self::Wire(_) | Self::Handshake(_) | Self::ExpectedHello => None,
+            Self::Frame(_)
+            | Self::Wire(_)
+            | Self::Handshake(_)
+            | Self::ExpectedHello
+            | Self::ExpectedRequest => None,
         }
     }
 }
@@ -157,29 +167,117 @@ fn serve_stream_with_limits(
     config: &HandshakeConfig,
     limits: FrameLimits,
 ) -> Result<(), DaemonError> {
+    let hello_payload = read_one_frame(stream, limits, DaemonError::ExpectedHello)?;
+    let hello = decode_hello(&hello_payload, limits.max_frame_bytes)?;
+    let reply = config.negotiator()?.receive_hello(&hello)?;
+    write_payload(
+        stream,
+        &encode_server_reply(&reply, limits.max_frame_bytes)?,
+        limits.max_frame_bytes,
+    )?;
+    if matches!(reply, ServerReply::Incompatible(_)) {
+        return Ok(());
+    }
+
+    let request_payload = read_one_frame(stream, limits, DaemonError::ExpectedRequest)?;
+    let envelope = decode_envelope(&request_payload, limits.max_frame_bytes)?;
+    let WireEnvelope::Request(request) = envelope else {
+        return Err(DaemonError::ExpectedRequest);
+    };
+    let response = describe_response(&request, config, limits.max_frame_bytes)?;
+    write_payload(stream, &response, limits.max_frame_bytes)
+}
+
+fn read_one_frame(
+    stream: &mut UnixStream,
+    limits: FrameLimits,
+    eof_error: DaemonError,
+) -> Result<Vec<u8>, DaemonError> {
     let mut decoder = FrameDecoder::new(limits);
     let mut buffer = [0_u8; READ_CHUNK_BYTES];
     loop {
         let read = stream.read(&mut buffer)?;
         if read == 0 {
             decoder.finish()?;
-            return Err(DaemonError::ExpectedHello);
+            return Err(eof_error);
         }
         if let Some(payload) = decoder.feed(&buffer[..read])?.into_iter().next() {
-            let hello = decode_hello(&payload, limits.max_frame_bytes)?;
-            let reply = config.negotiator()?.receive_hello(&hello)?;
-            let response = encode_server_reply(&reply, limits.max_frame_bytes)?;
-            let encoded = encode_frame(&response, limits.max_frame_bytes)?;
-            stream.write_all(&encoded)?;
-            return Ok(());
+            return Ok(payload);
         }
     }
+}
+
+fn write_payload(
+    stream: &mut UnixStream,
+    payload: &[u8],
+    max_frame_bytes: usize,
+) -> Result<(), DaemonError> {
+    stream.write_all(&encode_frame(payload, max_frame_bytes)?)?;
+    Ok(())
+}
+
+fn describe_response(
+    request: &choosh_protocol::envelope::Request<Value>,
+    config: &HandshakeConfig,
+    max_frame_bytes: usize,
+) -> Result<Vec<u8>, DaemonError> {
+    let valid = request.method.as_str() == "host.describe"
+        && request
+            .params
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty);
+    let value = if valid {
+        let capabilities: Vec<_> = config
+            .capabilities
+            .iter()
+            .map(|capability| match capability {
+                Capability::Events => "events",
+                Capability::GitBlobs => "git-blobs",
+                Capability::Services => "services",
+            })
+            .collect();
+        json!({
+            "kind": "response",
+            "id": request.id.as_str(),
+            "result": {
+                "protocol": {"major": config.protocol.major, "minor": config.protocol.minor},
+                "daemon": {"name": config.daemon.name, "version": config.daemon.version},
+                "host": {"name": config.host.name, "version": config.host.version},
+                "capabilities": capabilities,
+                "limits": {
+                    "max_control_frame_bytes": config.limits.max_control_frame_bytes,
+                    "max_in_flight_requests": config.limits.max_in_flight_requests,
+                },
+            },
+        })
+    } else {
+        json!({
+            "kind": "response",
+            "id": request.id.as_str(),
+            "error": {"code": "invalid_request", "message": "invalid host.describe request"},
+        })
+    };
+    let encoded = serde_json::to_vec(&value).map_err(|_| WireError::MalformedJson)?;
+    if encoded.len() > max_frame_bytes {
+        return Err(DaemonError::Wire(WireError::PayloadTooLarge));
+    }
+    Ok(encoded)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+
+    fn read_frame(stream: &mut UnixStream, max_frame_bytes: usize) -> Vec<u8> {
+        let mut header = [0_u8; 4];
+        stream.read_exact(&mut header).unwrap();
+        let length = u32::from_be_bytes(header) as usize;
+        assert!(length <= max_frame_bytes);
+        let mut payload = vec![0; length];
+        stream.read_exact(&mut payload).unwrap();
+        payload
+    }
 
     fn config(max_frame_bytes: u32) -> HandshakeConfig {
         HandshakeConfig {
@@ -192,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn hello_receives_one_canonical_welcome_then_connection_closes() {
+    fn hello_then_host_describe_receive_canonical_typed_responses() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let worker = std::thread::spawn(move || {
             serve_stream_with_limits(&mut server, &config(512), limits(512).unwrap()).unwrap();
@@ -201,15 +299,45 @@ mod tests {
         client
             .write_all(&encode_frame(hello, 512).unwrap())
             .unwrap();
-
-        let mut output = Vec::new();
-        client.read_to_end(&mut output).unwrap();
-        let mut decoder = FrameDecoder::new(FrameLimits::new(512, 1).unwrap());
+        let welcome = read_frame(&mut client, 512);
         assert_eq!(
-            decoder.feed(&output).unwrap(),
-            [br#"{"capabilities":["events"],"daemon":{"name":"chooshd","version":"test"},"host":{"name":"local-host","version":"test"},"kind":"welcome","limits":{"max_control_frame_bytes":512,"max_in_flight_requests":8},"protocol":{"major":1,"minor":1}}"#.to_vec()]
+            welcome,
+            br#"{"capabilities":["events"],"daemon":{"name":"chooshd","version":"test"},"host":{"name":"local-host","version":"test"},"kind":"welcome","limits":{"max_control_frame_bytes":512,"max_in_flight_requests":8},"protocol":{"major":1,"minor":1}}"#
         );
-        decoder.finish().unwrap();
+
+        let request = br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000001","method":"host.describe","params":{}}"#;
+        client
+            .write_all(&encode_frame(request, 512).unwrap())
+            .unwrap();
+        let response = read_frame(&mut client, 512);
+        assert_eq!(
+            response,
+            br#"{"id":"00000000-0000-0000-0000-000000000001","kind":"response","result":{"capabilities":["events"],"daemon":{"name":"chooshd","version":"test"},"host":{"name":"local-host","version":"test"},"limits":{"max_control_frame_bytes":512,"max_in_flight_requests":8},"protocol":{"major":1,"minor":2}}}"#
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn host_describe_requires_empty_params_and_returns_stable_error() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            serve_stream_with_limits(&mut server, &config(512), limits(512).unwrap()).unwrap();
+        });
+        let hello = br#"{"kind":"hello","protocol":{"major":1,"minor":1},"client":{"name":"test-client","version":"1"},"capabilities":[]}"#;
+        client
+            .write_all(&encode_frame(hello, 512).unwrap())
+            .unwrap();
+        let _welcome = read_frame(&mut client, 512);
+        let request = br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000002","method":"host.describe","params":{"secret":"do-not-echo"}}"#;
+        client
+            .write_all(&encode_frame(request, 512).unwrap())
+            .unwrap();
+        let response = read_frame(&mut client, 512);
+        assert_eq!(
+            response,
+            br#"{"error":{"code":"invalid_request","message":"invalid host.describe request"},"id":"00000000-0000-0000-0000-000000000002","kind":"response"}"#
+        );
+        assert!(!String::from_utf8(response).unwrap().contains("do-not-echo"));
         worker.join().unwrap();
     }
 

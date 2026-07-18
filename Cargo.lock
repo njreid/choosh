@@ -41,6 +41,7 @@ version = "0.0.0"
 dependencies = [
  "choosh-core",
  "choosh-protocol",
+ "serde_json",
 ]
 
 [[package]]
