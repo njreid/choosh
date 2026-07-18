@@ -1,0 +1,30 @@
+{
+  "releases": [
+    {
+      "tag": "v0.1.0",
+      "draft": false,
+      "prerelease": false,
+      "assets": [
+        "choosh-0.1.0.apk",
+        "choosh-0.1.0.sha256",
+        "choosh-0.1.0.apk.signer.json"
+      ]
+    },
+    {
+      "tag": "v0.3.0-rc1",
+      "draft": false,
+      "prerelease": true,
+      "assets": ["choosh-0.3.0-rc1.apk"]
+    },
+    {
+      "tag": "v0.2.0",
+      "draft": false,
+      "prerelease": false,
+      "assets": [
+        "choosh-0.2.0.apk.signer.json",
+        "choosh-0.2.0.apk",
+        "choosh-0.2.0.sha256"
+      ]
+    }
+  ]
+}

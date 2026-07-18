@@ -35,6 +35,17 @@ to the newest GitHub Release. Updates install only when the APK uses the same
 signing key as the installed build and its `versionCode` is larger. Do not mix
 debug-signed and release-signed installations.
 
+Pull-request CI does not query GitHub or publish a release. Instead,
+`scripts/test-release-discovery.sh` exercises a bounded local GitHub-release
+metadata fixture. The gate selects the highest stable `vMAJOR.MINOR.PATCH`,
+requires one version-matched universal APK and checksum, verifies the APK digest,
+requires signer evidence to name that same APK, and checks signing-identity
+continuity with the preceding stable fixture. Negative fixtures prove that
+checksum substitution, signer/APK misassociation, and signing-identity changes
+fail closed. The signer JSON
+records selection evidence only; cryptographic APK signature verification remains
+the release workflow's `apksigner verify` responsibility.
+
 Before treating a release as complete, verify the GitHub Release contains exactly:
 
 - `choosh-VERSION.apk`;
