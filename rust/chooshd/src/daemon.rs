@@ -2,9 +2,11 @@
 
 #![cfg(unix)]
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::mpsc;
 
 use choosh_protocol::framing::{FrameDecoder, FrameError, FrameLimits, encode_frame};
 use choosh_protocol::handshake::{
@@ -52,6 +54,7 @@ pub enum DaemonError {
     Handshake(HandshakeError),
     ExpectedHello,
     ExpectedRequest,
+    WorkerFailed,
 }
 
 impl fmt::Display for DaemonError {
@@ -64,6 +67,7 @@ impl fmt::Display for DaemonError {
             Self::Handshake(error) => write!(formatter, "daemon_handshake_{}", error.code()),
             Self::ExpectedHello => formatter.write_str("daemon_expected_hello"),
             Self::ExpectedRequest => formatter.write_str("daemon_expected_request"),
+            Self::WorkerFailed => formatter.write_str("daemon_worker_failed"),
         }
     }
 }
@@ -77,7 +81,8 @@ impl std::error::Error for DaemonError {
             | Self::Wire(_)
             | Self::Handshake(_)
             | Self::ExpectedHello
-            | Self::ExpectedRequest => None,
+            | Self::ExpectedRequest
+            | Self::WorkerFailed => None,
         }
     }
 }
@@ -167,43 +172,88 @@ fn serve_stream_with_limits(
     config: &HandshakeConfig,
     limits: FrameLimits,
 ) -> Result<(), DaemonError> {
+    serve_stream_with_handler(stream, config, limits, &|request| {
+        describe_response(request, config, limits.max_frame_bytes)
+    })
+}
+
+fn serve_stream_with_handler<H>(
+    stream: &mut UnixStream,
+    config: &HandshakeConfig,
+    limits: FrameLimits,
+    handler: &H,
+) -> Result<(), DaemonError>
+where
+    H: Fn(&choosh_protocol::envelope::Request<Value>) -> Result<Vec<u8>, DaemonError> + Sync,
+{
     let mut decoder = FrameDecoder::new(limits);
     let mut buffer = [0_u8; READ_CHUNK_BYTES];
     let mut negotiated = false;
-    loop {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            decoder.finish()?;
-            return if negotiated {
-                Ok(())
-            } else {
-                Err(DaemonError::ExpectedHello)
-            };
-        }
-        for payload in decoder.feed(&buffer[..read])? {
-            if !negotiated {
-                let hello = decode_hello(&payload, limits.max_frame_bytes)?;
-                let reply = config.negotiator()?.receive_hello(&hello)?;
-                write_payload(
-                    stream,
-                    &encode_server_reply(&reply, limits.max_frame_bytes)?,
-                    limits.max_frame_bytes,
-                )?;
-                if matches!(reply, ServerReply::Incompatible(_)) {
-                    return Ok(());
-                }
-                negotiated = true;
-                continue;
+    let mut writer = stream.try_clone()?;
+    std::thread::scope(|scope| {
+        let (responses, completed) = mpsc::channel::<Vec<u8>>();
+        let writer = scope.spawn(move || -> Result<(), DaemonError> {
+            for response in completed {
+                write_payload(&mut writer, &response, limits.max_frame_bytes)?;
             }
+            Ok(())
+        });
+        let mut workers = VecDeque::new();
+        let outcome = loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                decoder.finish()?;
+                break if negotiated {
+                    Ok(())
+                } else {
+                    Err(DaemonError::ExpectedHello)
+                };
+            }
+            for payload in decoder.feed(&buffer[..read])? {
+                if !negotiated {
+                    let hello = decode_hello(&payload, limits.max_frame_bytes)?;
+                    let reply = config.negotiator()?.receive_hello(&hello)?;
+                    write_payload(
+                        stream,
+                        &encode_server_reply(&reply, limits.max_frame_bytes)?,
+                        limits.max_frame_bytes,
+                    )?;
+                    if matches!(reply, ServerReply::Incompatible(_)) {
+                        return Ok(());
+                    }
+                    negotiated = true;
+                    continue;
+                }
 
-            let envelope = decode_envelope(&payload, limits.max_frame_bytes)?;
-            let WireEnvelope::Request(request) = envelope else {
-                return Err(DaemonError::ExpectedRequest);
-            };
-            let response = describe_response(&request, config, limits.max_frame_bytes)?;
-            write_payload(stream, &response, limits.max_frame_bytes)?;
+                let envelope = decode_envelope(&payload, limits.max_frame_bytes)?;
+                let WireEnvelope::Request(request) = envelope else {
+                    return Err(DaemonError::ExpectedRequest);
+                };
+                if workers.len() == usize::from(config.limits.max_in_flight_requests) {
+                    join_worker(workers.pop_front().expect("bounded workers is nonempty"))?;
+                }
+                let responses = responses.clone();
+                workers.push_back(scope.spawn(move || {
+                    let response = handler(&request)?;
+                    responses
+                        .send(response)
+                        .map_err(|_| DaemonError::WorkerFailed)
+                }));
+            }
+        };
+        while let Some(worker) = workers.pop_front() {
+            join_worker(worker)?;
         }
-    }
+        drop(responses);
+        writer.join().map_err(|_| DaemonError::WorkerFailed)??;
+        outcome
+    })
+}
+
+fn join_worker(
+    worker: std::thread::ScopedJoinHandle<'_, Result<(), DaemonError>>,
+) -> Result<(), DaemonError> {
+    worker.join().map_err(|_| DaemonError::WorkerFailed)?
 }
 
 fn write_payload(
@@ -267,6 +317,7 @@ fn describe_response(
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Condvar, Mutex};
 
     fn read_frame(stream: &mut UnixStream, max_frame_bytes: usize) -> Vec<u8> {
         let mut header = [0_u8; 4];
@@ -343,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_coalesced_requests_receive_ordered_typed_responses() {
+    fn multiple_coalesced_requests_each_receive_their_matching_response() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let worker = std::thread::spawn(move || {
             serve_stream_with_limits(&mut server, &config(512), limits(512).unwrap()).unwrap();
@@ -361,16 +412,59 @@ mod tests {
         assert!(welcome.starts_with(br#"{"capabilities"#));
         let first_response = read_frame(&mut client, 512);
         let second_response = read_frame(&mut client, 512);
-        assert!(
-            String::from_utf8(first_response)
-                .unwrap()
-                .contains("00000000-0000-0000-0000-000000000003")
-        );
-        assert!(
-            String::from_utf8(second_response)
-                .unwrap()
-                .contains("00000000-0000-0000-0000-000000000004")
-        );
+        let mut responses = [
+            String::from_utf8(first_response).unwrap(),
+            String::from_utf8(second_response).unwrap(),
+        ];
+        responses.sort();
+        assert!(responses[0].contains("00000000-0000-0000-0000-000000000003"));
+        assert!(responses[1].contains("00000000-0000-0000-0000-000000000004"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn injected_handler_proves_out_of_order_completion_preserves_ids() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let config = config(512);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let worker = std::thread::spawn(move || {
+            let handler = |request: &choosh_protocol::envelope::Request<Value>| {
+                let (lock, ready) = &*worker_release;
+                if request.id.as_str().ends_with("0006") {
+                    let released = lock.lock().map_err(|_| DaemonError::WorkerFailed)?;
+                    drop(
+                        ready
+                            .wait_while(released, |released| !*released)
+                            .map_err(|_| DaemonError::WorkerFailed)?,
+                    );
+                }
+                describe_response(request, &config, 512)
+            };
+            serve_stream_with_handler(&mut server, &config, limits(512).unwrap(), &handler)
+                .unwrap();
+        });
+        let hello = br#"{"kind":"hello","protocol":{"major":1,"minor":1},"client":{"name":"test-client","version":"1"},"capabilities":[]}"#;
+        client
+            .write_all(&encode_frame(hello, 512).unwrap())
+            .unwrap();
+        let _welcome = read_frame(&mut client, 512);
+        let first = br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000006","method":"host.describe","params":{}}"#;
+        let second = br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000007","method":"host.describe","params":{}}"#;
+        let mut input = encode_frame(first, 512).unwrap();
+        input.extend(encode_frame(second, 512).unwrap());
+        client.write_all(&input).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let completed_first = String::from_utf8(read_frame(&mut client, 512)).unwrap();
+        {
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_one();
+        }
+        let completed_second = String::from_utf8(read_frame(&mut client, 512)).unwrap();
+        assert!(completed_first.contains("00000000-0000-0000-0000-000000000007"));
+        assert!(completed_second.contains("00000000-0000-0000-0000-000000000006"));
         worker.join().unwrap();
     }
 

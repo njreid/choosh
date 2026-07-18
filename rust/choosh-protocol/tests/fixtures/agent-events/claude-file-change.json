@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "PostToolUse",
+  "timestamp": "2026-01-02T03:04:05Z",
+  "file_path": "src/main.rs",
+  "operation": "modified",
+  "tool_input": "REDACTION_CANARY_CLAUDE_TOOL_INPUT"
+}

@@ -1,0 +1,6 @@
+{
+  "hook": "PermissionRequest",
+  "occurred_at": "2026-01-02T03:04:05Z",
+  "prompt": "REDACTION_CANARY_CODEX_PROMPT",
+  "tool_arguments": "REDACTION_CANARY_CODEX_ARGUMENTS"
+}

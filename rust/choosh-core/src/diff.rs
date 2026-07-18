@@ -544,4 +544,62 @@ mod tests {
             }
         ));
     }
+
+    fn append_source(output: &mut Vec<u8>, line: &SourceLine<'_>) {
+        output.extend_from_slice(line.text.as_bytes());
+        if line.terminated {
+            output.push(b'\n');
+        }
+    }
+
+    fn append_diff_line(output: &mut Vec<u8>, line: &DiffLine) {
+        output.extend_from_slice(line.text.as_bytes());
+        if line.has_terminator {
+            output.push(b'\n');
+        }
+    }
+
+    fn apply_hunks(old: &[u8], diff: &TextDiff) -> Vec<u8> {
+        let (old_lines, _) = split_lines(std::str::from_utf8(old).unwrap());
+        let mut old_cursor = 0;
+        let mut reconstructed = Vec::new();
+        for hunk in &diff.hunks {
+            for line in &old_lines[old_cursor..hunk.old_start] {
+                append_source(&mut reconstructed, line);
+            }
+            old_cursor = hunk.old_start;
+            for line in &hunk.lines {
+                match line.kind {
+                    LineKind::Context => {
+                        append_diff_line(&mut reconstructed, line);
+                        old_cursor += 1;
+                    }
+                    LineKind::Deletion => old_cursor += 1,
+                    LineKind::Addition => append_diff_line(&mut reconstructed, line),
+                }
+            }
+            assert_eq!(old_cursor, hunk.old_end);
+        }
+        for line in &old_lines[old_cursor..] {
+            append_source(&mut reconstructed, line);
+        }
+        reconstructed
+    }
+
+    #[test]
+    fn applying_emitted_hunks_reconstructs_exact_right_side() {
+        for (old, new) in [
+            (&b""[..], &b"created\n"[..]),
+            (&b"deleted\n"[..], &b""[..]),
+            (&b"a\nb\nc\n"[..], &b"a\nchanged\nc\n"[..]),
+            (&b"same"[..], &b"same\n"[..]),
+            (
+                "alpha\n雪\nomega\n".as_bytes(),
+                "zero\nalpha\n雪だるま\nomega".as_bytes(),
+            ),
+        ] {
+            let diff = text(old, new);
+            assert_eq!(apply_hunks(old, &diff), new);
+        }
+    }
 }

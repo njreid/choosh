@@ -1,0 +1,7 @@
+{
+  "type": "agent_status",
+  "item_id": "22222222-2222-4222-8222-222222222222",
+  "occurred_at": "2026-01-02T03:04:05Z",
+  "status": "failed",
+  "message": "agent_reported_failure"
+}

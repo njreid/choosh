@@ -1,0 +1,6 @@
+{
+  "event": "session.error",
+  "time": "2026-01-02T03:04:05Z",
+  "error": "REDACTION_CANARY_OPENCODE_ERROR",
+  "model_context": "REDACTION_CANARY_OPENCODE_CONTEXT"
+}
