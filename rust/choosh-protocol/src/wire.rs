@@ -52,6 +52,24 @@ pub enum WireEnvelope {
     Event(Event<Value>),
 }
 
+/// Encodes one bounded client hello with stable object-key/capability order.
+///
+/// # Errors
+///
+/// Rejects zero limits or encoded output above the caller's byte ceiling.
+pub fn encode_hello(hello: &Hello, max_bytes: usize) -> Result<Vec<u8>, WireError> {
+    let capabilities: Vec<_> = hello.capabilities().map(capability_name).collect();
+    encode_value(
+        &serde_json::json!({
+            "kind": "hello",
+            "protocol": version_value(hello.protocol),
+            "client": identity_value(&hello.client),
+            "capabilities": capabilities,
+        }),
+        max_bytes,
+    )
+}
+
 /// Decodes one bounded hello object through existing domain constructors.
 ///
 /// # Errors
@@ -87,6 +105,62 @@ pub fn encode_server_reply(reply: &ServerReply, max_bytes: usize) -> Result<Vec<
         ServerReply::Incompatible(incompatible) => incompatible_value(*incompatible),
     };
     encode_value(&value, max_bytes)
+}
+
+/// Decodes one bounded welcome or incompatible response through existing
+/// domain constructors and exact-shape validation.
+///
+/// # Errors
+///
+/// Rejects zero limits, oversized/malformed JSON, unknown/additional fields,
+/// wrong kinds/types, unknown capabilities, and invalid handshake fields.
+pub fn decode_server_reply(payload: &[u8], max_bytes: usize) -> Result<ServerReply, WireError> {
+    let value = decode_value(payload, max_bytes)?;
+    let object = value.as_object().ok_or(WireError::InvalidShape)?;
+    match string(object, "kind")? {
+        "welcome" => {
+            require_keys(
+                object,
+                &[
+                    "kind",
+                    "protocol",
+                    "daemon",
+                    "host",
+                    "capabilities",
+                    "limits",
+                ],
+            )?;
+            let limits = exact_object(
+                object.get("limits").ok_or(WireError::InvalidShape)?,
+                &["max_control_frame_bytes", "max_in_flight_requests"],
+            )?;
+            let capabilities = object
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .ok_or(WireError::InvalidShape)?
+                .iter()
+                .map(capability)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ServerReply::Welcome(Welcome::new(
+                protocol(object.get("protocol").ok_or(WireError::InvalidShape)?)?,
+                identity(object.get("daemon").ok_or(WireError::InvalidShape)?)?,
+                identity(object.get("host").ok_or(WireError::InvalidShape)?)?,
+                capabilities,
+                crate::handshake::ProtocolLimits::new(
+                    u32_value(limits, "max_control_frame_bytes")?,
+                    u16_value(limits, "max_in_flight_requests")?,
+                )?,
+            )?))
+        }
+        "incompatible" => {
+            require_keys(object, &["kind", "client", "daemon"])?;
+            Ok(ServerReply::Incompatible(Incompatible {
+                client: protocol(object.get("client").ok_or(WireError::InvalidShape)?)?,
+                daemon: protocol(object.get("daemon").ok_or(WireError::InvalidShape)?)?,
+            }))
+        }
+        _ => Err(WireError::UnknownKind),
+    }
 }
 
 /// Decodes one bounded post-handshake envelope with untrusted bodies retained as
@@ -218,6 +292,14 @@ fn u16_value(object: &Map<String, Value>, key: &str) -> Result<u16, WireError> {
         .and_then(Value::as_u64)
         .ok_or(WireError::InvalidShape)?;
     u16::try_from(value).map_err(|_| WireError::InvalidShape)
+}
+
+fn u32_value(object: &Map<String, Value>, key: &str) -> Result<u32, WireError> {
+    let value = object
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or(WireError::InvalidShape)?;
+    u32::try_from(value).map_err(|_| WireError::InvalidShape)
 }
 
 fn capability(value: &Value) -> Result<Capability, WireError> {

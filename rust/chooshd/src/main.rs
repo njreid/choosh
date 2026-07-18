@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use chooshd::daemon::{DEFAULT_MAX_FRAME_BYTES, bind, serve};
+use choosh_protocol::handshake::{
+    PROTOCOL_V1_MAJOR, PeerIdentity, ProtocolLimits, ProtocolVersion,
+};
+use chooshd::daemon::{DEFAULT_MAX_FRAME_BYTES, HandshakeConfig, bind, serve};
 use chooshd::socket::SocketPlan;
 
 fn main() {
@@ -16,7 +19,19 @@ fn run(args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), &'static st
     let (state_dir, socket_path) = parse_args(args)?;
     let plan = SocketPlan::new(state_dir, socket_path).map_err(|_| "invalid_socket_plan")?;
     let owned = bind(&plan).map_err(|_| "socket_bind_failed")?;
-    serve(owned.listener(), DEFAULT_MAX_FRAME_BYTES).map_err(|_| "daemon_serve_failed")
+    let config = HandshakeConfig {
+        protocol: ProtocolVersion::new(PROTOCOL_V1_MAJOR, 0),
+        daemon: PeerIdentity::new("chooshd", env!("CARGO_PKG_VERSION"))
+            .map_err(|_| "invalid_handshake_config")?,
+        host: PeerIdentity::new("local-host", "unknown").map_err(|_| "invalid_handshake_config")?,
+        capabilities: Vec::new(),
+        limits: ProtocolLimits::new(
+            u32::try_from(DEFAULT_MAX_FRAME_BYTES).map_err(|_| "invalid_handshake_config")?,
+            64,
+        )
+        .map_err(|_| "invalid_handshake_config")?,
+    };
+    serve(owned.listener(), &config, DEFAULT_MAX_FRAME_BYTES).map_err(|_| "daemon_serve_failed")
 }
 
 fn parse_args(

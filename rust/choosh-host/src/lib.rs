@@ -2,6 +2,7 @@
 
 pub mod bridge;
 pub mod dispatch;
+pub mod handshake;
 #[cfg(unix)]
 pub mod socket_relay;
 

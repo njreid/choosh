@@ -30,7 +30,39 @@ test -S "$socket_path"
 test "$(stat -c '%a' "$state_dir")" = '700'
 test "$(stat -c '%a' "$socket_path")" = '600'
 
-response="$({ printf '\0\0\0\6health'; } | "$root/target/debug/choosh-host" rpc --stdio --socket "$socket_path" | od -An -tx1 | tr -d ' \n')"
-test "$response" = '000000076865616c746879'
+hello='{"kind":"hello","protocol":{"major":1,"minor":0},"client":{"name":"rpc-process-gate","version":"1"},"capabilities":[]}'
+hello_length=${#hello}
+response_frame="$fixture/response.frame"
+host_stderr="$fixture/host.stderr"
+{
+  printf '%08x' "$hello_length" | xxd -r -p
+  printf '%s' "$hello"
+} | "$root/target/debug/choosh-host" rpc --stdio --socket "$socket_path" \
+  >"$response_frame" 2>"$host_stderr"
 
-echo 'rpc_socket_process_test_passed'
+test ! -s "$host_stderr"
+test "$(wc -c <"$response_frame")" -ge 5
+response_hex_length=$(xxd -p -l 4 "$response_frame")
+response_length=$((16#$response_hex_length))
+test "$response_length" -gt 0
+test "$response_length" -le 1048576
+test "$(wc -c <"$response_frame")" -eq "$((response_length + 4))"
+tail -c +5 "$response_frame" >"$fixture/welcome.json"
+
+jq -e '
+  type == "object" and
+  (keys | sort) == (["capabilities", "daemon", "host", "kind", "limits", "protocol"] | sort) and
+  .kind == "welcome" and
+  .protocol == {"major": 1, "minor": 0} and
+  .daemon.name == "chooshd" and
+  (.daemon.version | type == "string" and length > 0) and
+  .host == {"name": "local-host", "version": "unknown"} and
+  .capabilities == [] and
+  .limits == {"max_control_frame_bytes": 1048576, "max_in_flight_requests": 64}
+' "$fixture/welcome.json" >/dev/null
+
+kill "$daemon_pid"
+wait "$daemon_pid" 2>/dev/null || true
+daemon_pid=''
+
+echo 'rpc_typed_hello_welcome_process_test_passed'

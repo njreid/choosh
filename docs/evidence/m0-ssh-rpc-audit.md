@@ -26,8 +26,9 @@ Audit date: 2026-07-17. This is an implementation evidence inventory, not an M0-
   persisted known-host store.
 - `chooshd` now has a minimal composition-root binary with mandatory injected
   `--state-dir` and `--socket` paths. It binds the existing private Unix socket
-  lifecycle and exposes only bounded raw `health`/echo frames. This is a
-  black-box process seam, not the versioned JSON hello/welcome protocol.
+  lifecycle and accepts exactly one bounded, typed JSON `hello` as the first
+  frame. It negotiates a canonical `welcome` or `incompatible` reply and then
+  closes; malformed, raw, and oversized first frames fail closed without a reply.
 - `choosh-host rpc --stdio --socket <absolute-path>` now composes bounded stdio
   framing with the injected daemon socket. The exact shell-free argument grammar
   rejects relative, non-normal, and oversized paths without echoing them.
@@ -41,8 +42,8 @@ Audit date: 2026-07-17. This is an implementation evidence inventory, not an M0-
 - PTY latency/fairness under throttled SFTP, disconnect injection for every channel type, and
   direct-tcpip HTTP/WebSocket/SSE fidelity remain unimplemented.
 
-Therefore M0-R5 and M0-R6 remain blocked. The new local process harness proves
-the daemon's injected private-socket plus `choosh-host` stdio raw-frame seam.
-The next vertical gate must add the versioned JSON protocol and verified SSH
+Therefore M0-R5 and M0-R6 remain blocked. The daemon black-box harness proves
+private-socket permissions and first-frame typed negotiation. The next vertical
+gate must compose that negotiation through the stdio relay and a verified SSH
 transport; only after that should the repository claim end-to-end SSH
 stdio-to-`0600`-socket behavior.

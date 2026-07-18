@@ -23,7 +23,7 @@ impl Drop for ProcessFixture {
 }
 
 #[test]
-fn composed_daemon_binds_privately_and_serves_bounded_raw_frames() {
+fn composed_daemon_binds_privately_and_negotiates_typed_hello() {
     let root = std::env::current_dir()
         .unwrap()
         .join(format!("chooshd-black-box-{}", std::process::id()));
@@ -57,14 +57,21 @@ fn composed_daemon_binds_privately_and_serves_bounded_raw_frames() {
     assert!(socket_metadata.file_type().is_socket());
     assert_eq!(socket_metadata.permissions().mode() & 0o777, 0o600);
 
+    let hello = br#"{"kind":"hello","protocol":{"major":1,"minor":0},"client":{"name":"black-box","version":"1"},"capabilities":[]}"#;
     stream
-        .write_all(&encode_frame(b"health", 32).unwrap())
+        .write_all(&encode_frame(hello, 1024).unwrap())
         .unwrap();
-    stream.shutdown(std::net::Shutdown::Write).unwrap();
     let mut output = Vec::new();
     stream.read_to_end(&mut output).unwrap();
-    let mut decoder = FrameDecoder::new(FrameLimits::new(32, 1).unwrap());
-    assert_eq!(decoder.feed(&output).unwrap(), [b"healthy".to_vec()]);
+    let mut decoder = FrameDecoder::new(FrameLimits::new(1024 * 1024, 1).unwrap());
+    assert_eq!(
+        decoder.feed(&output).unwrap(),
+        [format!(
+            "{{\"capabilities\":[],\"daemon\":{{\"name\":\"chooshd\",\"version\":\"{}\"}},\"host\":{{\"name\":\"local-host\",\"version\":\"unknown\"}},\"kind\":\"welcome\",\"limits\":{{\"max_control_frame_bytes\":1048576,\"max_in_flight_requests\":64}},\"protocol\":{{\"major\":1,\"minor\":0}}}}",
+            env!("CARGO_PKG_VERSION")
+        )
+        .into_bytes()]
+    );
     decoder.finish().unwrap();
 }
 

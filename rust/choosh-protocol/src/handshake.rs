@@ -125,6 +125,30 @@ pub struct Welcome {
 }
 
 impl Welcome {
+    /// Reconstructs a bounded welcome received from the wire.
+    ///
+    /// Client-side negotiation must still validate the selected version and
+    /// capabilities against the original hello.
+    ///
+    /// # Errors
+    ///
+    /// Returns `too_many_capabilities` when the input exceeds the bound.
+    pub fn new(
+        protocol: ProtocolVersion,
+        daemon: PeerIdentity,
+        host: PeerIdentity,
+        capabilities: impl IntoIterator<Item = Capability>,
+        limits: ProtocolLimits,
+    ) -> Result<Self, HandshakeError> {
+        Ok(Self {
+            protocol,
+            daemon,
+            host,
+            limits,
+            capabilities: bounded_capabilities(capabilities)?,
+        })
+    }
+
     #[must_use]
     pub fn capabilities(&self) -> impl ExactSizeIterator<Item = Capability> + '_ {
         self.capabilities.iter().copied()
