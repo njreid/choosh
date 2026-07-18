@@ -33,6 +33,8 @@ test "$(stat -c '%a' "$socket_path")" = '600'
 hello='{"kind":"hello","protocol":{"major":1,"minor":0},"client":{"name":"rpc-process-gate","version":"1"},"capabilities":[]}'
 request_id='00000000-0000-0000-0000-000000000001'
 describe="{\"kind\":\"request\",\"id\":\"$request_id\",\"method\":\"host.describe\",\"params\":{}}"
+second_request_id='00000000-0000-0000-0000-000000000002'
+second_describe="{\"kind\":\"request\",\"id\":\"$second_request_id\",\"method\":\"host.describe\",\"params\":{}}"
 response_frame="$fixture/response.frame"
 host_stderr="$fixture/host.stderr"
 {
@@ -40,6 +42,8 @@ host_stderr="$fixture/host.stderr"
   printf '%s' "$hello"
   printf '%08x' "${#describe}" | xxd -r -p
   printf '%s' "$describe"
+  printf '%08x' "${#second_describe}" | xxd -r -p
+  printf '%s' "$second_describe"
 } | "$root/target/debug/choosh-host" rpc --stdio --socket "$socket_path" \
   >"$response_frame" 2>"$host_stderr"
 
@@ -59,6 +63,7 @@ extract_frame() {
 
 extract_frame "$fixture/welcome.json"
 extract_frame "$fixture/describe.json"
+extract_frame "$fixture/second-describe.json"
 test "$offset" -eq "$(wc -c <"$response_frame")"
 
 jq -e '
@@ -87,8 +92,24 @@ jq -e --arg id "$request_id" '
   .result.limits == {"max_control_frame_bytes": 1048576, "max_in_flight_requests": 64}
 ' "$fixture/describe.json" >/dev/null
 
+jq -e --arg id "$second_request_id" '
+  type == "object" and
+  (keys | sort) == (["id", "kind", "result"] | sort) and
+  .kind == "response" and
+  .id == $id and
+  (.result | keys | sort) == (["capabilities", "daemon", "host", "limits", "protocol"] | sort) and
+  .result.protocol == {"major": 1, "minor": 0} and
+  .result.daemon.name == "chooshd" and
+  (.result.daemon.version | type == "string" and length > 0) and
+  .result.host == {"name": "local-host", "version": "unknown"} and
+  .result.capabilities == [] and
+  .result.limits == {"max_control_frame_bytes": 1048576, "max_in_flight_requests": 64}
+' "$fixture/second-describe.json" >/dev/null
+
+test "$(jq -r .id "$fixture/describe.json")" != "$(jq -r .id "$fixture/second-describe.json")"
+
 kill "$daemon_pid"
 wait "$daemon_pid" 2>/dev/null || true
 daemon_pid=''
 
-echo 'rpc_typed_hello_welcome_host_describe_process_test_passed'
+echo 'rpc_typed_session_multiple_host_describe_process_test_passed'

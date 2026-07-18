@@ -20,7 +20,7 @@ use crate::socket::{self, OwnedUnixListener, SocketError, SocketPlan};
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const READ_CHUNK_BYTES: usize = 8192;
-const MAX_FRAMES_PER_READ: usize = 1;
+const MAX_FRAMES_PER_READ: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct HandshakeConfig {
@@ -167,42 +167,41 @@ fn serve_stream_with_limits(
     config: &HandshakeConfig,
     limits: FrameLimits,
 ) -> Result<(), DaemonError> {
-    let hello_payload = read_one_frame(stream, limits, DaemonError::ExpectedHello)?;
-    let hello = decode_hello(&hello_payload, limits.max_frame_bytes)?;
-    let reply = config.negotiator()?.receive_hello(&hello)?;
-    write_payload(
-        stream,
-        &encode_server_reply(&reply, limits.max_frame_bytes)?,
-        limits.max_frame_bytes,
-    )?;
-    if matches!(reply, ServerReply::Incompatible(_)) {
-        return Ok(());
-    }
-
-    let request_payload = read_one_frame(stream, limits, DaemonError::ExpectedRequest)?;
-    let envelope = decode_envelope(&request_payload, limits.max_frame_bytes)?;
-    let WireEnvelope::Request(request) = envelope else {
-        return Err(DaemonError::ExpectedRequest);
-    };
-    let response = describe_response(&request, config, limits.max_frame_bytes)?;
-    write_payload(stream, &response, limits.max_frame_bytes)
-}
-
-fn read_one_frame(
-    stream: &mut UnixStream,
-    limits: FrameLimits,
-    eof_error: DaemonError,
-) -> Result<Vec<u8>, DaemonError> {
     let mut decoder = FrameDecoder::new(limits);
     let mut buffer = [0_u8; READ_CHUNK_BYTES];
+    let mut negotiated = false;
     loop {
         let read = stream.read(&mut buffer)?;
         if read == 0 {
             decoder.finish()?;
-            return Err(eof_error);
+            return if negotiated {
+                Ok(())
+            } else {
+                Err(DaemonError::ExpectedHello)
+            };
         }
-        if let Some(payload) = decoder.feed(&buffer[..read])?.into_iter().next() {
-            return Ok(payload);
+        for payload in decoder.feed(&buffer[..read])? {
+            if !negotiated {
+                let hello = decode_hello(&payload, limits.max_frame_bytes)?;
+                let reply = config.negotiator()?.receive_hello(&hello)?;
+                write_payload(
+                    stream,
+                    &encode_server_reply(&reply, limits.max_frame_bytes)?,
+                    limits.max_frame_bytes,
+                )?;
+                if matches!(reply, ServerReply::Incompatible(_)) {
+                    return Ok(());
+                }
+                negotiated = true;
+                continue;
+            }
+
+            let envelope = decode_envelope(&payload, limits.max_frame_bytes)?;
+            let WireEnvelope::Request(request) = envelope else {
+                return Err(DaemonError::ExpectedRequest);
+            };
+            let response = describe_response(&request, config, limits.max_frame_bytes)?;
+            write_payload(stream, &response, limits.max_frame_bytes)?;
         }
     }
 }
@@ -314,6 +313,7 @@ mod tests {
             response,
             br#"{"id":"00000000-0000-0000-0000-000000000001","kind":"response","result":{"capabilities":["events"],"daemon":{"name":"chooshd","version":"test"},"host":{"name":"local-host","version":"test"},"limits":{"max_control_frame_bytes":512,"max_in_flight_requests":8},"protocol":{"major":1,"minor":2}}}"#
         );
+        client.shutdown(std::net::Shutdown::Write).unwrap();
         worker.join().unwrap();
     }
 
@@ -338,6 +338,69 @@ mod tests {
             br#"{"error":{"code":"invalid_request","message":"invalid host.describe request"},"id":"00000000-0000-0000-0000-000000000002","kind":"response"}"#
         );
         assert!(!String::from_utf8(response).unwrap().contains("do-not-echo"));
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn multiple_coalesced_requests_receive_ordered_typed_responses() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            serve_stream_with_limits(&mut server, &config(512), limits(512).unwrap()).unwrap();
+        });
+        let hello = br#"{"kind":"hello","protocol":{"major":1,"minor":1},"client":{"name":"test-client","version":"1"},"capabilities":[]}"#;
+        let first = br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000003","method":"host.describe","params":{}}"#;
+        let second = br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000004","method":"host.describe","params":{}}"#;
+        let mut input = encode_frame(hello, 512).unwrap();
+        input.extend(encode_frame(first, 512).unwrap());
+        input.extend(encode_frame(second, 512).unwrap());
+        client.write_all(&input).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let welcome = read_frame(&mut client, 512);
+        assert!(welcome.starts_with(br#"{"capabilities"#));
+        let first_response = read_frame(&mut client, 512);
+        let second_response = read_frame(&mut client, 512);
+        assert!(
+            String::from_utf8(first_response)
+                .unwrap()
+                .contains("00000000-0000-0000-0000-000000000003")
+        );
+        assert!(
+            String::from_utf8(second_response)
+                .unwrap()
+                .contains("00000000-0000-0000-0000-000000000004")
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_request_after_success_fails_closed_without_an_extra_response() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            assert!(matches!(
+                serve_stream_with_limits(&mut server, &config(512), limits(512).unwrap()),
+                Err(DaemonError::Wire(WireError::MalformedJson))
+            ));
+        });
+        let hello = br#"{"kind":"hello","protocol":{"major":1,"minor":1},"client":{"name":"test-client","version":"1"},"capabilities":[]}"#;
+        let request = br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000005","method":"host.describe","params":{}}"#;
+        for payload in [hello.as_slice(), request.as_slice(), b"{".as_slice()] {
+            client
+                .write_all(&encode_frame(payload, 512).unwrap())
+                .unwrap();
+        }
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let _welcome = read_frame(&mut client, 512);
+        let response = read_frame(&mut client, 512);
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .contains("00000000-0000-0000-0000-000000000005")
+        );
+        let mut extra = Vec::new();
+        client.read_to_end(&mut extra).unwrap();
+        assert!(extra.is_empty());
         worker.join().unwrap();
     }
 

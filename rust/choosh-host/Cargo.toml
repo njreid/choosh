@@ -10,3 +10,4 @@ workspace = true
 
 [dependencies]
 choosh-protocol = { path = "../choosh-protocol" }
+serde_json = "=1.0.150"

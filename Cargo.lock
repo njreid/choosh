@@ -15,6 +15,7 @@ name = "choosh-host"
 version = "0.0.0"
 dependencies = [
  "choosh-protocol",
+ "serde_json",
 ]
 
 [[package]]

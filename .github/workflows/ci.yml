@@ -43,7 +43,7 @@ jobs:
       - name: Repository specifications
         if: matrix.host == 'linux-x86_64'
         run: ./scripts/check-specs.sh
-      - name: Typed hello/welcome and host.describe through private RPC process seam
+      - name: Typed session with sequential host.describe requests through private RPC seam
         if: matrix.host == 'linux-x86_64'
         run: ./scripts/test-rpc-socket.sh
       - name: Rust formatting
