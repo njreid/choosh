@@ -1,6 +1,7 @@
 # Termux SSH-key import boundary
 
-Status: design and domain-model evidence; no SSH transport is selected or implemented.
+Status: domain-model and headless Android coordinator evidence; no SSH transport is
+selected or implemented.
 
 ## Purpose
 
@@ -33,7 +34,7 @@ headless evidence.
 4. The adapter derives and shows the public-key algorithm and canonical unpadded
    `SHA256:` fingerprint for confirmation.  It emits to Rust only a newly allocated
    opaque credential reference plus that non-secret metadata.
-5. A replacement import is an explicit profile-binding change.  Failed validation,
+5. A replacement import is an explicit, atomic profile-binding change. Failed validation,
    cancelled consent, keystore failure, and profile-store failure leave the prior binding
    unchanged and use stable typed outcomes.
 
@@ -52,15 +53,25 @@ it is never passed to `chooshd`, a terminal, SFTP, Git, a loopback gateway, or a
 - `UserApprovedSshKeyImport` has no fields or constructors for raw private material,
   paths, URIs, or passphrases.
 
+The Android application now has the corresponding constructor-injected
+`SshKeyImportCoordinator` seam.  Its `ActivityResultDocumentPicker` abstraction is the
+only entry point and its document reader and Keystore store receive opaque handles, not
+paths or byte arrays. Its profile-store interface requires atomic replacement: failure
+must retain the prior binding. A profile-binding failure discards the newly stored credential;
+if cleanup fails it returns `CLEANUP_FAILED` rather than claiming success.  The concrete
+`ACTION_OPEN_DOCUMENT` and Android Keystore adapters remain outer-composition work and
+must not add storage permissions or Termux-path access.
+
 Run the deterministic proof with:
 
 ```sh
 cargo test -p choosh-core ssh_identity
+GRADLE_USER_HOME=/tmp/choosh-gradle ANDROID_HOME=/opt/android-sdk ./gradlew :app:testDebugUnitTest
 ```
 
 The negative cases reject filesystem paths, document URIs, private-key marker text,
-control characters, malformed fingerprints, and accidental debug disclosure of the
-opaque handle.
+control characters, malformed fingerprints, accidental debug disclosure of the opaque
+handle, cancelled picks, invalid documents, and profile-binding rollback.
 
 ## Deferred integration gate
 
