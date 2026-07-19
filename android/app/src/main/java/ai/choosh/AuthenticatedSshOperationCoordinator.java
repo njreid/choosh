@@ -88,6 +88,14 @@ public final class AuthenticatedSshOperationCoordinator {
             return value;
         }
 
+        @Override public boolean equals(Object other) {
+            return other instanceof ProfileId && value.equals(((ProfileId) other).value);
+        }
+
+        @Override public int hashCode() {
+            return value.hashCode();
+        }
+
         @Override public String toString() {
             return "ProfileId(REDACTED)";
         }
@@ -99,20 +107,37 @@ public final class AuthenticatedSshOperationCoordinator {
      */
     public static final class ConnectionRequest {
         private final ProfileId profileId;
+        private final ProfileConnectionMetadataSource.SshEndpoint endpoint;
+        private final ProfileConnectionMetadataSource.SshUsername username;
+        private final ProfileConnectionMetadataSource.KnownHost knownHost;
         private final SshKeyImportCoordinator.OpaqueCredentialRef credentialRef;
         private final SshKeyImportCoordinator.PublicKeyMetadata publicKey;
 
         public ConnectionRequest(
             ProfileId profileId,
+            ProfileConnectionMetadataSource.SshEndpoint endpoint,
+            ProfileConnectionMetadataSource.SshUsername username,
+            ProfileConnectionMetadataSource.KnownHost knownHost,
             SshKeyImportCoordinator.OpaqueCredentialRef credentialRef,
             SshKeyImportCoordinator.PublicKeyMetadata publicKey
         ) {
             this.profileId = Objects.requireNonNull(profileId, "profileId");
+            this.endpoint = Objects.requireNonNull(endpoint, "endpoint");
+            this.username = Objects.requireNonNull(username, "username");
+            this.knownHost = Objects.requireNonNull(knownHost, "knownHost");
             this.credentialRef = Objects.requireNonNull(credentialRef, "credentialRef");
             this.publicKey = Objects.requireNonNull(publicKey, "publicKey");
         }
 
         public ProfileId profileId() { return profileId; }
+
+        /** Separately encoded endpoint for the native SSH connector; it is never a shell argument. */
+        public ProfileConnectionMetadataSource.SshEndpoint endpoint() { return endpoint; }
+
+        public ProfileConnectionMetadataSource.SshUsername username() { return username; }
+
+        /** Exact persisted host-key identity that the connector MUST admit before authentication. */
+        public ProfileConnectionMetadataSource.KnownHost knownHost() { return knownHost; }
 
         /** Intended only for the native Keystore-backed credential signer adapter. */
         public SshKeyImportCoordinator.OpaqueCredentialRef credentialRef() { return credentialRef; }
@@ -120,7 +145,8 @@ public final class AuthenticatedSshOperationCoordinator {
         public SshKeyImportCoordinator.PublicKeyMetadata publicKey() { return publicKey; }
 
         @Override public String toString() {
-            return "ConnectionRequest(profile=" + profileId + ", credential=REDACTED, publicKey="
+            return "ConnectionRequest(profile=" + profileId + ", endpoint=REDACTED, username=REDACTED, "
+                + "knownHost=" + knownHost.algorithm() + ", credential=REDACTED, publicKey="
                 + publicKey.algorithm() + ")";
         }
     }

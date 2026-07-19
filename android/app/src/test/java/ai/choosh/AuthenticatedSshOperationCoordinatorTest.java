@@ -25,7 +25,7 @@ public final class AuthenticatedSshOperationCoordinatorTest {
         assertSame(request, connector.request);
         assertEquals(AuthenticatedSshOperationCoordinator.OpenCode.CONNECTED, outcome.value.code());
         assertSame(operations, outcome.value.operations());
-        assertEquals("ConnectionRequest(profile=ProfileId(REDACTED), credential=REDACTED, publicKey=ED25519)", request.toString());
+        assertEquals("ConnectionRequest(profile=ProfileId(REDACTED), endpoint=REDACTED, username=REDACTED, knownHost=ED25519, credential=REDACTED, publicKey=ED25519)", request.toString());
     }
 
     @Test public void unavailableProfileDoesNotOpenTransport() {
@@ -85,6 +85,12 @@ public final class AuthenticatedSshOperationCoordinatorTest {
     private static AuthenticatedSshOperationCoordinator.ConnectionRequest request() {
         return new AuthenticatedSshOperationCoordinator.ConnectionRequest(
             PROFILE,
+            new ProfileConnectionMetadataSource.SshEndpoint("ssh-fixture.example", 22),
+            new ProfileConnectionMetadataSource.SshUsername("fixture_user"),
+            new ProfileConnectionMetadataSource.KnownHost(
+                ProfileConnectionMetadataSource.HostKeyAlgorithm.ED25519,
+                "SHA256:0123456789012345678901234567890123456789012"
+            ),
             new SshKeyImportCoordinator.OpaqueCredentialRef("android_keystore_key_42"),
             new SshKeyImportCoordinator.PublicKeyMetadata(
                 SshKeyImportCoordinator.SshPublicKeyAlgorithm.ED25519,
