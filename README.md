@@ -27,6 +27,7 @@ Choosh is in specification and risk-spike stage. No production APK or host daemo
 
 - [System design and delivery plan](CHOOSH_DESIGN_PLAN.md)
 - [Specification index](docs/specs/README.md)
+- [Current delivery status](PLAN.md)
 - [Milestone plan](docs/milestones/README.md)
 - [Architecture decisions](docs/adr/README.md)
 - [Threat model](docs/threat-model.md)
