@@ -7,9 +7,11 @@
 
 mod host_key;
 mod session;
+mod signer;
 
 pub use host_key::{ExactHostKeyHandler, presented_fingerprint};
 pub use session::{PreAuthenticationSession, SessionConfigError, SessionLimits};
+pub use signer::{CredentialSigner, CredentialSignerAdapter};
 
 /// Exact Russh release admitted by ADR 0007.
 pub const RUSSH_VERSION: &str = "0.62.2";
