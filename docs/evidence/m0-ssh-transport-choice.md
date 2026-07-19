@@ -1,8 +1,11 @@
 # M0 SSH transport implementation choice
 
 The dependency-independent executable contract is specified in the
-[M0 SSH acceptance harness](m0-ssh-acceptance-harness.md). Candidate evaluation MUST use that
-shared fixture surface rather than adapter-specific happy-path tests.
+[M0 SSH acceptance harness](m0-ssh-acceptance-harness.md). The companion
+[dependency admission experiment](m0-ssh-dependency-admission.md) defines the
+lock, licence, Android packaging, exact-host-key ordering, and deterministic
+fixture evidence required to promote a candidate. Candidate evaluation MUST use
+both shared contracts rather than adapter-specific happy-path tests.
 
 Status: Blocked; do not add an SSH dependency yet.
 
@@ -117,6 +120,10 @@ Proceed with Russh only after one reviewed dependency-only spike can:
 6. enforce injected time, channel-count, packet, per-channel queue, and aggregate-byte
    limits and pass the documented throttled-SFTP/PTY latency budget without sleeps or
    external services.
+
+The admission spike MUST meet the detailed fixture and evidence contract in
+[the dependency admission experiment](m0-ssh-dependency-admission.md); this list
+is a summary, not a substitute for its required negative assertions.
 
 Until those checks pass, `choosh-core` traits and deterministic fakes remain the only
 SSH implementation surface; M0-R5 is not complete.
