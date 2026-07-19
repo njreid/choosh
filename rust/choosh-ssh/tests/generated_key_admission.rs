@@ -7,7 +7,7 @@ use choosh_core::ssh_identity::PublicKeyFingerprint;
 use choosh_ssh::{ExactHostKeyHandler, presented_fingerprint};
 use russh::Channel;
 use russh::client;
-use russh::keys::{Algorithm, PrivateKey, PublicKey};
+use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,7 +16,8 @@ enum Event {
     HostKeyMatched,
     HostKeyMismatch,
     AuthenticationStarted,
-    AuthenticationObserved,
+    AuthenticationKeyOffered,
+    AuthenticationKeyVerified,
     Ready,
     ChannelObserved,
 }
@@ -46,17 +47,42 @@ impl client::Handler for ClientHandler {
 
 struct ServerHandler {
     trace: Trace,
+    expected_client: PublicKeyFingerprint,
 }
 
 impl server::Handler for ServerHandler {
     type Error = russh::Error;
 
-    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+    async fn auth_publickey_offered(
+        &mut self,
+        _user: &str,
+        key: &PublicKey,
+    ) -> Result<Auth, Self::Error> {
         self.trace
             .lock()
             .expect("trace mutex is not poisoned")
-            .push(Event::AuthenticationObserved);
-        Ok(Auth::Accept)
+            .push(Event::AuthenticationKeyOffered);
+        Ok(
+            if presented_fingerprint(key) == self.expected_client.as_str() {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            },
+        )
+    }
+
+    async fn auth_publickey(&mut self, _user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+        self.trace
+            .lock()
+            .expect("trace mutex is not poisoned")
+            .push(Event::AuthenticationKeyVerified);
+        Ok(
+            if presented_fingerprint(key) == self.expected_client.as_str() {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            },
+        )
     }
 
     async fn channel_open_session(
@@ -86,6 +112,7 @@ fn expected(key: &PublicKey) -> PublicKeyFingerprint {
 
 fn spawn_server(
     key: PrivateKey,
+    expected_client: PublicKeyFingerprint,
     trace: Trace,
 ) -> (tokio::task::JoinHandle<()>, tokio::io::DuplexStream) {
     let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
@@ -96,8 +123,15 @@ fn spawn_server(
         ..server::Config::default()
     });
     let task = tokio::spawn(async move {
-        if let Ok(session) =
-            server::run_stream(config, server_stream, ServerHandler { trace }).await
+        if let Ok(session) = server::run_stream(
+            config,
+            server_stream,
+            ServerHandler {
+                trace,
+                expected_client,
+            },
+        )
+        .await
         {
             let _ = session.await;
         }
@@ -109,8 +143,13 @@ fn spawn_server(
 async fn changed_generated_host_key_stops_before_authentication_or_channel_events() {
     let presented = generated_server_key();
     let different = generated_server_key();
+    let client_key = generated_server_key();
     let trace = Trace::default();
-    let (server, stream) = spawn_server(presented, Arc::clone(&trace));
+    let (server, stream) = spawn_server(
+        presented,
+        expected(client_key.public_key()),
+        Arc::clone(&trace),
+    );
     let handler = ClientHandler {
         verifier: ExactHostKeyHandler::new(expected(different.public_key())),
         trace: Arc::clone(&trace),
@@ -128,9 +167,10 @@ async fn changed_generated_host_key_stops_before_authentication_or_channel_event
 #[tokio::test]
 async fn exact_generated_host_key_precedes_authentication_and_channel_open() {
     let key = generated_server_key();
+    let client_key = generated_server_key();
     let fingerprint = expected(key.public_key());
     let trace = Trace::default();
-    let (server, stream) = spawn_server(key, Arc::clone(&trace));
+    let (server, stream) = spawn_server(key, expected(client_key.public_key()), Arc::clone(&trace));
     let handler = ClientHandler {
         verifier: ExactHostKeyHandler::new(fingerprint),
         trace: Arc::clone(&trace),
@@ -145,7 +185,10 @@ async fn exact_generated_host_key_precedes_authentication_and_channel_open() {
         .push(Event::AuthenticationStarted);
     assert!(
         client
-            .authenticate_none("fixture-user")
+            .authenticate_publickey(
+                "fixture-user",
+                PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
+            )
             .await
             .unwrap()
             .success()
@@ -164,9 +207,57 @@ async fn exact_generated_host_key_precedes_authentication_and_channel_open() {
             Event::HostKeyPresented,
             Event::HostKeyMatched,
             Event::AuthenticationStarted,
-            Event::AuthenticationObserved,
+            Event::AuthenticationKeyOffered,
+            Event::AuthenticationKeyVerified,
             Event::Ready,
             Event::ChannelObserved,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn wrong_generated_client_key_stops_before_ready_or_channel_open() {
+    let host_key = generated_server_key();
+    let allowed_client = generated_server_key();
+    let rejected_client = generated_server_key();
+    let host_fingerprint = expected(host_key.public_key());
+    let trace = Trace::default();
+    let (server, stream) = spawn_server(
+        host_key,
+        expected(allowed_client.public_key()),
+        Arc::clone(&trace),
+    );
+    let handler = ClientHandler {
+        verifier: ExactHostKeyHandler::new(host_fingerprint),
+        trace: Arc::clone(&trace),
+    };
+    let mut client = client::connect_stream(Arc::new(client::Config::default()), stream, handler)
+        .await
+        .expect("exact generated host key connects");
+    trace
+        .lock()
+        .expect("trace mutex is not poisoned")
+        .push(Event::AuthenticationStarted);
+
+    assert!(
+        !client
+            .authenticate_publickey(
+                "fixture-user",
+                PrivateKeyWithHashAlg::new(Arc::new(rejected_client), None),
+            )
+            .await
+            .unwrap()
+            .success()
+    );
+    drop(client);
+    server.abort();
+    assert_eq!(
+        *trace.lock().expect("trace mutex is not poisoned"),
+        [
+            Event::HostKeyPresented,
+            Event::HostKeyMatched,
+            Event::AuthenticationStarted,
+            Event::AuthenticationKeyOffered,
         ]
     );
 }
