@@ -26,7 +26,7 @@ string pointers would also contradict its established safety boundary.
 The current candidate is `io.github.rosemoe:editor:0.24.6`. Maven Central marks it
 as the current `latest`/`release` version and its published Gradle metadata marks
 the artifact as a release. The AAR declares `minSdk 21` and `minCompileSdk 36`, so
-those dimensions are compatible with Choosh's `minSdk 26` and `compileSdk 37`.
+those dimensions are compatible with Choosh's `minSdk 26` and `compileSdk 36`.
 The published AAR SHA-256 is
 `fb76ae4db31d94d9fee7f97d9b8ec1c9659c54b5ee1ded7f9f95f7039646243e`.
 

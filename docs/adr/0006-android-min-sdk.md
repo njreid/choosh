@@ -6,7 +6,7 @@ Accepted for the initial Android skeleton.
 
 ## Decision
 
-Choosh uses `minSdk = 26` (Android 8.0) while compiling and targeting API 37.
+Choosh uses `minSdk = 26` (Android 8.0) while compiling and targeting API 36.
 Newer platform APIs remain guarded by AndroidX or runtime SDK checks.
 
 API 26 provides notification channels, modern Android Keystore primitives, and
@@ -18,6 +18,6 @@ new compatibility report and an ADR amendment.
 
 ## Verification
 
-The debug manifest is inspected for `minSdkVersion=26` and `targetSdkVersion=37`.
-JVM and instrumentation suites compile against API 37. Device acceptance needs
-both the API 37 primary lane and an API 26 compatibility lane before release.
+The debug manifest is inspected for `minSdkVersion=26` and `targetSdkVersion=36`.
+JVM and instrumentation suites compile against API 36. Device acceptance needs
+both the API 36 primary lane and an API 26 compatibility lane before release.

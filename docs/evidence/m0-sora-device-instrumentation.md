@@ -10,7 +10,7 @@ Inventory captured on 2026-07-19:
 
 - Android Emulator 36.6.11 and Platform Tools 37.0.0 are installed.
 - AVD `medium_phone` uses the installed API 36 Google Play x86_64 image.
-- API 37 is installed for compilation; the application targets API 37 and has
+- API 36 is installed for compilation; the application targets API 36 and has
   `minSdk 26`.
 - `emulator -accel-check` reports that KVM needs VMX or SVM and `/dev/kvm` is
   absent. ADB also cannot bind its local server socket in the restricted

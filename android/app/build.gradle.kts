@@ -23,12 +23,12 @@ val signingNames = listOf(
 
 android {
     namespace = "ai.choosh"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "ai.choosh"
         minSdk = 26
-        targetSdk = 37
+        targetSdk = 36
         versionCode = releaseVersionCode
         versionName = releaseVersionName
         testInstrumentationRunner = "ai.choosh.SmokeInstrumentation"

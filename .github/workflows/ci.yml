@@ -71,7 +71,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - uses: android-actions/setup-android@v3
       - name: Install stable Android SDK
-        run: sdkmanager "platforms;android-37" "build-tools;36.0.0" "ndk;28.2.13676358"
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
       - name: Static Android policy checks
         run: ./scripts/check-android.sh
       - name: Lint, unit test, and package test APKs
@@ -133,11 +133,11 @@ jobs:
             echo 'preview_codename_invalid' >&2
             exit 1
           }
-          test "$(grep -Fc '    compileSdk = 37' android/app/build.gradle.kts)" -eq 1 || {
+          test "$(grep -Fc '    compileSdk = 36' android/app/build.gradle.kts)" -eq 1 || {
             echo 'preview_compile_baseline_mismatch' >&2
             exit 1
           }
-          sed -i "s/    compileSdk = 37/    compileSdkPreview = \"$PREVIEW_CODENAME\"/" android/app/build.gradle.kts
+          sed -i "s/    compileSdk = 36/    compileSdkPreview = \"$PREVIEW_CODENAME\"/" android/app/build.gradle.kts
       - name: Compile and test preview compatibility
         if: steps.preview.outputs.available == 'true'
         run: ./gradlew :app:lintDebug :app:testDebugUnitTest :app:assembleDebug --stacktrace

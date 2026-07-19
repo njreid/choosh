@@ -16,8 +16,8 @@ fi
 
 grep -Fq 'namespace = "ai.choosh"' "$root/android/app/build.gradle.kts"
 grep -Fq 'applicationId = "ai.choosh"' "$root/android/app/build.gradle.kts"
-grep -Fq 'compileSdk = 37' "$root/android/app/build.gradle.kts"
-grep -Fq 'targetSdk = 37' "$root/android/app/build.gradle.kts"
+grep -Fq 'compileSdk = 36' "$root/android/app/build.gradle.kts"
+grep -Fq 'targetSdk = 36' "$root/android/app/build.gradle.kts"
 grep -Fq 'distributionUrl=https\://services.gradle.org/distributions/gradle-9.6.1-bin.zip' \
   "$root/gradle/wrapper/gradle-wrapper.properties"
 grep -Fq 'distributionSha256Sum=9c0f7faeeb306cb14e4279a3e084ca6b596894089a0638e68a07c945a32c9e14' \
