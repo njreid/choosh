@@ -9,10 +9,11 @@ rust-version.workspace = true
 choosh-core = { path = "../choosh-core" }
 russh = { version = "=0.62.2", default-features = false, features = ["ring"] }
 russh-sftp = "=2.3.0"
+tokio = { version = "=1.53.0", features = ["io-util"] }
 
 [dev-dependencies]
 rand = "=0.10.2"
-tokio = { version = "=1.53.0", features = ["io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "=1.53.0", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

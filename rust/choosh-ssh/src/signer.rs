@@ -15,6 +15,9 @@ use russh::keys::agent::AgentIdentity;
 pub trait CredentialSigner: Send {
     type Error: From<russh::SendError>;
 
+    /// Returns the non-secret public key paired with this signing capability.
+    fn public_key(&self) -> russh::keys::PublicKey;
+
     fn sign(
         &mut self,
         identity: &AgentIdentity,
@@ -37,6 +40,14 @@ impl<S> CredentialSignerAdapter<S> {
     #[must_use]
     pub fn into_inner(self) -> S {
         self.signer
+    }
+}
+
+impl<S: CredentialSigner> CredentialSignerAdapter<S> {
+    /// Returns the public key that the injected capability will prove control of.
+    #[must_use]
+    pub fn public_key(&self) -> russh::keys::PublicKey {
+        self.signer.public_key()
     }
 }
 
@@ -81,6 +92,10 @@ mod tests {
     impl CredentialSigner for FakeSigner {
         type Error = FakeError;
 
+        fn public_key(&self) -> PublicKey {
+            FIXTURE_KEY.parse().expect("fixture public key is valid")
+        }
+
         async fn sign(
             &mut self,
             identity: &AgentIdentity,
@@ -101,6 +116,7 @@ mod tests {
             seen_payload: Vec::new(),
         });
 
+        assert_eq!(adapter.public_key(), key);
         let signature = adapter
             .auth_sign(&AgentIdentity::from(key), None, vec![9, 8, 7])
             .await

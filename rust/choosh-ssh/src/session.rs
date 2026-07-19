@@ -164,6 +164,12 @@ impl PreAuthenticationSession {
     pub fn accepts_presented_key(&self, key: &russh::keys::PublicKey) -> bool {
         self.handler.matches(key)
     }
+
+    /// Transfers the private Russh pieces to the only future capability that
+    /// is allowed to establish an authenticated connection.
+    pub(crate) fn into_russh_parts(self) -> (Arc<client::Config>, ExactHostKeyHandler) {
+        (self.config, self.handler)
+    }
 }
 
 #[cfg(test)]

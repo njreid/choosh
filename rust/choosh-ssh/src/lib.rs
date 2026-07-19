@@ -5,10 +5,12 @@
 //! admission harness: exact host-key verification must complete before this
 //! crate attempts authentication or opens a channel.
 
+mod connection;
 mod host_key;
 mod session;
 mod signer;
 
+pub use connection::{SshUsername, UsernameError, VerifiedConnection, VerifiedConnectionError};
 pub use host_key::{ExactHostKeyHandler, presented_fingerprint};
 pub use session::{PreAuthenticationSession, SessionConfigError, SessionLimits};
 pub use signer::{CredentialSigner, CredentialSignerAdapter};
