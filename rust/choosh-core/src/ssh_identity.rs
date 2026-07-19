@@ -186,7 +186,10 @@ mod tests {
         let import = UserApprovedSshKeyImport::new(credential_ref, metadata());
 
         assert_eq!(import.credential_ref().as_str(), "android_keystore_key_42");
-        assert_eq!(import.public_key().algorithm(), SshPublicKeyAlgorithm::Ed25519);
+        assert_eq!(
+            import.public_key().algorithm(),
+            SshPublicKeyAlgorithm::Ed25519
+        );
         assert_eq!(import.public_key().fingerprint().as_str(), FINGERPRINT);
     }
 

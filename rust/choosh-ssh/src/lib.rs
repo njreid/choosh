@@ -6,8 +6,10 @@
 //! crate attempts authentication or opens a channel.
 
 mod host_key;
+mod session;
 
 pub use host_key::{ExactHostKeyHandler, presented_fingerprint};
+pub use session::{PreAuthenticationSession, SessionConfigError, SessionLimits};
 
 /// Exact Russh release admitted by ADR 0007.
 pub const RUSSH_VERSION: &str = "0.62.2";

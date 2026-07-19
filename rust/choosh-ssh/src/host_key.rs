@@ -35,7 +35,10 @@ impl ExactHostKeyHandler {
 impl client::Handler for ExactHostKeyHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, server_public_key: &PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKey,
+    ) -> Result<bool, Self::Error> {
         Ok(self.matches(server_public_key))
     }
 }
@@ -50,7 +53,9 @@ mod tests {
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
 
     fn fixture_key() -> PublicKey {
-        FIXTURE_KEY.parse().expect("repository fixture public key is valid")
+        FIXTURE_KEY
+            .parse()
+            .expect("repository fixture public key is valid")
     }
 
     #[test]
@@ -60,10 +65,9 @@ mod tests {
         let handler = ExactHostKeyHandler::new(expected);
         assert!(handler.matches(&key));
 
-        let different = PublicKeyFingerprint::parse(
-            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        )
-        .unwrap();
+        let different =
+            PublicKeyFingerprint::parse("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .unwrap();
         assert!(!ExactHostKeyHandler::new(different).matches(&key));
     }
 }
