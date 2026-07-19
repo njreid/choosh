@@ -2,6 +2,7 @@
 
 pub mod bridge;
 pub mod dispatch;
+pub mod exec_stdio;
 pub mod handshake;
 pub mod request;
 #[cfg(unix)]
@@ -16,6 +17,7 @@ const MAX_COMMAND_BYTES: usize = 64 * 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
+    ExecStdioV1,
     RpcStdio,
     EmitStdin,
     Stream { capability: Capability },
@@ -123,11 +125,20 @@ where
         return Err(ParseError::MissingCommand);
     };
     match head.as_str() {
+        "--exec-stdio-v1" => exact_command(tail, Command::ExecStdioV1),
         "rpc" => exact_switch(tail, "--stdio", Command::RpcStdio),
         "emit" => exact_switch(tail, "--stdin", Command::EmitStdin),
         "stream" => parse_stream(tail),
         "service" => parse_service(tail),
         _ => Err(ParseError::UnknownCommand),
+    }
+}
+
+fn exact_command(args: &[String], command: Command) -> Result<Command, ParseError> {
+    if args.is_empty() {
+        Ok(command)
+    } else {
+        Err(ParseError::UnexpectedArgument)
     }
 }
 
@@ -292,11 +303,16 @@ mod tests {
 
     #[test]
     fn parses_fixed_commands_exactly() {
+        assert_eq!(parse(["--exec-stdio-v1"]), Ok(Command::ExecStdioV1));
         assert_eq!(parse(["rpc", "--stdio"]), Ok(Command::RpcStdio));
         assert_eq!(parse(["emit", "--stdin"]), Ok(Command::EmitStdin));
         assert_eq!(parse(["rpc"]), Err(ParseError::MissingFlag));
         assert_eq!(
             parse(["rpc", "--stdio", "extra"]),
+            Err(ParseError::UnexpectedArgument)
+        );
+        assert_eq!(
+            parse(["--exec-stdio-v1", "extra"]),
             Err(ParseError::UnexpectedArgument)
         );
     }

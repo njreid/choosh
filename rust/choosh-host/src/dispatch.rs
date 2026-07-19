@@ -125,6 +125,11 @@ where
             return Ok(cancelled_record());
         }
         let result = match command {
+            // The binary dispatcher parser is intentionally not wired to a
+            // process launcher until its direct-exec allowlist is selected.
+            // Treat it as unavailable rather than falling back to a shell or
+            // another capability.
+            Command::ExecStdioV1 => return Ok(usage_record("unsupported_command")),
             Command::RpcStdio => self.rpc.rpc_stdio(input, cancellation),
             Command::EmitStdin => self.events.emit(input, cancellation),
             Command::Stream { capability } => {
