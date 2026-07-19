@@ -26,6 +26,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   licence, Android ABI, host-key-before-auth, channel, and fairness evidence.
 - [x] The isolated Russh graph is selected, lockfile-pinned, and compiles for Android
   arm64-v8a/x86_64 under its [time-bounded exception](docs/adr/0007-russh-crypto-exception.md).
+- [x] Exact host-key admission, injected credential signing, bounded fixed-command RPC,
+  and root-confined SFTP request boundaries have deterministic local evidence. The
+  host's fixed dispatcher parser is also fail-closed until a direct-exec allowlist is
+  composed.
 - [ ] A real Android SSH transport passes dependency admission and interoperability
   under the selected graph; see [SSH transport choice](docs/evidence/m0-ssh-transport-choice.md).
 - [ ] An SSH interoperability harness proves exact host-key verification before
@@ -43,8 +47,8 @@ public-1.0 milestone has passed.
 
 | Milestone | State | Evidence / remaining gate |
 |---|---|---|
-| M0 — Foundation | **In progress** | Build, editor, bridge/RPC, release and several headless domain spikes exist. M0-R5/R6 remain blocked on a real SSH transport and multiplex harness; M0-R7/R15 remain blocked on terminal provenance and device implementation. Device matrix and complete cross-target evidence remain required. |
-| M1 — Remote workspace | **Not started** | Depends on M0 SSH and terminal gates. Profile, credentials, Zellij, root-confined SFTP, Markdown, reconnect, and lifecycle acceptance remain future work. |
+| M0 — Foundation | **In progress** | Build, editor, bridge/RPC, release and SSH admission/channel boundary evidence exist. M0-R5/R6 still need Android composition plus one multiplexed interoperability harness; M0-R7/R15 remain blocked on terminal provenance and device implementation. Device matrix and complete cross-target evidence remain required. |
+| M1 — Remote workspace | **Not started** | Depends on M0 SSH and terminal gates. Root-confined SFTP request scaffolding exists, but profile, concrete transport, Zellij, Markdown, reconnect, and lifecycle acceptance remain future work. |
 | M2 — Agents and notifications | **Not started** | Adapter/event and Android notification slices await the M1 remote foundation. |
 | M3 — Pinning and services | **Not started** | Depends on M2 snapshots and verified SSH `direct-tcpip`. |
 | M4 — Editing and Git diff | **Not started** | Pure bounded diff groundwork exists, but the real daemon/SFTP/Git adapter and complete acceptance gate do not. |
@@ -56,14 +60,12 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **Android credential-import adapter.** Implement the user-selected document flow,
-   local key validation, Keystore-backed storage, confirmation, replacement semantics,
-   and typed outcomes behind the existing opaque import model.  This must not add broad
-   filesystem access or expose private-key material.  It remains preparatory work only.
-2. **SSH transport admission spike.** Resolve a production-acceptable transport or
-   record a time-bounded dependency exception.  Lock the graph, inventory licences,
-   compile Android arm64-v8a/x86_64, and implement the generated-key local harness
-   described by the dependency-admission evidence.
+1. **Android SSH composition.** Bind the already user-selected, opaque credential and
+   known-host records into the admitted Russh adapter through explicit DI. It must not
+   expose private-key material or add broad filesystem access.
+2. **Concrete SFTP and host direct-exec adapters.** Bind the root-confined request
+   boundary to the selected SFTP subsystem and bind the host decoder only to an
+   explicit allowlist. Preserve bounded reads/writes and no-shell execution.
 3. **M0-R5/M0-R6 vertical proof.** Compose known-host persistence, credential use,
    multiplexed channels, bounded cancellation, and negotiated stdio-to-private-socket
    RPC.  Make the harness the release claim, not unit fakes.
