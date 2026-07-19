@@ -19,6 +19,11 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   [ADR 0006](docs/adr/0006-android-min-sdk.md).
 - [x] Font assets and terminal provenance candidates are recorded, including the
   requested Geomini and Iosevka Charon Mono UI/terminal direction.
+- [x] User-approved SSH-key import is modeled as an opaque, redacted credential
+  reference plus public-key metadata; it neither reads Termux private storage nor
+  exposes private-key material to the Rust domain.
+- [x] SSH transport dependency admission has a deterministic contract for lock,
+  licence, Android ABI, host-key-before-auth, channel, and fairness evidence.
 - [ ] A real Android SSH transport is selected and admitted under dependency and
   licence policy.  Current evidence deliberately leaves this blocked; see
   [SSH transport choice](docs/evidence/m0-ssh-transport-choice.md).
@@ -49,14 +54,14 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **SSH credential-import boundary.** Model a user-approved Android document import
-   as an opaque credential reference with public-key metadata.  The platform adapter
-   must never silently read Termux private storage, expose key bytes to Rust snapshots,
-   logs, or WebViews, or request broad storage access.  This is preparatory work only;
-   it does not make SSH login functional.
+1. **Android credential-import adapter.** Implement the user-selected document flow,
+   local key validation, Keystore-backed storage, confirmation, replacement semantics,
+   and typed outcomes behind the existing opaque import model.  This must not add broad
+   filesystem access or expose private-key material.  It remains preparatory work only.
 2. **SSH transport admission spike.** Resolve a production-acceptable transport or
    record a time-bounded dependency exception.  Lock the graph, inventory licences,
-   compile Android arm64-v8a/x86_64, and implement the generated-key local harness.
+   compile Android arm64-v8a/x86_64, and implement the generated-key local harness
+   described by the dependency-admission evidence.
 3. **M0-R5/M0-R6 vertical proof.** Compose known-host persistence, credential use,
    multiplexed channels, bounded cancellation, and negotiated stdio-to-private-socket
    RPC.  Make the harness the release claim, not unit fakes.
