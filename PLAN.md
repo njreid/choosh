@@ -27,8 +27,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The isolated Russh graph is selected, lockfile-pinned, and compiles for Android
   arm64-v8a/x86_64 under its [time-bounded exception](docs/adr/0007-russh-crypto-exception.md).
 - [x] Exact host-key admission, injected credential signing, bounded fixed-command RPC,
-  and root-confined SFTP request boundaries have deterministic local evidence. The
-  host's fixed dispatcher parser is also fail-closed until a direct-exec allowlist is
+  root-confined SFTP request boundaries, and bounded Russh SFTP subsystem admission have
+  deterministic local evidence. The host's fixed dispatcher parser and its `chooshd rpc
+  --stdio` allowlist launcher are fail-closed; the platform process adapter remains to be
   composed.
 - [ ] A real Android SSH transport passes dependency admission and interoperability
   under the selected graph; see [SSH transport choice](docs/evidence/m0-ssh-transport-choice.md).
@@ -64,8 +65,9 @@ bounded resources, and a commit/push after verification.
    known-host records into the admitted Russh adapter through explicit DI. It must not
    expose private-key material or add broad filesystem access.
 2. **Concrete SFTP and host direct-exec adapters.** Bind the root-confined request
-   boundary to the selected SFTP subsystem and bind the host decoder only to an
-   explicit allowlist. Preserve bounded reads/writes and no-shell execution.
+   boundary to the admitted SFTP subsystem, and compose the host's existing fixed
+   allowlist with its platform process adapter. Preserve bounded reads/writes and
+   no-shell execution.
 3. **M0-R5/M0-R6 vertical proof.** Compose known-host persistence, credential use,
    multiplexed channels, bounded cancellation, and negotiated stdio-to-private-socket
    RPC.  Make the harness the release claim, not unit fakes.
