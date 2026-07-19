@@ -4,7 +4,7 @@ import android.app.Instrumentation;
 import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
-import android.widget.TextView;
+import android.view.ViewGroup;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -33,10 +33,9 @@ public final class SmokeInstrumentation extends Instrumentation {
         require(activity.findViewById(android.R.id.content) != null, "content root missing");
         require(activity.findViewById(android.R.id.content).getRootView().isAttachedToWindow(), "content not attached");
 
-        // The activity's only content child carries the deterministic M0 label.
-        TextView label = (TextView) ((android.view.ViewGroup) activity.findViewById(android.R.id.content)).getChildAt(0);
-        require("Choosh".contentEquals(label.getText()), "visible application label mismatch");
-        require("Choosh".contentEquals(label.getContentDescription()), "accessible label mismatch");
+        CodeEditor editor = (CodeEditor) ((ViewGroup) activity.findViewById(android.R.id.content)).getChildAt(0);
+        require("Choosh".contentEquals(editor.getText()), "visible application label mismatch");
+        require("Choosh".contentEquals(editor.getContentDescription()), "accessible label mismatch");
         runOnMainSync(activity::finish);
         waitForIdleSync();
         require(activity.isFinishing() || activity.isDestroyed(), "activity teardown was not observed");
