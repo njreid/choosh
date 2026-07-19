@@ -62,6 +62,12 @@ if cleanup fails it returns `CLEANUP_FAILED` rather than claiming success.  The 
 `ACTION_OPEN_DOCUMENT` and Android Keystore adapters remain outer-composition work and
 must not add storage permissions or Termux-path access.
 
+`AndroidOpenDocumentPicker` is now the concrete outer picker adapter. It builds an
+`ACTION_OPEN_DOCUMENT`, `CATEGORY_OPENABLE`, read-grant-only request and delegates
+registered Activity Result wiring through constructor injection. A successful Android
+result is reduced to a package-private opaque document handle; only a future document
+reader can obtain its URI. It neither persists URI access nor reads a document itself.
+
 Run the deterministic proof with:
 
 ```sh
