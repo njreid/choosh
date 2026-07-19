@@ -17,5 +17,6 @@ do
 done
 
 "$root/scripts/check-terminal-provenance.sh"
+"$root/scripts/check-ssh-admission-fixtures.sh"
 
 echo "Specification syntax checks passed."

@@ -34,6 +34,13 @@ absolute paths, generated public-key bytes, or a development machine identity.
 The fixture generator creates keys under its temporary directory at runtime and
 reports only an algorithm label plus a SHA-256 fingerprint.
 
+The repository already carries the dependency-free trust fixture schema at
+[`protocol/ssh-admission/v1/fixture.schema.json`](../../protocol/ssh-admission/v1/fixture.schema.json)
+and six required scenario fixtures. `check-specs.sh` validates their strict
+shape and contract mapping without a network connection or SSH dependency. The
+candidate declaration schema is intentionally deferred until a candidate exists:
+inventing its package/native closure now would falsely imply an approved choice.
+
 ## Admission checks
 
 The candidate is admissible only when all checks below pass from a clean checkout.

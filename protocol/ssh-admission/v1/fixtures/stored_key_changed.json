@@ -1,0 +1,17 @@
+{
+  "fixture_version": 1,
+  "id": "stored_key_changed",
+  "seed": "ssh-admission-v1",
+  "endpoint_id": "fixture-endpoint-a",
+  "profile_id": "fixture-profile-a",
+  "stored_fingerprint": "SHA256:fixture-key-a",
+  "presented_fingerprint": "SHA256:fixture-key-b",
+  "credential": "fixture-credential-valid",
+  "limits": { "channels": 4, "per_channel_bytes": 65536, "aggregate_bytes": 262144 },
+  "expected": {
+    "outcome": "host_key_mismatch",
+    "ordered_events": ["transport_connected", "host_key_presented", "host_key_mismatch", "transport_closed"],
+    "prohibited_before_outcome": ["trust_consent_required", "authentication_started", "channel_opened"]
+  },
+  "steps": []
+}

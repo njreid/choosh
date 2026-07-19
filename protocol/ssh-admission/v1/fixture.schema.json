@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://choosh.dev/protocol/ssh-admission/v1/fixture.schema.json",
+  "title": "Choosh SSH dependency-admission fixture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "fixture_version",
+    "id",
+    "seed",
+    "endpoint_id",
+    "profile_id",
+    "stored_fingerprint",
+    "presented_fingerprint",
+    "credential",
+    "limits",
+    "expected",
+    "steps"
+  ],
+  "properties": {
+    "fixture_version": { "const": 1 },
+    "id": {
+      "enum": [
+        "unknown_key",
+        "unknown_key_rejected",
+        "unknown_key_accepted_exact",
+        "stored_key_exact",
+        "stored_key_changed",
+        "stored_key_exact_bad_credential"
+      ]
+    },
+    "seed": { "$ref": "#/$defs/fixture_id" },
+    "endpoint_id": { "$ref": "#/$defs/fixture_id" },
+    "profile_id": { "$ref": "#/$defs/fixture_id" },
+    "stored_fingerprint": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/fingerprint" }
+      ]
+    },
+    "presented_fingerprint": { "$ref": "#/$defs/fingerprint" },
+    "credential": { "$ref": "#/$defs/fixture_id" },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channels", "per_channel_bytes", "aggregate_bytes"],
+      "properties": {
+        "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "per_channel_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+        "aggregate_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "ordered_events", "prohibited_before_outcome"],
+      "properties": {
+        "outcome": {
+          "enum": ["ready", "trust_consent_required", "trust_rejected", "host_key_mismatch", "authentication_failed"]
+        },
+        "ordered_events": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/event" }
+        },
+        "prohibited_before_outcome": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/event" }
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at_ms", "ordinal", "action"],
+        "properties": {
+          "at_ms": { "type": "integer", "minimum": 0, "maximum": 600000 },
+          "ordinal": { "type": "integer", "minimum": 0, "maximum": 1024 },
+          "action": { "$ref": "#/$defs/fixture_id" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "fixture_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "fingerprint": {
+      "type": "string",
+      "pattern": "^SHA256:fixture-[a-z0-9-]{1,40}$"
+    },
+    "event": {
+      "enum": [
+        "transport_connected",
+        "host_key_presented",
+        "trust_consent_required",
+        "trust_rejected",
+        "trust_accepted_exact",
+        "host_key_matched",
+        "host_key_mismatch",
+        "authentication_started",
+        "authentication_succeeded",
+        "authentication_failed",
+        "ready",
+        "channel_opened",
+        "transport_closed"
+      ]
+    }
+  }
+}
