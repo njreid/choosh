@@ -1,6 +1,7 @@
 //! Shell-free command-line parsing for the Choosh host helper.
 
 pub mod bridge;
+pub mod direct_exec;
 pub mod dispatch;
 pub mod exec_stdio;
 pub mod handshake;
