@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.rosemoe.sora.event.ContentChangeEvent;
 import io.github.rosemoe.sora.event.SubscriptionReceipt;
+import io.github.rosemoe.sora.text.CharPosition;
 import io.github.rosemoe.sora.widget.CodeEditor;
 
 public final class SmokeInstrumentation extends Instrumentation {
@@ -17,6 +18,7 @@ public final class SmokeInstrumentation extends Instrumentation {
     @Override public void onStart() {
         Bundle evidence = new Bundle();
         verifySoraLifecycle(evidence);
+        verifySoraEventTranslation(evidence);
         String expectedPackage = BuildIdentity.packageName();
         require("ai.choosh".equals(expectedPackage), "build identity changed");
         require(expectedPackage.equals(getTargetContext().getPackageName()), "target package mismatch");
@@ -63,6 +65,56 @@ public final class SmokeInstrumentation extends Instrumentation {
         receipt.unsubscribe();
         editor.release();
         evidence.putString("sora", "0.24.6:setText-event-and-release");
+    }
+
+    private void verifySoraEventTranslation(Bundle evidence) {
+        CodeEditor editor = new CodeEditor(getTargetContext());
+        SoraTextEdit insert = SoraContentChangeTranslator.translate(new ContentChangeEvent(
+                editor,
+                ContentChangeEvent.ACTION_INSERT,
+                position(1),
+                position(3),
+                "😀",
+                false));
+        require(insert.startUtf16() == 1 && insert.endUtf16() == 1,
+                "Sora insert must use its pre-insert range");
+        require("😀".equals(insert.replacement()), "Sora insert replacement mismatch");
+
+        SoraTextEdit delete = SoraContentChangeTranslator.translate(new ContentChangeEvent(
+                editor,
+                ContentChangeEvent.ACTION_DELETE,
+                position(1),
+                position(3),
+                "😀",
+                false));
+        require(delete.startUtf16() == 1 && delete.endUtf16() == 3,
+                "Sora delete range mismatch");
+        require(delete.replacement().isEmpty(), "Sora delete must have an empty replacement");
+        expectTranslationFailure(() -> SoraContentChangeTranslator.translate(new ContentChangeEvent(
+                editor,
+                ContentChangeEvent.ACTION_SET_NEW_TEXT,
+                position(0),
+                position(2),
+                "M0",
+                false)));
+        editor.release();
+        evidence.putString("sora_translation", "insert-delete-utf16-and-projection-rejection");
+    }
+
+    private static CharPosition position(int index) {
+        CharPosition position = new CharPosition();
+        position.index = index;
+        return position;
+    }
+
+    private static void expectTranslationFailure(Runnable action) {
+        try {
+            action.run();
+            throw new AssertionError("Sora full projection was translated as an incremental edit");
+        } catch (IllegalArgumentException expected) {
+            require("unsupported_sora_content_action".equals(expected.getMessage()),
+                    "unexpected Sora translation failure");
+        }
     }
 
     private static void require(boolean condition, String message) {

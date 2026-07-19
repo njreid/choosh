@@ -64,12 +64,17 @@ comparison, retry, or wall-clock assertion:
    `ContentChangeEvent`, sets `M0`, observes exactly one event with non-null
    change bounds and text, unsubscribes, and calls `release()`.
 3. The result bundle contains `sora=0.24.6:setText-event-and-release`.
-4. The launched package and component are `ai.choosh` and
+4. The runner translates synthetic real `ContentChangeEvent` insert/delete events
+   using UTF-16 indices, preserves a non-BMP two-unit boundary, and rejects a
+   full `ACTION_SET_NEW_TEXT` projection as an incremental edit. The result
+   bundle contains
+   `sora_translation=insert-delete-utf16-and-projection-rejection`.
+5. The launched package and component are `ai.choosh` and
    `ai.choosh.MainActivity`; its content is attached, then teardown is observed.
-5. The result bundle contains `package=ai.choosh`,
+6. The result bundle contains `package=ai.choosh`,
    `activity=ai.choosh.MainActivity`, `lifecycle=active-then-finished`, and
    `accessibility_label=Choosh`.
-6. No instrumentation failure, crash, ANR, process death, or test failure appears
+7. No instrumentation failure, crash, ANR, process death, or test failure appears
    in the Gradle XML/report output. Screenshots and logcat may diagnose failures
    but are never a pass oracle.
 
