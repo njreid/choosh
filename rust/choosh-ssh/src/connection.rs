@@ -75,7 +75,7 @@ pub struct VerifiedConnection {
         dead_code,
         reason = "the handle preserves the authenticated transport until an admitted channel capability consumes it"
     )]
-    handle: russh::client::Handle<crate::ExactHostKeyHandler>,
+    pub(crate) handle: russh::client::Handle<crate::ExactHostKeyHandler>,
 }
 
 impl VerifiedConnection {

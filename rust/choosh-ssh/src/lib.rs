@@ -6,11 +6,13 @@
 //! crate attempts authentication or opens a channel.
 
 mod connection;
+mod exec;
 mod host_key;
 mod session;
 mod signer;
 
 pub use connection::{SshUsername, UsernameError, VerifiedConnection, VerifiedConnectionError};
+pub use exec::{FixedCommand, FixedCommandError, FixedExecError, FixedExecOutput};
 pub use host_key::{ExactHostKeyHandler, presented_fingerprint};
 pub use session::{PreAuthenticationSession, SessionConfigError, SessionLimits};
 pub use signer::{CredentialSigner, CredentialSignerAdapter};

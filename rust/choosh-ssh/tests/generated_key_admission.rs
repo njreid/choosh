@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use choosh_core::ssh_identity::PublicKeyFingerprint;
 use choosh_ssh::{ExactHostKeyHandler, presented_fingerprint};
-use russh::Channel;
 use russh::client;
 use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session};
+use russh::{Channel, ChannelId, ChannelMsg, Pty};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Event {
@@ -20,7 +20,16 @@ enum Event {
     AuthenticationKeyVerified,
     Ready,
     ChannelObserved,
+    PtyAccepted,
+    PtyRejected,
+    ShellAccepted,
 }
+
+const MAX_TERM_BYTES: usize = 16;
+const MAX_COLUMNS: u32 = 240;
+const MAX_ROWS: u32 = 100;
+const MAX_PIXELS: u32 = 8192;
+const MAX_MODES: usize = 16;
 
 type Trace = Arc<Mutex<Vec<Event>>>;
 
@@ -96,6 +105,53 @@ impl server::Handler for ServerHandler {
             .expect("trace mutex is not poisoned")
             .push(Event::ChannelObserved);
         reply.accept().await;
+        Ok(())
+    }
+
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        term: &str,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        modes: &[(Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let accepted = !term.is_empty()
+            && term.len() <= MAX_TERM_BYTES
+            && (1..=MAX_COLUMNS).contains(&col_width)
+            && (1..=MAX_ROWS).contains(&row_height)
+            && pix_width <= MAX_PIXELS
+            && pix_height <= MAX_PIXELS
+            && modes.len() <= MAX_MODES;
+        self.trace
+            .lock()
+            .expect("trace mutex is not poisoned")
+            .push(if accepted {
+                Event::PtyAccepted
+            } else {
+                Event::PtyRejected
+            });
+        if accepted {
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
+        Ok(())
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.trace
+            .lock()
+            .expect("trace mutex is not poisoned")
+            .push(Event::ShellAccepted);
+        session.channel_success(channel)?;
         Ok(())
     }
 }
@@ -260,4 +316,102 @@ async fn wrong_generated_client_key_stops_before_ready_or_channel_open() {
             Event::AuthenticationKeyOffered,
         ]
     );
+}
+
+#[tokio::test]
+async fn authenticated_pty_and_shell_requests_obey_explicit_fixture_limits() {
+    let host_key = generated_server_key();
+    let client_key = generated_server_key();
+    let trace = Trace::default();
+    let (server, stream) = spawn_server(
+        host_key.clone(),
+        expected(client_key.public_key()),
+        Arc::clone(&trace),
+    );
+    let handler = ClientHandler {
+        verifier: ExactHostKeyHandler::new(expected(host_key.public_key())),
+        trace: Arc::clone(&trace),
+    };
+    let mut client = client::connect_stream(Arc::new(client::Config::default()), stream, handler)
+        .await
+        .unwrap();
+    trace.lock().unwrap().push(Event::AuthenticationStarted);
+    assert!(
+        client
+            .authenticate_publickey(
+                "fixture-user",
+                PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
+            )
+            .await
+            .unwrap()
+            .success()
+    );
+    trace.lock().unwrap().push(Event::Ready);
+    let mut channel = client.channel_open_session().await.unwrap();
+    channel
+        .request_pty(true, "xterm-256color", 120, 40, 1920, 1080, &[])
+        .await
+        .unwrap();
+    assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
+    channel.request_shell(true).await.unwrap();
+    assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
+    channel.close().await.unwrap();
+    drop(client);
+    server.abort();
+
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            Event::HostKeyPresented,
+            Event::HostKeyMatched,
+            Event::AuthenticationStarted,
+            Event::AuthenticationKeyOffered,
+            Event::AuthenticationKeyVerified,
+            Event::Ready,
+            Event::ChannelObserved,
+            Event::PtyAccepted,
+            Event::ShellAccepted,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn oversized_pty_is_rejected_without_a_shell_callback() {
+    let host_key = generated_server_key();
+    let client_key = generated_server_key();
+    let trace = Trace::default();
+    let (server, stream) = spawn_server(
+        host_key.clone(),
+        expected(client_key.public_key()),
+        Arc::clone(&trace),
+    );
+    let handler = ClientHandler {
+        verifier: ExactHostKeyHandler::new(expected(host_key.public_key())),
+        trace: Arc::clone(&trace),
+    };
+    let mut client = client::connect_stream(Arc::new(client::Config::default()), stream, handler)
+        .await
+        .unwrap();
+    trace.lock().unwrap().push(Event::AuthenticationStarted);
+    assert!(
+        client
+            .authenticate_publickey(
+                "fixture-user",
+                PrivateKeyWithHashAlg::new(Arc::new(client_key), None),
+            )
+            .await
+            .unwrap()
+            .success()
+    );
+    trace.lock().unwrap().push(Event::Ready);
+    let mut channel = client.channel_open_session().await.unwrap();
+    channel
+        .request_pty(true, "xterm-256color", MAX_COLUMNS + 1, 40, 0, 0, &[])
+        .await
+        .unwrap();
+    assert!(matches!(channel.wait().await, Some(ChannelMsg::Failure)));
+    drop(client);
+    server.abort();
+    assert_eq!(trace.lock().unwrap().last(), Some(&Event::PtyRejected));
+    assert!(!trace.lock().unwrap().contains(&Event::ShellAccepted));
 }
