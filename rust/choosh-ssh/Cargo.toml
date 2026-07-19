@@ -7,8 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 choosh-core = { path = "../choosh-core" }
+choosh-protocol = { path = "../choosh-protocol" }
 russh = { version = "=0.62.2", default-features = false, features = ["ring"] }
 russh-sftp = "=2.3.0"
+serde_json = "=1.0.150"
 tokio = { version = "=1.53.0", features = ["io-util"] }
 
 [dev-dependencies]

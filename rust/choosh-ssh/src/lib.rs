@@ -8,13 +8,17 @@
 mod connection;
 mod exec;
 mod host_key;
+mod rpc;
 mod session;
+mod sftp;
 mod signer;
 
 pub use connection::{SshUsername, UsernameError, VerifiedConnection, VerifiedConnectionError};
 pub use exec::{FixedCommand, FixedCommandError, FixedExecError, FixedExecOutput};
 pub use host_key::{ExactHostKeyHandler, presented_fingerprint};
+pub use rpc::{RpcError, RpcRequest, RpcResponse};
 pub use session::{PreAuthenticationSession, SessionConfigError, SessionLimits};
+pub use sftp::{ConfinedSftp, RootedSftpTransport, SftpError, SftpLimits};
 pub use signer::{CredentialSigner, CredentialSignerAdapter};
 
 /// Exact Russh release admitted by ADR 0007.

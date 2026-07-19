@@ -226,9 +226,11 @@ name = "choosh-ssh"
 version = "0.0.0"
 dependencies = [
  "choosh-core",
+ "choosh-protocol",
  "rand",
  "russh",
  "russh-sftp",
+ "serde_json",
  "tokio",
 ]
 
