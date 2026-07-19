@@ -59,12 +59,12 @@ against the exact loaded faces.
 
 Run `./scripts/check-terminal-provenance.sh`. It verifies the five recorded hashes, checks that the
 packaged texts identify SIL Open Font License 1.1, confirms this record retains every required
-component and blocked gate, and fails if terminal renderer crates appear in Cargo manifests or the
-lockfile before the audit is updated. It also validates
+component, and fails if terminal renderer crates appear in Cargo manifests or the lockfile while
+the machine-readable decision is blocked. It also validates
 [`terminal-go-no-go.json`](../evidence/terminal-go-no-go.json), including the four prerequisite
 gates, exact device classes, required conformance scenarios, evidence paths, and derived decision.
 
-The JSON file is the machine-readable handoff. A reviewer clears one prerequisite only by changing
+The JSON file is the authoritative machine-readable handoff state. A reviewer clears one prerequisite only by changing
 its status to `passed`, retaining a non-empty repository-owned evidence path, and replacing the
 next action with the completed verification result. Device conformance becomes `passed` only after
 all four target entries contain retained evidence covering every listed scenario. The decision can

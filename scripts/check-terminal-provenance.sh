@@ -30,8 +30,6 @@ for component in Zelland libghostty-vt wgpu glyphon 'Iosevka Charon Mono' Geomin
     exit 1
   }
 done
-grep -Fq 'Status: **blocked**' "$record"
-
 jq -e '
   type == "object" and
   keys == ["decision", "device_conformance", "gates", "schema_version"] and
@@ -75,6 +73,8 @@ jq -e '
   exit 1
 }
 
+decision_state=$(jq -r '.decision' "$decision")
+
 while IFS= read -r evidence; do
   test -s "$root/docs/evidence/$evidence" || {
     echo "terminal go/no-go evidence path is missing: $evidence" >&2
@@ -84,10 +84,10 @@ done <<EOF
 $(jq -r '.gates[].evidence[], .device_conformance.targets[].evidence[]' "$decision")
 EOF
 
-if rg -n '\b(libghostty[-_]vt|wgpu|glyphon)\b' \
+if test "$decision_state" = blocked && rg -n '\b(libghostty[-_]vt|wgpu|glyphon)\b' \
   "$root/Cargo.toml" "$root/Cargo.lock" "$root/rust"/*/Cargo.toml >/dev/null; then
-  echo "terminal renderer dependency added before provenance record was cleared" >&2
+  echo "terminal renderer dependency added while the provenance decision is blocked" >&2
   exit 1
 fi
 
-echo "Terminal provenance evidence checks passed; go/no-go decision: $(jq -r '.decision' "$decision")."
+echo "Terminal provenance evidence checks passed; go/no-go decision: $decision_state."
