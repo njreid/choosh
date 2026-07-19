@@ -7,7 +7,10 @@ lock, licence, Android packaging, exact-host-key ordering, and deterministic
 fixture evidence required to promote a candidate. Candidate evaluation MUST use
 both shared contracts rather than adapter-specific happy-path tests.
 
-Status: Blocked; do not add an SSH dependency yet.
+Status: Admission in progress. `choosh-ssh` pins the reviewed Russh graph under
+[ADR 0007](../adr/0007-russh-crypto-exception.md), with defaults disabled and the
+`ring` backend selected. It compiles for Android arm64-v8a and x86_64, but no concrete
+transport or interoperability harness exists yet; M0-R5 remains blocked.
 
 ## Required fit
 

@@ -37,10 +37,12 @@ trap 'rm -rf -- "$stage"' EXIT INT TERM
 build_one() {
   local target="$1" abi="$2" linker="$3"
   local linker_key="CARGO_TARGET_${target^^}_LINKER"
+  local cc_key="CC_${target//-/_}"
+  local ar_key="AR_${target//-/_}"
   linker_key="${linker_key//-/_}"
-  env "$linker_key=$toolchain/$linker" cargo build \
+  env "$linker_key=$toolchain/$linker" "$cc_key=$toolchain/$linker" "$ar_key=$toolchain/llvm-ar" cargo build \
     --manifest-path "$root/Cargo.toml" \
-    --locked --release --target "$target" -p choosh-android-bridge
+    --locked --release --target "$target" -p choosh-android-bridge -p choosh-ssh
   local library="$root/target/$target/release/libchoosh_android_bridge.so"
   for symbol in choosh_bridge_abi_version choosh_bridge_generation \
     choosh_bridge_request_begin choosh_bridge_request_cancel choosh_bridge_recreate; do

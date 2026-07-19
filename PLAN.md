@@ -24,9 +24,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   exposes private-key material to the Rust domain.
 - [x] SSH transport dependency admission has a deterministic contract for lock,
   licence, Android ABI, host-key-before-auth, channel, and fairness evidence.
-- [ ] A real Android SSH transport is selected and admitted under dependency and
-  licence policy.  Current evidence deliberately leaves this blocked; see
-  [SSH transport choice](docs/evidence/m0-ssh-transport-choice.md).
+- [x] The isolated Russh graph is selected, lockfile-pinned, and compiles for Android
+  arm64-v8a/x86_64 under its [time-bounded exception](docs/adr/0007-russh-crypto-exception.md).
+- [ ] A real Android SSH transport passes dependency admission and interoperability
+  under the selected graph; see [SSH transport choice](docs/evidence/m0-ssh-transport-choice.md).
 - [ ] An SSH interoperability harness proves exact host-key verification before
   authentication and concurrent PTY, exec, SFTP, and loopback-only `direct-tcpip`
   on one connection.

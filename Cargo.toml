@@ -4,6 +4,7 @@ members = [
     "rust/choosh-core",
     "rust/choosh-host",
     "rust/choosh-protocol",
+    "rust/choosh-ssh",
     "rust/choosh-testkit",
     "rust/choosh-web",
     "rust/chooshd",
