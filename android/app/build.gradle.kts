@@ -60,7 +60,10 @@ android {
     }
 }
 
-dependencies { testImplementation(libs.junit4) }
+dependencies {
+    implementation(libs.soraEditor)
+    testImplementation(libs.junit4)
+}
 
 dependencyLocking { lockAllConfigurations() }
 

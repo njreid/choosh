@@ -1,9 +1,11 @@
 [versions]
 agp = "9.3.0"
 junit4 = "4.13.2"
+sora = "0.24.6"
 
 [libraries]
 junit4 = { module = "junit:junit", version.ref = "junit4" }
+soraEditor = { module = "io.github.rosemoe:editor", version.ref = "sora" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
