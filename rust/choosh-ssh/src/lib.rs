@@ -6,6 +6,7 @@
 //! crate attempts authentication or opens a channel.
 
 mod connection;
+mod direct_tcpip;
 mod exec;
 mod host_key;
 mod rpc;
@@ -15,6 +16,10 @@ mod sftp_subsystem;
 mod signer;
 
 pub use connection::{SshUsername, UsernameError, VerifiedConnection, VerifiedConnectionError};
+pub use direct_tcpip::{
+    DirectTcpipError, DirectTcpipLimits, LoopbackForwarding, LoopbackTcpTarget,
+    LoopbackTcpipChannel,
+};
 pub use exec::{FixedCommand, FixedCommandError, FixedExecError, FixedExecOutput};
 pub use host_key::{ExactHostKeyHandler, presented_fingerprint};
 pub use rpc::{RpcError, RpcRequest, RpcResponse};
