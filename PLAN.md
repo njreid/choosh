@@ -30,9 +30,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [ ] An SSH interoperability harness proves exact host-key verification before
   authentication and concurrent PTY, exec, SFTP, and loopback-only `direct-tcpip`
   on one connection.
-- [ ] The native terminal has a redistributable source/licence decision and an
-  Android implementation/device conformance result.  Do not copy Zelland-derived
-  source while [terminal provenance](docs/licenses/terminal-provenance.md) is blocked.
+- [x] The project owner granted Choosh permission to use the exact Zelland source;
+  its [recorded grant](docs/licenses/zelland-grant.md) clears that provenance item.
+- [ ] The native terminal still needs a pinned native graph and Android implementation/device
+  conformance result; see [terminal provenance](docs/licenses/terminal-provenance.md).
 
 `v0.0.1` is an early signed distribution slice, not an assertion that M0 or a
 public-1.0 milestone has passed.

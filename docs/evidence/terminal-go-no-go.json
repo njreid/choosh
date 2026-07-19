@@ -4,9 +4,9 @@
   "gates": [
     {
       "id": "zelland-licence",
-      "status": "blocked",
-      "evidence": ["../licenses/terminal-provenance.md"],
-      "next_action": "Record an explicit licence grant covering Zelland commit 8bf9cf55911588451804a39526f8ae869da021b6."
+      "status": "passed",
+      "evidence": ["../licenses/zelland-grant.md"],
+      "next_action": "Grant recorded; retain it with the exact copied source provenance."
     },
     {
       "id": "libghostty-pin",
