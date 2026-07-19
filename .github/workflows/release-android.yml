@@ -99,7 +99,7 @@ jobs:
           CHOOSH_KEY_PASSWORD: ${{ secrets.CHOOSH_KEY_PASSWORD }}
           CHOOSH_VERSION_NAME: ${{ steps.version.outputs.name }}
           CHOOSH_VERSION_CODE: ${{ steps.version.outputs.code }}
-        run: ./gradlew :app:buildRustAndroid :app:assembleRelease :app:checkNativeAbiPackaging :app:cyclonedxBom :app:generateReleaseLicenseReport --stacktrace
+        run: ./gradlew --no-configuration-cache :app:buildRustAndroid :app:assembleRelease :app:checkNativeAbiPackaging :app:cyclonedxBom :app:generateReleaseLicenseReport --stacktrace
 
       - name: Collect and verify release evidence
         env:
