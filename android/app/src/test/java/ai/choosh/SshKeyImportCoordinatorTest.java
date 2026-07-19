@@ -61,6 +61,21 @@ public final class SshKeyImportCoordinatorTest {
         assertEquals(0, store.imports.get());
     }
 
+    @Test public void unavailableKeystoreDoesNotBindProfile() {
+        FakePicker picker = new FakePicker();
+        FakeStore store = new FakeStore();
+        store.failImport = true;
+        FakeBinding binding = new FakeBinding();
+        SshKeyImportCoordinator.SshKeyImportOutcome[] result = new SshKeyImportCoordinator.SshKeyImportOutcome[1];
+        coordinator(picker, new FakeReader(), store, binding).requestImport(outcome -> result[0] = outcome);
+
+        picker.select();
+
+        assertEquals(SshKeyImportCoordinator.SshKeyImportCode.KEYSTORE_UNAVAILABLE, result[0].code());
+        assertNull(binding.bound);
+        assertEquals(0, store.discards.get());
+    }
+
     @Test public void failedProfileBindingDiscardsNewCredential() {
         FakePicker picker = new FakePicker();
         FakeStore store = new FakeStore();
@@ -102,6 +117,7 @@ public final class SshKeyImportCoordinatorTest {
             "content://provider/key",
             "-----BEGIN OPENSSH PRIVATE KEY-----",
             "key\nreference",
+            "credentialé",
         }) {
             try {
                 new SshKeyImportCoordinator.OpaqueCredentialRef(invalid);
@@ -114,10 +130,36 @@ public final class SshKeyImportCoordinatorTest {
         try {
             new SshKeyImportCoordinator.PublicKeyMetadata(
                 SshKeyImportCoordinator.SshPublicKeyAlgorithm.ED25519, "SHA256:not-a-digest");
+            throw new AssertionError("expected malformed fingerprint rejection");
+        } catch (IllegalArgumentException expected) {
+            // Continue with the cross-language ASCII boundary check below.
+        }
+        try {
+            new SshKeyImportCoordinator.PublicKeyMetadata(
+                SshKeyImportCoordinator.SshPublicKeyAlgorithm.ED25519,
+                "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/abcdé"
+            );
         } catch (IllegalArgumentException expected) {
             return;
         }
         throw new AssertionError("expected malformed fingerprint rejection");
+    }
+
+    @Test public void pickerCallbackReplayCannotImportOrBindTwice() {
+        FakePicker picker = new FakePicker();
+        FakeReader reader = new FakeReader();
+        FakeStore store = new FakeStore();
+        FakeBinding binding = new FakeBinding();
+        AtomicInteger outcomes = new AtomicInteger();
+        coordinator(picker, reader, store, binding).requestImport(outcome -> outcomes.incrementAndGet());
+
+        picker.select();
+        picker.select();
+
+        assertEquals(1, outcomes.get());
+        assertEquals(1, reader.opens.get());
+        assertEquals(1, store.imports.get());
+        assertEquals(1, binding.binds.get());
     }
 
     private static SshKeyImportCoordinator coordinator(
@@ -163,12 +205,14 @@ public final class SshKeyImportCoordinatorTest {
         final SshKeyImportCoordinator.ImportedSshCredential credential = credential();
         SshKeyImportCoordinator.OpaqueCredentialRef discarded;
         boolean failDiscard;
+        boolean failImport;
 
         @Override public SshKeyImportCoordinator.ImportedSshCredential importDocument(
             SshKeyImportCoordinator.SshKeyDocument document
-        ) {
+        ) throws SshKeyImportCoordinator.KeystoreException {
             imports.incrementAndGet();
             assertTrue(document instanceof FakeDocument);
+            if (failImport) throw new SshKeyImportCoordinator.KeystoreException();
             return credential;
         }
 
@@ -183,9 +227,11 @@ public final class SshKeyImportCoordinatorTest {
     private static final class FakeBinding implements SshKeyImportCoordinator.ProfileCredentialBinding {
         SshKeyImportCoordinator.ImportedSshCredential bound;
         boolean fail;
+        final AtomicInteger binds = new AtomicInteger();
 
         @Override public void replaceAtomically(SshKeyImportCoordinator.ImportedSshCredential credential)
             throws SshKeyImportCoordinator.ProfileBindingException {
+            binds.incrementAndGet();
             if (fail) throw new SshKeyImportCoordinator.ProfileBindingException();
             bound = credential;
         }

@@ -35,7 +35,23 @@ public final class SshKeyImportCoordinator {
     /** Starts exactly one user-mediated private-key document selection. */
     public void requestImport(OutcomeListener listener) {
         Objects.requireNonNull(listener, "listener");
-        documentPicker.launchOpenDocument(result -> complete(result, listener));
+        ImportCompletion completion = new ImportCompletion(listener);
+        documentPicker.launchOpenDocument(completion::completeOnce);
+    }
+
+    private final class ImportCompletion {
+        private final OutcomeListener listener;
+        private boolean completed;
+
+        ImportCompletion(OutcomeListener listener) {
+            this.listener = listener;
+        }
+
+        void completeOnce(DocumentPickResult result) {
+            if (completed) return;
+            completed = true;
+            complete(result, listener);
+        }
     }
 
     private void complete(DocumentPickResult result, OutcomeListener listener) {
@@ -265,7 +281,7 @@ public final class SshKeyImportCoordinator {
         if (value == null || value.isEmpty() || value.length() > MAX_CREDENTIAL_REF_BYTES) return false;
         for (int index = 0; index < value.length(); index += 1) {
             char character = value.charAt(index);
-            if (!(Character.isLetterOrDigit(character) || character == '-' || character == '_')) return false;
+            if (!(isAsciiLetterOrDigit(character) || character == '-' || character == '_')) return false;
         }
         return true;
     }
@@ -275,8 +291,14 @@ public final class SshKeyImportCoordinator {
             || value.length() != SHA256_PREFIX.length() + SHA256_BASE64_BYTES) return false;
         for (int index = SHA256_PREFIX.length(); index < value.length(); index += 1) {
             char character = value.charAt(index);
-            if (!(Character.isLetterOrDigit(character) || character == '+' || character == '/')) return false;
+            if (!(isAsciiLetterOrDigit(character) || character == '+' || character == '/')) return false;
         }
         return true;
+    }
+
+    private static boolean isAsciiLetterOrDigit(char character) {
+        return (character >= 'a' && character <= 'z')
+            || (character >= 'A' && character <= 'Z')
+            || (character >= '0' && character <= '9');
     }
 }
