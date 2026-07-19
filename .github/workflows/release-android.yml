@@ -114,7 +114,7 @@ jobs:
           fi
           apk="$RELEASE_DIR/choosh-${VERSION}.apk"
           cp "${apks[0]}" "$apk"
-          apksigner verify --verbose --print-certs "$apk"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk"
           cp android/app/build/reports/bom.json "$RELEASE_DIR/choosh-${VERSION}.cdx.json"
           cp android/app/build/reports/licenses/NOTICE.txt "$RELEASE_DIR/choosh-${VERSION}-NOTICE.txt"
           sha256sum "$RELEASE_DIR"/* > "$RELEASE_DIR/choosh-${VERSION}.sha256"
