@@ -44,6 +44,7 @@ pub mod runtime;
 pub mod security_audit;
 pub mod selection;
 pub mod service;
+pub mod ssh_identity;
 pub mod terminal;
 pub mod text;
 pub mod toolchain_evidence;

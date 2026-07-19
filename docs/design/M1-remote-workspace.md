@@ -66,6 +66,24 @@ Production code implements every operation; the runner supplies fake Keystore co
 
 A profile contains a stable ID, display label, SSH endpoint, username, host-key algorithm and fingerprint, credential reference, last successful daemon compatibility, and timestamps. It MUST NOT contain private key bytes in serializable snapshots or logs.
 
+#### User-approved SSH-key import
+
+An Android platform adapter imports a private key only after an explicit user-selected
+document action.  It immediately places the sensitive material in app-private,
+Keystore-backed storage and returns the Rust domain an opaque credential reference,
+public-key algorithm, and canonical SHA-256 public-key fingerprint.  The Rust domain
+does not receive a document URI, filesystem path, private-key bytes, or passphrase.
+
+The importer MUST NOT silently inspect another Android app's private storage, assume a
+Termux home-directory path, or request broad storage access for this feature.  A key
+originating in Termux is therefore selected by the user and imported once; Choosh never
+uses Termux as a background credential service.  Credential references are store-local
+handles, not paths or URIs, and MUST be redacted from logs and acceptance evidence.
+
+Import completion is separate from SSH authentication.  The adapter confirms the
+fingerprint with the user before replacing a profile binding; only a future selected SSH
+transport may use the resulting reference after exact host-key verification succeeds.
+
 Endpoint validation rejects invalid ports, control characters and ambiguous host syntax. SSH uses separately encoded connection parameters, not a shell command.
 
 ### Connection state machine
