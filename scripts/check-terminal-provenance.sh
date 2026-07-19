@@ -3,6 +3,7 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 record="$root/docs/licenses/terminal-provenance.md"
+decision="$root/docs/evidence/terminal-go-no-go.json"
 
 check_hash() {
   expected=$1
@@ -31,10 +32,62 @@ for component in Zelland libghostty-vt wgpu glyphon 'Iosevka Charon Mono' Geomin
 done
 grep -Fq 'Status: **blocked**' "$record"
 
+jq -e '
+  type == "object" and
+  keys == ["decision", "device_conformance", "gates", "schema_version"] and
+  .schema_version == 1 and
+  (.decision == "blocked" or .decision == "go") and
+  (.gates | type == "array" and length == 4) and
+  ([.gates[].id] | sort == ["font-provenance", "libghostty-pin", "renderer-graph", "zelland-licence"]) and
+  ([.gates[].id] | unique | length == 4) and
+  all(.gates[];
+    keys == ["evidence", "id", "next_action", "status"] and
+    (.status == "blocked" or .status == "passed") and
+    (.next_action | type == "string" and length > 0 and length <= 256) and
+    (.evidence | type == "array" and length > 0 and
+      all(.[]; type == "string" and test("^\\.\\./(licenses|evidence)/[A-Za-z0-9._/-]+$")))) and
+  (.device_conformance | type == "object" and
+    keys == ["scenarios", "status", "targets"] and
+    (.status == "not-run" or .status == "failed" or .status == "passed") and
+    ([.targets[].id] | sort == ["android-high-vulkan", "android-low-vulkan", "android-mid-vulkan", "android-x86_64-emulator"]) and
+    ([.targets[].id] | unique | length == 4) and
+    all(.targets[];
+      keys == ["evidence", "id"] and
+      (.evidence | type == "array" and
+        all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._/-]+$") and (contains("..") | not)))) and
+    (.scenarios | sort == [
+      "alternate-screen-mouse-and-bracketed-paste",
+      "damage-only-rendering",
+      "dimension-clamping",
+      "gpu-device-loss",
+      "gpu-init-visible-fallback",
+      "rotation-and-screen-lock",
+      "surface-loss",
+      "sustained-output-input-latency",
+      "wide-combining-and-bidi-text"
+    ])) and
+  (if any(.gates[]; .status == "blocked") or .device_conformance.status != "passed"
+   then .decision == "blocked"
+   else .decision == "go" and all(.device_conformance.targets[]; .evidence | length > 0)
+   end)
+' "$decision" >/dev/null || {
+  echo "terminal go/no-go evidence is malformed or internally inconsistent" >&2
+  exit 1
+}
+
+while IFS= read -r evidence; do
+  test -s "$root/docs/evidence/$evidence" || {
+    echo "terminal go/no-go evidence path is missing: $evidence" >&2
+    exit 1
+  }
+done <<EOF
+$(jq -r '.gates[].evidence[], .device_conformance.targets[].evidence[]' "$decision")
+EOF
+
 if rg -n '\b(libghostty[-_]vt|wgpu|glyphon)\b' \
   "$root/Cargo.toml" "$root/Cargo.lock" "$root/rust"/*/Cargo.toml >/dev/null; then
   echo "terminal renderer dependency added before provenance record was cleared" >&2
   exit 1
 fi
 
-echo "Terminal provenance evidence checks passed; renderer import remains blocked."
+echo "Terminal provenance evidence checks passed; go/no-go decision: $(jq -r '.decision' "$decision")."

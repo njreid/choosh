@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "decision": "blocked",
+  "gates": [
+    {
+      "id": "zelland-licence",
+      "status": "blocked",
+      "evidence": ["../licenses/terminal-provenance.md"],
+      "next_action": "Record an explicit licence grant covering Zelland commit 8bf9cf55911588451804a39526f8ae869da021b6."
+    },
+    {
+      "id": "libghostty-pin",
+      "status": "blocked",
+      "evidence": ["../licenses/terminal-provenance.md"],
+      "next_action": "Approve an exact released version or commit pin and audit its enabled source and native graph."
+    },
+    {
+      "id": "renderer-graph",
+      "status": "blocked",
+      "evidence": ["../licenses/terminal-provenance.md"],
+      "next_action": "Select renderer features and Android backends, resolve the lockfile, and inventory every enabled transitive."
+    },
+    {
+      "id": "font-provenance",
+      "status": "blocked",
+      "evidence": ["../licenses/terminal-provenance.md"],
+      "next_action": "Tie each bundled font hash to an authoritative release or reproducible build configuration."
+    }
+  ],
+  "device_conformance": {
+    "status": "not-run",
+    "targets": [
+      {"id": "android-low-vulkan", "evidence": []},
+      {"id": "android-mid-vulkan", "evidence": []},
+      {"id": "android-high-vulkan", "evidence": []},
+      {"id": "android-x86_64-emulator", "evidence": []}
+    ],
+    "scenarios": [
+      "sustained-output-input-latency",
+      "damage-only-rendering",
+      "surface-loss",
+      "gpu-device-loss",
+      "rotation-and-screen-lock",
+      "dimension-clamping",
+      "gpu-init-visible-fallback",
+      "wide-combining-and-bidi-text",
+      "alternate-screen-mouse-and-bracketed-paste"
+    ]
+  }
+}
