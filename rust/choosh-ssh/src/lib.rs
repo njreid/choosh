@@ -5,6 +5,10 @@
 //! admission harness: exact host-key verification must complete before this
 //! crate attempts authentication or opens a channel.
 
+mod host_key;
+
+pub use host_key::{ExactHostKeyHandler, presented_fingerprint};
+
 /// Exact Russh release admitted by ADR 0007.
 pub const RUSSH_VERSION: &str = "0.62.2";
 
