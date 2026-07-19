@@ -1,6 +1,6 @@
 # Sora-to-Rust revisioned edit spike
 
-Status: Blocked on a verified Sora dependency/API fixture.
+Status: Blocked on a locally resolved Sora dependency/API fixture and licence approval.
 
 ## Evidence in this checkout
 
@@ -20,6 +20,34 @@ Status: Blocked on a verified Sora dependency/API fixture.
 Adding an unverified Sora coordinate or inventing event accessors would not be a
 headlessly verifiable increment. Extending the current C ABI with borrowed Java
 string pointers would also contradict its established safety boundary.
+
+## Candidate audit (2026-07-18)
+
+The current candidate is `io.github.rosemoe:editor:0.24.6`. Maven Central marks it
+as the current `latest`/`release` version and its published Gradle metadata marks
+the artifact as a release. The AAR declares `minSdk 21` and `minCompileSdk 36`, so
+those dimensions are compatible with Choosh's `minSdk 26` and `compileSdk 37`.
+The published AAR SHA-256 is
+`fb76ae4db31d94d9fee7f97d9b8ec1c9659c54b5ee1ded7f9f95f7039646243e`.
+
+This is a candidate, not an approval to ship. Upstream and the published POM
+identify Sora as LGPL-2.1-or-later (the POM labels it LGPL 2.1), so its source,
+notice, relinking, and distribution obligations require the provenance review
+already required for M0. Its runtime graph includes AndroidX Collection 1.5.0,
+Kotlin stdlib 2.3.10, and AndroidX Annotation 1.10.0; that graph must be locked
+and verified on Choosh's Kotlin 2.4.10/AGP 9.3.0 baseline before it becomes a
+production dependency.
+
+The documented widget is `io.github.rosemoe.sora.widget.CodeEditor`, and its
+lifecycle requires `release()` when the view is no longer used. The exact
+`ContentChangeEvent` callback/API remains an evidence requirement: it must be
+compiled from the resolved artifact rather than inferred from documentation.
+
+Primary evidence:
+
+- [Maven Central artifact metadata](https://central.sonatype.com/artifact/io.github.rosemoe/editor/0.24.6)
+- [Sora Editor repository and LGPL notice](https://github.com/Rosemoe/sora-editor)
+- [Sora Editor getting-started documentation](https://sora-editor.github.io/sora-editor-docs/guide/getting-started)
 
 ## Smallest supportable implementation after unblocking
 
