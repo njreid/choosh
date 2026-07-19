@@ -18,6 +18,7 @@ pub mod diff_navigation;
 pub mod document;
 pub mod document_format;
 pub mod document_save;
+pub mod editor_document;
 pub mod event_spool;
 pub mod explorer;
 pub mod fault_campaign;
