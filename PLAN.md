@@ -46,10 +46,13 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   workspace-status controllers. Native plans cannot advance without bridge ownership and fail
   closed to a typed transport-unavailable result.
 - [x] Documentation now distinguishes the Java/View M0 connection-status screen and bounded
-  `bounded-lcs-v1` reference diff from the future Compose/navigation and production-diff
+  `bounded-myers-v1` deterministic diff from the future Compose/navigation and production-diff
   targets. Agent integration is described as per-agent pluggable adapters, not neutrality.
 - [x] The bounded reference diff preserves per-line `LF`/`CRLF` identity, including
   line-ending-only changes, with byte-exact headless reconstruction coverage.
+- [x] Text diff construction now uses bounded Myers frontiers rather than a quadratic
+  old-lines by new-lines LCS matrix; large unchanged inputs have headless coverage and
+  retained-frontier exhaustion still returns metadata only.
 - [x] Blob capability completion consumes a bounded reader and stops an oversized source
   after the first byte above its declared limit; daemon fixture roots are unique under
   parallel headless test execution.
