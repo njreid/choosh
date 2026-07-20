@@ -6,8 +6,17 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 
+use choosh_protocol::envelope::EnvelopeId;
 use choosh_protocol::framing::encode_frame;
+use choosh_protocol::handshake::{
+    PROTOCOL_V1_MAJOR, PeerIdentity, ProtocolLimits, ProtocolVersion,
+};
+use chooshd::daemon::{DaemonRpc, HandshakeConfig, bind, serve_once_with_handler};
+use chooshd::git::{StatusLimits, StatusSnapshot, parse_status};
+use chooshd::git_status::{GitStatusError, GitStatusOperation};
+use chooshd::socket::SocketPlan;
 
 struct ProcessFixture {
     child: Child,
@@ -79,6 +88,87 @@ fn composed_daemon_binds_privately_and_negotiates_typed_hello() {
         choosh_protocol::wire::decode_envelope(&response, 1024 * 1024),
         Ok(choosh_protocol::wire::WireEnvelope::Response(_))
     ));
+}
+
+#[derive(Clone)]
+struct FixedStatus(StatusSnapshot);
+
+impl GitStatusOperation for FixedStatus {
+    fn status_snapshot(&self) -> Result<StatusSnapshot, GitStatusError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[test]
+fn registered_git_status_crosses_the_private_socket_with_opaque_paths() {
+    const WORKSPACE_ID: &str = "00000000-0000-0000-0000-000000000041";
+    let root = std::env::temp_dir().join(format!(
+        "chooshd-git-status-black-box-{}",
+        std::process::id()
+    ));
+    let state = root.join("state");
+    let socket = state.join("daemon.sock");
+    fs::create_dir(&root).unwrap();
+    let plan = SocketPlan::new(&state, &socket).unwrap();
+    let owned = bind(&plan).unwrap();
+
+    let snapshot = parse_status(
+        b" M src/\xff.rs\0",
+        StatusLimits {
+            max_bytes: 64,
+            max_entries: 2,
+            max_path_bytes: 32,
+        },
+    )
+    .unwrap();
+    let mut handler = DaemonRpc::new();
+    handler
+        .register_git_status(
+            EnvelopeId::new(WORKSPACE_ID).unwrap(),
+            Arc::new(FixedStatus(snapshot)),
+        )
+        .unwrap();
+    let config = handshake_config();
+
+    std::thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            serve_once_with_handler(owned.listener(), &config, 1024, &handler).unwrap();
+        });
+        let mut stream = connect_bounded(&socket).expect("daemon accepts private socket client");
+        let hello = br#"{"kind":"hello","protocol":{"major":1,"minor":0},"client":{"name":"black-box","version":"1"},"capabilities":[]}"#;
+        let request = format!(
+            "{{\"kind\":\"request\",\"id\":\"00000000-0000-0000-0000-000000000042\",\"method\":\"git.status\",\"params\":{{\"workspace_id\":\"{WORKSPACE_ID}\"}}}}"
+        );
+        stream
+            .write_all(&encode_frame(hello, 1024).unwrap())
+            .unwrap();
+        stream
+            .write_all(&encode_frame(request.as_bytes(), 1024).unwrap())
+            .unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let _welcome = read_frame(&mut stream);
+        let response = read_frame(&mut stream);
+        server.join().unwrap();
+        assert_eq!(
+            response,
+            format!(
+                "{{\"id\":\"00000000-0000-0000-0000-000000000042\",\"kind\":\"response\",\"result\":{{\"entries\":[{{\"new_path_b64\":\"c3JjL_8ucnM\",\"staged\":\"unmodified\",\"unstaged\":\"modified\"}}],\"workspace_id\":\"{WORKSPACE_ID}\"}}}}"
+            )
+            .into_bytes()
+        );
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn handshake_config() -> HandshakeConfig {
+    HandshakeConfig {
+        protocol: ProtocolVersion::new(PROTOCOL_V1_MAJOR, 0),
+        daemon: PeerIdentity::new("chooshd", "test").unwrap(),
+        host: PeerIdentity::new("local-host", "test").unwrap(),
+        capabilities: Vec::new(),
+        limits: ProtocolLimits::new(1024, 4).unwrap(),
+    }
 }
 
 fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
