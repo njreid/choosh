@@ -6,6 +6,7 @@
 //! socket plan to an injected direct-process capability; it never constructs
 //! shell text or discovers a path, environment, or working directory.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -143,6 +144,158 @@ pub trait ChooshdRpcProcess {
     ) -> Result<DirectExecOutput, DirectExecCapabilityError>;
 }
 
+/// Explicit absolute executable path for the locally deployed daemon.
+///
+/// The SSH request names the *operation* (`chooshd rpc --stdio`), never a
+/// process path.  Deployment wiring supplies this value to the composition
+/// root, which keeps PATH lookup and current-directory resolution out of the
+/// remote request boundary.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ChooshdExecutable(PathBuf);
+
+impl ChooshdExecutable {
+    /// Creates a bounded, normalized absolute executable location.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable error without including the deployment path.
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, ChooshdExecutableError> {
+        let path = path.into();
+        validate_daemon_path(&path).map_err(|()| ChooshdExecutableError::InvalidPath)?;
+        if path.file_name().is_none() {
+            return Err(ChooshdExecutableError::InvalidPath);
+        }
+        Ok(Self(path))
+    }
+
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ChooshdExecutable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ChooshdExecutable([REDACTED])")
+    }
+}
+
+/// Stable invalid-executable classification without deployment diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChooshdExecutableError {
+    InvalidPath,
+}
+
+impl ChooshdExecutableError {
+    /// Returns a stable machine-readable outcome code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidPath => "direct_exec_invalid_chooshd_path",
+        }
+    }
+}
+
+/// An argv-shaped invocation supplied to an injected child-process boundary.
+///
+/// It deliberately does not contain a shell command, working directory,
+/// environment, inherited descriptors, or caller-controlled executable name.
+/// The adapter below creates it from fixed literals plus the deployment plan.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DirectProcessInvocation {
+    executable: PathBuf,
+    arguments: Vec<OsString>,
+}
+
+impl DirectProcessInvocation {
+    /// Returns the explicit executable path to the process capability.
+    #[must_use]
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    /// Returns the fixed argv values to the process capability.
+    #[must_use]
+    pub fn arguments(&self) -> &[OsString] {
+        &self.arguments
+    }
+}
+
+impl fmt::Debug for DirectProcessInvocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DirectProcessInvocation([REDACTED])")
+    }
+}
+
+/// Injected outer-boundary child runner.
+///
+/// The host binary may adapt this trait to its platform process API.  It must
+/// execute [`DirectProcessInvocation`] as argv, clear or explicitly set its
+/// environment, and cap both output streams.  This shared crate intentionally
+/// has no ambient process, PATH, home-directory, or current-directory access.
+pub trait DirectProcessRunner {
+    /// Runs the supplied direct invocation with opaque input and bounded I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns only a sanitized process classification.
+    fn run_direct(
+        &mut self,
+        invocation: &DirectProcessInvocation,
+        stdin: &[u8],
+        limits: DirectExecLimits,
+    ) -> Result<DirectExecOutput, DirectExecCapabilityError>;
+}
+
+/// Composes the fixed daemon operation with an injected direct-process runner.
+///
+/// This is the sole conversion from the internal daemon plan into child argv:
+/// `rpc --stdio --state-dir <state-dir> --socket <socket>`.  It cannot accept
+/// an SSH-selected program, argument, environment, or working directory.
+#[derive(Debug)]
+pub struct ChooshdRpcProcessAdapter<R> {
+    runner: R,
+    executable: ChooshdExecutable,
+}
+
+impl<R> ChooshdRpcProcessAdapter<R> {
+    /// Creates the adapter from explicit deployment wiring.
+    #[must_use]
+    pub fn new(runner: R, executable: ChooshdExecutable) -> Self {
+        Self { runner, executable }
+    }
+
+    /// Returns the injected runner to the outer composition root.
+    #[must_use]
+    pub fn into_runner(self) -> R {
+        self.runner
+    }
+}
+
+impl<R> ChooshdRpcProcess for ChooshdRpcProcessAdapter<R>
+where
+    R: DirectProcessRunner,
+{
+    fn run_rpc_stdio(
+        &mut self,
+        plan: &DaemonRpcPlan,
+        stdin: &[u8],
+        limits: DirectExecLimits,
+    ) -> Result<DirectExecOutput, DirectExecCapabilityError> {
+        let invocation = DirectProcessInvocation {
+            executable: self.executable.as_path().to_owned(),
+            arguments: vec![
+                OsString::from("rpc"),
+                OsString::from("--stdio"),
+                OsString::from("--state-dir"),
+                plan.state_dir().as_os_str().to_owned(),
+                OsString::from("--socket"),
+                plan.socket_path().as_os_str().to_owned(),
+            ],
+        };
+        self.runner.run_direct(&invocation, stdin, limits)
+    }
+}
+
 /// Stable direct-dispatch outcomes, without request bytes or host errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectExecError {
@@ -266,6 +419,29 @@ mod tests {
     struct FakeProcess {
         calls: Vec<(DaemonRpcPlan, Vec<u8>, DirectExecLimits)>,
         result: Option<Result<DirectExecOutput, DirectExecCapabilityError>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingRunner {
+        calls: Vec<(DirectProcessInvocation, Vec<u8>, DirectExecLimits)>,
+        result: Option<Result<DirectExecOutput, DirectExecCapabilityError>>,
+    }
+
+    impl DirectProcessRunner for RecordingRunner {
+        fn run_direct(
+            &mut self,
+            invocation: &DirectProcessInvocation,
+            stdin: &[u8],
+            limits: DirectExecLimits,
+        ) -> Result<DirectExecOutput, DirectExecCapabilityError> {
+            self.calls
+                .push((invocation.clone(), stdin.to_vec(), limits));
+            self.result.take().unwrap_or(Ok(DirectExecOutput {
+                stdout: b"ok".to_vec(),
+                stderr: Vec::new(),
+                exit_status: 0,
+            }))
+        }
     }
 
     impl ChooshdRpcProcess for FakeProcess {
@@ -428,5 +604,94 @@ mod tests {
         ] {
             assert!(DaemonRpcPlan::new(state, socket).is_err());
         }
+    }
+
+    #[test]
+    fn process_adapter_emits_only_fixed_direct_argv_from_explicit_deployment_values() {
+        let executable = ChooshdExecutable::new("/opt/choosh/bin/chooshd").unwrap();
+        let adapter = ChooshdRpcProcessAdapter::new(RecordingRunner::default(), executable);
+        let mut launcher = DirectExecLauncher::new(
+            adapter,
+            daemon_plan(),
+            DirectExecLimits {
+                max_stdout_bytes: 8,
+                max_stderr_bytes: 8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            launcher.launch(&request("chooshd", &["rpc", "--stdio"], b"opaque")),
+            Ok(DirectExecOutput {
+                stdout: b"ok".to_vec(),
+                stderr: Vec::new(),
+                exit_status: 0,
+            })
+        );
+
+        let runner = launcher.into_process().into_runner();
+        assert_eq!(runner.calls.len(), 1);
+        let (invocation, stdin, limits) = &runner.calls[0];
+        assert_eq!(
+            invocation.executable(),
+            Path::new("/opt/choosh/bin/chooshd")
+        );
+        assert_eq!(
+            invocation.arguments(),
+            [
+                OsString::from("rpc"),
+                OsString::from("--stdio"),
+                OsString::from("--state-dir"),
+                OsString::from("/run/user/1000/choosh"),
+                OsString::from("--socket"),
+                OsString::from("/run/user/1000/choosh/daemon.sock"),
+            ]
+        );
+        assert_eq!(stdin, b"opaque");
+        assert_eq!(
+            *limits,
+            DirectExecLimits {
+                max_stdout_bytes: 8,
+                max_stderr_bytes: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn process_adapter_never_admits_relative_or_diagnostic_executable_paths() {
+        for path in ["chooshd", "./chooshd", "/opt/choosh/../secret/chooshd", "/"] {
+            assert_eq!(
+                ChooshdExecutable::new(path),
+                Err(ChooshdExecutableError::InvalidPath)
+            );
+        }
+        let executable = ChooshdExecutable::new("/opt/choosh/private/chooshd").unwrap();
+        assert_eq!(format!("{executable:?}"), "ChooshdExecutable([REDACTED])");
+        assert!(!format!("{executable:?}").contains("private"));
+    }
+
+    #[test]
+    fn process_adapter_forwards_only_sanitized_runner_failures() {
+        let runner = RecordingRunner {
+            result: Some(Err(DirectExecCapabilityError::Failed)),
+            ..RecordingRunner::default()
+        };
+        let adapter = ChooshdRpcProcessAdapter::new(
+            runner,
+            ChooshdExecutable::new("/opt/choosh/bin/chooshd").unwrap(),
+        );
+        let mut launcher = DirectExecLauncher::new(
+            adapter,
+            daemon_plan(),
+            DirectExecLimits {
+                max_stdout_bytes: 8,
+                max_stderr_bytes: 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            launcher.launch(&request("chooshd", &["rpc", "--stdio"], b"secret")),
+            Err(DirectExecError::LaunchFailed)
+        );
     }
 }
