@@ -1,1 +1,14 @@
-<resources><string name="app_name">Choosh</string></resources>
+<resources>
+    <string name="app_name">Choosh</string>
+    <string name="profile_hint">Profile ID</string>
+    <string name="connect">Connect</string>
+    <string name="status_awaiting_profile">Choose a saved profile to connect.</string>
+    <string name="status_invalid_profile">Profile IDs use letters, numbers, hyphens, and underscores only.</string>
+    <string name="status_ready">Ready to connect.</string>
+    <string name="status_connecting">Verifying host and connecting…</string>
+    <string name="status_connected">Connected. Workspace channels are ready.</string>
+    <string name="status_profile_unavailable">This saved profile is unavailable.</string>
+    <string name="status_host_key_rejected">The saved host key did not match.</string>
+    <string name="status_authentication_failed">Authentication was not accepted.</string>
+    <string name="status_transport_unavailable">The connection could not be opened.</string>
+</resources>
