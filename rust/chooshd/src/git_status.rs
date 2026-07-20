@@ -31,6 +31,19 @@ pub trait GitStatusExecutor: Send + Sync {
     ) -> Result<Vec<u8>, GitStatusExecutionError>;
 }
 
+/// Narrow, injectable capability for one already-registered workspace.
+///
+/// The RPC layer owns workspace identity lookup. Implementations never accept a
+/// path from a request, so a caller cannot turn status into filesystem authority.
+pub trait GitStatusOperation: Send + Sync {
+    /// Returns a complete reconciled status snapshot or a stable domain failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the domain failure without exposing a partial snapshot.
+    fn status_snapshot(&self) -> Result<StatusSnapshot, GitStatusError>;
+}
+
 /// Concrete outer-adapter executor.  Its only process invocation is [`GitCommandPlan`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemGitStatusExecutor;
@@ -171,6 +184,15 @@ where
             snapshot,
             current_files,
         })
+    }
+}
+
+impl<E> GitStatusOperation for GitStatusService<E>
+where
+    E: GitStatusExecutor,
+{
+    fn status_snapshot(&self) -> Result<StatusSnapshot, GitStatusError> {
+        self.status().map(|status| status.snapshot().clone())
     }
 }
 

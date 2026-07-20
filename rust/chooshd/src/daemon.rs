@@ -2,11 +2,11 @@
 
 #![cfg(unix)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use choosh_protocol::framing::{FrameDecoder, FrameError, FrameLimits, encode_frame};
 use choosh_protocol::handshake::{
@@ -19,6 +19,10 @@ use choosh_protocol::wire::{
 use serde_json::{Value, json};
 
 use crate::socket::{self, OwnedUnixListener, SocketError, SocketPlan};
+use crate::{
+    git::ChangeKind,
+    git_status::{GitStatusError, GitStatusOperation},
+};
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const READ_CHUNK_BYTES: usize = 8192;
@@ -31,6 +35,110 @@ pub struct HandshakeConfig {
     pub host: PeerIdentity,
     pub capabilities: Vec<Capability>,
     pub limits: ProtocolLimits,
+}
+
+/// Injected post-handshake request composition. It never receives a socket,
+/// path, environment, or process-launch capability.
+pub trait RpcHandler: Send + Sync {
+    /// Encodes one terminal response for a validated request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded framing or handler failure.
+    fn handle(
+        &self,
+        request: &choosh_protocol::envelope::Request<Value>,
+        config: &HandshakeConfig,
+        max_frame_bytes: usize,
+    ) -> Result<Vec<u8>, DaemonError>;
+}
+
+/// Default daemon RPC composition containing `host.describe` and injected,
+/// opaque-identity `git.status` workspace operations.
+#[derive(Default)]
+pub struct DaemonRpc {
+    git_status: BTreeMap<choosh_protocol::envelope::EnvelopeId, Arc<dyn GitStatusOperation>>,
+}
+
+impl DaemonRpc {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds the operation for an identity registered by the outer composition root.
+    /// Duplicate identities are rejected instead of silently replacing authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcRegistrationError::DuplicateWorkspace`] when the identity is
+    /// already registered.
+    pub fn register_git_status(
+        &mut self,
+        workspace_id: choosh_protocol::envelope::EnvelopeId,
+        operation: Arc<dyn GitStatusOperation>,
+    ) -> Result<(), RpcRegistrationError> {
+        if self.git_status.insert(workspace_id, operation).is_some() {
+            return Err(RpcRegistrationError::DuplicateWorkspace);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RpcRegistrationError {
+    DuplicateWorkspace,
+}
+
+impl RpcHandler for DaemonRpc {
+    fn handle(
+        &self,
+        request: &choosh_protocol::envelope::Request<Value>,
+        config: &HandshakeConfig,
+        max_frame_bytes: usize,
+    ) -> Result<Vec<u8>, DaemonError> {
+        if request.method.as_str() == "host.describe" {
+            return describe_response(request, config, max_frame_bytes);
+        }
+        if request.method.as_str() != "git.status" {
+            return error_response(
+                request,
+                "invalid_request",
+                "unsupported request",
+                max_frame_bytes,
+            );
+        }
+        let Some(workspace_id) = git_status_workspace_id(&request.params) else {
+            return error_response(
+                request,
+                "invalid_request",
+                "invalid git.status request",
+                max_frame_bytes,
+            );
+        };
+        let Some(operation) = self.git_status.get(&workspace_id) else {
+            return error_response(request, "not_found", "workspace not found", max_frame_bytes);
+        };
+        match operation.status_snapshot() {
+            Ok(snapshot) => {
+                git_status_response(request, workspace_id.as_str(), &snapshot, max_frame_bytes)
+            }
+            Err(error) => {
+                let (code, message) = match error {
+                    GitStatusError::Execution(
+                        crate::git_status::GitStatusExecutionError::OutputTooLarge,
+                    )
+                    | GitStatusError::Parse(
+                        crate::git::StatusParseError::OutputTooLarge
+                        | crate::git::StatusParseError::TooManyEntries
+                        | crate::git::StatusParseError::PathTooLong,
+                    ) => ("limit_exceeded", "git status limit exceeded"),
+                    _ => ("internal", "git status unavailable"),
+                };
+                error_response(request, code, message, max_frame_bytes)
+            }
+        }
+    }
 }
 
 impl HandshakeConfig {
@@ -140,11 +248,31 @@ pub fn serve(
     config: &HandshakeConfig,
     max_frame_bytes: usize,
 ) -> Result<(), DaemonError> {
+    serve_with_handler(listener, config, max_frame_bytes, &DaemonRpc::new())
+}
+
+/// Serves accepted private-socket connections with an explicitly injected RPC graph.
+///
+/// The outer composition root supplies only operations that already own their
+/// registered roots and launch capabilities.
+///
+/// # Errors
+///
+/// Returns invalid framing limits or listener accept failure.
+pub fn serve_with_handler<H>(
+    listener: &UnixListener,
+    config: &HandshakeConfig,
+    max_frame_bytes: usize,
+    handler: &H,
+) -> Result<(), DaemonError>
+where
+    H: RpcHandler,
+{
     let limits = limits(max_frame_bytes)?;
     loop {
         let (mut stream, _) = listener.accept()?;
         socket::verify_same_effective_user(&stream)?;
-        let _ = serve_stream_with_limits(&mut stream, config, limits);
+        let _ = serve_stream_with_rpc_handler(&mut stream, config, limits, handler);
     }
 }
 
@@ -159,23 +287,57 @@ pub fn serve_once(
     config: &HandshakeConfig,
     max_frame_bytes: usize,
 ) -> Result<(), DaemonError> {
+    serve_once_with_handler(listener, config, max_frame_bytes, &DaemonRpc::new())
+}
+
+/// Accepts exactly one private connection with an explicitly injected RPC graph.
+///
+/// This is the deterministic acceptance-test seam for the same peer admission
+/// and framed request path used by [`serve_with_handler`].
+///
+/// # Errors
+///
+/// Returns invalid framing limits, accept failure, peer-admission failure,
+/// malformed/truncated framing, or stream I/O errors.
+pub fn serve_once_with_handler<H>(
+    listener: &UnixListener,
+    config: &HandshakeConfig,
+    max_frame_bytes: usize,
+    handler: &H,
+) -> Result<(), DaemonError>
+where
+    H: RpcHandler,
+{
     let limits = limits(max_frame_bytes)?;
     let (mut stream, _) = listener.accept()?;
     socket::verify_same_effective_user(&stream)?;
-    serve_stream_with_limits(&mut stream, config, limits)
+    serve_stream_with_rpc_handler(&mut stream, config, limits, handler)
 }
 
 fn limits(max_frame_bytes: usize) -> Result<FrameLimits, DaemonError> {
     FrameLimits::new(max_frame_bytes, MAX_FRAMES_PER_READ).map_err(Into::into)
 }
 
+#[cfg(test)]
 fn serve_stream_with_limits(
     stream: &mut UnixStream,
     config: &HandshakeConfig,
     limits: FrameLimits,
 ) -> Result<(), DaemonError> {
+    serve_stream_with_rpc_handler(stream, config, limits, &DaemonRpc::new())
+}
+
+fn serve_stream_with_rpc_handler<H>(
+    stream: &mut UnixStream,
+    config: &HandshakeConfig,
+    limits: FrameLimits,
+    handler: &H,
+) -> Result<(), DaemonError>
+where
+    H: RpcHandler,
+{
     serve_stream_with_handler(stream, config, limits, &|request| {
-        describe_response(request, config, limits.max_frame_bytes)
+        handler.handle(request, config, limits.max_frame_bytes)
     })
 }
 
@@ -315,9 +477,115 @@ fn describe_response(
     Ok(encoded)
 }
 
+fn git_status_workspace_id(params: &Value) -> Option<choosh_protocol::envelope::EnvelopeId> {
+    let object = params.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let workspace_id = object.get("workspace_id")?.as_str()?;
+    choosh_protocol::envelope::EnvelopeId::new(workspace_id).ok()
+}
+
+fn git_status_response(
+    request: &choosh_protocol::envelope::Request<Value>,
+    workspace_id: &str,
+    snapshot: &crate::git::StatusSnapshot,
+    max_frame_bytes: usize,
+) -> Result<Vec<u8>, DaemonError> {
+    let entries: Vec<Value> = snapshot
+        .entries()
+        .iter()
+        .map(|entry| {
+            let mut value = serde_json::Map::new();
+            value.insert(
+                "staged".to_owned(),
+                Value::String(change_kind_name(entry.staged()).to_owned()),
+            );
+            value.insert(
+                "unstaged".to_owned(),
+                Value::String(change_kind_name(entry.unstaged()).to_owned()),
+            );
+            value.insert(
+                "new_path_b64".to_owned(),
+                Value::String(base64_url_unpadded(entry.new_path())),
+            );
+            if let Some(old_path) = entry.old_path() {
+                value.insert(
+                    "old_path_b64".to_owned(),
+                    Value::String(base64_url_unpadded(old_path)),
+                );
+            }
+            Value::Object(value)
+        })
+        .collect();
+    let value = json!({
+        "kind": "response",
+        "id": request.id.as_str(),
+        "result": {"workspace_id": workspace_id, "entries": entries},
+    });
+    response_bytes(&value, max_frame_bytes)
+}
+
+fn change_kind_name(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Unmodified => "unmodified",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Added => "added",
+        ChangeKind::Deleted => "deleted",
+        ChangeKind::Renamed => "renamed",
+        ChangeKind::Copied => "copied",
+        ChangeKind::UpdatedButUnmerged => "updated_but_unmerged",
+        ChangeKind::Untracked => "untracked",
+        ChangeKind::Ignored => "ignored",
+    }
+}
+
+fn base64_url_unpadded(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        output.push(TABLE[usize::from(chunk[0] >> 2)] as char);
+        output.push(
+            TABLE[usize::from(
+                (chunk[0] & 0b0000_0011) << 4 | chunk.get(1).copied().unwrap_or(0) >> 4,
+            )] as char,
+        );
+        if chunk.len() > 1 {
+            output.push(
+                TABLE[usize::from(
+                    (chunk[1] & 0b0000_1111) << 2 | chunk.get(2).copied().unwrap_or(0) >> 6,
+                )] as char,
+            );
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[usize::from(chunk[2] & 0b0011_1111)] as char);
+        }
+    }
+    output
+}
+
+fn error_response(
+    request: &choosh_protocol::envelope::Request<Value>,
+    code: &'static str,
+    message: &'static str,
+    max_frame_bytes: usize,
+) -> Result<Vec<u8>, DaemonError> {
+    let value = json!({"kind": "response", "id": request.id.as_str(), "error": {"code": code, "message": message}});
+    response_bytes(&value, max_frame_bytes)
+}
+
+fn response_bytes(value: &Value, max_frame_bytes: usize) -> Result<Vec<u8>, DaemonError> {
+    let encoded = serde_json::to_vec(&value).map_err(|_| WireError::MalformedJson)?;
+    if encoded.len() > max_frame_bytes {
+        return Err(DaemonError::Wire(WireError::PayloadTooLarge));
+    }
+    Ok(encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::{StatusLimits, parse_status};
     use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Condvar, Mutex};
 
@@ -339,6 +607,96 @@ mod tests {
             capabilities: vec![Capability::Events],
             limits: ProtocolLimits::new(max_frame_bytes, 8).unwrap(),
         }
+    }
+
+    struct StaticGitStatus(Result<crate::git::StatusSnapshot, GitStatusError>);
+
+    impl GitStatusOperation for StaticGitStatus {
+        fn status_snapshot(&self) -> Result<crate::git::StatusSnapshot, GitStatusError> {
+            self.0.clone()
+        }
+    }
+
+    fn request(payload: &[u8]) -> choosh_protocol::envelope::Request<Value> {
+        let WireEnvelope::Request(request) = decode_envelope(payload, 512).unwrap() else {
+            panic!("test input must be a request");
+        };
+        request
+    }
+
+    #[test]
+    fn injected_git_status_uses_only_registered_uuid_and_preserves_opaque_path_bytes() {
+        let workspace_id =
+            choosh_protocol::envelope::EnvelopeId::new("00000000-0000-0000-0000-000000000011")
+                .unwrap();
+        let snapshot = parse_status(
+            b" M src/opaque-\xff.rs\0",
+            StatusLimits {
+                max_bytes: 128,
+                max_entries: 4,
+                max_path_bytes: 64,
+            },
+        )
+        .unwrap();
+        let mut rpc = DaemonRpc::new();
+        rpc.register_git_status(
+            workspace_id.clone(),
+            Arc::new(StaticGitStatus(Ok(snapshot))),
+        )
+        .unwrap();
+        let request = request(br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000012","method":"git.status","params":{"workspace_id":"00000000-0000-0000-0000-000000000011"}}"#);
+        let response = String::from_utf8(rpc.handle(&request, &config(512), 512).unwrap()).unwrap();
+        assert_eq!(
+            response,
+            r#"{"id":"00000000-0000-0000-0000-000000000012","kind":"response","result":{"entries":[{"new_path_b64":"c3JjL29wYXF1ZS3_LnJz","staged":"unmodified","unstaged":"modified"}],"workspace_id":"00000000-0000-0000-0000-000000000011"}}"#
+        );
+        assert_eq!(
+            rpc.register_git_status(
+                workspace_id,
+                Arc::new(StaticGitStatus(Err(GitStatusError::Parse(
+                    crate::git::StatusParseError::MalformedRecord
+                ))))
+            ),
+            Err(RpcRegistrationError::DuplicateWorkspace)
+        );
+    }
+
+    #[test]
+    fn git_status_rejects_paths_and_unknown_or_unregistered_workspace_ids_without_echoing_them() {
+        let rpc = DaemonRpc::new();
+        for (payload, code) in [
+            (br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000013","method":"git.status","params":{"workspace_id":"00000000-0000-0000-0000-000000000099"}}"#.as_slice(), "not_found"),
+            (br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000014","method":"git.status","params":{"workspace_id":"00000000-0000-0000-0000-000000000099","path":"/secret"}}"#.as_slice(), "invalid_request"),
+        ] {
+            let response = String::from_utf8(rpc.handle(&request(payload), &config(512), 512).unwrap()).unwrap();
+            assert!(response.contains(&format!(r#""code":"{code}""#)));
+            assert!(!response.contains("/secret"));
+        }
+    }
+
+    #[test]
+    fn git_status_maps_bounded_domain_failure_to_limit_exceeded() {
+        let workspace_id =
+            choosh_protocol::envelope::EnvelopeId::new("00000000-0000-0000-0000-000000000015")
+                .unwrap();
+        let mut rpc = DaemonRpc::new();
+        rpc.register_git_status(
+            workspace_id,
+            Arc::new(StaticGitStatus(Err(GitStatusError::Parse(
+                crate::git::StatusParseError::TooManyEntries,
+            )))),
+        )
+        .unwrap();
+        let response = String::from_utf8(
+            rpc.handle(
+                &request(br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000016","method":"git.status","params":{"workspace_id":"00000000-0000-0000-0000-000000000015"}}"#),
+                &config(512),
+                512,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(response.contains(r#""code":"limit_exceeded""#));
     }
 
     #[test]
