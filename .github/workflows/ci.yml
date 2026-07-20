@@ -87,8 +87,10 @@ jobs:
           echo "ANDROID_SDK_ROOT=$stable_sdk_root" >> "$GITHUB_ENV"
       - name: Static Android policy checks
         run: ./scripts/check-android.sh
-      - name: Lint, unit test, and package test APKs
-        run: ./gradlew :app:buildRustAndroid :app:lintDebug :app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest :app:checkNativeAbiPackaging --stacktrace
+      - name: Lint and unit test checked-in Android fixtures
+        run: ./gradlew :app:lintDebug :app:testDebugUnitTest --stacktrace
+      - name: Rebuild and package native Android artifacts
+        run: ./gradlew :app:buildRustAndroid :app:assembleDebug :app:assembleDebugAndroidTest :app:checkNativeAbiPackaging --stacktrace
       - name: Retain pre-device reports and APKs
         if: always()
         uses: actions/upload-artifact@v4
@@ -154,4 +156,9 @@ jobs:
         if: steps.preview.outputs.available == 'true'
         env:
           PREVIEW_CODENAME: ${{ steps.preview.outputs.codename }}
-        run: ./gradlew -Pchoosh.previewCodename="$PREVIEW_CODENAME" :app:lintDebug :app:testDebugUnitTest :app:assembleDebug --stacktrace
+        run: ./gradlew -Pchoosh.previewCodename="$PREVIEW_CODENAME" :app:lintDebug :app:testDebugUnitTest --stacktrace
+      - name: Assemble preview compatibility APK
+        if: steps.preview.outputs.available == 'true'
+        env:
+          PREVIEW_CODENAME: ${{ steps.preview.outputs.codename }}
+        run: ./gradlew -Pchoosh.previewCodename="$PREVIEW_CODENAME" :app:assembleDebug --stacktrace

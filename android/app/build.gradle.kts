@@ -1,5 +1,6 @@
 import java.util.Properties
 import java.util.zip.ZipFile
+import org.gradle.api.tasks.testing.Test
 
 plugins { alias(libs.plugins.android.application) }
 
@@ -84,6 +85,12 @@ dependencies {
 }
 
 dependencyLocking { lockAllConfigurations() }
+
+// JVM tests may inspect checked-in Android fixtures. Make their module-relative paths
+// deterministic instead of depending on Gradle's invocation directory.
+tasks.withType<Test>().configureEach {
+    workingDir = project.projectDir
+}
 
 val buildRustAndroid = tasks.register<Exec>("buildRustAndroid") {
     group = "build"
