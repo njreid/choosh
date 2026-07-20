@@ -43,6 +43,10 @@ Worktree reads MUST be root-confined and checked against the snapshot metadata b
 The daemon reads every blob stream with the capability's byte bound: it retains no more
 than that bound and probes one additional byte to classify an oversized source.
 
+`git.status` identifies only a pre-registered workspace UUID. Its path metadata is unpadded
+URL-safe base64 of the original Git path bytes, so Android can defer path display decoding
+without losing valid non-UTF-8 repository names.
+
 ## Android computation
 
 Android decodes text using the document encoding policy, normalizes only for comparison,

@@ -89,6 +89,20 @@ events.ack
 
 Destructive methods require an explicit `confirmation` object tied to a short-lived daemon challenge.
 
+### `git.status`
+
+`git.status` accepts exactly one parameter, an already registered opaque workspace identity:
+
+```json
+{"workspace_id":"00000000-0000-0000-0000-000000000000"}
+```
+
+The client MUST NOT provide a host path. The result contains a bounded snapshot and entries
+whose `new_path_b64` and optional `old_path_b64` fields use unpadded URL-safe base64 of the
+original Git path bytes. This preserves valid non-UTF-8 Git paths without making an implicit
+display-decoding policy. Unknown workspaces return `not_found`; malformed parameters return
+`invalid_request`; exceeded status bounds return `limit_exceeded`.
+
 ## Binary streams
 
 Large file versions are not base64-encoded into control frames. `git.blob.prepare` returns a single-use, short-lived capability and exact byte limit. Android opens a second SSH exec channel:
