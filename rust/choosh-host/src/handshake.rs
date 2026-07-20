@@ -26,7 +26,7 @@ impl HandshakeLimits {
         read_buffer_bytes: usize,
         max_tracked_workspaces: usize,
     ) -> Result<Self, ClientHandshakeError> {
-        FrameLimits::new(max_frame_bytes, 1).map_err(ClientHandshakeError::Frame)?;
+        FrameLimits::new(max_frame_bytes, 2).map_err(ClientHandshakeError::Frame)?;
         if read_buffer_bytes == 0 || max_tracked_workspaces == 0 {
             return Err(ClientHandshakeError::InvalidLimits);
         }
@@ -83,7 +83,7 @@ pub fn perform_client_handshake<T: Read + Write>(
     limits: HandshakeLimits,
 ) -> Result<ClientSession, ClientHandshakeError> {
     let frame_limits =
-        FrameLimits::new(limits.max_frame_bytes, 1).map_err(ClientHandshakeError::Frame)?;
+        FrameLimits::new(limits.max_frame_bytes, 2).map_err(ClientHandshakeError::Frame)?;
     if limits.read_buffer_bytes == 0 || limits.max_tracked_workspaces == 0 {
         return Err(ClientHandshakeError::InvalidLimits);
     }
@@ -268,9 +268,6 @@ mod tests {
             &hello,
             HandshakeLimits::new(1024, 4096, 8).unwrap(),
         );
-        assert!(matches!(
-            result,
-            Err(ClientHandshakeError::Frame(FrameError::BatchLimitExceeded))
-        ));
+        assert!(matches!(result, Err(ClientHandshakeError::MultipleReplies)));
     }
 }

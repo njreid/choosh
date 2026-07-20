@@ -41,7 +41,7 @@ struct SocketFrameRelay<T> {
 
 impl<T> SocketFrameRelay<T> {
     fn new(transport: T, limits: BridgeLimits) -> Result<Self, BridgeError> {
-        let _ = FrameLimits::new(limits.max_frame_bytes, 1)?;
+        let _ = FrameLimits::new(limits.max_frame_bytes, 2)?;
         if limits.read_buffer_bytes == 0 {
             return Err(BridgeError::InvalidLimits);
         }
@@ -68,7 +68,7 @@ impl<T: Read + Write> FrameHandler for SocketFrameRelay<T> {
             .flush()
             .map_err(|_| HandlerFailure::Unavailable)?;
 
-        let frame_limits = FrameLimits::new(self.limits.max_frame_bytes, 1)
+        let frame_limits = FrameLimits::new(self.limits.max_frame_bytes, 2)
             .map_err(|_| HandlerFailure::Internal)?;
         let mut decoder = FrameDecoder::new(frame_limits);
         loop {

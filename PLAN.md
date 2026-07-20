@@ -50,6 +50,8 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Blob capability completion consumes a bounded reader and stops an oversized source
   after the first byte above its declared limit; daemon fixture roots are unique under
   parallel headless test execution.
+- [x] Handshake, request, and socket-relay readers admit two coalesced frames solely to
+  classify duplicate replies explicitly, then fail closed before accepting either result.
 - [x] A generated-key protocol harness proves fixed exec, SFTP subsystem, and loopback-only
   forwarding can coexist on one authenticated Russh transport. It is not yet the full
   Android-to-host vertical acceptance harness.

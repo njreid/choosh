@@ -39,6 +39,9 @@ UTF-8 JSON payload
 ## Handshake
 
 The first client frame MUST be `hello`; the first daemon response MUST be `welcome` or `incompatible`.
+The handshake permits exactly one reply: a coalesced second reply is rejected before
+either reply establishes a session. Likewise, one request permits exactly one coalesced
+terminal response; additional responses close the client session.
 
 ```json
 {

@@ -26,7 +26,7 @@ impl RequestLimits {
         max_frame_bytes: usize,
         read_buffer_bytes: usize,
     ) -> Result<Self, ClientRequestError> {
-        FrameLimits::new(max_frame_bytes, 1).map_err(ClientRequestError::Frame)?;
+        FrameLimits::new(max_frame_bytes, 2).map_err(ClientRequestError::Frame)?;
         if read_buffer_bytes == 0 {
             return Err(ClientRequestError::InvalidLimits);
         }
@@ -45,6 +45,7 @@ pub enum ClientRequestError {
     TransportWrite,
     UnexpectedEof,
     UnexpectedEnvelope,
+    MultipleResponses,
     Frame(FrameError),
     Wire(WireError),
     Session(SessionError),
@@ -61,6 +62,7 @@ impl ClientRequestError {
             Self::TransportWrite => "request_write",
             Self::UnexpectedEof => "request_eof",
             Self::UnexpectedEnvelope => "expected_response",
+            Self::MultipleResponses => "multiple_responses",
             Self::Frame(error) => error.code(),
             Self::Wire(error) => error.code(),
             Self::Session(error) => error.code(),
@@ -84,7 +86,7 @@ pub fn perform_request<T: Read + Write>(
     request: &Request<Value>,
     limits: RequestLimits,
 ) -> Result<Response<Value, Value>, ClientRequestError> {
-    FrameLimits::new(limits.max_frame_bytes, 1).map_err(ClientRequestError::Frame)?;
+    FrameLimits::new(limits.max_frame_bytes, 2).map_err(ClientRequestError::Frame)?;
     if limits.read_buffer_bytes == 0 {
         return Err(ClientRequestError::InvalidLimits);
     }
@@ -152,7 +154,7 @@ fn read_response_frame<T: Read>(
     limits: RequestLimits,
 ) -> Result<Vec<u8>, ClientRequestError> {
     let frame_limits =
-        FrameLimits::new(limits.max_frame_bytes, 1).map_err(ClientRequestError::Frame)?;
+        FrameLimits::new(limits.max_frame_bytes, 2).map_err(ClientRequestError::Frame)?;
     let mut decoder = FrameDecoder::new(frame_limits);
     let mut buffer = vec![0; limits.read_buffer_bytes];
     loop {
@@ -174,6 +176,10 @@ fn read_response_frame<T: Read>(
         }
         match decoder.feed(&buffer[..read]) {
             Ok(frames) => {
+                if frames.len() > 1 {
+                    session.receive_eof();
+                    return Err(ClientRequestError::MultipleResponses);
+                }
                 if let Some(frame) = frames.into_iter().next() {
                     return Ok(frame);
                 }
@@ -316,6 +322,30 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code(), "unknown_response");
+        assert_eq!(session.phase(), SessionPhase::Closed);
+    }
+
+    #[test]
+    fn coalesced_responses_close_the_session_before_one_can_be_accepted() {
+        let id = "00000000-0000-0000-0000-000000000001";
+        let mut responses = framed_response(id);
+        responses.extend(framed_response(id));
+        let mut transport = ScriptedTransport {
+            reads: VecDeque::from([responses]),
+            written: Vec::new(),
+            fail_write: false,
+        };
+        let mut session = established_session();
+
+        assert_eq!(
+            perform_request(
+                &mut transport,
+                &mut session,
+                &request(id),
+                RequestLimits::new(512, 4096).unwrap(),
+            ),
+            Err(ClientRequestError::MultipleResponses)
+        );
         assert_eq!(session.phase(), SessionPhase::Closed);
     }
 
