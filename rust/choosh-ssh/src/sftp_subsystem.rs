@@ -8,9 +8,14 @@
 //! caller from bypassing the lexical and root-confinement boundary in
 //! [`crate::ConfinedSftp`].
 
-use russh_sftp::client::{Config as RusshSftpConfig, SftpSession};
+use std::sync::Arc;
 
-use crate::VerifiedConnection;
+use russh_sftp::client::{Config as RusshSftpConfig, SftpSession};
+use tokio::io::AsyncReadExt;
+
+use choosh_core::path::RelativePath;
+
+use crate::{ConfinedSftp, RootedSftpTransport, SftpLimits, VerifiedConnection};
 
 const SFTP_SUBSYSTEM_NAME: &str = "sftp";
 const MAX_PACKET_BYTES: u32 = 256 * 1024;
@@ -76,6 +81,9 @@ impl SftpSubsystemLimits {
 pub enum SftpSubsystemError {
     InvalidLimits,
     TransportFailed,
+    RootConfinementNotProven,
+    AtomicWriteNotProven,
+    ReadLimitExceeded,
 }
 
 impl SftpSubsystemError {
@@ -84,6 +92,9 @@ impl SftpSubsystemError {
         match self {
             Self::InvalidLimits => "invalid_limits",
             Self::TransportFailed => "transport_error",
+            Self::RootConfinementNotProven => "root_confinement_not_proven",
+            Self::AtomicWriteNotProven => "atomic_write_not_proven",
+            Self::ReadLimitExceeded => "read_limit_exceeded",
         }
     }
 }
@@ -91,6 +102,27 @@ impl SftpSubsystemError {
 /// A live, bounded SFTP subsystem with no public path-operation authority.
 pub struct RusshSftpSubsystem {
     session: SftpSession,
+}
+
+/// Server-side confinement evidence injected by the host protocol boundary.
+///
+/// This is a trust capability, not a client path assertion: an implementation
+/// MUST establish that the SFTP server resolves the returned canonical root
+/// beneath the selected workspace and rejects symlinks escaping that root.
+/// Standard SFTP has no such proof, so callers without a server-specific
+/// capability must not create a rooted transport.
+pub trait ServerRootConfinement: Send + Sync {
+    /// Returns the server-attested canonical SFTP root, never client input.
+    fn canonical_sftp_root(&self) -> &str;
+}
+
+/// Actual Russh SFTP reads bound to an attested server root.
+///
+/// Atomic writes deliberately remain unavailable until the server protocol
+/// provides an atomic root-confined write primitive (or an equivalent proof).
+pub struct RusshRootedSftp {
+    session: Arc<SftpSession>,
+    root: String,
 }
 
 impl VerifiedConnection {
@@ -126,6 +158,37 @@ impl VerifiedConnection {
 }
 
 impl RusshSftpSubsystem {
+    /// Binds the admitted subsystem to a server-attested root.
+    ///
+    /// The proof is deliberately injected rather than inferred from SFTP
+    /// `realpath`: a standard server can canonicalize a path while still
+    /// following a symlink outside the selected workspace.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an absent or malformed proof before exposing operations.
+    pub fn into_confined<P>(
+        self,
+        proof: Option<&P>,
+        limits: SftpLimits,
+    ) -> Result<ConfinedSftp<RusshRootedSftp>, SftpSubsystemError>
+    where
+        P: ServerRootConfinement,
+    {
+        let proof = proof.ok_or(SftpSubsystemError::RootConfinementNotProven)?;
+        let root = proof.canonical_sftp_root();
+        if !valid_canonical_root(root) {
+            return Err(SftpSubsystemError::RootConfinementNotProven);
+        }
+        Ok(ConfinedSftp::new(
+            RusshRootedSftp {
+                session: Arc::new(self.session),
+                root: root.to_owned(),
+            },
+            limits,
+        ))
+    }
+
     /// Closes the opaque SFTP subsystem without exposing filesystem operations.
     ///
     /// # Errors
@@ -140,9 +203,63 @@ impl RusshSftpSubsystem {
     }
 }
 
+impl RootedSftpTransport for RusshRootedSftp {
+    type Error = SftpSubsystemError;
+
+    async fn read(&self, path: &RelativePath, max_bytes: usize) -> Result<Vec<u8>, Self::Error> {
+        let mut file = self
+            .session
+            .open(self.rooted_path(path))
+            .await
+            .map_err(|_| SftpSubsystemError::TransportFailed)?;
+        let mut contents = Vec::with_capacity(max_bytes.saturating_add(1));
+        (&mut file)
+            .take(u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX))
+            .read_to_end(&mut contents)
+            .await
+            .map_err(|_| SftpSubsystemError::TransportFailed)?;
+        if contents.len() > max_bytes {
+            Err(SftpSubsystemError::ReadLimitExceeded)
+        } else {
+            Ok(contents)
+        }
+    }
+
+    async fn write_atomic(
+        &self,
+        _path: &RelativePath,
+        _contents: &[u8],
+    ) -> Result<(), Self::Error> {
+        Err(SftpSubsystemError::AtomicWriteNotProven)
+    }
+}
+
+impl RusshRootedSftp {
+    fn rooted_path(&self, path: &RelativePath) -> String {
+        if self.root == "/" {
+            format!("/{path}")
+        } else {
+            format!("{}/{path}", self.root)
+        }
+    }
+}
+
+fn valid_canonical_root(root: &str) -> bool {
+    root == "/"
+        || (root.starts_with('/')
+            && root.len() <= 4_096
+            && !root
+                .bytes()
+                .any(|byte| byte == 0 || byte.is_ascii_control())
+            && root
+                .split('/')
+                .skip(1)
+                .all(|part| !part.is_empty() && part != "." && part != ".."))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SftpSubsystemError, SftpSubsystemLimits};
+    use super::{SftpSubsystemError, SftpSubsystemLimits, valid_canonical_root};
 
     #[test]
     fn bounded_defaults_are_stable_and_accepted() {
@@ -171,6 +288,21 @@ mod tests {
             SftpSubsystemLimits::new(1, 1, 61),
         ] {
             assert_eq!(limits, Err(SftpSubsystemError::InvalidLimits));
+        }
+    }
+
+    #[test]
+    fn root_capability_requires_a_canonical_absolute_sftp_root() {
+        assert!(valid_canonical_root("/"));
+        assert!(valid_canonical_root("/workspace/fixture"));
+        for root in [
+            "",
+            "relative",
+            "/workspace/../secret",
+            "/workspace//fixture",
+            "/workspace\x00",
+        ] {
+            assert!(!valid_canonical_root(root));
         }
     }
 }
