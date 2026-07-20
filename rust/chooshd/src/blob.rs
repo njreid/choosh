@@ -1,6 +1,7 @@
 //! Bounded, immutable Git blob stream capabilities.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SnapshotId(String);
@@ -114,6 +115,7 @@ pub enum BlobError {
     IdentityMismatch,
     TooLarge,
     WrongIdentityKind,
+    ReadFailed,
 }
 
 #[derive(Debug)]
@@ -203,7 +205,7 @@ impl BlobCapabilities {
         })
     }
 
-    /// Finishes a stream atomically from the caller's complete bounded bytes.
+    /// Finishes a stream atomically while retaining at most `max_bytes`.
     ///
     /// Worktree bytes are discarded unless the post-stream identity equals the
     /// pre-stream identity. Immutable object/empty sides require no observation.
@@ -211,9 +213,9 @@ impl BlobCapabilities {
     /// # Errors
     ///
     /// Rejects oversized bytes or an observation of the wrong identity kind.
-    pub fn finish(
+    pub fn finish<R: Read>(
         active: ActiveBlob,
-        bytes: Vec<u8>,
+        reader: &mut R,
         observed_after: Option<&WorktreeIdentity>,
     ) -> Result<BlobOutcome, BlobError> {
         let ActiveBlob {
@@ -221,9 +223,7 @@ impl BlobCapabilities {
             descriptor,
             observed_before,
         } = active;
-        if bytes.len() > descriptor.max_bytes {
-            return Err(BlobError::TooLarge);
-        }
+        let bytes = read_bounded(reader, descriptor.max_bytes)?;
         match descriptor.identity {
             BlobIdentity::Worktree(_) => {
                 if observed_after == observed_before.as_ref() {
@@ -262,6 +262,31 @@ impl BlobCapabilities {
     }
 }
 
+fn read_bounded(reader: &mut impl Read, max_bytes: usize) -> Result<Vec<u8>, BlobError> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        if bytes.len() == max_bytes {
+            return match reader
+                .read(&mut chunk[..1])
+                .map_err(|_| BlobError::ReadFailed)?
+            {
+                0 => Ok(bytes),
+                _ => Err(BlobError::TooLarge),
+            };
+        }
+        let remaining = max_bytes - bytes.len();
+        let chunk_len = chunk.len();
+        let read = reader
+            .read(&mut chunk[..remaining.min(chunk_len)])
+            .map_err(|_| BlobError::ReadFailed)?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
 fn validate_descriptor(descriptor: &BlobDescriptor) -> Result<(), BlobError> {
     let valid_identity = match &descriptor.identity {
         BlobIdentity::Empty => true,
@@ -281,6 +306,7 @@ fn validate_descriptor(descriptor: &BlobDescriptor) -> Result<(), BlobError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn address(side: Side) -> BlobAddress {
         BlobAddress {
@@ -321,7 +347,7 @@ mod tests {
             .unwrap();
         let active = capabilities.begin(&token, 6, None).unwrap();
         assert_eq!(
-            BlobCapabilities::finish(active, b"data".to_vec(), None).unwrap(),
+            BlobCapabilities::finish(active, &mut Cursor::new(b"data"), None).unwrap(),
             BlobOutcome::Complete(b"data".to_vec())
         );
         assert_eq!(
@@ -367,7 +393,7 @@ mod tests {
             ..worktree()
         };
         assert_eq!(
-            BlobCapabilities::finish(active, b"new".to_vec(), Some(&changed)).unwrap(),
+            BlobCapabilities::finish(active, &mut Cursor::new(b"new"), Some(&changed)).unwrap(),
             BlobOutcome::StaleDiscarded
         );
     }
@@ -399,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn immutable_identities_reject_worktree_evidence_and_byte_overflow() {
+    fn immutable_identities_reject_worktree_evidence_and_bound_streaming_reads() {
         let mut capabilities = BlobCapabilities::new(1, 10).unwrap();
         let token = CapabilityToken::new("head");
         capabilities
@@ -423,10 +449,12 @@ mod tests {
             )
             .unwrap();
         let active = capabilities.begin(&token, 1, None).unwrap();
+        let mut oversized = Cursor::new(vec![0; 1024 * 1024]);
         assert_eq!(
-            BlobCapabilities::finish(active, vec![0; 5], None),
+            BlobCapabilities::finish(active, &mut oversized, None),
             Err(BlobError::TooLarge)
         );
+        assert_eq!(oversized.position(), 5);
     }
 
     #[test]

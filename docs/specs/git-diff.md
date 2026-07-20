@@ -40,6 +40,8 @@ Untracked files use empty content on the left. Deleted files use empty content o
 `git.blob.prepare` accepts `snapshot_id`, path, side, and comparison mode. It returns metadata plus a short-lived stream capability. The daemon MUST reject stale snapshots when the requested identity can no longer be reproduced.
 
 Worktree reads MUST be root-confined and checked against the snapshot metadata before and after streaming. HEAD and index content MUST be addressed by resolved object identity rather than mutable names.
+The daemon reads every blob stream with the capability's byte bound: it retains no more
+than that bound and probes one additional byte to classify an oversized source.
 
 ## Android computation
 

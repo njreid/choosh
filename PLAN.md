@@ -47,6 +47,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   targets. Agent integration is described as per-agent pluggable adapters, not neutrality.
 - [x] The bounded reference diff preserves per-line `LF`/`CRLF` identity, including
   line-ending-only changes, with byte-exact headless reconstruction coverage.
+- [x] Blob capability completion consumes a bounded reader and stops an oversized source
+  after the first byte above its declared limit; daemon fixture roots are unique under
+  parallel headless test execution.
 - [x] A generated-key protocol harness proves fixed exec, SFTP subsystem, and loopback-only
   forwarding can coexist on one authenticated Russh transport. It is not yet the full
   Android-to-host vertical acceptance harness.

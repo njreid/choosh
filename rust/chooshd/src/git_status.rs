@@ -179,13 +179,17 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     const LIMITS: StatusLimits = StatusLimits {
         max_bytes: 256,
         max_entries: 4,
         max_path_bytes: 64,
     };
+    static FIXTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     type ObservedPlan = (bool, String, Vec<String>);
 
@@ -213,9 +217,11 @@ mod tests {
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
-            let root =
-                std::env::temp_dir().join(format!("choosh-git-status-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&root);
+            let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "choosh-git-status-{}-{sequence}",
+                std::process::id()
+            ));
             fs::create_dir_all(root.join("src")).unwrap();
             fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
             Self(root)
