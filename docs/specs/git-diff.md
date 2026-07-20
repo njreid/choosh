@@ -48,10 +48,12 @@ than that bound and probes one additional byte to classify an oversized source.
 Android decodes text using the document encoding policy, normalizes only for comparison,
 and preserves original line-ending metadata. Each emitted line records `none`, `lf`, or
 `crlf`; a line-ending-only change is therefore a visible deletion/addition pair rather
-than unchanged text. The current M0 implementation uses the
-bounded quadratic `bounded-lcs-v1` reference algorithm. It is not a claim of Git,
-histogram, Myers, or `imara-diff` fidelity. A production algorithm replacement MUST
-preserve this bounded result contract and add deterministic performance/fidelity evidence.
+than unchanged text. The current M0 implementation uses the bounded
+`bounded-myers-v1` shortest-edit-script algorithm. It does not allocate an old-lines by
+new-lines matrix: frontier work is bounded by edit distance, while retained frontiers for
+deterministic backtracking are bounded independently. It is not a claim of Git,
+histogram, or `imara-diff` fidelity. It returns metadata only when its work or
+retained-frontier limit is exceeded.
 
 Default V1 limits:
 

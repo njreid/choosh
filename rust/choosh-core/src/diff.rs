@@ -20,8 +20,9 @@ impl Default for DiffLimits {
         Self {
             max_bytes_per_side: 2 * 1024 * 1024,
             max_lines_per_side: 100_000,
-            // The quadratic reference algorithm is deliberately limited. A
-            // later Myers implementation can retain this public contract.
+            // Maximum retained Myers frontier cells used for deterministic
+            // backtracking. This bounds auxiliary memory independently of
+            // the input matrix shape.
             max_cells: 4_000_000,
             max_work: 8_000_000,
             max_hunks: 10_000,
@@ -214,53 +215,9 @@ pub fn compute_diff(
     if old_lines.len() > limits.max_lines_per_side || new_lines.len() > limits.max_lines_per_side {
         return fail(MetadataReason::TooManyLines);
     }
-    let Some(rows) = old_lines.len().checked_add(1) else {
+    let Some((ops, work)) = bounded_myers(&old_lines, &new_lines, limits) else {
         return fail(MetadataReason::DiffBudgetExceeded);
     };
-    let Some(cols) = new_lines.len().checked_add(1) else {
-        return fail(MetadataReason::DiffBudgetExceeded);
-    };
-    let Some(cells) = rows.checked_mul(cols) else {
-        return fail(MetadataReason::DiffBudgetExceeded);
-    };
-    if cells > limits.max_cells || u64::try_from(cells).map_or(true, |c| c > limits.max_work) {
-        return fail(MetadataReason::DiffBudgetExceeded);
-    }
-    let mut work = 0_u64;
-    let mut table = vec![0_u32; cells];
-    for i in (0..old_lines.len()).rev() {
-        for j in (0..new_lines.len()).rev() {
-            work += 1;
-            let at = i * cols + j;
-            table[at] = if lines_equal(old_lines[i], new_lines[j]) {
-                1 + table[(i + 1) * cols + j + 1]
-            } else {
-                table[(i + 1) * cols + j].max(table[i * cols + j + 1])
-            };
-        }
-    }
-    let mut ops = Vec::with_capacity(old_lines.len().saturating_add(new_lines.len()));
-    let (mut i, mut j) = (0, 0);
-    while i < old_lines.len() || j < new_lines.len() {
-        work += 1;
-        if work > limits.max_work {
-            return fail(MetadataReason::DiffBudgetExceeded);
-        }
-        if i < old_lines.len() && j < new_lines.len() && lines_equal(old_lines[i], new_lines[j]) {
-            ops.push(Op::Equal(old_lines[i]));
-            i += 1;
-            j += 1;
-        } else if j < new_lines.len()
-            && (i == old_lines.len() || table[i * cols + j + 1] > table[(i + 1) * cols + j])
-        {
-            ops.push(Op::Add(new_lines[j]));
-            j += 1;
-        } else {
-            // Stable tie break: deletion before addition.
-            ops.push(Op::Delete(old_lines[i]));
-            i += 1;
-        }
-    }
     let hunks = build_hunks(&ops, limits.context_lines);
     if hunks.len() > limits.max_hunks {
         return fail(MetadataReason::TooManyHunks);
@@ -268,13 +225,150 @@ pub fn compute_diff(
     let line_map = hunks.iter().flat_map(mappings_for_hunk).collect();
     DiffResult::Text(TextDiff {
         metadata,
-        algorithm: "bounded-lcs-v1",
+        algorithm: "bounded-myers-v1",
         old_ends_with_newline: old.last() == Some(&b'\n'),
         new_ends_with_newline: new.last() == Some(&b'\n'),
         hunks,
         line_map,
         work_used: work,
     })
+}
+
+/// Computes a shortest edit script with Myers' O((N + M)D) frontier algorithm.
+///
+/// We retain the successive frontiers solely to reconstruct a deterministic
+/// script. `max_cells` caps that retained trace; `max_work` caps frontier,
+/// snake, and reconstruction work. The operation ordering deliberately keeps
+/// the previous LCS contract's deletion-before-addition tie break.
+fn bounded_myers<'a>(
+    old: &[SourceLine<'a>],
+    new: &[SourceLine<'a>],
+    limits: DiffLimits,
+) -> Option<(Vec<Op<'a>>, u64)> {
+    let max_distance = old.len().checked_add(new.len())?;
+    // One sentinel on each side keeps the `k ± 1` frontier lookup valid at
+    // the first and outermost diagonals.
+    let frontier_len = max_distance.checked_mul(2)?.checked_add(3)?;
+    let offset = isize::try_from(max_distance.checked_add(1)?).ok()?;
+    let mut frontier = vec![0_isize; frontier_len];
+    let mut trace = Vec::<Vec<isize>>::new();
+    let mut retained_cells = 0_usize;
+    let mut work = 0_u64;
+
+    for distance in 0..=max_distance {
+        let distance_i = isize::try_from(distance).ok()?;
+        for diagonal in (-distance_i..=distance_i).step_by(2) {
+            work = work.checked_add(1)?;
+            if work > limits.max_work {
+                return None;
+            }
+            let index = usize::try_from(offset.checked_add(diagonal)?).ok()?;
+            let mut x = if diagonal == -distance_i
+                || (diagonal != distance_i && frontier[index + 1] > frontier[index - 1])
+            {
+                frontier[index + 1]
+            } else {
+                frontier[index - 1].checked_add(1)?
+            };
+            let mut y = x.checked_sub(diagonal)?;
+            while usize::try_from(x).ok().is_some_and(|i| i < old.len())
+                && usize::try_from(y).ok().is_some_and(|i| i < new.len())
+                && lines_equal(old[usize::try_from(x).ok()?], new[usize::try_from(y).ok()?])
+            {
+                x = x.checked_add(1)?;
+                y = y.checked_add(1)?;
+                work = work.checked_add(1)?;
+                if work > limits.max_work {
+                    return None;
+                }
+            }
+            frontier[index] = x;
+            if usize::try_from(x).ok() == Some(old.len())
+                && usize::try_from(y).ok() == Some(new.len())
+            {
+                retained_cells = retained_cells.checked_add(frontier_len)?;
+                if retained_cells > limits.max_cells {
+                    return None;
+                }
+                trace.push(frontier.clone());
+                return backtrack_myers(old, new, &trace, work, offset, limits.max_work);
+            }
+        }
+        retained_cells = retained_cells.checked_add(frontier_len)?;
+        if retained_cells > limits.max_cells {
+            return None;
+        }
+        trace.push(frontier.clone());
+    }
+    None
+}
+
+fn backtrack_myers<'a>(
+    old: &[SourceLine<'a>],
+    new: &[SourceLine<'a>],
+    trace: &[Vec<isize>],
+    mut work: u64,
+    offset: isize,
+    max_work: u64,
+) -> Option<(Vec<Op<'a>>, u64)> {
+    let mut x = isize::try_from(old.len()).ok()?;
+    let mut y = isize::try_from(new.len()).ok()?;
+    let mut ops = Vec::with_capacity(old.len().checked_add(new.len())?);
+    for distance in (1..trace.len()).rev() {
+        let distance_i = isize::try_from(distance).ok()?;
+        let previous = &trace[distance - 1];
+        let diagonal = x.checked_sub(y)?;
+        let index = usize::try_from(offset.checked_add(diagonal)?).ok()?;
+        let previous_diagonal = if diagonal == -distance_i
+            || (diagonal != distance_i && previous[index + 1] > previous[index - 1])
+        {
+            diagonal.checked_add(1)?
+        } else {
+            diagonal.checked_sub(1)?
+        };
+        let previous_index = usize::try_from(offset.checked_add(previous_diagonal)?).ok()?;
+        let previous_x = previous[previous_index];
+        let previous_y = previous_x.checked_sub(previous_diagonal)?;
+        while x > previous_x && y > previous_y {
+            x = x.checked_sub(1)?;
+            y = y.checked_sub(1)?;
+            ops.push(Op::Equal(old[usize::try_from(x).ok()?]));
+            work = work.checked_add(1)?;
+            if work > max_work {
+                return None;
+            }
+        }
+        if x == previous_x {
+            y = y.checked_sub(1)?;
+            ops.push(Op::Add(new[usize::try_from(y).ok()?]));
+        } else {
+            x = x.checked_sub(1)?;
+            ops.push(Op::Delete(old[usize::try_from(x).ok()?]));
+        }
+        work = work.checked_add(1)?;
+        if work > max_work {
+            return None;
+        }
+    }
+    while x > 0 && y > 0 {
+        x = x.checked_sub(1)?;
+        y = y.checked_sub(1)?;
+        ops.push(Op::Equal(old[usize::try_from(x).ok()?]));
+        work = work.checked_add(1)?;
+        if work > max_work {
+            return None;
+        }
+    }
+    while x > 0 {
+        x = x.checked_sub(1)?;
+        ops.push(Op::Delete(old[usize::try_from(x).ok()?]));
+    }
+    while y > 0 {
+        y = y.checked_sub(1)?;
+        ops.push(Op::Add(new[usize::try_from(y).ok()?]));
+    }
+    ops.reverse();
+    Some((ops, work))
 }
 
 fn split_lines(text: &str) -> (Vec<SourceLine<'_>>, Ending) {
@@ -417,6 +511,7 @@ fn mappings_for_hunk(hunk: &Hunk) -> Vec<LineMapping> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write;
     fn meta(change: ChangeKind) -> DiffMetadata {
         DiffMetadata {
             old_path: None,
@@ -544,6 +639,33 @@ mod tests {
         };
         assert!(matches!(
             compute_diff(meta(ChangeKind::Modified), b"a\nb\n", b"c\nd\n", limits),
+            DiffResult::MetadataOnly {
+                reason: MetadataReason::DiffBudgetExceeded,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn large_unchanged_input_does_not_allocate_a_quadratic_matrix() {
+        // This is deliberately beyond the previous 4,000,000-cell LCS
+        // matrix ceiling. Myers follows the one matching diagonal instead.
+        let mut input = String::new();
+        for line in 0..10_000 {
+            writeln!(input, "line-{line}").unwrap();
+        }
+        let diff = text(input.as_bytes(), input.as_bytes());
+        assert_eq!(diff.algorithm, "bounded-myers-v1");
+        assert!(diff.hunks.is_empty());
+        assert!(diff.work_used <= 20_001);
+    }
+    #[test]
+    fn retained_frontier_budget_fails_without_a_partial_diff() {
+        let limits = DiffLimits {
+            max_cells: 10,
+            ..DiffLimits::default()
+        };
+        assert!(matches!(
+            compute_diff(meta(ChangeKind::Modified), b"a\n", b"b\n", limits),
             DiffResult::MetadataOnly {
                 reason: MetadataReason::DiffBudgetExceeded,
                 ..
