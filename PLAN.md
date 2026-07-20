@@ -36,6 +36,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Android profile/known-host metadata, authenticated-operation composition, and an
   opaque JNI plan boundary have headless evidence. The JNI plan deliberately does not
   claim a live connection until native exact-host admission and Keystore signing exist.
+- [x] The Android candidate flow now has deterministic profile connection and authenticated
+  workspace-status controllers. Native plans cannot advance without bridge ownership and fail
+  closed to a typed transport-unavailable result.
 - [x] A generated-key protocol harness proves fixed exec, SFTP subsystem, and loopback-only
   forwarding can coexist on one authenticated Russh transport. It is not yet the full
   Android-to-host vertical acceptance harness.
