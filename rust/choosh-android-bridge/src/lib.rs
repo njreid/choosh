@@ -5,6 +5,7 @@
 
 #![allow(unsafe_code)] // Required only for Edition 2024's `no_mangle` ABI attribute.
 
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const ABI_VERSION: u32 = 1;
@@ -13,6 +14,7 @@ const STATUS_STALE_GENERATION: i32 = 1;
 const STATUS_UNKNOWN_REQUEST: i32 = 2;
 const STATUS_CAPACITY: i32 = 3;
 const STATUS_INVALID_ARGUMENT: i32 = 4;
+const AUTHENTICATED_PLAN_STATUS: u32 = 8;
 const SLOT_COUNT: usize = 64;
 
 static GENERATION: AtomicU32 = AtomicU32::new(1);
@@ -51,6 +53,90 @@ pub extern "C" fn choosh_bridge_request_begin(generation: u32, status: u32) -> u
         }
     }
     0
+}
+
+/// Begins an opaque Android-to-Rust authenticated-connection plan.
+///
+/// Every input is a non-zero opaque handle owned by Android. In particular,
+/// this ABI accepts neither a private key nor any pointer to credential,
+/// hostname, user name, or fingerprint bytes. A plan is not a verified SSH
+/// session and cannot perform an operation; a later bridge slice must consume
+/// it only after exact host-key admission and public-key authentication.
+#[unsafe(no_mangle)]
+pub extern "C" fn choosh_bridge_authenticated_plan_begin(
+    generation: u32,
+    endpoint: u64,
+    username: u64,
+    known_host: u64,
+    credential_ref: u64,
+    public_key: u64,
+) -> u64 {
+    if endpoint == 0 || username == 0 || known_host == 0 || credential_ref == 0 || public_key == 0 {
+        return 0;
+    }
+    choosh_bridge_request_begin(generation, AUTHENTICATED_PLAN_STATUS)
+}
+
+/// Cancels one opaque authenticated-connection plan.
+#[unsafe(no_mangle)]
+pub extern "C" fn choosh_bridge_authenticated_plan_cancel(generation: u32, plan: u64) -> i32 {
+    choosh_bridge_request_cancel(generation, plan)
+}
+
+// JNI wrappers intentionally accept only primitive values. The Java side
+// resolves typed profile metadata to opaque handles before this boundary, so
+// Rust never dereferences a JVM object or receives credential material.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeAbiVersion(
+    _environment: *mut c_void,
+    _class: *mut c_void,
+) -> i32 {
+    choosh_bridge_abi_version().cast_signed()
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenticatedPlan(
+    _environment: *mut c_void,
+    _class: *mut c_void,
+    generation: i32,
+    endpoint: i64,
+    username: i64,
+    known_host: i64,
+    credential_ref: i64,
+    public_key: i64,
+) -> i64 {
+    if generation <= 0
+        || endpoint <= 0
+        || username <= 0
+        || known_host <= 0
+        || credential_ref <= 0
+        || public_key <= 0
+    {
+        return 0;
+    }
+    choosh_bridge_authenticated_plan_begin(
+        generation.cast_unsigned(),
+        endpoint.cast_unsigned(),
+        username.cast_unsigned(),
+        known_host.cast_unsigned(),
+        credential_ref.cast_unsigned(),
+        public_key.cast_unsigned(),
+    )
+    .cast_signed()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeCancelAuthenticatedPlan(
+    _environment: *mut c_void,
+    _class: *mut c_void,
+    generation: i32,
+    plan: i64,
+) -> i32 {
+    if generation <= 0 || plan <= 0 {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    choosh_bridge_authenticated_plan_cancel(generation.cast_unsigned(), plan.cast_unsigned())
 }
 
 /// Cancels a request at most once and returns a stable typed status code.
@@ -135,6 +221,21 @@ mod tests {
         assert_eq!(
             choosh_bridge_request_cancel(generation, stale),
             STATUS_STALE_GENERATION
+        );
+    }
+
+    #[test]
+    fn authenticated_plan_accepts_only_opaque_nonzero_handles() {
+        let generation = choosh_bridge_generation();
+        assert_eq!(
+            choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 0, 5),
+            0
+        );
+        let plan = choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 4, 5);
+        assert_ne!(plan, 0);
+        assert_eq!(
+            choosh_bridge_authenticated_plan_cancel(generation, plan),
+            STATUS_OK
         );
     }
 }
