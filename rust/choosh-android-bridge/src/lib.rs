@@ -266,9 +266,13 @@ const fn kind_of(request: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ABI_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn abi_request_cancel_and_recreation_are_typed_and_bounded() {
+        let _guard = ABI_TEST_LOCK.lock().unwrap();
         assert_eq!(choosh_bridge_abi_version(), 1);
         let generation = choosh_bridge_generation();
         let request = choosh_bridge_request_begin(generation, 7);
@@ -290,6 +294,7 @@ mod tests {
 
     #[test]
     fn authenticated_plan_accepts_only_opaque_nonzero_handles() {
+        let _guard = ABI_TEST_LOCK.lock().unwrap();
         let generation = choosh_bridge_generation();
         assert_eq!(
             choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 0, 5),
@@ -309,6 +314,7 @@ mod tests {
 
     #[test]
     fn unowned_authenticated_plan_cannot_advance_to_transport() {
+        let _guard = ABI_TEST_LOCK.lock().unwrap();
         let generation = choosh_bridge_generation();
         assert_eq!(
             choosh_bridge_authenticated_plan_open(
@@ -321,6 +327,7 @@ mod tests {
 
     #[test]
     fn generic_request_cannot_claim_authenticated_plan_admission() {
+        let _guard = ABI_TEST_LOCK.lock().unwrap();
         let generation = choosh_bridge_generation();
         let generic = choosh_bridge_request_begin(generation, 7);
         assert_ne!(generic, 0);
