@@ -71,7 +71,20 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - uses: android-actions/setup-android@v3
       - name: Install stable Android SDK
-        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sdk_root="${ANDROID_HOME:?android-actions/setup-android did not set ANDROID_HOME}"
+          stable_sdk_root="$RUNNER_TEMP/android-sdk-stable"
+          mkdir -p "$stable_sdk_root"
+          # Keep accepted license hashes, but no platforms, from setup-android's tool root.
+          # The isolated root below therefore exposes only the stable packages installed here.
+          if [[ -d "$source_sdk_root/licenses" ]]; then
+            cp -a "$source_sdk_root/licenses" "$stable_sdk_root/"
+          fi
+          sdkmanager --sdk_root="$stable_sdk_root" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "ANDROID_HOME=$stable_sdk_root" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$stable_sdk_root" >> "$GITHUB_ENV"
       - name: Static Android policy checks
         run: ./scripts/check-android.sh
       - name: Lint, unit test, and package test APKs
@@ -126,7 +139,7 @@ jobs:
       - name: Install preview SDK
         if: steps.preview.outputs.available == 'true'
         run: sdkmanager --channel=3 "${{ steps.preview.outputs.package }}" "build-tools;36.0.0"
-      - name: Isolate preview compile configuration
+      - name: Validate preview SDK codename
         if: steps.preview.outputs.available == 'true'
         env:
           PREVIEW_CODENAME: ${{ steps.preview.outputs.codename }}
@@ -137,11 +150,8 @@ jobs:
             echo 'preview_codename_invalid' >&2
             exit 1
           }
-          test "$(grep -Fc '    compileSdk = 36' android/app/build.gradle.kts)" -eq 1 || {
-            echo 'preview_compile_baseline_mismatch' >&2
-            exit 1
-          }
-          sed -i "s/    compileSdk = 36/    compileSdkPreview = \"$PREVIEW_CODENAME\"/" android/app/build.gradle.kts
       - name: Compile and test preview compatibility
         if: steps.preview.outputs.available == 'true'
-        run: ./gradlew :app:lintDebug :app:testDebugUnitTest :app:assembleDebug --stacktrace
+        env:
+          PREVIEW_CODENAME: ${{ steps.preview.outputs.codename }}
+        run: ./gradlew -Pchoosh.previewCodename="$PREVIEW_CODENAME" :app:lintDebug :app:testDebugUnitTest :app:assembleDebug --stacktrace
