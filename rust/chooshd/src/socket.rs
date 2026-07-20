@@ -194,6 +194,31 @@ pub fn bind(plan: &SocketPlan) -> Result<OwnedUnixListener, SocketError> {
     })
 }
 
+/// Verifies an explicitly injected, already-running daemon endpoint.
+///
+/// The stdio relay uses this before connecting so it never follows a socket
+/// plan through a public or symlinked state directory. It does not create,
+/// remove, or otherwise recover any filesystem entry.
+///
+/// # Errors
+///
+/// Fails closed unless the state directory is private and real and the exact
+/// planned path is a mode-`0600` Unix socket.
+pub fn verify_running_endpoint(plan: &SocketPlan) -> Result<(), SocketError> {
+    let state_metadata = fs::symlink_metadata(plan.state_dir())?;
+    validate_state_directory(&state_metadata)?;
+
+    let socket_metadata = fs::symlink_metadata(plan.socket_path())?;
+    if !socket_metadata.file_type().is_socket()
+        || socket_metadata.mode() & 0o777 != PRIVATE_SOCKET_MODE
+    {
+        return Err(SocketError::UnsafeStateDirectory(
+            "existing endpoint is not a mode 0600 Unix socket",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_private_state_directory(path: &Path) -> Result<(), SocketError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => validate_state_directory(&metadata),
@@ -313,6 +338,25 @@ mod tests {
         fs::write(&socket, b"not a socket").unwrap();
         let plan = SocketPlan::new(&state, &socket).unwrap();
         assert!(matches!(bind(&plan), Err(SocketError::ExistingSocketPath)));
+    }
+
+    #[test]
+    fn verifies_only_the_private_running_endpoint_at_the_injected_path() {
+        let root = TestDirectory::new();
+        let state = root.0.join("state");
+        let socket = state.join("daemon.sock");
+        let plan = SocketPlan::new(&state, &socket).unwrap();
+        assert!(verify_running_endpoint(&plan).is_err());
+
+        let owned = bind(&plan).unwrap();
+        assert!(verify_running_endpoint(&plan).is_ok());
+        drop(owned);
+
+        fs::write(&socket, b"not a socket").unwrap();
+        assert!(matches!(
+            verify_running_endpoint(&plan),
+            Err(SocketError::UnsafeStateDirectory(_))
+        ));
     }
 
     #[test]

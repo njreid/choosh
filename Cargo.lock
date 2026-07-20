@@ -250,6 +250,7 @@ name = "chooshd"
 version = "0.0.0"
 dependencies = [
  "choosh-core",
+ "choosh-host",
  "choosh-protocol",
  "serde_json",
 ]

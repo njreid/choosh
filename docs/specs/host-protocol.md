@@ -10,6 +10,16 @@ The host protocol connects Android's Rust engine to `chooshd` without opening a 
 Android Rust → SSH exec → choosh-host rpc → 0600 Unix socket → chooshd
 ```
 
+The normal RPC channel uses `choosh-host rpc --stdio`. A deployment
+composition root MAY instead invoke `chooshd rpc --stdio --state-dir
+<absolute-state-dir> --socket <absolute-socket>` directly. Both paths are
+explicitly injected configuration: neither helper discovers a socket through
+`HOME`, the current directory, environment variables, or a default path. The
+socket MUST be the immediate child of the supplied state directory, and the
+relay verifies that the directory is private and real and that the endpoint is
+a mode-`0600` Unix socket before connecting. Android does not send either path
+on the SSH channel.
+
 ## Transport
 
 The client executes `choosh-host rpc --stdio`. Standard input and output carry frames. Standard error is diagnostic only and MUST NOT contain protocol data or secrets.
@@ -100,4 +110,3 @@ internal
 ```
 
 Unknown error codes are treated as `internal` while preserving the display message.
-
