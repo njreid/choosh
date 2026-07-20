@@ -33,6 +33,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The fixed host dispatcher and `chooshd rpc --stdio` now share an explicit bounded
   state/socket plan. Their actual platform process adapter remains an injected outer
   capability, so no ambient path lookup or shell execution has been introduced.
+- [x] Native authenticated-plan tokens are type-separated from generic requests, and the
+  host has an injected direct-process adapter that emits only the fixed daemon argv. Both
+  remain fail-closed until their outer platform compositions provide verified transport.
 - [x] Android profile/known-host metadata, authenticated-operation composition, and an
   opaque JNI plan boundary have headless evidence. The JNI plan deliberately does not
   claim a live connection until native exact-host admission and Keystore signing exist.
