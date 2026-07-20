@@ -17,6 +17,7 @@ public final class RustNativeConnectorJni {
     public interface NativePlanBridge {
         int abiVersion();
         long beginAuthenticatedPlan(int generation, NativeHandles handles);
+        int openAuthenticatedPlan(int generation, long plan);
         int cancelAuthenticatedPlan(int generation, long plan);
     }
 
@@ -80,6 +81,18 @@ public final class RustNativeConnectorJni {
             this.value = value;
         }
 
+        /**
+         * Advances this admitted token through the native transport boundary.
+         *
+         * <p>The status is intentionally opaque to callers: only the production transport
+         * adapter maps it to a public connection result. The token remains owned by this
+         * lifecycle and must still be closed exactly once.</p>
+         */
+        int open() throws NativePlanException {
+            if (value == 0) throw new NativePlanException();
+            return bridge.openAuthenticatedPlan(generation, value);
+        }
+
         @Override public void close() throws NativePlanException {
             if (value == 0) return;
             long closing = value;
@@ -107,6 +120,10 @@ public final class RustNativeConnectorJni {
             );
         }
 
+        @Override public int openAuthenticatedPlan(int generation, long plan) {
+            return nativeOpenAuthenticatedPlan(generation, plan);
+        }
+
         @Override public int cancelAuthenticatedPlan(int generation, long plan) {
             return nativeCancelAuthenticatedPlan(generation, plan);
         }
@@ -116,5 +133,6 @@ public final class RustNativeConnectorJni {
             int generation, long endpoint, long username, long knownHost, long credentialRef, long publicKey
         );
         private static native int nativeCancelAuthenticatedPlan(int generation, long plan);
+        private static native int nativeOpenAuthenticatedPlan(int generation, long plan);
     }
 }

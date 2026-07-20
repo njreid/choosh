@@ -45,6 +45,18 @@ public final class PlannedNativeConnectorPortTest {
         assertEquals(1, bridge.cancels);
     }
 
+    @Test public void production_jni_transport_fails_closed_without_a_verified_native_session() throws Exception {
+        RecordingBridge bridge = new RecordingBridge(1, 29, 0);
+        PlannedNativeConnectorPort port = port(bridge, new PlannedNativeConnectorPort.JniPlannedTransport());
+        Outcome outcome = new Outcome();
+
+        port.open(input(), outcome);
+
+        assertEquals(1, bridge.opens);
+        assertEquals(1, bridge.cancels);
+        assertEquals(1, outcome.completions);
+    }
+
     private static PlannedNativeConnectorPort port(
         RecordingBridge bridge, PlannedNativeConnectorPort.PlannedTransportPort transport
     ) {
@@ -101,6 +113,7 @@ public final class PlannedNativeConnectorPortTest {
         final int cancelResult;
         int generation;
         int cancels;
+        int opens;
         RecordingBridge(int abi, long plan, int cancelResult) {
             this.abi = abi; this.plan = plan; this.cancelResult = cancelResult;
         }
@@ -108,6 +121,7 @@ public final class PlannedNativeConnectorPortTest {
         @Override public long beginAuthenticatedPlan(int generation, RustNativeConnectorJni.NativeHandles handles) {
             this.generation = generation; return plan;
         }
+        @Override public int openAuthenticatedPlan(int generation, long plan) { opens++; return 5; }
         @Override public int cancelAuthenticatedPlan(int generation, long plan) {
             cancels++; return cancelResult;
         }

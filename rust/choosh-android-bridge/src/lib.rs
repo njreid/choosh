@@ -14,6 +14,7 @@ const STATUS_STALE_GENERATION: i32 = 1;
 const STATUS_UNKNOWN_REQUEST: i32 = 2;
 const STATUS_CAPACITY: i32 = 3;
 const STATUS_INVALID_ARGUMENT: i32 = 4;
+const STATUS_TRANSPORT_UNAVAILABLE: i32 = 5;
 const AUTHENTICATED_PLAN_STATUS: u32 = 8;
 const SLOT_COUNT: usize = 64;
 
@@ -83,6 +84,32 @@ pub extern "C" fn choosh_bridge_authenticated_plan_cancel(generation: u32, plan:
     choosh_bridge_request_cancel(generation, plan)
 }
 
+/// Attempts to advance an admitted plan into the native transport.
+///
+/// This deliberately fails closed until a later composition root can resolve
+/// the opaque Android handles into an injected stream, exact-host-key verifier,
+/// and Keystore-backed signer. In particular it never asks Android to provide
+/// credential material and it never treats plan creation as authentication.
+/// The request remains owned by the Java plan lifecycle and must be cancelled
+/// by its caller after this result.
+#[unsafe(no_mangle)]
+pub extern "C" fn choosh_bridge_authenticated_plan_open(generation: u32, plan: u64) -> i32 {
+    if generation == 0 || generation != GENERATION.load(Ordering::Acquire) {
+        return STATUS_STALE_GENERATION;
+    }
+    if plan == 0 || generation_of(plan) != generation {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    if REQUESTS
+        .iter()
+        .any(|slot| slot.load(Ordering::Acquire) == plan)
+    {
+        STATUS_TRANSPORT_UNAVAILABLE
+    } else {
+        STATUS_UNKNOWN_REQUEST
+    }
+}
+
 // JNI wrappers intentionally accept only primitive values. The Java side
 // resolves typed profile metadata to opaque handles before this boundary, so
 // Rust never dereferences a JVM object or receives credential material.
@@ -137,6 +164,19 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeCancelAuthent
         return STATUS_INVALID_ARGUMENT;
     }
     choosh_bridge_authenticated_plan_cancel(generation.cast_unsigned(), plan.cast_unsigned())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeOpenAuthenticatedPlan(
+    _environment: *mut c_void,
+    _class: *mut c_void,
+    generation: i32,
+    plan: i64,
+) -> i32 {
+    if generation <= 0 || plan <= 0 {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    choosh_bridge_authenticated_plan_open(generation.cast_unsigned(), plan.cast_unsigned())
 }
 
 /// Cancels a request at most once and returns a stable typed status code.
@@ -234,8 +274,21 @@ mod tests {
         let plan = choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 4, 5);
         assert_ne!(plan, 0);
         assert_eq!(
+            choosh_bridge_authenticated_plan_open(generation, plan),
+            STATUS_TRANSPORT_UNAVAILABLE
+        );
+        assert_eq!(
             choosh_bridge_authenticated_plan_cancel(generation, plan),
             STATUS_OK
+        );
+    }
+
+    #[test]
+    fn unowned_authenticated_plan_cannot_advance_to_transport() {
+        let generation = choosh_bridge_generation();
+        assert_eq!(
+            choosh_bridge_authenticated_plan_open(generation, u64::from(generation) << 32 | 0x004d),
+            STATUS_UNKNOWN_REQUEST
         );
     }
 }

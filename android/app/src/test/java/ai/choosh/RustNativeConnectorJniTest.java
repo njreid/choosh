@@ -23,6 +23,7 @@ public final class RustNativeConnectorJniTest {
         RustNativeConnectorJni.Plan plan = factory.begin(7, connector.input);
         assertEquals(7, bridge.generation);
         assertEquals("NativeHandles(REDACTED)", bridge.handles.toString());
+        assertEquals(5, plan.open());
         plan.close();
         plan.close();
         assertEquals(1, bridge.cancels);
@@ -91,6 +92,7 @@ public final class RustNativeConnectorJniTest {
             this.handles = handles;
             return plan;
         }
+        @Override public int openAuthenticatedPlan(int generation, long plan) { return 5; }
         @Override public int cancelAuthenticatedPlan(int generation, long plan) {
             cancels++;
             return 0;

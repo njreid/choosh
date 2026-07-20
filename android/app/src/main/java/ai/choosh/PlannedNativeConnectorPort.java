@@ -62,6 +62,33 @@ public final class PlannedNativeConnectorPort
         ) throws NativeAuthenticatedSshConnector.NativeBridgeException;
     }
 
+    /**
+     * First production transport adapter. The current native bridge is intentionally fail-closed
+     * while its handle registry cannot yet compose an injected stream, exact host-key verifier,
+     * and Keystore signer. This adapter therefore never reports a connected session from plan
+     * admission alone.
+     */
+    public static final class JniPlannedTransport implements PlannedTransportPort {
+        private static final int STATUS_TRANSPORT_UNAVAILABLE = 5;
+
+        @Override public void open(
+            RustNativeConnectorJni.Plan plan,
+            NativeAuthenticatedSshConnector.NativeOpenCallback callback
+        ) throws NativeAuthenticatedSshConnector.NativeBridgeException {
+            Objects.requireNonNull(plan, "plan");
+            Objects.requireNonNull(callback, "callback");
+            try {
+                if (plan.open() != STATUS_TRANSPORT_UNAVAILABLE) {
+                    throw new NativeAuthenticatedSshConnector.NativeBridgeException();
+                }
+                callback.onComplete(NativeAuthenticatedSshConnector.NativeOpenResult.failure(
+                    NativeAuthenticatedSshConnector.Code.TRANSPORT_UNAVAILABLE));
+            } catch (RustNativeConnectorJni.NativePlanException exception) {
+                throw new NativeAuthenticatedSshConnector.NativeBridgeException();
+            }
+        }
+    }
+
     private static final class Completion {
         private final RustNativeConnectorJni.Plan plan;
         private final NativeAuthenticatedSshConnector.NativeOpenCallback callback;
