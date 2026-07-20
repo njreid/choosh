@@ -188,8 +188,10 @@ public final class NativeAuthenticatedSshConnector
             Objects.requireNonNull(callback, "callback");
             try {
                 session.executeRpc(request.copyBytesForNativeAdapter(), result -> {
-                    if (result == null) throw new IllegalArgumentException("native RPC result missing");
-                    callback.onResult(result.toRpcResult());
+                    // The callback can run after this method returns, so throwing here would
+                    // escape the transport boundary and crash its callback thread. Preserve the
+                    // malformed-result signal for the coordinator's typed presentation state.
+                    callback.onResult(result == null ? null : result.toRpcResult());
                 });
             } catch (NativeBridgeException exception) {
                 throw new AuthenticatedSshOperationCoordinator.SshTransportException();

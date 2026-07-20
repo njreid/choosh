@@ -325,7 +325,7 @@ fn is_uuid(value: &str) -> bool {
             if matches!(index, 8 | 13 | 18 | 23) {
                 byte == b'-'
             } else {
-                byte.is_ascii_hexdigit()
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
             }
         })
 }
@@ -514,6 +514,15 @@ mod tests {
         assert_eq!(
             normalize_codex(&malformed, &hook("Stop")),
             Err(ValidationError::InvalidItemId)
+        );
+
+        let uppercase = AdapterContext {
+            workspace_id: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            ..context(AgentAdapter::Codex)
+        };
+        assert_eq!(
+            normalize_codex(&uppercase, &hook("Stop")),
+            Err(ValidationError::InvalidWorkspaceId)
         );
     }
 

@@ -62,6 +62,27 @@ public final class NativeAuthenticatedSshConnectorTest {
             () -> connector.openVerified(request(), result -> { }));
     }
 
+    @Test public void null_native_rpc_result_is_reported_to_the_callback_without_throwing() throws Exception {
+        NativeAuthenticatedSshConnector.NativeSession session = (request, callback) -> callback.onComplete(null);
+        NativeAuthenticatedSshConnector.NativeOpenResult open =
+            NativeAuthenticatedSshConnector.NativeOpenResult.connected(session);
+        Outcome outcome = new Outcome();
+
+        new AuthenticatedSshOperationCoordinator(profileId -> request(),
+            new NativeAuthenticatedSshConnector((input, callback) -> callback.onComplete(open)))
+            .open(new AuthenticatedSshOperationCoordinator.ProfileId("fixture_profile"), outcome);
+
+        AtomicInteger callbacks = new AtomicInteger();
+        outcome.result.operations().executeRpc(
+            new AuthenticatedSshOperationCoordinator.RpcRequest(new byte[] {1}),
+            response -> {
+                callbacks.incrementAndGet();
+                assertNull(response);
+            }
+        );
+        assertEquals(1, callbacks.get());
+    }
+
     private static AuthenticatedSshOperationCoordinator.ConnectionRequest request() {
         return new AuthenticatedSshOperationCoordinator.ConnectionRequest(
             new AuthenticatedSshOperationCoordinator.ProfileId("fixture_profile"),

@@ -22,7 +22,6 @@ pub enum ConnectionFailure {
     HostKeyRejected,
     HostKeyMismatch,
     AuthenticationFailed,
-    TransportFailed,
     RetryExhausted,
     GenerationOverflow,
     InvalidTransition,
@@ -35,7 +34,6 @@ impl ConnectionFailure {
             Self::HostKeyRejected => "host_key_rejected",
             Self::HostKeyMismatch => "host_key_mismatch",
             Self::AuthenticationFailed => "authentication_failed",
-            Self::TransportFailed => "transport_failed",
             Self::RetryExhausted => "retry_exhausted",
             Self::GenerationOverflow => "connection_generation_overflow",
             Self::InvalidTransition => "invalid_connection_transition",
@@ -44,7 +42,7 @@ impl ConnectionFailure {
 
     #[must_use]
     pub const fn retryable(self) -> bool {
-        matches!(self, Self::TransportFailed | Self::RetryExhausted)
+        false
     }
 }
 
@@ -345,6 +343,13 @@ mod tests {
         machine.authentication_failed().unwrap();
         let failure = ConnectionFailure::AuthenticationFailed;
         assert_eq!(failure.code(), "authentication_failed");
+        assert!(!failure.retryable());
+    }
+
+    #[test]
+    fn terminal_retry_exhaustion_is_not_retryable() {
+        let failure = ConnectionFailure::RetryExhausted;
+        assert_eq!(failure.code(), "retry_exhausted");
         assert!(!failure.retryable());
     }
 
