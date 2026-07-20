@@ -17,6 +17,16 @@ const STATUS_INVALID_ARGUMENT: i32 = 4;
 const STATUS_TRANSPORT_UNAVAILABLE: i32 = 5;
 const AUTHENTICATED_PLAN_STATUS: u32 = 8;
 const SLOT_COUNT: usize = 64;
+// Request tokens are process-local opaque capabilities, not serialized IDs. Keeping the
+// request kind in the atomically stored token prevents a generic bridge request from being
+// reinterpreted as an authenticated plan during a slot reuse race.
+const TOKEN_KIND_BITS: u32 = 4;
+const TOKEN_ID_BITS: u32 = 30;
+const TOKEN_GENERATION_BITS: u32 = 30;
+const TOKEN_KIND_MASK: u32 = (1 << TOKEN_KIND_BITS) - 1;
+const TOKEN_KIND_MASK_U64: u64 = TOKEN_KIND_MASK as u64;
+const TOKEN_ID_MASK: u32 = (1 << TOKEN_ID_BITS) - 1;
+const TOKEN_GENERATION_MASK: u32 = (1 << TOKEN_GENERATION_BITS) - 1;
 
 static GENERATION: AtomicU32 = AtomicU32::new(1);
 static NEXT_REQUEST: AtomicU32 = AtomicU32::new(1);
@@ -37,14 +47,19 @@ pub extern "C" fn choosh_bridge_generation() -> u32 {
 /// Begins a bounded request, returning zero and a typed status on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn choosh_bridge_request_begin(generation: u32, status: u32) -> u64 {
-    if generation == 0 || status == 0 || generation != GENERATION.load(Ordering::Acquire) {
+    if generation == 0
+        || generation > TOKEN_GENERATION_MASK
+        || status == 0
+        || status > TOKEN_KIND_MASK
+        || generation != GENERATION.load(Ordering::Acquire)
+    {
         return 0;
     }
     let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
-    if id == 0 {
+    if id == 0 || id > TOKEN_ID_MASK {
         return 0;
     }
-    let key = encode(generation, id);
+    let key = encode(generation, id, status);
     for slot in &REQUESTS {
         if slot
             .compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire)
@@ -97,7 +112,10 @@ pub extern "C" fn choosh_bridge_authenticated_plan_open(generation: u32, plan: u
     if generation == 0 || generation != GENERATION.load(Ordering::Acquire) {
         return STATUS_STALE_GENERATION;
     }
-    if plan == 0 || generation_of(plan) != generation {
+    if plan == 0
+        || generation_of(plan) != generation
+        || kind_of(plan) != u64::from(AUTHENTICATED_PLAN_STATUS)
+    {
         return STATUS_INVALID_ARGUMENT;
     }
     if REQUESTS
@@ -185,7 +203,7 @@ pub extern "C" fn choosh_bridge_request_cancel(generation: u32, request: u64) ->
     if generation == 0 || generation != GENERATION.load(Ordering::Acquire) {
         return STATUS_STALE_GENERATION;
     }
-    if request == 0 || generation_of(request) != generation {
+    if request == 0 || generation_of(request) != generation || kind_of(request) == 0 {
         return STATUS_INVALID_ARGUMENT;
     }
     for slot in &REQUESTS {
@@ -202,7 +220,7 @@ pub extern "C" fn choosh_bridge_request_cancel(generation: u32, request: u64) ->
 /// Advances process recreation generation and invalidates every old callback ID.
 #[unsafe(no_mangle)]
 pub extern "C" fn choosh_bridge_recreate(expected_generation: u32) -> i32 {
-    if expected_generation == 0 {
+    if expected_generation == 0 || expected_generation >= TOKEN_GENERATION_MASK {
         return STATUS_INVALID_ARGUMENT;
     }
     let Some(next) = expected_generation.checked_add(1) else {
@@ -231,12 +249,18 @@ pub extern "C" fn choosh_bridge_status_capacity() -> i32 {
     STATUS_CAPACITY
 }
 
-const fn encode(generation: u32, id: u32) -> u64 {
-    (generation as u64) << 32 | id as u64
+const fn encode(generation: u32, id: u32, kind: u32) -> u64 {
+    ((generation as u64) << (TOKEN_ID_BITS + TOKEN_KIND_BITS))
+        | ((id as u64) << TOKEN_KIND_BITS)
+        | kind as u64
 }
 
 const fn generation_of(request: u64) -> u32 {
-    (request >> 32) as u32
+    ((request >> (TOKEN_ID_BITS + TOKEN_KIND_BITS)) as u32) & TOKEN_GENERATION_MASK
+}
+
+const fn kind_of(request: u64) -> u64 {
+    request & TOKEN_KIND_MASK_U64
 }
 
 #[cfg(test)]
@@ -287,8 +311,23 @@ mod tests {
     fn unowned_authenticated_plan_cannot_advance_to_transport() {
         let generation = choosh_bridge_generation();
         assert_eq!(
-            choosh_bridge_authenticated_plan_open(generation, u64::from(generation) << 32 | 0x004d),
+            choosh_bridge_authenticated_plan_open(
+                generation,
+                encode(generation, 0x004d, AUTHENTICATED_PLAN_STATUS),
+            ),
             STATUS_UNKNOWN_REQUEST
         );
+    }
+
+    #[test]
+    fn generic_request_cannot_claim_authenticated_plan_admission() {
+        let generation = choosh_bridge_generation();
+        let generic = choosh_bridge_request_begin(generation, 7);
+        assert_ne!(generic, 0);
+        assert_eq!(
+            choosh_bridge_authenticated_plan_open(generation, generic),
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(choosh_bridge_request_cancel(generation, generic), STATUS_OK);
     }
 }
