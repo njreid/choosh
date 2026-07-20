@@ -11,6 +11,7 @@ acceptance harnesses are defined in the [detailed milestone designs](../design/R
 | [Android and Kotlin toolchain](android-toolchain.md) | Stable SDK/toolchain baseline, compatibility and update policy | Draft |
 | [Terminal rendering and input](terminal-experience.md) | Zelland GPU port, Android IME, extra keys, gestures and recovery | Draft |
 | [Host protocol](host-protocol.md) | SSH stdio framing, handshake, RPC, events, errors | Draft |
+| [Native SSH reconnect](native-ssh-reconnect.md) | Re-admission, retry, generation invalidation, and recovery after network loss | Draft |
 | [Workspace and item model](workspace-items.md) | Explicit workspaces and typed Zellij-backed items | Draft |
 | [Agent interoperability](agent-events.md) | Codex, OpenCode, Claude hooks and notifications | Draft |
 | [Client-side Git diff](git-diff.md) | Status, version retrieval, diff model, limits | Draft |

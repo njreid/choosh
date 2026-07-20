@@ -77,7 +77,8 @@ bounded resources, and a commit/push after verification.
 
 1. **Complete the native Android connector.** Turn the opaque JNI plan into a real
    exact-host-key-before-signing connection using a reviewed Keystore callback and a
-   bounded stream adapter; continue to expose no private key material.
+   bounded stream adapter; add deterministic reconnect/recovery using the native SSH
+   reconnect contract, while continuing to expose no private key material.
 2. **Complete concrete host/SFTP adapters.** Compose the host launcher with an injected
    process adapter, and add only server-proven root-confined/atomic SFTP operations.
 3. **M0-R5/M0-R6 vertical proof.** Exercise the real Android/native connector,
