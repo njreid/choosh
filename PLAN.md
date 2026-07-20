@@ -53,6 +53,12 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Text diff construction now uses bounded Myers frontiers rather than a quadratic
   old-lines by new-lines LCS matrix; large unchanged inputs have headless coverage and
   retained-frontier exhaustion still returns metadata only.
+- [x] The first bounded `git.status` vertical host slice accepts only registered opaque
+  workspace UUIDs, executes a fixed environment-cleared Git plan, reconciles paths under
+  the registered root, and proves byte-preserving paths through a private Unix socket.
+- [x] Android has a headless `git.status` request/response codec and controller with
+  injected request IDs, strict envelope/base64 validation, and typed failure projection;
+  it is deliberately not wired to the unavailable live SSH connector yet.
 - [x] Blob capability completion consumes a bounded reader and stops an oversized source
   after the first byte above its declared limit; daemon fixture roots are unique under
   parallel headless test execution.
@@ -100,10 +106,9 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **Land one real vertical composition.** Add a fixed-argv `git status` daemon method
-   that clears its environment, reconciles returned paths under the registered root, and
-   returns bounded metadata over the private socket and SSH stdio bridge. Exercise it from
-   the Android connector boundary; do not add another isolated primitive first.
+1. **Join the first vertical composition.** Exercise the existing bounded `git.status`
+   daemon/private-socket slice through the Android connector boundary; do not claim it is
+   live until exact host-key admission and Keystore signing are present.
 2. **Complete the native Android connector.** Turn the opaque JNI plan into a real
    exact-host-key-before-signing connection using a reviewed Keystore callback and a
    bounded stream adapter; add deterministic reconnect/recovery while continuing to expose
