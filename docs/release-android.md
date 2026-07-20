@@ -53,3 +53,17 @@ Before treating a release as complete, verify the GitHub Release contains exactl
 - `choosh-VERSION.cdx.json`;
 - `choosh-VERSION-NOTICE.txt`;
 - the GitHub provenance attestation associated with the APK.
+
+## LGPL component evidence
+
+Sora Editor is an accepted LGPL-2.1-or-later dependency. Acceptance does not by
+itself establish that a particular APK distribution satisfies every applicable
+obligation. Before a release containing Sora is promoted, retain the evidence
+listed in [the Sora packaging record](licenses/sora-packaging.md): the exact
+resolved artifact/source identity, the complete notice and licence text, Choosh
+modification status, and the source/replacement information made available with
+the release. The release gate must fail closed if that record is incomplete.
+
+This is an engineering evidence requirement, not legal advice. The release owner
+remains responsible for obtaining legal review where the selected packaging or
+distribution model requires it.

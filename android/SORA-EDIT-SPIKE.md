@@ -1,6 +1,7 @@
 # Sora-to-Rust revisioned edit spike
 
-Status: Event API and LGPL acceptance verified; blocked on the headless adapter fixture.
+Status: Event API and project licence acceptance verified; blocked on the headless
+adapter fixture and release distribution evidence.
 
 ## Evidence in this checkout
 
@@ -32,7 +33,8 @@ The published AAR SHA-256 is
 
 Upstream and the published POM identify Sora as LGPL-2.1-or-later (the POM labels
 it LGPL 2.1). The project has accepted that licence for this integration; its
-source and notice obligations remain recorded for release evidence. Its runtime
+source, notice, and distribution obligations remain release gates described in
+[the Sora packaging record](../docs/licenses/sora-packaging.md). Its runtime
 graph includes AndroidX Collection 1.5.0, Kotlin stdlib 2.3.10, and AndroidX
 Annotation 1.10.0; that graph must be locked and verified on Choosh's Kotlin
 2.4.10/AGP 9.3.0 baseline before it becomes a production dependency.

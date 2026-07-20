@@ -19,6 +19,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   [ADR 0006](docs/adr/0006-android-min-sdk.md).
 - [x] Font assets and terminal provenance candidates are recorded, including the
   requested Geomini and Iosevka Charon Mono UI/terminal direction.
+- [x] Sora is an accepted LGPL-2.1-or-later dependency for the editor spike; its
+  exact packaging/source/notice evidence remains an explicit release gate rather
+  than an implied consequence of dependency acceptance.
 - [x] User-approved SSH-key import is modeled as an opaque, redacted credential
   reference plus public-key metadata; it neither reads Termux private storage nor
   exposes private-key material to the Rust domain.
@@ -67,6 +70,12 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   its [recorded grant](docs/licenses/zelland-grant.md) clears that provenance item.
 - [ ] The native terminal still needs a pinned native graph and Android implementation/device
   conformance result; see [terminal provenance](docs/licenses/terminal-provenance.md).
+- [ ] Bundled-font authoritative upstream identity, deterministic fallback layout
+  evidence, and Sora distribution evidence remain release blockers; see
+  [terminal provenance](docs/licenses/terminal-provenance.md) and [Sora packaging](docs/licenses/sora-packaging.md).
+- [ ] No preview currently supplies the opt-in redacted diagnostic bundle required
+  for supportable public distribution; its headless-first contract is in
+  [diagnostics](docs/specs/diagnostics.md).
 
 `v0.0.1` is an early signed distribution slice, not an assertion that M0 or a
 public-1.0 milestone has passed.
@@ -102,9 +111,10 @@ bounded resources, and a commit/push after verification.
 4. **Then widen host/SFTP operations.** Compose the injected host process adapter and add
    only server-proven root-confined/atomic SFTP operations after the first vertical thread
    is reachable.
-5. **Terminal go/no-go.** Obtain terminal source permission/licence or choose a
-   permitted replacement; then implement the renderer behind the existing interface
-   and run headless conformance plus isolated device instrumentation.
+5. **Terminal go/no-go.** Preserve the recorded Zelland grant, close native and
+   font provenance gates, then implement the wgpu renderer behind the existing
+   interface (or approve the specified CPU cell-grid fallback by ADR) and run
+   headless conformance plus isolated device instrumentation.
 6. **M1 profile/workspace slice.** Persist profiles securely, pin known hosts, list
    explicit registrations, create/adopt Zellij sessions, and exercise reconnect and
    separated destructive lifecycle actions in one black-box scenario.

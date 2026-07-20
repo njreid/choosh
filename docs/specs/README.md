@@ -17,6 +17,7 @@ acceptance harnesses are defined in the [detailed milestone designs](../design/R
 | [Client-side Git diff](git-diff.md) | Status, version retrieval, diff model, limits | Draft |
 | [Development services](service-tunnels.md) | Explicit launch, lifecycle, SSH/WebView tunnel | Draft |
 | [Android navigation](android-navigation.md) | Explorer, pinning, deep links, page restoration | Draft |
+| [Diagnostics and support bundles](diagnostics.md) | Opt-in redacted local diagnostics and crash/support evidence | Draft |
 
 ## Normative language
 
