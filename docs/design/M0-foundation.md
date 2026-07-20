@@ -29,9 +29,9 @@ The skeleton contains these ownership units:
 
 ```text
 android/app        packaging and Android lifecycle
-android/ui         Compose hosts and platform adapters
+android/app        Java/View M0 screen and Android composition roots
 rust/choosh-core   state actor and client domain model
-rust/choosh-android typed Kotlin/Rust bridge
+rust/choosh-android-bridge typed Android/Rust bridge
 rust/choosh-web    loopback rendering/gateway primitives
 rust/chooshd       authoritative workspace/item metadata
 rust/choosh-host   stdio RPC, stream and hook CLI
@@ -129,7 +129,7 @@ Programmatic Sora updates carry an adapter suppression token. They update the wi
 ### Headless evidence
 
 - Rust model tests generate edit sequences, Unicode boundaries, cancellation races and callback reorderings from fixed seeds.
-- A JVM bridge contract test uses the packaged native library without Compose and asserts typed success, error, callback and cancellation behavior.
+- A JVM bridge contract test uses the packaged native library without a Compose dependency and asserts typed success, error, callback and cancellation behavior.
 - A Robolectric or instrumentation adapter test feeds synthetic `ContentChangeEvent` values and asserts exactly one Rust mutation per user edit and zero mutations for projection updates.
 - A saved-state fixture serializes only durable client identifiers/revisions, reconstructs the engine, and proves stale callbacks cannot mutate the new generation.
 

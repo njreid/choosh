@@ -42,6 +42,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The Android candidate flow now has deterministic profile connection and authenticated
   workspace-status controllers. Native plans cannot advance without bridge ownership and fail
   closed to a typed transport-unavailable result.
+- [x] Documentation now distinguishes the Java/View M0 connection-status screen and bounded
+  `bounded-lcs-v1` reference diff from the future Compose/navigation and production-diff
+  targets. Agent integration is described as per-agent pluggable adapters, not neutrality.
 - [x] A generated-key protocol harness proves fixed exec, SFTP subsystem, and loopback-only
   forwarding can coexist on one authenticated Russh transport. It is not yet the full
   Android-to-host vertical acceptance harness.
@@ -62,7 +65,7 @@ public-1.0 milestone has passed.
 
 | Milestone | State | Evidence / remaining gate |
 |---|---|---|
-| M0 — Foundation | **In progress** | Build, editor, bridge/RPC, release, SSH channel evidence, and a protocol multiplex harness exist. M0-R5/R6 still need the native Android connector, actual process adapter, and a full vertical harness; M0-R7/R15 remain blocked on terminal provenance and device implementation. Required Android CI is being stabilized. |
+| M0 — Foundation | **In progress** | Build, editor seams, bridge/RPC, release, SSH channel evidence, and a protocol multiplex harness exist. The shipped M0 UI is a Java/View connection-status screen, not the future Compose shell. M0-R5/R6 still need one composed Android-to-daemon proof; M0-R7/R15 remain blocked on terminal provenance and device implementation. |
 | M1 — Remote workspace | **Not started** | Depends on M0 SSH and terminal gates. Profile/known-host and root-confined SFTP read seams exist, but a concrete live transport, safe atomic writes, Zellij, Markdown, reconnect, and lifecycle acceptance remain future work. |
 | M2 — Agents and notifications | **Not started** | Adapter/event and Android notification slices await the M1 remote foundation. |
 | M3 — Pinning and services | **Not started** | Depends on M2 snapshots and verified SSH `direct-tcpip`. |
@@ -75,17 +78,20 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **Complete the native Android connector.** Turn the opaque JNI plan into a real
+1. **Land one real vertical composition.** Add a fixed-argv `git status` daemon method
+   that clears its environment, reconciles returned paths under the registered root, and
+   returns bounded metadata over the private socket and SSH stdio bridge. Exercise it from
+   the Android connector boundary; do not add another isolated primitive first.
+2. **Complete the native Android connector.** Turn the opaque JNI plan into a real
    exact-host-key-before-signing connection using a reviewed Keystore callback and a
-   bounded stream adapter; add deterministic reconnect/recovery using the native SSH
-   reconnect contract, while continuing to expose no private key material.
-2. **Complete concrete host/SFTP adapters.** Compose the host launcher with an injected
-   process adapter, and add only server-proven root-confined/atomic SFTP operations.
+   bounded stream adapter; add deterministic reconnect/recovery while continuing to expose
+   no private key material.
 3. **M0-R5/M0-R6 vertical proof.** Exercise the real Android/native connector,
-   credential use, multiplexed channels, bounded cancellation, and negotiated
-   stdio-to-private-socket RPC in one release harness—not only protocol fakes.
-4. **Android candidate flow and CI.** Make the profile → connect → workspace-status
-   flow installable/headless-testable, and restore a green required pre-device CI lane.
+   credential use, the fixed daemon method, bounded cancellation, and negotiated
+   stdio-to-private-socket RPC in one harness—not only protocol fakes.
+4. **Then widen host/SFTP operations.** Compose the injected host process adapter and add
+   only server-proven root-confined/atomic SFTP operations after the first vertical thread
+   is reachable.
 5. **Terminal go/no-go.** Obtain terminal source permission/licence or choose a
    permitted replacement; then implement the renderer behind the existing interface
    and run headless conformance plus isolated device instrumentation.

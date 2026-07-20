@@ -4,7 +4,16 @@ Status: Accepted
 
 ## Decision
 
-Jetpack Compose owns navigation and the fixed explorer. Sora provides source editing through `AndroidView`. A native `SurfaceView` hosts the Rust GPU terminal. Internal Markdown uses a locked-down WebView driven by Rust/Maud/Datastar. Development services use a separate isolated WebView and authenticated loopback gateway. Agent pages are complete interactive terminal TUIs, not parsed native chats.
+This ADR records the target presentation architecture, not the current M0 implementation.
+The current Android application is a programmatic Java/View connection-status screen;
+it has no Compose navigation/explorer, Sora editor, terminal, or WebView surface.
+
+When those surfaces are implemented, Jetpack Compose will own navigation and the fixed
+explorer. Sora will provide source editing through `AndroidView`. A native `SurfaceView`
+will host the Rust GPU terminal. Internal Markdown will use a locked-down WebView driven
+by Rust/Maud/Datastar. Development services will use a separate isolated WebView and
+authenticated loopback gateway. Agent pages will remain complete interactive terminal
+TUIs, not parsed native chats.
 
 ## Consequences
 

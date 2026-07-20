@@ -37,7 +37,7 @@ Tapping a row toggles its pinned state. Tapping or gesturing inside an open page
 | Service | Isolated WebView through authenticated SSH gateway |
 | Markdown | Annotatable internal WebView |
 | Source | Sora editor |
-| Git diff | Native Compose unified diff |
+| Git diff | Future native unified-diff surface (not implemented in M0) |
 
 Heavy views are retained and rebound to the focused logical page. Focus changes MUST preserve remote processes, Sora revision state, scroll position where practical, and WebView lifecycle policy.
 
@@ -64,4 +64,3 @@ If the item no longer exists, Choosh opens the workspace explorer and explains t
 - From a pinned page, back returns to the explorer without unpinning.
 - From the explorer, back returns to the workspace list.
 - Stopping an agent/service or terminating a workspace always requires a separately labelled destructive action.
-

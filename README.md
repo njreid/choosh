@@ -1,17 +1,20 @@
 # Choosh
 
-Choosh is an Android-first remote development cockpit for persistent, agent-neutral workspaces.
+Choosh is an Android-first remote development cockpit for persistent, agent-pluggable workspaces.
 
 A workspace is an explicitly registered project root plus a Zellij session with the same name. Each coding agent and development service runs in its own managed Zellij tab. The Android client presents a fixed explorer followed by swipeable pinned terminals, Markdown previews, source editors, Git diffs, and tunneled web services.
 
 ## Status
 
-Choosh is in specification and risk-spike stage. No production APK or host daemon exists yet.
+Choosh is an early engineering preview. Signed preview APK releases, a private-socket
+host daemon, and deterministic boundary tests exist, but the application cannot yet
+establish a live Android-to-host session or provide a usable terminal/workspace flow.
 
 ## Core decisions
 
 - Android application ID: `ai.choosh`
-- Android UI: Jetpack Compose on the [latest mutually compatible stable Android/Kotlin toolchain](docs/specs/android-toolchain.md)
+- Android UI: a programmatic Java/View M0 connection-status screen today; Compose navigation
+  and explorer surfaces remain a future target on the [stable Android/Kotlin toolchain](docs/specs/android-toolchain.md)
 - Terminal: [Zelland-derived native wgpu/glyphon renderer](docs/specs/terminal-experience.md) with libghostty-vt and an Android IME extra-keys bar
 - Source editor: [Sora Editor](https://github.com/Rosemoe/sora-editor)
 - Durable engines: Rust on Android and a small Rust `chooshd` on the host
@@ -19,8 +22,11 @@ Choosh is in specification and risk-spike stage. No production APK or host daemo
 - Persistence: Zellij sessions and tabs
 - Documents: SFTP, with revision-aware saves
 - Markdown: Maud/Datastar fragments in a locked-down WebView
-- Git review: host-supplied metadata/blobs, client-computed native diffs
-- Supported agents: Codex, OpenCode, and Claude Code interactive TUIs
+- Git review: host-supplied metadata/blobs with a bounded native LCS reference diff today;
+  production diff algorithm/fidelity remains pending
+- Agent adapters: fixture-normalized Codex, OpenCode, and Claude Code lifecycle events;
+  each adapter is independently versioned and maintained, and absent/incompatible adapters
+  leave the terminal usable without notification integration
 - Initial host targets: macOS/arm64 and Linux/x86_64
 
 ## Documents
@@ -36,10 +42,9 @@ Choosh is in specification and risk-spike stage. No production APK or host daemo
 ## Planned repository layout
 
 ```text
-android/app/          Android packaging and entry point
-android/ui/           Compose shell and platform adapters
+android/app/          Packaging, Java/View M0 screen, and Android composition roots
 rust/choosh-core/     Android-side state engine
-rust/choosh-android/  Kotlin/Rust bridge
+rust/choosh-android-bridge/  Android/Rust bridge
 rust/choosh-web/      Maud, Datastar, and loopback gateways
 rust/chooshd/         Host workspace/item daemon
 rust/choosh-host/     Host CLI, hooks, and SSH stdio bridge

@@ -43,7 +43,11 @@ Worktree reads MUST be root-confined and checked against the snapshot metadata b
 
 ## Android computation
 
-Android decodes text using the document encoding policy, normalizes only for comparison, and preserves original line-ending metadata. The initial implementation uses bounded histogram or Myers line diff.
+Android decodes text using the document encoding policy, normalizes only for comparison,
+and preserves original line-ending metadata. The current M0 implementation uses the
+bounded quadratic `bounded-lcs-v1` reference algorithm. It is not a claim of Git,
+histogram, Myers, or `imara-diff` fidelity. A production algorithm replacement MUST
+preserve this bounded result contract and add deterministic performance/fidelity evidence.
 
 Default V1 limits:
 
@@ -65,4 +69,3 @@ Selecting a context/addition line opens the new path at its new line. Selecting 
 ## Non-goals
 
 V1 does not stage, unstage, discard, commit, branch, merge, pull, or push. It does not render textual diffs for binary files, submodules, symlinks with unsafe targets, or files above limits.
-
