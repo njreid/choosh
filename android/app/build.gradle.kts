@@ -99,6 +99,10 @@ val buildRustAndroid = tasks.register<Exec>("buildRustAndroid") {
     commandLine(rootProject.file("scripts/build-android-rust.sh").absolutePath)
 }
 
+tasks.matching { it.name == "testDebugUnitTest" }.configureEach {
+    dependsOn(buildRustAndroid)
+}
+
 val checkNativeAbiPackaging = tasks.register("checkNativeAbiPackaging") {
     group = "verification"
     description = "Builds and verifies both native bridge ABIs in the debug APK."
