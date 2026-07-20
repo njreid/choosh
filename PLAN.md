@@ -52,6 +52,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   parallel headless test execution.
 - [x] Handshake, request, and socket-relay readers admit two coalesced frames solely to
   classify duplicate replies explicitly, then fail closed before accepting either result.
+- [x] Linux daemon accepts verify `SO_PEERCRED` against the daemon effective UID before
+  protocol reads. Non-Linux Unix builds fail closed until an equivalent credential adapter
+  is implemented.
 - [x] A generated-key protocol harness proves fixed exec, SFTP subsystem, and loopback-only
   forwarding can coexist on one authenticated Russh transport. It is not yet the full
   Android-to-host vertical acceptance harness.

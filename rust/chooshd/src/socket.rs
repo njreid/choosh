@@ -13,6 +13,11 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use nix::sys::socket::{getsockopt, sockopt};
+#[cfg(target_os = "linux")]
+use nix::unistd::Uid;
+
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_SOCKET_MODE: u32 = 0o600;
 
@@ -82,6 +87,8 @@ pub enum SocketError {
     InvalidLayout(&'static str),
     UnsafeStateDirectory(&'static str),
     ExistingSocketPath,
+    PeerCredentialRejected,
+    PeerCredentialUnavailable,
     Io(io::Error),
 }
 
@@ -94,8 +101,54 @@ impl fmt::Display for SocketError {
                 write!(formatter, "unsafe state directory: {reason}")
             }
             Self::ExistingSocketPath => formatter.write_str("socket path already exists"),
+            Self::PeerCredentialRejected => formatter.write_str("socket peer credential rejected"),
+            Self::PeerCredentialUnavailable => {
+                formatter.write_str("socket peer credential verification unavailable")
+            }
             Self::Io(error) => write!(formatter, "socket filesystem operation failed: {error}"),
         }
+    }
+}
+
+/// Verifies that the connected peer has the daemon's effective Unix user ID.
+///
+/// Socket permissions remain a first boundary. On Linux this additional check
+/// rejects privileged or otherwise substituted peers after accept and before
+/// they can send protocol bytes. Other Unix platforms fail closed until an
+/// equivalent peer-credential adapter is implemented.
+///
+/// # Errors
+///
+/// Returns a content-free failure when peer credentials are unavailable or do
+/// not match the daemon's effective user.
+pub fn verify_same_effective_user(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(), SocketError> {
+    verify_same_effective_user_impl(stream)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_same_effective_user_impl(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(), SocketError> {
+    let peer = getsockopt(stream, sockopt::PeerCredentials)
+        .map_err(|_| SocketError::PeerCredentialUnavailable)?;
+    validate_peer_uid(u64::from(peer.uid()), u64::from(Uid::effective().as_raw()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_same_effective_user_impl(
+    _stream: &std::os::unix::net::UnixStream,
+) -> Result<(), SocketError> {
+    Err(SocketError::PeerCredentialUnavailable)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_peer_uid(peer_uid: u64, effective_uid: u64) -> Result<(), SocketError> {
+    if peer_uid == effective_uid {
+        Ok(())
+    } else {
+        Err(SocketError::PeerCredentialRejected)
     }
 }
 
@@ -251,6 +304,7 @@ fn validate_state_directory(metadata: &fs::Metadata) -> Result<(), SocketError> 
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -286,6 +340,17 @@ mod tests {
         assert!(SocketPlan::new("/state", "/state/nested/daemon.sock").is_err());
         assert!(SocketPlan::new("/state/../state", "/state/daemon.sock").is_err());
         assert!(SocketPlan::new("/state", "/state/daemon.sock").is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_peer_credentials_require_the_daemon_effective_user() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        assert!(verify_same_effective_user(&server).is_ok());
+        assert!(matches!(
+            validate_peer_uid(7, 8),
+            Err(SocketError::PeerCredentialRejected)
+        ));
     }
 
     #[test]

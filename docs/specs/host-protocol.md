@@ -19,6 +19,10 @@ socket MUST be the immediate child of the supplied state directory, and the
 relay verifies that the directory is private and real and that the endpoint is
 a mode-`0600` Unix socket before connecting. Android does not send either path
 on the SSH channel.
+On Linux, the daemon also verifies `SO_PEERCRED` after accept and before reading
+protocol bytes; the peer effective UID MUST equal the daemon effective UID.
+Platforms without an equivalent adapter fail closed rather than silently skipping
+peer-credential verification.
 
 ## Transport
 

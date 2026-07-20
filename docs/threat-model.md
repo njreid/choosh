@@ -64,6 +64,6 @@ Status: Initial draft
 ## Open questions before release
 
 - Host binary update signing and rollback.
-- Unix socket peer credential verification on both host platforms.
+- Equivalent Unix socket peer credential verification for supported non-Linux hosts.
 - WebView data-directory/profile isolation across supported Android versions.
 - Annotation export confidentiality and repository inclusion policy.

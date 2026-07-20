@@ -143,6 +143,7 @@ pub fn serve(
     let limits = limits(max_frame_bytes)?;
     loop {
         let (mut stream, _) = listener.accept()?;
+        socket::verify_same_effective_user(&stream)?;
         let _ = serve_stream_with_limits(&mut stream, config, limits);
     }
 }
@@ -160,6 +161,7 @@ pub fn serve_once(
 ) -> Result<(), DaemonError> {
     let limits = limits(max_frame_bytes)?;
     let (mut stream, _) = listener.accept()?;
+    socket::verify_same_effective_user(&stream)?;
     serve_stream_with_limits(&mut stream, config, limits)
 }
 
