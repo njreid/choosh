@@ -2,11 +2,102 @@
 //!
 //! The dispatcher decoder accepts a bounded argv-shaped request. This module
 //! admits only the one operation presently owned by `choosh-host`:
-//! `chooshd rpc --stdio`. It passes bytes to an injected direct-process
-//! capability; it never constructs shell text, a path, an environment, or a
-//! working directory.
+//! `chooshd rpc --stdio`. It passes bytes and an already validated daemon
+//! socket plan to an injected direct-process capability; it never constructs
+//! shell text or discovers a path, environment, or working directory.
+
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
 
 use crate::exec_stdio::FixedExecRequest;
+
+const MAX_DAEMON_PATH_BYTES: usize = 4_096;
+
+/// Explicit daemon paths held by the host composition root.
+///
+/// These paths never originate in the SSH request. They are deliberately
+/// excluded from `Debug` output because a local path may be sensitive.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DaemonRpcPlan {
+    state_dir: PathBuf,
+    socket_path: PathBuf,
+}
+
+impl DaemonRpcPlan {
+    /// Validates a bounded absolute plan whose socket is the direct state child.
+    ///
+    /// # Errors
+    ///
+    /// Rejects relative, non-normal, oversized, or mismatched paths without
+    /// including either path in the error.
+    pub fn new(
+        state_dir: impl Into<PathBuf>,
+        socket_path: impl Into<PathBuf>,
+    ) -> Result<Self, DaemonRpcPlanError> {
+        let state_dir = state_dir.into();
+        let socket_path = socket_path.into();
+        validate_daemon_path(&state_dir).map_err(|()| DaemonRpcPlanError::InvalidStateDirectory)?;
+        validate_daemon_path(&socket_path).map_err(|()| DaemonRpcPlanError::InvalidSocketPath)?;
+        if socket_path.parent() != Some(state_dir.as_path()) || socket_path.file_name().is_none() {
+            return Err(DaemonRpcPlanError::InvalidSocketLayout);
+        }
+        Ok(Self {
+            state_dir,
+            socket_path,
+        })
+    }
+
+    /// Returns the validated state directory only to the process adapter.
+    #[must_use]
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// Returns the validated socket path only to the process adapter.
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+}
+
+impl fmt::Debug for DaemonRpcPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DaemonRpcPlan([REDACTED])")
+    }
+}
+
+fn validate_daemon_path(path: &Path) -> Result<(), ()> {
+    if !path.is_absolute()
+        || path.as_os_str().as_encoded_bytes().is_empty()
+        || path.as_os_str().as_encoded_bytes().len() > MAX_DAEMON_PATH_BYTES
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Stable invalid-plan classifications without local path diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DaemonRpcPlanError {
+    InvalidStateDirectory,
+    InvalidSocketPath,
+    InvalidSocketLayout,
+}
+
+impl DaemonRpcPlanError {
+    /// Returns a stable machine-readable outcome code.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidStateDirectory => "direct_exec_invalid_state_directory",
+            Self::InvalidSocketPath => "direct_exec_invalid_socket_path",
+            Self::InvalidSocketLayout => "direct_exec_invalid_socket_layout",
+        }
+    }
+}
 
 /// Upper bounds the launcher gives to its direct-process capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,8 +125,10 @@ pub enum DirectExecCapabilityError {
 /// Narrow outer-boundary capability for the allowlisted daemon invocation.
 ///
 /// A concrete implementation must launch `chooshd` directly with the fixed
-/// `rpc --stdio` argument vector and enforce the supplied output bounds while
-/// capturing its pipes. Implementations must not invoke a shell.
+/// `rpc --stdio --state-dir <plan> --socket <plan>` argument vector and
+/// enforce the supplied output bounds while capturing its pipes.
+/// Implementations must not invoke a shell or replace the injected plan with
+/// configuration discovered from the environment.
 pub trait ChooshdRpcProcess {
     /// Runs the fixed daemon RPC operation with bounded standard I/O.
     ///
@@ -44,6 +137,7 @@ pub trait ChooshdRpcProcess {
     /// Returns a sanitized process outcome without host diagnostics.
     fn run_rpc_stdio(
         &mut self,
+        plan: &DaemonRpcPlan,
         stdin: &[u8],
         limits: DirectExecLimits,
     ) -> Result<DirectExecOutput, DirectExecCapabilityError>;
@@ -84,6 +178,7 @@ impl DirectExecError {
 #[derive(Debug)]
 pub struct DirectExecLauncher<P> {
     process: P,
+    daemon_plan: DaemonRpcPlan,
     limits: DirectExecLimits,
 }
 
@@ -97,18 +192,28 @@ where
     ///
     /// Returns [`DirectExecError::InvalidLimits`] if either output stream has
     /// no bounded capture capacity.
-    pub fn new(process: P, limits: DirectExecLimits) -> Result<Self, DirectExecError> {
+    pub fn new(
+        process: P,
+        daemon_plan: DaemonRpcPlan,
+        limits: DirectExecLimits,
+    ) -> Result<Self, DirectExecError> {
         if limits.max_stdout_bytes == 0 || limits.max_stderr_bytes == 0 {
             return Err(DirectExecError::InvalidLimits);
         }
-        Ok(Self { process, limits })
+        Ok(Self {
+            process,
+            daemon_plan,
+            limits,
+        })
     }
 
     /// Admits and launches exactly `chooshd rpc --stdio`.
     ///
     /// The supplied request must already have passed the versioned
-    /// length-delimited decoder. Any other executable or argument vector is
-    /// rejected before the injected process capability is called.
+    /// length-delimited decoder. Its state directory and socket are not part of
+    /// that untrusted request: they are supplied only by the injected plan.
+    /// Any other executable or argument vector is rejected before the injected
+    /// process capability is called.
     ///
     /// # Errors
     ///
@@ -127,7 +232,7 @@ where
         }
         let output = self
             .process
-            .run_rpc_stdio(request.stdin(), self.limits)
+            .run_rpc_stdio(&self.daemon_plan, request.stdin(), self.limits)
             .map_err(map_capability_error)?;
         if output.stdout.len() > self.limits.max_stdout_bytes
             || output.stderr.len() > self.limits.max_stderr_bytes
@@ -159,17 +264,18 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FakeProcess {
-        calls: Vec<(Vec<u8>, DirectExecLimits)>,
+        calls: Vec<(DaemonRpcPlan, Vec<u8>, DirectExecLimits)>,
         result: Option<Result<DirectExecOutput, DirectExecCapabilityError>>,
     }
 
     impl ChooshdRpcProcess for FakeProcess {
         fn run_rpc_stdio(
             &mut self,
+            plan: &DaemonRpcPlan,
             stdin: &[u8],
             limits: DirectExecLimits,
         ) -> Result<DirectExecOutput, DirectExecCapabilityError> {
-            self.calls.push((stdin.to_vec(), limits));
+            self.calls.push((plan.clone(), stdin.to_vec(), limits));
             self.result.take().unwrap_or(Ok(DirectExecOutput {
                 stdout: b"ok".to_vec(),
                 stderr: Vec::new(),
@@ -211,12 +317,17 @@ mod tests {
     fn launcher() -> DirectExecLauncher<FakeProcess> {
         DirectExecLauncher::new(
             FakeProcess::default(),
+            daemon_plan(),
             DirectExecLimits {
                 max_stdout_bytes: 8,
                 max_stderr_bytes: 8,
             },
         )
         .unwrap()
+    }
+
+    fn daemon_plan() -> DaemonRpcPlan {
+        DaemonRpcPlan::new("/run/user/1000/choosh", "/run/user/1000/choosh/daemon.sock").unwrap()
     }
 
     #[test]
@@ -229,9 +340,10 @@ mod tests {
 
         let process = launcher.into_process();
         assert_eq!(process.calls.len(), 1);
-        assert_eq!(process.calls[0].0, b"frame");
+        assert_eq!(process.calls[0].0, daemon_plan());
+        assert_eq!(process.calls[0].1, b"frame");
         assert_eq!(
-            process.calls[0].1,
+            process.calls[0].2,
             DirectExecLimits {
                 max_stdout_bytes: 8,
                 max_stderr_bytes: 8,
@@ -286,6 +398,7 @@ mod tests {
         assert!(matches!(
             DirectExecLauncher::new(
                 FakeProcess::default(),
+                daemon_plan(),
                 DirectExecLimits {
                     max_stdout_bytes: 0,
                     max_stderr_bytes: 1,
@@ -293,5 +406,27 @@ mod tests {
             ),
             Err(DirectExecError::InvalidLimits)
         ));
+    }
+
+    #[test]
+    fn daemon_plan_is_explicit_bounded_and_never_exposes_paths_in_debug_output() {
+        let plan = daemon_plan();
+        assert_eq!(plan.state_dir(), Path::new("/run/user/1000/choosh"));
+        assert_eq!(
+            plan.socket_path(),
+            Path::new("/run/user/1000/choosh/daemon.sock")
+        );
+        assert_eq!(format!("{plan:?}"), "DaemonRpcPlan([REDACTED])");
+
+        for (state, socket) in [
+            ("relative", "relative/daemon.sock"),
+            (
+                "/run/user/1000/../secret",
+                "/run/user/1000/secret/daemon.sock",
+            ),
+            ("/run/user/1000/choosh", "/tmp/daemon.sock"),
+        ] {
+            assert!(DaemonRpcPlan::new(state, socket).is_err());
+        }
     }
 }
