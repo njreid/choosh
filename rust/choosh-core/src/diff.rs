@@ -130,6 +130,16 @@ pub struct DiffLine {
     pub old_line: Option<usize>,
     pub new_line: Option<usize>,
     pub has_terminator: bool,
+    /// Exact terminator style. This makes a CRLF-only edit visible and lets a
+    /// headless consumer reconstruct the right side byte-for-byte.
+    pub terminator: LineTerminator,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LineTerminator {
+    None,
+    Lf,
+    CrLf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,7 +155,7 @@ pub struct LineMapping {
 #[derive(Clone, Copy)]
 struct SourceLine<'a> {
     text: &'a str,
-    terminated: bool,
+    terminator: LineTerminator,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,21 +295,25 @@ fn split_lines(text: &str) -> (Vec<SourceLine<'_>>, Ending) {
         let end = if crlf { index - 1 } else { index };
         lines.push(SourceLine {
             text: &text[start..end],
-            terminated: true,
+            terminator: if crlf {
+                LineTerminator::CrLf
+            } else {
+                LineTerminator::Lf
+            },
         });
         start = index + 1;
     }
     if start < text.len() {
         lines.push(SourceLine {
             text: &text[start..],
-            terminated: false,
+            terminator: LineTerminator::None,
         });
     }
     (lines, ending)
 }
 
 fn lines_equal(left: SourceLine<'_>, right: SourceLine<'_>) -> bool {
-    left.text == right.text && left.terminated == right.terminated
+    left.text == right.text && left.terminator == right.terminator
 }
 
 fn build_hunks(ops: &[Op<'_>], context: usize) -> Vec<Hunk> {
@@ -346,7 +360,8 @@ fn build_hunks(ops: &[Op<'_>], context: usize) -> Vec<Hunk> {
                     text: source.text.to_owned(),
                     old_line,
                     new_line,
-                    has_terminator: source.terminated,
+                    has_terminator: source.terminator != LineTerminator::None,
+                    terminator: source.terminator,
                 });
                 advance(*op, &mut old_no, &mut new_no);
             }
@@ -459,6 +474,20 @@ mod tests {
         assert_eq!(newline_only.hunks[0].lines.len(), 2);
     }
     #[test]
+    fn preserves_and_reports_crlf_only_changes() {
+        let d = text(b"same\r\n", b"same\n");
+        assert_eq!(
+            d.hunks[0]
+                .lines
+                .iter()
+                .map(|line| line.kind)
+                .collect::<Vec<_>>(),
+            vec![LineKind::Deletion, LineKind::Addition]
+        );
+        assert_eq!(d.hunks[0].lines[0].terminator, LineTerminator::CrLf);
+        assert_eq!(d.hunks[0].lines[1].terminator, LineTerminator::Lf);
+    }
+    #[test]
     fn rejects_binary_encoding_and_limits() {
         assert!(matches!(
             compute_diff(
@@ -547,15 +576,19 @@ mod tests {
 
     fn append_source(output: &mut Vec<u8>, line: &SourceLine<'_>) {
         output.extend_from_slice(line.text.as_bytes());
-        if line.terminated {
-            output.push(b'\n');
+        match line.terminator {
+            LineTerminator::None => {}
+            LineTerminator::Lf => output.push(b'\n'),
+            LineTerminator::CrLf => output.extend_from_slice(b"\r\n"),
         }
     }
 
     fn append_diff_line(output: &mut Vec<u8>, line: &DiffLine) {
         output.extend_from_slice(line.text.as_bytes());
-        if line.has_terminator {
-            output.push(b'\n');
+        match line.terminator {
+            LineTerminator::None => {}
+            LineTerminator::Lf => output.push(b'\n'),
+            LineTerminator::CrLf => output.extend_from_slice(b"\r\n"),
         }
     }
 
@@ -597,6 +630,8 @@ mod tests {
                 "alpha\n雪\nomega\n".as_bytes(),
                 "zero\nalpha\n雪だるま\nomega".as_bytes(),
             ),
+            (&b"one\r\ntwo\r\n"[..], &b"one\r\nchanged\r\n"[..]),
+            (&b"same\r\n"[..], &b"same\n"[..]),
         ] {
             let diff = text(old, new);
             assert_eq!(apply_hunks(old, &diff), new);

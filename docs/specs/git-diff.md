@@ -44,7 +44,9 @@ Worktree reads MUST be root-confined and checked against the snapshot metadata b
 ## Android computation
 
 Android decodes text using the document encoding policy, normalizes only for comparison,
-and preserves original line-ending metadata. The current M0 implementation uses the
+and preserves original line-ending metadata. Each emitted line records `none`, `lf`, or
+`crlf`; a line-ending-only change is therefore a visible deletion/addition pair rather
+than unchanged text. The current M0 implementation uses the
 bounded quadratic `bounded-lcs-v1` reference algorithm. It is not a claim of Git,
 histogram, Myers, or `imara-diff` fidelity. A production algorithm replacement MUST
 preserve this bounded result contract and add deterministic performance/fidelity evidence.

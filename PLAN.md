@@ -45,6 +45,8 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Documentation now distinguishes the Java/View M0 connection-status screen and bounded
   `bounded-lcs-v1` reference diff from the future Compose/navigation and production-diff
   targets. Agent integration is described as per-agent pluggable adapters, not neutrality.
+- [x] The bounded reference diff preserves per-line `LF`/`CRLF` identity, including
+  line-ending-only changes, with byte-exact headless reconstruction coverage.
 - [x] A generated-key protocol harness proves fixed exec, SFTP subsystem, and loopback-only
   forwarding can coexist on one authenticated Russh transport. It is not yet the full
   Android-to-host vertical acceptance harness.
