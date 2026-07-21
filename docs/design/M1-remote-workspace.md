@@ -84,6 +84,14 @@ Import completion is separate from SSH authentication.  The adapter confirms the
 fingerprint with the user before replacing a profile binding; only a future selected SSH
 transport may use the resulting reference after exact host-key verification succeeds.
 
+The Android composition root uses the headless `KeystoreCredentialSigner` boundary for that
+future callback. It compares the observed host-key algorithm and canonical fingerprint with the
+persisted `KnownHost` before it can construct a bounded signing request. Its Keystore backend
+receives only an opaque credential reference, public-key metadata, and SSH signing payload; it
+never exports private-key material. The native transport independently retains the same exact
+host-key-before-signing requirement. The boundary is unit-tested, but it is not yet connected to
+the JNI transport adapter and must not be represented as a live Android SSH connection.
+
 Endpoint validation rejects invalid ports, control characters and ambiguous host syntax. SSH uses separately encoded connection parameters, not a shell command.
 
 ### Connection state machine

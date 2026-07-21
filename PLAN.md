@@ -39,9 +39,11 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Native authenticated-plan tokens are type-separated from generic requests, and the
   host has an injected direct-process adapter that emits only the fixed daemon argv. Both
   remain fail-closed until their outer platform compositions provide verified transport.
-- [x] Android profile/known-host metadata, authenticated-operation composition, and an
-  opaque JNI plan boundary have headless evidence. The JNI plan deliberately does not
-  claim a live connection until native exact-host admission and Keystore signing exist.
+- [x] Android profile/known-host metadata, authenticated-operation composition, an opaque
+  JNI plan boundary, and a Keystore signer boundary have headless evidence. The signer
+  refuses to construct a request before exact host admission and exposes no key material;
+  the JNI plan deliberately does not claim a live connection until native transport-side
+  exact-host admission and Keystore signing are composed.
 - [x] The native bridge now makes exact host-key admission a typed capability required
   before its Keystore public-key-authentication boundary; this is a headless ordering seam,
   not an implementation of a live JNI/Russh connection.
