@@ -15,8 +15,10 @@ use std::path::{Component, Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{getsockopt, sockopt};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::unistd::Uid;
+#[cfg(target_os = "macos")]
+use nix::unistd::getpeereid;
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_SOCKET_MODE: u32 = 0o600;
@@ -112,10 +114,10 @@ impl fmt::Display for SocketError {
 
 /// Verifies that the connected peer has the daemon's effective Unix user ID.
 ///
-/// Socket permissions remain a first boundary. On Linux this additional check
-/// rejects privileged or otherwise substituted peers after accept and before
-/// they can send protocol bytes. Other Unix platforms fail closed until an
-/// equivalent peer-credential adapter is implemented.
+/// Socket permissions remain a first boundary. On Linux and macOS this
+/// additional check rejects privileged or otherwise substituted peers after
+/// accept and before they can send protocol bytes. Other Unix platforms fail
+/// closed until an equivalent peer-credential adapter is implemented.
 ///
 /// # Errors
 ///
@@ -136,14 +138,25 @@ fn verify_same_effective_user_impl(
     validate_peer_uid(u64::from(peer.uid()), u64::from(Uid::effective().as_raw()))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn verify_same_effective_user_impl(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<(), SocketError> {
+    let (peer_uid, _) = getpeereid(stream).map_err(|_| SocketError::PeerCredentialUnavailable)?;
+    validate_peer_uid(
+        u64::from(peer_uid.as_raw()),
+        u64::from(Uid::effective().as_raw()),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn verify_same_effective_user_impl(
     _stream: &std::os::unix::net::UnixStream,
 ) -> Result<(), SocketError> {
     Err(SocketError::PeerCredentialUnavailable)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_peer_uid(peer_uid: u64, effective_uid: u64) -> Result<(), SocketError> {
     if peer_uid == effective_uid {
         Ok(())
@@ -327,6 +340,17 @@ mod tests {
             fs::create_dir(&path).expect("create test root");
             Self(path)
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_peer_credentials_require_the_daemon_effective_user() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        assert!(verify_same_effective_user(&server).is_ok());
+        assert!(matches!(
+            validate_peer_uid(7, 8),
+            Err(SocketError::PeerCredentialRejected)
+        ));
     }
 
     impl Drop for TestDirectory {
