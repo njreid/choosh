@@ -18,6 +18,13 @@ pub trait CredentialSigner: Send {
     /// Returns the non-secret public key paired with this signing capability.
     fn public_key(&self) -> russh::keys::PublicKey;
 
+    /// Appends one SSH wire-encoded signature to the supplied signing buffer.
+    ///
+    /// The returned buffer MUST retain `payload` unchanged and append the
+    /// signature as an SSH `string` (a four-byte length followed by the
+    /// algorithm-and-signature encoding). This is Russh's custom-signer
+    /// contract and keeps the platform callback responsible only for a single
+    /// public-key proof.
     fn sign(
         &mut self,
         identity: &AgentIdentity,

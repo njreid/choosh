@@ -211,6 +211,8 @@ dependencies = [
  "choosh-ssh",
  "rand",
  "russh",
+ "signature",
+ "ssh-key",
  "tokio",
 ]
 

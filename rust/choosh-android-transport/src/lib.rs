@@ -168,7 +168,8 @@ mod tests {
     use choosh_ssh::{CredentialSigner, SessionLimits, presented_fingerprint};
     use russh::keys::agent::AgentIdentity;
     use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
-    use russh::server;
+    use russh::server::{self, Auth};
+    use signature::Signer as _;
     use std::convert::Infallible;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -185,6 +186,37 @@ mod tests {
         type Error = russh::Error;
     }
 
+    struct AcceptingServer {
+        expected_credential: PublicKeyFingerprint,
+    }
+    impl server::Handler for AcceptingServer {
+        type Error = russh::Error;
+
+        async fn auth_publickey_offered(
+            &mut self,
+            _: &str,
+            key: &PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(
+                if presented_fingerprint(key) == self.expected_credential.as_str() {
+                    Auth::Accept
+                } else {
+                    Auth::reject()
+                },
+            )
+        }
+
+        async fn auth_publickey(&mut self, _: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+            Ok(
+                if presented_fingerprint(key) == self.expected_credential.as_str() {
+                    Auth::Accept
+                } else {
+                    Auth::reject()
+                },
+            )
+        }
+    }
+
     #[derive(Debug)]
     struct FixtureSignerError;
     impl From<russh::SendError> for FixtureSignerError {
@@ -194,22 +226,34 @@ mod tests {
     }
 
     struct CountingSigner {
-        key: PublicKey,
+        key: PrivateKey,
         calls: Arc<AtomicUsize>,
     }
     impl CredentialSigner for CountingSigner {
         type Error = FixtureSignerError;
         fn public_key(&self) -> PublicKey {
-            self.key.clone()
+            self.key.public_key().clone()
         }
         async fn sign(
             &mut self,
             _: &AgentIdentity,
             _: Option<HashAlg>,
-            _: Vec<u8>,
+            mut payload: Vec<u8>,
         ) -> Result<Vec<u8>, Self::Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Vec::new())
+            let signature = self
+                .key
+                .try_sign(&payload)
+                .expect("generated Ed25519 fixture key signs SSH authentication payloads");
+            let signature = Vec::try_from(signature)
+                .expect("generated Ed25519 fixture signature has SSH wire encoding");
+            payload.extend_from_slice(
+                &u32::try_from(signature.len())
+                    .expect("generated Ed25519 fixture signature is bounded")
+                    .to_be_bytes(),
+            );
+            payload.extend_from_slice(&signature);
+            Ok(payload)
         }
     }
 
@@ -277,7 +321,7 @@ mod tests {
             )),
             stream: Some(client),
             signer: Some(CountingSigner {
-                key: credential.public_key().clone(),
+                key: credential,
                 calls: Arc::clone(&calls),
             }),
         };
@@ -293,6 +337,50 @@ mod tests {
             ))
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exact_host_key_reaches_android_signer_and_authenticates() {
+        let host = generated_key();
+        let credential = generated_key();
+        let expected =
+            PublicKeyFingerprint::parse(presented_fingerprint(host.public_key())).unwrap();
+        let expected_credential =
+            PublicKeyFingerprint::parse(presented_fingerprint(credential.public_key())).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (client, server_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(server::run_stream(
+            Arc::new(server::Config {
+                keys: vec![host],
+                ..server::Config::default()
+            }),
+            server_stream,
+            AcceptingServer {
+                expected_credential,
+            },
+        ));
+        let mut runtime = FixtureRuntime {
+            session: Some(choosh_ssh::PreAuthenticationSession::new(
+                expected,
+                SessionLimits::admission_default(),
+            )),
+            stream: Some(client),
+            signer: Some(CountingSigner {
+                key: credential,
+                calls: Arc::clone(&calls),
+            }),
+        };
+
+        let connection = connect_verified(
+            &mut runtime,
+            AndroidConnectionPlan::new(1, 2, 3, 4, 5).unwrap(),
+        )
+        .await
+        .expect("the exact generated host key and credential authenticate");
+
+        assert!(calls.load(Ordering::SeqCst) > 0);
+        drop(connection);
         server.abort();
     }
 }
