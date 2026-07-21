@@ -203,6 +203,14 @@ name = "choosh-android-bridge"
 version = "0.0.0"
 
 [[package]]
+name = "choosh-android-transport"
+version = "0.0.0"
+dependencies = [
+ "choosh-android-bridge",
+ "choosh-ssh",
+]
+
+[[package]]
 name = "choosh-core"
 version = "0.0.0"
 
