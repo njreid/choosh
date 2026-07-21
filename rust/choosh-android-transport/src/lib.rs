@@ -47,6 +47,37 @@ pub trait AndroidSshRuntime {
     fn username(&self, username: AndroidHandle) -> Result<choosh_ssh::SshUsername, Self::Error>;
 }
 
+/// Resolves a persisted exact host identity into the Russh pre-authentication plan.
+pub trait ExactHostSessionResolver {
+    type Error;
+
+    /// # Errors
+    ///
+    /// Returns a content-free registry or host-identity validation failure.
+    fn pre_authentication_session(
+        &self,
+        known_host: AndroidHandle,
+    ) -> Result<choosh_ssh::PreAuthenticationSession, Self::Error>;
+}
+
+/// Resolves an opaque Android credential into the Russh signing capability.
+///
+/// The concrete implementation invokes the Java Keystore callback per SSH
+/// challenge; it MUST NOT return private-key bytes.
+pub trait KeystoreSignerResolver {
+    type Signer: choosh_ssh::CredentialSigner;
+    type Error;
+
+    /// # Errors
+    ///
+    /// Returns a content-free registry or public-metadata validation failure.
+    fn signer(
+        &mut self,
+        credential_reference: AndroidHandle,
+        public_key: AndroidHandle,
+    ) -> Result<Self::Signer, Self::Error>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::COMPOSITION_BOUNDARY;
