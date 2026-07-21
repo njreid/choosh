@@ -207,7 +207,10 @@ name = "choosh-android-transport"
 version = "0.0.0"
 dependencies = [
  "choosh-android-bridge",
+ "choosh-core",
  "choosh-ssh",
+ "rand",
+ "russh",
  "tokio",
 ]
 

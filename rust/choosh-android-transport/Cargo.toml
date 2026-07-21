@@ -10,5 +10,11 @@ choosh-android-bridge = { path = "../choosh-android-bridge" }
 choosh-ssh = { path = "../choosh-ssh" }
 tokio = { version = "=1.53.0", features = ["io-util"] }
 
+[dev-dependencies]
+choosh-core = { path = "../choosh-core" }
+rand = "=0.10.2"
+russh = { version = "=0.62.2", default-features = false, features = ["ring"] }
+tokio = { version = "=1.53.0", features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true

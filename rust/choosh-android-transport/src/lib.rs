@@ -86,8 +86,8 @@ pub trait ExactHostSessionResolver {
     /// # Errors
     ///
     /// Returns a content-free registry or host-identity validation failure.
-    fn pre_authentication_session(
-        &self,
+    fn take_pre_authentication_session(
+        &mut self,
         known_host: AndroidHandle,
     ) -> Result<choosh_ssh::PreAuthenticationSession, Self::Error>;
 }
@@ -140,7 +140,7 @@ where
     R::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let session = runtime
-        .pre_authentication_session(plan.known_host)
+        .take_pre_authentication_session(plan.known_host)
         .map_err(AndroidTransportError::Session)?;
     let username = runtime
         .username(plan.username)
@@ -163,12 +163,136 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::COMPOSITION_BOUNDARY;
+    use super::*;
+    use choosh_core::ssh_identity::PublicKeyFingerprint;
+    use choosh_ssh::{CredentialSigner, SessionLimits, presented_fingerprint};
+    use russh::keys::agent::AgentIdentity;
+    use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
+    use russh::server;
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn keeps_the_platform_composition_boundary_explicit() {
         assert_eq!(COMPOSITION_BOUNDARY, "android-opaque-handles-to-russh");
         assert!(super::AndroidHandle::new(0).is_none());
         assert!(super::AndroidHandle::new(1).is_some());
+    }
+
+    struct FixtureServer;
+    impl server::Handler for FixtureServer {
+        type Error = russh::Error;
+    }
+
+    #[derive(Debug)]
+    struct FixtureSignerError;
+    impl From<russh::SendError> for FixtureSignerError {
+        fn from(_: russh::SendError) -> Self {
+            Self
+        }
+    }
+
+    struct CountingSigner {
+        key: PublicKey,
+        calls: Arc<AtomicUsize>,
+    }
+    impl CredentialSigner for CountingSigner {
+        type Error = FixtureSignerError;
+        fn public_key(&self) -> PublicKey {
+            self.key.clone()
+        }
+        async fn sign(
+            &mut self,
+            _: &AgentIdentity,
+            _: Option<HashAlg>,
+            _: Vec<u8>,
+        ) -> Result<Vec<u8>, Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    struct FixtureRuntime {
+        session: Option<choosh_ssh::PreAuthenticationSession>,
+        stream: Option<tokio::io::DuplexStream>,
+        signer: Option<CountingSigner>,
+    }
+    impl AndroidSshRuntime for FixtureRuntime {
+        type Stream = tokio::io::DuplexStream;
+        type Error = Infallible;
+        fn open_stream(&mut self, _: AndroidHandle) -> Result<Self::Stream, Self::Error> {
+            Ok(self.stream.take().expect("one stream"))
+        }
+        fn username(&self, _: AndroidHandle) -> Result<choosh_ssh::SshUsername, Self::Error> {
+            Ok(choosh_ssh::SshUsername::parse("fixture-user").unwrap())
+        }
+    }
+    impl ExactHostSessionResolver for FixtureRuntime {
+        type Error = Infallible;
+        fn take_pre_authentication_session(
+            &mut self,
+            _: AndroidHandle,
+        ) -> Result<choosh_ssh::PreAuthenticationSession, Self::Error> {
+            Ok(self.session.take().expect("one session"))
+        }
+    }
+    impl KeystoreSignerResolver for FixtureRuntime {
+        type Signer = CountingSigner;
+        type Error = Infallible;
+        fn signer(
+            &mut self,
+            _: AndroidHandle,
+            _: AndroidHandle,
+        ) -> Result<Self::Signer, Self::Error> {
+            Ok(self.signer.take().expect("one signer"))
+        }
+    }
+
+    fn generated_key() -> PrivateKey {
+        PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap()
+    }
+
+    #[tokio::test]
+    async fn changed_host_key_rejects_before_android_signer_is_called() {
+        let presented = generated_key();
+        let different = generated_key();
+        let credential = generated_key();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (client, server_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(server::run_stream(
+            Arc::new(server::Config {
+                keys: vec![presented],
+                ..server::Config::default()
+            }),
+            server_stream,
+            FixtureServer,
+        ));
+        let expected =
+            PublicKeyFingerprint::parse(presented_fingerprint(different.public_key())).unwrap();
+        let mut runtime = FixtureRuntime {
+            session: Some(choosh_ssh::PreAuthenticationSession::new(
+                expected,
+                SessionLimits::admission_default(),
+            )),
+            stream: Some(client),
+            signer: Some(CountingSigner {
+                key: credential.public_key().clone(),
+                calls: Arc::clone(&calls),
+            }),
+        };
+        let result = connect_verified(
+            &mut runtime,
+            AndroidConnectionPlan::new(1, 2, 3, 4, 5).unwrap(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AndroidTransportError::Connection(
+                choosh_ssh::VerifiedConnectionError::TransportFailed
+            ))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 }
