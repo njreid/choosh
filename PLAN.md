@@ -36,6 +36,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The fixed host dispatcher and `chooshd rpc --stdio` now share an explicit bounded
   state/socket plan. Their actual platform process adapter remains an injected outer
   capability, so no ambient path lookup or shell execution has been introduced.
+- [x] The SSH stdio-to-private-socket relay now completes and consumes the required
+  daemon hello/welcome exchange before forwarding a bounded RPC frame; a subprocess
+  acceptance test proves `chooshd rpc --stdio` reaches `host.describe` without exposing
+  the handshake on the SSH-facing stdio stream.
 - [x] Native authenticated-plan tokens are type-separated from generic requests, and the
   host has an injected direct-process adapter that emits only the fixed daemon argv. Both
   remain fail-closed until their outer platform compositions provide verified transport.
