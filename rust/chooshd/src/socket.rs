@@ -317,7 +317,7 @@ fn validate_state_directory(metadata: &fs::Metadata) -> Result<(), SocketError> 
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
 
