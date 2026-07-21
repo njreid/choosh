@@ -30,7 +30,6 @@ test -S "$socket_path"
 test "$(stat -c '%a' "$state_dir")" = '700'
 test "$(stat -c '%a' "$socket_path")" = '600'
 
-hello='{"kind":"hello","protocol":{"major":1,"minor":0},"client":{"name":"rpc-process-gate","version":"1"},"capabilities":[]}'
 request_id='00000000-0000-0000-0000-000000000001'
 describe="{\"kind\":\"request\",\"id\":\"$request_id\",\"method\":\"host.describe\",\"params\":{}}"
 second_request_id='00000000-0000-0000-0000-000000000002'
@@ -38,8 +37,6 @@ second_describe="{\"kind\":\"request\",\"id\":\"$second_request_id\",\"method\":
 response_frame="$fixture/response.frame"
 host_stderr="$fixture/host.stderr"
 {
-  printf '%08x' "${#hello}" | xxd -r -p
-  printf '%s' "$hello"
   printf '%08x' "${#describe}" | xxd -r -p
   printf '%s' "$describe"
   printf '%08x' "${#second_describe}" | xxd -r -p
@@ -61,22 +58,9 @@ extract_frame() {
   offset=$((offset + 4 + frame_length))
 }
 
-extract_frame "$fixture/welcome.json"
 extract_frame "$fixture/describe.json"
 extract_frame "$fixture/second-describe.json"
 test "$offset" -eq "$(wc -c <"$response_frame")"
-
-jq -e '
-  type == "object" and
-  (keys | sort) == (["capabilities", "daemon", "host", "kind", "limits", "protocol"] | sort) and
-  .kind == "welcome" and
-  .protocol == {"major": 1, "minor": 0} and
-  .daemon.name == "chooshd" and
-  (.daemon.version | type == "string" and length > 0) and
-  .host == {"name": "local-host", "version": "unknown"} and
-  .capabilities == [] and
-  .limits == {"max_control_frame_bytes": 1048576, "max_in_flight_requests": 64}
-' "$fixture/welcome.json" >/dev/null
 
 jq -e --arg id "$request_id" '
   type == "object" and
