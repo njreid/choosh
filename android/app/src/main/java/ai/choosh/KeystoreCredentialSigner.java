@@ -39,17 +39,75 @@ public final class KeystoreCredentialSigner {
         return new HostKeyAdmission();
     }
 
+    /**
+     * Binds one admitted connection to its Android-owned credential before Russh asks for a
+     * challenge proof.
+     *
+     * <p>The returned callback deliberately has no credential or public-key arguments. A native
+     * per-challenge callback can therefore supply only the bounded SSH payload; it cannot switch
+     * identities between challenges or obtain private-key material.</p>
+     */
+    public ChallengeSigner beginChallengeSigning(
+        HostKeyAdmission admission,
+        SshKeyImportCoordinator.OpaqueCredentialRef credentialRef,
+        SshKeyImportCoordinator.PublicKeyMetadata publicKey
+    ) {
+        return new ChallengeSigner(
+            Objects.requireNonNull(admission, "admission"),
+            Objects.requireNonNull(credentialRef, "credentialRef"),
+            Objects.requireNonNull(publicKey, "publicKey")
+        );
+    }
+
     /** Produces one non-secret SSH signature after exact host admission. */
     public Signature sign(SigningRequest request) throws SigningException {
         Objects.requireNonNull(request, "request");
-        try {
-            return new Signature(backend.sign(
-                request.credentialRef,
-                request.publicKey,
-                request.copyPayloadForKeystore()
-            ));
-        } catch (KeystoreFailure exception) {
-            throw new SigningException();
+        return beginChallengeSigning(
+            request.admission, request.credentialRef, request.publicKey
+        ).sign(request.copyPayloadForKeystore());
+    }
+
+    /**
+     * Per-connection callback for Rust's public-key authentication challenges.
+     *
+     * <p>It intentionally exposes only {@link #sign(byte[])}. The opaque admission, credential
+     * reference, and public-key metadata remain fixed for this connection attempt and never
+     * cross the callback boundary as private-key bytes.</p>
+     */
+    public final class ChallengeSigner {
+        private final HostKeyAdmission admission;
+        private final SshKeyImportCoordinator.OpaqueCredentialRef credentialRef;
+        private final SshKeyImportCoordinator.PublicKeyMetadata publicKey;
+
+        private ChallengeSigner(
+            HostKeyAdmission admission,
+            SshKeyImportCoordinator.OpaqueCredentialRef credentialRef,
+            SshKeyImportCoordinator.PublicKeyMetadata publicKey
+        ) {
+            this.admission = admission;
+            this.credentialRef = credentialRef;
+            this.publicKey = publicKey;
+        }
+
+        /** Signs one bounded SSH authentication payload with the connection's fixed identity. */
+        public Signature sign(byte[] payload) throws SigningException {
+            Objects.requireNonNull(payload, "payload");
+            if (payload.length == 0 || payload.length > MAX_SIGNING_PAYLOAD_BYTES) {
+                throw new IllegalArgumentException("invalid signing payload length");
+            }
+            byte[] payloadCopy = payload.clone();
+            try {
+                return new Signature(backend.sign(credentialRef, publicKey, payloadCopy));
+            } catch (KeystoreFailure | IllegalArgumentException | NullPointerException exception) {
+                // The native callback receives one stable, content-free failure for both backend
+                // and malformed-output errors. In particular no provider detail reaches Rust.
+                throw new SigningException();
+            }
+        }
+
+        @Override public String toString() {
+            return "ChallengeSigner(admission=REDACTED, credential=REDACTED, publicKey="
+                + publicKey.algorithm() + ")";
         }
     }
 

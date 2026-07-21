@@ -28,6 +28,38 @@ public final class KeystoreCredentialSignerTest {
         assertArrayEquals(new byte[] {1, 2, 3}, backend.payload);
     }
 
+    @Test public void admitted_challenge_callback_binds_identity_and_accepts_only_payloads()
+        throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        KeystoreCredentialSigner signer = new KeystoreCredentialSigner(backend);
+        KeystoreCredentialSigner.ChallengeSigner callback = signer.beginChallengeSigning(
+            KeystoreCredentialSigner.admitExactHost(knownHost(), presentedHost()),
+            credential(), publicKey()
+        );
+
+        byte[] firstPayload = new byte[] {4, 5};
+        assertArrayEquals(new byte[] {9, 8}, callback.sign(firstPayload).copyForNativeCallback());
+        firstPayload[0] = 0;
+        assertArrayEquals(new byte[] {4, 5}, backend.payload);
+        assertEquals(1, backend.calls.get());
+        assertEquals("ChallengeSigner(admission=REDACTED, credential=REDACTED, publicKey=ED25519)",
+            callback.toString());
+
+        assertThrows(IllegalArgumentException.class, () -> callback.sign(new byte[0]));
+        assertEquals(1, backend.calls.get());
+    }
+
+    @Test public void malformed_keystore_output_becomes_a_typed_callback_failure() throws Exception {
+        KeystoreCredentialSigner signer = new KeystoreCredentialSigner((ref, key, payload) -> null);
+        KeystoreCredentialSigner.ChallengeSigner callback = signer.beginChallengeSigning(
+            KeystoreCredentialSigner.admitExactHost(knownHost(), presentedHost()),
+            credential(), publicKey()
+        );
+
+        assertThrows(KeystoreCredentialSigner.SigningException.class,
+            () -> callback.sign(new byte[] {1}));
+    }
+
     @Test public void changed_or_different_algorithm_host_never_reaches_signer() {
         RecordingBackend backend = new RecordingBackend();
 
