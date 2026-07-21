@@ -6,6 +6,7 @@
 #![allow(unsafe_code)] // Required only for Edition 2024's `no_mangle` ABI attribute.
 
 use std::ffi::c_void;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const ABI_VERSION: u32 = 1;
@@ -31,6 +32,152 @@ const TOKEN_GENERATION_MASK: u32 = (1 << TOKEN_GENERATION_BITS) - 1;
 static GENERATION: AtomicU32 = AtomicU32::new(1);
 static NEXT_REQUEST: AtomicU32 = AtomicU32::new(1);
 static REQUESTS: [AtomicU64; SLOT_COUNT] = [const { AtomicU64::new(0) }; SLOT_COUNT];
+
+macro_rules! opaque_handle {
+    ($name:ident) => {
+        /// A non-zero Android-owned registry handle. Its represented value never crosses Rust's
+        /// Android ABI and it deliberately has no `Display` implementation.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub struct $name(NonZeroU64);
+
+        impl $name {
+            /// Validates an Android registry handle without exposing its underlying value.
+            pub const fn new(value: u64) -> Option<Self> {
+                match NonZeroU64::new(value) {
+                    Some(value) => Some(Self(value)),
+                    None => None,
+                }
+            }
+        }
+    };
+}
+
+opaque_handle!(EndpointHandle);
+opaque_handle!(UsernameHandle);
+opaque_handle!(KnownHostHandle);
+opaque_handle!(CredentialReferenceHandle);
+opaque_handle!(PublicKeyHandle);
+
+/// A validated, Android-owned connection description before host-key admission.
+///
+/// This is deliberately separate from the opaque C/JNI request token. It is the typed native
+/// composition seam a future stream registry will resolve; it is not a live connection and does
+/// not grant signing access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeAuthenticatedPlan {
+    endpoint: EndpointHandle,
+    username: UsernameHandle,
+    known_host: KnownHostHandle,
+    credential_reference: CredentialReferenceHandle,
+    public_key: PublicKeyHandle,
+}
+
+impl NativeAuthenticatedPlan {
+    /// Creates a plan only when every Android registry reference is non-zero.
+    #[must_use]
+    pub fn new(
+        endpoint: u64,
+        username: u64,
+        known_host: u64,
+        credential_reference: u64,
+        public_key: u64,
+    ) -> Option<Self> {
+        Some(Self {
+            endpoint: EndpointHandle::new(endpoint)?,
+            username: UsernameHandle::new(username)?,
+            known_host: KnownHostHandle::new(known_host)?,
+            credential_reference: CredentialReferenceHandle::new(credential_reference)?,
+            public_key: PublicKeyHandle::new(public_key)?,
+        })
+    }
+
+    /// Performs the required exact host-key admission before the plan can request a signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns the injected verifier's error, including a changed or untrusted presented key.
+    pub fn admit_exact_host_key<V>(self, verifier: &mut V) -> Result<HostKeyAdmittedPlan, V::Error>
+    where
+        V: ExactHostKeyAdmission,
+    {
+        verifier.verify_exact_host_key(self.endpoint, self.known_host)?;
+        Ok(HostKeyAdmittedPlan { plan: self })
+    }
+}
+
+/// Capability implemented at the Android/native outer composition root.
+///
+/// The implementation owns the bounded stream and must compare its *presented* host key to the
+/// exact persisted key resolved from `known_host`. Supplying an opaque handle is not admission;
+/// only a successful return may mint [`HostKeyAdmittedPlan`].
+pub trait ExactHostKeyAdmission {
+    type Error;
+
+    /// Verifies the stream's presented key against exactly this persisted known-host record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-defined admission error when the stream cannot be verified.
+    fn verify_exact_host_key(
+        &mut self,
+        endpoint: EndpointHandle,
+        known_host: KnownHostHandle,
+    ) -> Result<(), Self::Error>;
+}
+
+/// A plan whose stream has completed exact host-key admission.
+///
+/// This capability has no public constructor. It is the only type accepted by the Keystore
+/// public-key-authentication boundary, so an unverified plan cannot request a signature by API
+/// shape alone.
+#[derive(Debug)]
+pub struct HostKeyAdmittedPlan {
+    plan: NativeAuthenticatedPlan,
+}
+
+impl HostKeyAdmittedPlan {
+    /// Starts public-key authentication through the injected Keystore capability.
+    ///
+    /// The concrete adapter supplies the SSH signing payload to the Keystore and never exposes
+    /// private-key bytes to Rust. A successful result is still not a usable session: a later
+    /// transport slice must complete protocol authentication and channel admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns the injected Keystore adapter's error when authentication cannot begin.
+    pub fn begin_public_key_authentication<S>(self, signer: &mut S) -> Result<(), S::Error>
+    where
+        S: KeystorePublicKeyAuthentication,
+    {
+        signer.begin_public_key_authentication(
+            self.plan.endpoint,
+            self.plan.username,
+            self.plan.credential_reference,
+            self.plan.public_key,
+        )
+    }
+}
+
+/// Keystore-backed public-key authentication boundary.
+///
+/// It is intentionally invoked only with typed opaque references. The eventual Russh adapter
+/// will adapt this capability to its per-challenge signing callback.
+pub trait KeystorePublicKeyAuthentication {
+    type Error;
+
+    /// Begins public-key authentication after exact host-key admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-defined error when the Keystore cannot begin authentication.
+    fn begin_public_key_authentication(
+        &mut self,
+        endpoint: EndpointHandle,
+        username: UsernameHandle,
+        credential_reference: CredentialReferenceHandle,
+        public_key: PublicKeyHandle,
+    ) -> Result<(), Self::Error>;
+}
 
 /// Returns the stable ABI contract version.
 #[unsafe(no_mangle)]
@@ -87,7 +234,9 @@ pub extern "C" fn choosh_bridge_authenticated_plan_begin(
     credential_ref: u64,
     public_key: u64,
 ) -> u64 {
-    if endpoint == 0 || username == 0 || known_host == 0 || credential_ref == 0 || public_key == 0 {
+    if NativeAuthenticatedPlan::new(endpoint, username, known_host, credential_ref, public_key)
+        .is_none()
+    {
         return 0;
     }
     choosh_bridge_request_begin(generation, AUTHENTICATED_PLAN_STATUS)
@@ -269,6 +418,89 @@ mod tests {
     use std::sync::Mutex;
 
     static ABI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum AdmissionError {
+        HostKeyMismatch,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum Event {
+        HostKeyChecked,
+        SignatureRequested,
+    }
+
+    struct RecordingAdmission<'a> {
+        events: &'a Mutex<Vec<Event>>,
+        accept: bool,
+    }
+
+    impl ExactHostKeyAdmission for RecordingAdmission<'_> {
+        type Error = AdmissionError;
+
+        fn verify_exact_host_key(
+            &mut self,
+            _endpoint: EndpointHandle,
+            _known_host: KnownHostHandle,
+        ) -> Result<(), Self::Error> {
+            self.events.lock().unwrap().push(Event::HostKeyChecked);
+            self.accept
+                .then_some(())
+                .ok_or(AdmissionError::HostKeyMismatch)
+        }
+    }
+
+    struct RecordingSigner<'a> {
+        events: &'a Mutex<Vec<Event>>,
+    }
+
+    impl KeystorePublicKeyAuthentication for RecordingSigner<'_> {
+        type Error = std::convert::Infallible;
+
+        fn begin_public_key_authentication(
+            &mut self,
+            _endpoint: EndpointHandle,
+            _username: UsernameHandle,
+            _credential_reference: CredentialReferenceHandle,
+            _public_key: PublicKeyHandle,
+        ) -> Result<(), Self::Error> {
+            self.events.lock().unwrap().push(Event::SignatureRequested);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn typed_plan_cannot_request_keystore_authentication_before_exact_host_key_admission() {
+        let events = Mutex::new(Vec::new());
+        let plan = NativeAuthenticatedPlan::new(1, 2, 3, 4, 5).expect("non-zero handles");
+        let error = plan
+            .admit_exact_host_key(&mut RecordingAdmission {
+                events: &events,
+                accept: false,
+            })
+            .expect_err("changed host key rejects before authentication");
+        assert_eq!(error, AdmissionError::HostKeyMismatch);
+        assert_eq!(*events.lock().unwrap(), [Event::HostKeyChecked]);
+    }
+
+    #[test]
+    fn typed_plan_requests_keystore_authentication_only_after_exact_host_key_admission() {
+        let events = Mutex::new(Vec::new());
+        let plan = NativeAuthenticatedPlan::new(1, 2, 3, 4, 5).expect("non-zero handles");
+        let admitted = plan
+            .admit_exact_host_key(&mut RecordingAdmission {
+                events: &events,
+                accept: true,
+            })
+            .expect("exact host key admitted");
+        admitted
+            .begin_public_key_authentication(&mut RecordingSigner { events: &events })
+            .expect("fake keystore accepts");
+        assert_eq!(
+            *events.lock().unwrap(),
+            [Event::HostKeyChecked, Event::SignatureRequested]
+        );
+    }
 
     #[test]
     fn abi_request_cancel_and_recreation_are_typed_and_bounded() {

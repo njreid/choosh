@@ -42,6 +42,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Android profile/known-host metadata, authenticated-operation composition, and an
   opaque JNI plan boundary have headless evidence. The JNI plan deliberately does not
   claim a live connection until native exact-host admission and Keystore signing exist.
+- [x] The native bridge now makes exact host-key admission a typed capability required
+  before its Keystore public-key-authentication boundary; this is a headless ordering seam,
+  not an implementation of a live JNI/Russh connection.
 - [x] The Android candidate flow now has deterministic profile connection and authenticated
   workspace-status controllers. Native plans cannot advance without bridge ownership and fail
   closed to a typed transport-unavailable result.
@@ -67,6 +70,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Linux daemon accepts verify `SO_PEERCRED` against the daemon effective UID before
   protocol reads. Non-Linux Unix builds fail closed until an equivalent credential adapter
   is implemented.
+- [x] Reconnect policy now rejects first-trust downgrade after an authenticated generation;
+  a deterministic headless acceptance test proves logical retry timing, stale-channel
+  invalidation, terminal changed-key handling, and replay-versus-snapshot recovery actions.
 - [x] A generated-key protocol harness proves fixed exec, SFTP subsystem, and loopback-only
   forwarding can coexist on one authenticated Russh transport. It is not yet the full
   Android-to-host vertical acceptance harness.

@@ -105,10 +105,19 @@ impl ConnectionMachine {
         Ok(())
     }
 
+    /// First trust is permitted only before any authenticated generation.
+    ///
+    /// A reconnect must compare against the already persisted exact host-key
+    /// fingerprint.  It must never turn a changed key into a fresh trust
+    /// prompt, because that would allow a reconnect path to bypass host-key
+    /// pinning.
+    ///
     /// # Errors
-    /// Returns `InvalidTransition` unless verifying a key.
+    /// Returns `InvalidTransition` unless verifying an initial key.
     pub fn host_key_unknown(&mut self, fingerprint: String) -> Result<(), ConnectionFailure> {
-        Self::require_state(matches!(self.state, ConnectionState::VerifyingHostKey))?;
+        Self::require_state(
+            self.generation == 0 && matches!(self.state, ConnectionState::VerifyingHostKey),
+        )?;
         self.state = ConnectionState::TrustDecisionRequired { fingerprint };
         Ok(())
     }
@@ -332,6 +341,28 @@ mod tests {
         );
         assert_eq!(
             machine.accept_unknown("SHA256:new"),
+            Err(ConnectionFailure::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn reconnect_cannot_downgrade_a_changed_key_to_first_trust() {
+        let mut machine = ConnectionMachine::new(RetryPolicy::new(3));
+        let first = ready(&mut machine);
+        machine.transport_lost(10).unwrap();
+        assert!(machine.retry_due(10));
+
+        assert_eq!(
+            machine.host_key_unknown("SHA256:changed".into()),
+            Err(ConnectionFailure::InvalidTransition)
+        );
+        assert_eq!(machine.state(), &ConnectionState::VerifyingHostKey);
+        assert_eq!(
+            machine.validate_channel(first),
+            Err(ChannelFailure::NotReady)
+        );
+        assert_eq!(
+            machine.authenticated(),
             Err(ConnectionFailure::InvalidTransition)
         );
     }

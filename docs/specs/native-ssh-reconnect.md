@@ -24,6 +24,22 @@ It MUST NOT invoke the credential signer for an unknown, changed, rejected, or
 unverified host key. It MUST NOT expose a session merely because a native plan
 was created.
 
+## Typed native admission boundary
+
+The Android/Rust bridge represents an unconnected attempt as a
+`NativeAuthenticatedPlan` containing only separately typed opaque registry
+handles. It cannot invoke the Keystore boundary directly. The native outer
+composition root first supplies an `ExactHostKeyAdmission` adapter, which owns
+the bounded stream and compares its presented key with the exact persisted
+known-host record. Only its successful result mints a `HostKeyAdmittedPlan`.
+Only that capability can call `KeystorePublicKeyAuthentication`.
+
+This is an ordering boundary, not a fake transport implementation: neither
+capability means that SSH authentication, a channel, or a daemon RPC is live.
+The future Russh/JNI composition must adapt the Keystore's per-challenge
+signature operation without passing private-key bytes or Java object pointers
+through the native ABI.
+
 ## Loss and retry
 
 A transport loss MUST invalidate every channel belonging to its generation.
