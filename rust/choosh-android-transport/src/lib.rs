@@ -6,13 +6,138 @@
 
 #![forbid(unsafe_code)]
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::io;
+use std::num::NonZeroUsize;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Marker for the outer Android/Russh composition root.
 ///
 /// The runtime adapter is deliberately not implemented until its JNI stream
 /// and callback contracts have deterministic generated-key acceptance tests.
 pub const COMPOSITION_BOUNDARY: &str = "android-opaque-handles-to-russh";
+
+/// Per-callback byte limits for the Android-owned stream adapter.
+///
+/// These limits bound a single read or write crossing the eventual JNI
+/// boundary. They deliberately do not impose a connection lifetime byte
+/// budget: SSH is a long-lived multiplexed protocol and lifetime accounting
+/// belongs to the individual RPC, SFTP, or terminal capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamChunkLimits {
+    read: NonZeroUsize,
+    write: NonZeroUsize,
+}
+
+impl StreamChunkLimits {
+    /// Creates non-zero read and write callback limits.
+    #[must_use]
+    pub fn new(read: usize, write: usize) -> Option<Self> {
+        Some(Self {
+            read: NonZeroUsize::new(read)?,
+            write: NonZeroUsize::new(write)?,
+        })
+    }
+
+    /// Returns the maximum bytes requested from one native read callback.
+    #[must_use]
+    pub const fn read_bytes(self) -> usize {
+        self.read.get()
+    }
+
+    /// Returns the maximum bytes supplied to one native write callback.
+    #[must_use]
+    pub const fn write_bytes(self) -> usize {
+        self.write.get()
+    }
+}
+
+/// Bounded adapter for a byte stream resolved by Android-owned metadata.
+///
+/// The concrete JNI runtime owns the socket and supplies it as `S`; this
+/// wrapper makes it impossible for Russh to make an unbounded callback into
+/// that runtime. It contains no JVM object, endpoint, username, or credential
+/// material and is therefore safe to exercise in a headless host test.
+pub struct BoundedAndroidStream<S> {
+    inner: S,
+    limits: StreamChunkLimits,
+    read_scratch: Box<[u8]>,
+}
+
+impl<S> BoundedAndroidStream<S> {
+    /// Wraps one Android-owned stream with non-zero callback limits.
+    #[must_use]
+    pub fn new(inner: S, limits: StreamChunkLimits) -> Self {
+        Self {
+            inner,
+            limits,
+            read_scratch: vec![0; limits.read_bytes()].into_boxed_slice(),
+        }
+    }
+
+    /// Returns the configured callback limits.
+    #[must_use]
+    pub const fn limits(&self) -> StreamChunkLimits {
+        self.limits
+    }
+
+    /// Releases the wrapped Android-owned stream after the session ends.
+    #[must_use]
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S> AsyncRead for BoundedAndroidStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let requested = output.remaining().min(this.limits.read_bytes());
+        if requested == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let mut bounded = ReadBuf::new(&mut this.read_scratch[..requested]);
+        match Pin::new(&mut this.inner).poll_read(context, &mut bounded) {
+            Poll::Ready(Ok(())) => {
+                output.put_slice(bounded.filled());
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> AsyncWrite for BoundedAndroidStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let bounded = &input[..input.len().min(this.limits.write_bytes())];
+        Pin::new(&mut this.inner).poll_write(context, bounded)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
 
 /// Opaque Android registry reference used only by the outer composition root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,15 +295,101 @@ mod tests {
     use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
     use russh::server::{self, Auth};
     use signature::Signer as _;
+    use std::collections::VecDeque;
     use std::convert::Infallible;
+    use std::io;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 
     #[test]
     fn keeps_the_platform_composition_boundary_explicit() {
         assert_eq!(COMPOSITION_BOUNDARY, "android-opaque-handles-to-russh");
         assert!(super::AndroidHandle::new(0).is_none());
         assert!(super::AndroidHandle::new(1).is_some());
+    }
+
+    #[derive(Default)]
+    struct RecordingStream {
+        unread: VecDeque<u8>,
+        read_capacities: Vec<usize>,
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl RecordingStream {
+        fn with_read(bytes: impl IntoIterator<Item = u8>) -> Self {
+            Self {
+                unread: bytes.into_iter().collect(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl AsyncRead for RecordingStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.read_capacities.push(output.remaining());
+            let read = output.remaining().min(self.unread.len());
+            output.put_slice(&self.unread.drain(..read).collect::<Vec<_>>());
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for RecordingStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            input: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.push(input.to_vec());
+            Poll::Ready(Ok(input.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_android_stream_never_crosses_callback_chunk_limits() {
+        let limits = StreamChunkLimits::new(3, 2).expect("non-zero chunk limits");
+        let mut stream = BoundedAndroidStream::new(RecordingStream::with_read(*b"abcdefg"), limits);
+        let mut read = Vec::new();
+        stream
+            .read_to_end(&mut read)
+            .await
+            .expect("recording stream reads");
+        stream
+            .write_all(b"12345")
+            .await
+            .expect("recording stream writes");
+        stream
+            .shutdown()
+            .await
+            .expect("recording stream shuts down");
+
+        let recorded = stream.into_inner();
+        assert_eq!(read, b"abcdefg");
+        assert!(recorded.read_capacities.iter().all(|&size| size <= 3));
+        assert_eq!(
+            recorded.writes,
+            [b"12".to_vec(), b"34".to_vec(), b"5".to_vec()]
+        );
+    }
+
+    #[test]
+    fn stream_chunk_limits_reject_zero_callbacks() {
+        assert!(StreamChunkLimits::new(0, 1).is_none());
+        assert!(StreamChunkLimits::new(1, 0).is_none());
     }
 
     struct FixtureServer;
