@@ -66,8 +66,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   it is deliberately not wired to the unavailable live SSH connector yet.
 - [x] The Android transport composition root now joins opaque runtime capabilities to the
   pinned Russh admission path in the required order: exact host session, username, Keystore
-  signer, injected stream, then Russh host-key callback before signing. Concrete JNI runtime
-  adapters and generated-key/device evidence remain required before it can report connected.
+  signer, injected stream, then Russh host-key callback before signing. Generated Ed25519
+  acceptance proves a changed host key reaches no signer and an exact host key reaches the
+  injected signer and authenticates; the custom-signer buffer contract is explicit. Concrete
+  JNI runtime adapters and device evidence remain required before it can report connected.
 - [x] Blob capability completion consumes a bounded reader and stops an oversized source
   after the first byte above its declared limit; daemon fixture roots are unique under
   parallel headless test execution.
@@ -82,6 +84,8 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] A generated-key protocol harness proves fixed exec, SFTP subsystem, and loopback-only
   forwarding can coexist on one authenticated Russh transport. It is not yet the full
   Android-to-host vertical acceptance harness.
+- [x] The macOS host-Rust lane canonicalizes fixture roots before comparing reconciled paths,
+  preserving the same containment assertion on `/var` and `/private/var` systems.
 - [ ] A real Android SSH transport passes dependency admission and interoperability
   under the selected graph; see [SSH transport choice](docs/evidence/m0-ssh-transport-choice.md).
 - [ ] An SSH interoperability harness proves exact host-key verification before
