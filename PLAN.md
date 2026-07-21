@@ -64,6 +64,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Android has a headless `git.status` request/response codec and controller with
   injected request IDs, strict envelope/base64 validation, and typed failure projection;
   it is deliberately not wired to the unavailable live SSH connector yet.
+- [x] The Android transport composition root now joins opaque runtime capabilities to the
+  pinned Russh admission path in the required order: exact host session, username, Keystore
+  signer, injected stream, then Russh host-key callback before signing. Concrete JNI runtime
+  adapters and generated-key/device evidence remain required before it can report connected.
 - [x] Blob capability completion consumes a bounded reader and stops an oversized source
   after the first byte above its declared limit; daemon fixture roots are unique under
   parallel headless test execution.
