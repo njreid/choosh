@@ -278,11 +278,14 @@ mod tests {
         assert_eq!(status.snapshot().entries().len(), 1);
         assert_eq!(
             status.current_files()[0].canonical_path(),
-            fixture.0.join("src/main.rs")
+            fs::canonicalize(fixture.0.join("src/main.rs")).unwrap()
         );
         let (cleared, root, args) = seen.lock().unwrap().clone().unwrap();
         assert!(cleared);
-        assert_eq!(root, fixture.0.display().to_string());
+        assert_eq!(
+            root,
+            fs::canonicalize(&fixture.0).unwrap().display().to_string()
+        );
         assert!(args.contains(&"--porcelain=v1".to_owned()));
     }
 
