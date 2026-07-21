@@ -85,7 +85,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   forwarding can coexist on one authenticated Russh transport. It is not yet the full
   Android-to-host vertical acceptance harness.
 - [x] The macOS host-Rust lane canonicalizes fixture roots before comparing reconciled paths,
-  preserving the same containment assertion on `/var` and `/private/var` systems.
+  preserving the same containment assertion on `/var` and `/private/var` systems; its private
+  socket admission now verifies the peer's effective user through `getpeereid` before protocol
+  bytes are read.
 - [ ] A real Android SSH transport passes dependency admission and interoperability
   under the selected graph; see [SSH transport choice](docs/evidence/m0-ssh-transport-choice.md).
 - [ ] An SSH interoperability harness proves exact host-key verification before
