@@ -161,6 +161,60 @@ fn registered_git_status_crosses_the_private_socket_with_opaque_paths() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn rpc_stdio_performs_daemon_handshake_before_forwarding_the_ssh_request() {
+    let root = std::env::temp_dir().join(format!(
+        "chooshd-rpc-stdio-black-box-{}",
+        std::process::id()
+    ));
+    let state = root.join("state");
+    let socket = state.join("daemon.sock");
+    fs::create_dir(&root).unwrap();
+    let plan = SocketPlan::new(&state, &socket).unwrap();
+    let owned = bind(&plan).unwrap();
+    let config = handshake_config();
+
+    std::thread::scope(|scope| {
+        let server = scope.spawn(|| {
+            serve_once_with_handler(owned.listener(), &config, 1024, &DaemonRpc::new()).unwrap();
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_chooshd"))
+            .args([
+                "rpc",
+                "--stdio",
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--socket",
+                socket.to_str().unwrap(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let request = br#"{"kind":"request","id":"00000000-0000-0000-0000-000000000031","method":"host.describe","params":{}}"#;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&encode_frame(request, 1024).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        server.join().unwrap();
+
+        assert!(
+            output.status.success(),
+            "rpc stdio failed: {:?}",
+            output.stderr
+        );
+        assert_eq!(
+            read_frame(&mut output.stdout.as_slice()),
+            br#"{"id":"00000000-0000-0000-0000-000000000031","kind":"response","result":{"capabilities":[],"daemon":{"name":"chooshd","version":"test"},"host":{"name":"local-host","version":"test"},"limits":{"max_control_frame_bytes":1024,"max_in_flight_requests":4},"protocol":{"major":1,"minor":0}}}"#
+        );
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn handshake_config() -> HandshakeConfig {
     HandshakeConfig {
         protocol: ProtocolVersion::new(PROTOCOL_V1_MAJOR, 0),
@@ -171,7 +225,7 @@ fn handshake_config() -> HandshakeConfig {
     }
 }
 
-fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
+fn read_frame(stream: &mut impl Read) -> Vec<u8> {
     let mut header = [0_u8; 4];
     stream.read_exact(&mut header).unwrap();
     let length = u32::from_be_bytes(header) as usize;

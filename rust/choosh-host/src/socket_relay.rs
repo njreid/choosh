@@ -7,10 +7,12 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use choosh_protocol::framing::{FrameDecoder, FrameLimits, encode_frame};
+use choosh_protocol::handshake::{Hello, PeerIdentity, ProtocolVersion};
 
 use crate::bridge::{
     BridgeError, BridgeLimits, BridgeStats, FrameHandler, FrameWriter, HandlerFailure, run_bridge,
 };
+use crate::handshake::{HandshakeLimits, perform_client_handshake};
 
 /// Runs `rpc --stdio` over one explicitly injected daemon socket path.
 ///
@@ -27,10 +29,33 @@ pub fn run_unix_socket_relay<R: Read, W: Write>(
     socket_path: &Path,
     limits: BridgeLimits,
 ) -> Result<BridgeStats, BridgeError> {
-    let stream = UnixStream::connect(socket_path)
+    let mut stream = UnixStream::connect(socket_path)
         .map_err(|_| BridgeError::Handler(HandlerFailure::Unavailable))?;
+    establish_daemon_session(&mut stream, limits)?;
     let mut relay = SocketFrameRelay::new(stream, limits)?;
     run_bridge(input, output, &mut relay, limits)
+}
+
+/// Completes the daemon protocol handshake before any untrusted RPC frame is
+/// relayed. The daemon welcome is consumed at this local bridge boundary: the
+/// SSH caller sends and receives only terminal RPC frames.
+fn establish_daemon_session(
+    stream: &mut UnixStream,
+    limits: BridgeLimits,
+) -> Result<(), BridgeError> {
+    let hello = Hello::new(
+        ProtocolVersion::new(1, 0),
+        PeerIdentity::new("choosh-host", env!("CARGO_PKG_VERSION"))
+            .map_err(|_| BridgeError::Handler(HandlerFailure::Internal))?,
+        [],
+    )
+    .map_err(|_| BridgeError::Handler(HandlerFailure::Internal))?;
+    let handshake_limits =
+        HandshakeLimits::new(limits.max_frame_bytes, limits.read_buffer_bytes, 64)
+            .map_err(|_| BridgeError::Handler(HandlerFailure::Internal))?;
+    perform_client_handshake(stream, &hello, handshake_limits)
+        .map(|_| ())
+        .map_err(|_| BridgeError::Handler(HandlerFailure::Unavailable))
 }
 
 struct SocketFrameRelay<T> {
