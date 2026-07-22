@@ -476,6 +476,10 @@ mod tests {
     };
     use choosh_protocol::wire::{decode_hello, encode_response, encode_server_reply};
     use choosh_ssh::{CredentialSigner, SessionLimits, presented_fingerprint};
+    use chooshd::daemon::{DaemonRpc, HandshakeConfig, bind, serve_once_with_handler};
+    use chooshd::git::{StatusLimits, StatusSnapshot, parse_status};
+    use chooshd::git_status::{GitStatusError, GitStatusOperation};
+    use chooshd::socket::SocketPlan;
     use russh::keys::agent::AgentIdentity;
     use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
     use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session};
@@ -783,6 +787,56 @@ mod tests {
         (path, worker)
     }
 
+    #[derive(Clone)]
+    struct FixedStatus(StatusSnapshot);
+
+    impl GitStatusOperation for FixedStatus {
+        fn status_snapshot(&self) -> Result<StatusSnapshot, GitStatusError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn real_daemon_socket_fixture() -> (PathBuf, PathBuf, thread::JoinHandle<()>) {
+        let root = std::env::temp_dir().join(format!(
+            "choosh-android-real-daemon-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let state = root.join("state");
+        let socket = state.join("daemon.sock");
+        std::fs::create_dir(&root).expect("unique daemon fixture root");
+        let plan = SocketPlan::new(&state, &socket).expect("valid private daemon plan");
+        let owned = bind(&plan).expect("private daemon socket binds");
+        let snapshot = parse_status(
+            b" M src/\xff.rs\0",
+            StatusLimits {
+                max_bytes: 64,
+                max_entries: 2,
+                max_path_bytes: 32,
+            },
+        )
+        .expect("fixed status parses");
+        let mut handler = DaemonRpc::new();
+        handler
+            .register_git_status(
+                EnvelopeId::new("00000000-0000-0000-0000-000000000051").unwrap(),
+                Arc::new(FixedStatus(snapshot)),
+            )
+            .expect("registered workspace is unique");
+        let config = HandshakeConfig {
+            protocol: ProtocolVersion::new(1, 0),
+            daemon: PeerIdentity::new("chooshd", "test").unwrap(),
+            host: PeerIdentity::new("fixture-host", "test").unwrap(),
+            capabilities: Vec::new(),
+            limits: ProtocolLimits::new(1024, 4).unwrap(),
+        };
+        let worker = thread::spawn(move || {
+            serve_once_with_handler(owned.listener(), &config, 1024, &handler)
+                .expect("real daemon serves one SSH-relayed RPC");
+        });
+        (root, socket, worker)
+    }
+
     fn read_single_frame(stream: &mut UnixStream) -> Vec<u8> {
         let mut decoder = FrameDecoder::new(FrameLimits::new(1024, 2).unwrap());
         let mut buffer = [0; 128];
@@ -1028,6 +1082,64 @@ mod tests {
         server.abort();
         daemon.join().expect("daemon fixture completes");
         std::fs::remove_file(daemon_socket).expect("daemon fixture socket is removed");
+    }
+
+    #[tokio::test]
+    async fn android_git_status_crosses_authenticated_ssh_and_the_real_private_daemon() {
+        let host = generated_key();
+        let credential = generated_key();
+        let expected_host =
+            PublicKeyFingerprint::parse(presented_fingerprint(host.public_key())).unwrap();
+        let expected_credential =
+            PublicKeyFingerprint::parse(presented_fingerprint(credential.public_key())).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (daemon_root, daemon_socket, daemon) = real_daemon_socket_fixture();
+        let (client, server_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(server::run_stream(
+            Arc::new(server::Config {
+                keys: vec![host],
+                ..server::Config::default()
+            }),
+            server_stream,
+            GitStatusServer {
+                expected_credential,
+                command_accepted: false,
+                input: Vec::new(),
+                daemon_socket,
+            },
+        ));
+        let mut runtime = FixtureRuntime {
+            session: Some(choosh_ssh::PreAuthenticationSession::new(
+                expected_host,
+                SessionLimits::admission_default(),
+            )),
+            stream: Some(client),
+            signer: Some(CountingSigner {
+                key: credential,
+                calls: Arc::clone(&calls),
+            }),
+        };
+        let connection = connect_verified(
+            &mut runtime,
+            AndroidConnectionPlan::new(1, 2, 3, 4, 5).unwrap(),
+        )
+        .await
+        .expect("generated Android fixture authenticates before real daemon RPC");
+        let response = AndroidRpcSession::new(connection)
+            .execute(
+                br#"{"id":"00000000-0000-0000-0000-000000000052","kind":"request","method":"git.status","params":{"workspace_id":"00000000-0000-0000-0000-000000000051"}}"#,
+            )
+            .await
+            .expect("real private daemon returns registered git status");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response,
+            br#"{"id":"00000000-0000-0000-0000-000000000052","kind":"response","result":{"entries":[{"new_path_b64":"c3JjL_8ucnM","staged":"unmodified","unstaged":"modified"}],"workspace_id":"00000000-0000-0000-0000-000000000051"}}"#
+        );
+        server.abort();
+        daemon.join().expect("real daemon fixture completes");
+        std::fs::remove_dir_all(daemon_root).expect("real daemon fixture root is removed");
     }
 
     #[test]

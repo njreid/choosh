@@ -211,6 +211,7 @@ dependencies = [
  "choosh-host",
  "choosh-protocol",
  "choosh-ssh",
+ "chooshd",
  "rand",
  "russh",
  "serde_json",
