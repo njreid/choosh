@@ -69,7 +69,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   the registered root, and proves byte-preserving paths through a private Unix socket.
 - [x] Android has a headless `git.status` request/response codec and controller with
   injected request IDs, strict envelope/base64 validation, and typed failure projection;
-  it is deliberately not wired to the unavailable live SSH connector yet.
+  a constructor-injected composition now reaches it through the planned native connector
+  only after a connected result, while host-key rejection cannot construct a controller or
+  issue an RPC. The underlying JNI runtime remains unavailable until it can invoke its
+  registered socket and Keystore callback.
 - [x] The Android transport composition root now joins opaque runtime capabilities to the
   pinned Russh admission path in the required order: exact host session, username, Keystore
   signer, injected stream, then Russh host-key callback before signing. Generated Ed25519
