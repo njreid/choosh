@@ -80,6 +80,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   callback handle. The Java callback retains key material on Android, Rust retains only the
   opaque handle after exact-host admission, and focused JVM/Rust tests prove the ABI rejects
   missing handles without exposing signing inputs or outputs through plan metadata.
+- [x] Android now has a constructor-injected bounded socket adapter and an explicit per-attempt
+  native-runtime lease. The lease releases opaque socket and signer registrations exactly once
+  after plan rejection, cancellation, completion, or a late callback; headless JVM fakes cover
+  the lifecycle. The JNI bridge still does not invoke those registrations from Rust.
 - [x] A generated-key Android-shaped `git.status` acceptance reaches the fixed
   `choosh-host rpc --stdio` SSH command through a bounded native-stream composition and returns
   a bounded terminal envelope. Its SSH fixture invokes the real host stdio relay, which completes
