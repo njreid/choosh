@@ -82,9 +82,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   missing handles without exposing signing inputs or outputs through plan metadata.
 - [x] A generated-key Android-shaped `git.status` acceptance reaches the fixed
   `choosh-host rpc --stdio` SSH command through a bounded native-stream composition and returns
-  a bounded terminal envelope. It rejects a non-request envelope before SSH. This proves the
-  Rust composition seam only; it does not yet bind a JVM socket, invoke the Java callback, or
-  reach `chooshd`'s private socket from Android.
+  a bounded terminal envelope. Its SSH fixture invokes the real host stdio relay, which completes
+  hello/welcome against a private Unix-socket daemon fixture before forwarding the request. It
+  rejects a non-request envelope before SSH. This proves the Rust composition seam and relay only;
+  it does not yet bind a JVM socket, invoke the Java callback, or reach a real `chooshd` from Android.
 - [x] Blob capability completion consumes a bounded reader and stops an oversized source
   after the first byte above its declared limit; daemon fixture roots are unique under
   parallel headless test execution.
@@ -144,7 +145,7 @@ bounded resources, and a commit/push after verification.
    bounded JVM socket adapter; no credential material may cross the ABI.
 2. **Finish M0-R5/M0-R6.** Exercise that real Android/native connector, credential use,
    bounded cancellation, the fixed `git.status` daemon method, and negotiated
-   stdio-to-private-socket RPC in one harness—not only generated-key protocol fakes.
+   stdio-to-real-`chooshd` private-socket RPC in one harness—not only generated-key fixtures.
 4. **Then widen host/SFTP operations.** Compose the injected host process adapter and add
    only server-proven root-confined/atomic SFTP operations after the first vertical thread
    is reachable.
