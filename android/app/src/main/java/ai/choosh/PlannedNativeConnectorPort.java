@@ -44,7 +44,7 @@ public final class PlannedNativeConnectorPort
         try {
             transport.open(plan, completion::complete);
         } catch (NativeAuthenticatedSshConnector.NativeBridgeException exception) {
-            completion.closePlan();
+            completion.cancel();
             throw exception;
         }
     }
@@ -90,8 +90,8 @@ public final class PlannedNativeConnectorPort
     }
 
     private static final class Completion {
-        private final RustNativeConnectorJni.Plan plan;
-        private final NativeAuthenticatedSshConnector.NativeOpenCallback callback;
+        private RustNativeConnectorJni.Plan plan;
+        private NativeAuthenticatedSshConnector.NativeOpenCallback callback;
         private final AtomicBoolean complete = new AtomicBoolean();
 
         Completion(RustNativeConnectorJni.Plan plan, NativeAuthenticatedSshConnector.NativeOpenCallback callback) {
@@ -101,18 +101,34 @@ public final class PlannedNativeConnectorPort
 
         void complete(NativeAuthenticatedSshConnector.NativeOpenResult result) {
             if (!complete.compareAndSet(false, true)) return;
+            NativeAuthenticatedSshConnector.NativeOpenCallback completion = takeCallback();
             if (!closePlan()) {
-                callback.onComplete(NativeAuthenticatedSshConnector.NativeOpenResult.failure(
+                completion.onComplete(NativeAuthenticatedSshConnector.NativeOpenResult.failure(
                     NativeAuthenticatedSshConnector.Code.TRANSPORT_UNAVAILABLE
                 ));
                 return;
             }
-            callback.onComplete(result);
+            completion.onComplete(result);
+        }
+
+        void cancel() {
+            if (!complete.compareAndSet(false, true)) return;
+            takeCallback();
+            closePlan();
+        }
+
+        private NativeAuthenticatedSshConnector.NativeOpenCallback takeCallback() {
+            NativeAuthenticatedSshConnector.NativeOpenCallback value = callback;
+            callback = null;
+            return value;
         }
 
         boolean closePlan() {
+            RustNativeConnectorJni.Plan closing = plan;
+            plan = null;
+            if (closing == null) return true;
             try {
-                plan.close();
+                closing.close();
                 return true;
             } catch (RustNativeConnectorJni.NativePlanException exception) {
                 return false;

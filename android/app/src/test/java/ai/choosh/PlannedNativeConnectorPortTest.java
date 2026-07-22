@@ -37,12 +37,19 @@ public final class PlannedNativeConnectorPortTest {
 
     @Test public void transport_throw_cancels_plan_before_propagating() {
         RecordingBridge bridge = new RecordingBridge(2, 29, 0);
+        RecordingTransport transport = new RecordingTransport();
         PlannedNativeConnectorPort port = port(bridge, (plan, callback) -> {
+            transport.callback = callback;
             throw new NativeAuthenticatedSshConnector.NativeBridgeException();
         });
+        Outcome outcome = new Outcome();
         assertThrows(NativeAuthenticatedSshConnector.NativeBridgeException.class,
-            () -> port.open(input(), result -> { }));
+            () -> port.open(input(), outcome));
         assertEquals(1, bridge.cancels);
+        transport.callback.onComplete(NativeAuthenticatedSshConnector.NativeOpenResult.failure(
+            NativeAuthenticatedSshConnector.Code.AUTHENTICATION_FAILED
+        ));
+        assertEquals(0, outcome.completions);
     }
 
     @Test public void production_jni_transport_fails_closed_without_a_verified_native_session() throws Exception {
@@ -57,12 +64,53 @@ public final class PlannedNativeConnectorPortTest {
         assertEquals(1, outcome.completions);
     }
 
+    @Test public void injected_runtime_registrations_are_independent_until_their_own_callbacks_finish()
+        throws Exception {
+        RecordingBridge firstBridge = new RecordingBridge(2, 29, 0);
+        RecordingBridge secondBridge = new RecordingBridge(2, 31, 0);
+        RecordingTransport firstTransport = new RecordingTransport();
+        RecordingTransport secondTransport = new RecordingTransport();
+        PlannedNativeConnectorPort first = new PlannedNativeConnectorPort(
+            () -> 7,
+            RustNativeConnectorJni.PlanFactory.fromHandleResolver(firstBridge,
+                ignored -> new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6)),
+            firstTransport
+        );
+        PlannedNativeConnectorPort second = new PlannedNativeConnectorPort(
+            () -> 11,
+            RustNativeConnectorJni.PlanFactory.fromHandleResolver(secondBridge,
+                ignored -> new RustNativeConnectorJni.NativeHandles(11, 12, 13, 14, 15, 16)),
+            secondTransport
+        );
+        Outcome firstOutcome = new Outcome();
+        Outcome secondOutcome = new Outcome();
+
+        first.open(input(), firstOutcome);
+        second.open(input(), secondOutcome);
+        firstTransport.callback.onComplete(NativeAuthenticatedSshConnector.NativeOpenResult.failure(
+            NativeAuthenticatedSshConnector.Code.HOST_KEY_REJECTED
+        ));
+
+        assertEquals(7, firstBridge.generation);
+        assertEquals(11, secondBridge.generation);
+        assertEquals(1, firstBridge.cancels);
+        assertEquals(0, secondBridge.cancels);
+        assertEquals(1, firstOutcome.completions);
+        assertEquals(0, secondOutcome.completions);
+
+        secondTransport.callback.onComplete(NativeAuthenticatedSshConnector.NativeOpenResult.failure(
+            NativeAuthenticatedSshConnector.Code.TRANSPORT_UNAVAILABLE
+        ));
+        assertEquals(1, secondBridge.cancels);
+        assertEquals(1, secondOutcome.completions);
+    }
+
     private static PlannedNativeConnectorPort port(
         RecordingBridge bridge, PlannedNativeConnectorPort.PlannedTransportPort transport
     ) {
         return new PlannedNativeConnectorPort(
             () -> 7,
-            new RustNativeConnectorJni.PlanFactory(bridge,
+            RustNativeConnectorJni.PlanFactory.fromHandleResolver(bridge,
                 ignored -> new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6)),
             transport
         );
