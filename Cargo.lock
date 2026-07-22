@@ -208,9 +208,11 @@ version = "0.0.0"
 dependencies = [
  "choosh-android-bridge",
  "choosh-core",
+ "choosh-protocol",
  "choosh-ssh",
  "rand",
  "russh",
+ "serde_json",
  "signature",
  "ssh-key",
  "tokio",

@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+use choosh_protocol::envelope::Response;
+use choosh_protocol::wire::{WireEnvelope, WireError, decode_envelope, encode_response};
 use std::io;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
@@ -235,6 +237,83 @@ pub trait KeystoreSignerResolver {
     ) -> Result<Self::Signer, Self::Error>;
 }
 
+/// Android outer runtime with a bounded native stream at its only I/O exit.
+///
+/// `R` remains responsible for resolving opaque Android handles and for the
+/// JNI socket implementation. This adapter is the composition step that puts
+/// [`BoundedAndroidStream`] between that socket and Russh, while forwarding
+/// only the existing narrow metadata, host-session, and signing capabilities.
+/// It does not expose a JVM reference, a host path, or key material.
+pub struct BoundedAndroidRuntime<R> {
+    inner: R,
+    stream_limits: StreamChunkLimits,
+}
+
+impl<R> BoundedAndroidRuntime<R> {
+    /// Creates one outer runtime whose native stream callbacks are bounded.
+    #[must_use]
+    pub const fn new(inner: R, stream_limits: StreamChunkLimits) -> Self {
+        Self {
+            inner,
+            stream_limits,
+        }
+    }
+
+    /// Releases the Android-owned runtime after its connection attempt ends.
+    #[must_use]
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R> AndroidSshRuntime for BoundedAndroidRuntime<R>
+where
+    R: AndroidSshRuntime,
+{
+    type Stream = BoundedAndroidStream<R::Stream>;
+    type Error = R::Error;
+
+    fn open_stream(&mut self, endpoint: AndroidHandle) -> Result<Self::Stream, Self::Error> {
+        self.inner
+            .open_stream(endpoint)
+            .map(|stream| BoundedAndroidStream::new(stream, self.stream_limits))
+    }
+
+    fn username(&self, username: AndroidHandle) -> Result<choosh_ssh::SshUsername, Self::Error> {
+        self.inner.username(username)
+    }
+}
+
+impl<R> ExactHostSessionResolver for BoundedAndroidRuntime<R>
+where
+    R: ExactHostSessionResolver,
+{
+    type Error = R::Error;
+
+    fn take_pre_authentication_session(
+        &mut self,
+        known_host: AndroidHandle,
+    ) -> Result<choosh_ssh::PreAuthenticationSession, Self::Error> {
+        self.inner.take_pre_authentication_session(known_host)
+    }
+}
+
+impl<R> KeystoreSignerResolver for BoundedAndroidRuntime<R>
+where
+    R: KeystoreSignerResolver,
+{
+    type Signer = R::Signer;
+    type Error = R::Error;
+
+    fn signer(
+        &mut self,
+        credential_reference: AndroidHandle,
+        public_key: AndroidHandle,
+    ) -> Result<Self::Signer, Self::Error> {
+        self.inner.signer(credential_reference, public_key)
+    }
+}
+
 /// Typed failures while composing Android-owned capabilities into Russh.
 #[derive(Debug)]
 pub enum AndroidTransportError<RuntimeError, SessionError, SignerError> {
@@ -242,6 +321,77 @@ pub enum AndroidTransportError<RuntimeError, SessionError, SignerError> {
     Session(SessionError),
     Signer(SignerError),
     Connection(choosh_ssh::VerifiedConnectionError<SignerError>),
+}
+
+const MAX_ANDROID_RPC_BYTES: usize = 256 * 1024 - 4;
+
+/// The opaque post-authentication session exposed to the Android JNI boundary.
+///
+/// It accepts one validated Android envelope payload at a time and retains the
+/// live Russh handle privately. This is intentionally narrower than a raw
+/// byte stream: callers cannot choose an SSH command, argv, channel type, or
+/// socket path.
+pub struct AndroidRpcSession {
+    connection: choosh_ssh::VerifiedConnection,
+}
+
+impl AndroidRpcSession {
+    /// Wraps a connection which has already completed exact-host admission and
+    /// public-key authentication.
+    #[must_use]
+    pub const fn new(connection: choosh_ssh::VerifiedConnection) -> Self {
+        Self { connection }
+    }
+
+    /// Carries one Android protocol request through the fixed SSH RPC bridge.
+    ///
+    /// The input and output are unframed JSON envelope payloads, matching the
+    /// Java `GitStatusRpc` boundary. Framing, fixed command selection, and
+    /// SSH-channel lifetime remain owned by `choosh-ssh`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content-free classification for malformed Android request
+    /// payloads, non-request envelopes, SSH RPC failures, or a response that
+    /// exceeds the Android protocol bound.
+    pub async fn execute(&self, payload: &[u8]) -> Result<Vec<u8>, AndroidRpcError> {
+        let request = decode_android_rpc_request(payload)?;
+        let response = self
+            .connection
+            .request_rpc(request)
+            .await
+            .map_err(AndroidRpcError::Rpc)?;
+        encode_response(
+            &Response {
+                id: response.id,
+                terminal: response.terminal,
+            },
+            MAX_ANDROID_RPC_BYTES,
+        )
+        .map_err(AndroidRpcError::Response)
+    }
+}
+
+/// Stable classifications for the Android-to-fixed-RPC capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AndroidRpcError {
+    Request(WireError),
+    RequestKind,
+    Rpc(choosh_ssh::RpcError),
+    Response(WireError),
+}
+
+fn decode_android_rpc_request(payload: &[u8]) -> Result<choosh_ssh::RpcRequest, AndroidRpcError> {
+    let WireEnvelope::Request(request) =
+        decode_envelope(payload, MAX_ANDROID_RPC_BYTES).map_err(AndroidRpcError::Request)?
+    else {
+        return Err(AndroidRpcError::RequestKind);
+    };
+    Ok(choosh_ssh::RpcRequest::new(
+        request.id,
+        request.method,
+        request.params,
+    ))
 }
 
 /// Opens and authenticates exactly one injected Android SSH stream.
@@ -286,14 +436,45 @@ where
     .map_err(AndroidTransportError::Connection)
 }
 
+/// Opens one authenticated Android connection with bounded native callbacks.
+///
+/// This is the smallest real native runtime composition: callers supply the
+/// Android-owned resolver and opaque plan, while the transport crate ensures
+/// the raw stream is bounded before the verified Russh admission path starts.
+/// Concrete JNI socket and Keystore implementations remain outer adapters.
+///
+/// # Errors
+///
+/// Returns only the injected runtime or verified-connection failure.
+pub async fn connect_verified_bounded<R, E>(
+    runtime: R,
+    plan: AndroidConnectionPlan,
+    stream_limits: StreamChunkLimits,
+) -> Result<
+    choosh_ssh::VerifiedConnection,
+    AndroidTransportError<E, E, <R::Signer as choosh_ssh::CredentialSigner>::Error>,
+>
+where
+    R: AndroidSshRuntime + ExactHostSessionResolver<Error = E> + KeystoreSignerResolver<Error = E>,
+    R: AndroidSshRuntime<Error = E>,
+    R::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut runtime = BoundedAndroidRuntime::new(runtime, stream_limits);
+    connect_verified(&mut runtime, plan).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use choosh_core::ssh_identity::PublicKeyFingerprint;
+    use choosh_protocol::envelope::{EnvelopeId, Response, Terminal};
+    use choosh_protocol::framing::encode_frame;
+    use choosh_protocol::wire::encode_response;
     use choosh_ssh::{CredentialSigner, SessionLimits, presented_fingerprint};
     use russh::keys::agent::AgentIdentity;
     use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
-    use russh::server::{self, Auth};
+    use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session};
+    use russh::{Channel, ChannelId};
     use signature::Signer as _;
     use std::collections::VecDeque;
     use std::convert::Infallible;
@@ -426,6 +607,134 @@ mod tests {
                 },
             )
         }
+    }
+
+    struct GitStatusServer {
+        expected_credential: PublicKeyFingerprint,
+        command_accepted: bool,
+        input: Vec<u8>,
+    }
+    impl server::Handler for GitStatusServer {
+        type Error = russh::Error;
+
+        async fn auth_publickey_offered(
+            &mut self,
+            _: &str,
+            key: &PublicKey,
+        ) -> Result<Auth, Self::Error> {
+            Ok(
+                if presented_fingerprint(key) == self.expected_credential.as_str() {
+                    Auth::Accept
+                } else {
+                    Auth::reject()
+                },
+            )
+        }
+
+        async fn auth_publickey(&mut self, _: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+            Ok(
+                if presented_fingerprint(key) == self.expected_credential.as_str() {
+                    Auth::Accept
+                } else {
+                    Auth::reject()
+                },
+            )
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _: Channel<Msg>,
+            reply: ChannelOpenHandle,
+            _: &mut Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: ChannelId,
+            command: &[u8],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.command_accepted = command == b"choosh-host --exec-stdio-v1";
+            if self.command_accepted {
+                session.channel_success(channel)?;
+            } else {
+                session.channel_failure(channel)?;
+            }
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            _: ChannelId,
+            data: &[u8],
+            _: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.input.extend_from_slice(data);
+            Ok(())
+        }
+
+        async fn channel_eof(
+            &mut self,
+            channel: ChannelId,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            assert!(self.command_accepted);
+            let request = fixed_command_stdin(&self.input);
+            let request = &request[4..];
+            let response = encode_response(
+                &Response {
+                    id: EnvelopeId::new("00000000-0000-0000-0000-000000000052").unwrap(),
+                    terminal: Terminal::Result(serde_json::json!({
+                        "workspace_id": "00000000-0000-0000-0000-000000000051",
+                        "entries": [{
+                            "staged": "unmodified",
+                            "unstaged": "modified",
+                            "new_path_b64": "c3JjL_8ucnM"
+                        }]
+                    })),
+                },
+                1024,
+            )
+            .unwrap();
+            assert_eq!(
+                request,
+                br#"{"id":"00000000-0000-0000-0000-000000000052","kind":"request","method":"git.status","params":{"workspace_id":"00000000-0000-0000-0000-000000000051"}}"#
+            );
+            session.data(channel, encode_frame(&response, 1024).unwrap())?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    fn fixed_command_stdin(input: &[u8]) -> &[u8] {
+        assert_eq!(input.first(), Some(&1));
+        let mut cursor = 1;
+        let executable = take_u16_bytes(input, &mut cursor);
+        assert_eq!(executable, b"choosh-host");
+        assert_eq!(
+            u16::from_be_bytes(input[cursor..cursor + 2].try_into().unwrap()),
+            2
+        );
+        cursor += 2;
+        assert_eq!(take_u16_bytes(input, &mut cursor), b"rpc");
+        assert_eq!(take_u16_bytes(input, &mut cursor), b"--stdio");
+        let size = u32::from_be_bytes(input[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        assert_eq!(cursor + size, input.len());
+        &input[cursor..]
+    }
+
+    fn take_u16_bytes<'a>(input: &'a [u8], cursor: &mut usize) -> &'a [u8] {
+        let size = u16::from_be_bytes(input[*cursor..*cursor + 2].try_into().unwrap()) as usize;
+        *cursor += 2;
+        let value = &input[*cursor..*cursor + size];
+        *cursor += size;
+        value
     }
 
     #[derive(Debug)]
@@ -571,7 +880,7 @@ mod tests {
                 expected_credential,
             },
         ));
-        let mut runtime = FixtureRuntime {
+        let runtime = FixtureRuntime {
             session: Some(choosh_ssh::PreAuthenticationSession::new(
                 expected,
                 SessionLimits::admission_default(),
@@ -583,9 +892,10 @@ mod tests {
             }),
         };
 
-        let connection = connect_verified(
-            &mut runtime,
+        let connection = connect_verified_bounded(
+            runtime,
             AndroidConnectionPlan::new(1, 2, 3, 4, 5).unwrap(),
+            StreamChunkLimits::new(4 * 1024, 4 * 1024).expect("non-zero JNI callback bounds"),
         )
         .await
         .expect("the exact generated host key and credential authenticate");
@@ -593,5 +903,70 @@ mod tests {
         assert!(calls.load(Ordering::SeqCst) > 0);
         drop(connection);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn android_git_status_payload_crosses_the_admitted_fixed_ssh_rpc_capability() {
+        let host = generated_key();
+        let credential = generated_key();
+        let expected_host =
+            PublicKeyFingerprint::parse(presented_fingerprint(host.public_key())).unwrap();
+        let expected_credential =
+            PublicKeyFingerprint::parse(presented_fingerprint(credential.public_key())).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (client, server_stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(server::run_stream(
+            Arc::new(server::Config {
+                keys: vec![host],
+                ..server::Config::default()
+            }),
+            server_stream,
+            GitStatusServer {
+                expected_credential,
+                command_accepted: false,
+                input: Vec::new(),
+            },
+        ));
+        let mut runtime = FixtureRuntime {
+            session: Some(choosh_ssh::PreAuthenticationSession::new(
+                expected_host,
+                SessionLimits::admission_default(),
+            )),
+            stream: Some(client),
+            signer: Some(CountingSigner {
+                key: credential,
+                calls: Arc::clone(&calls),
+            }),
+        };
+        let connection = connect_verified(
+            &mut runtime,
+            AndroidConnectionPlan::new(1, 2, 3, 4, 5).unwrap(),
+        )
+        .await
+        .expect("generated Android fixture authenticates before RPC");
+        let session = AndroidRpcSession::new(connection);
+        let response = session
+            .execute(
+                br#"{"id":"00000000-0000-0000-0000-000000000052","kind":"request","method":"git.status","params":{"workspace_id":"00000000-0000-0000-0000-000000000051"}}"#,
+            )
+            .await
+            .expect("fixed SSH RPC returns the terminal git status response");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            response,
+            br#"{"id":"00000000-0000-0000-0000-000000000052","kind":"response","result":{"entries":[{"new_path_b64":"c3JjL_8ucnM","staged":"unmodified","unstaged":"modified"}],"workspace_id":"00000000-0000-0000-0000-000000000051"}}"#
+        );
+        drop(session);
+        server.abort();
+    }
+
+    #[test]
+    fn android_rpc_session_rejects_non_request_payloads_before_ssh() {
+        let error = decode_android_rpc_request(
+            br#"{"id":"00000000-0000-0000-0000-000000000052","kind":"response","result":{}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error, AndroidRpcError::RequestKind);
     }
 }
