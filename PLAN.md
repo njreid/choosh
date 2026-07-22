@@ -76,6 +76,15 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   acceptance proves a changed host key reaches no signer and an exact host key reaches the
   injected signer and authenticates; the custom-signer buffer contract is explicit. Concrete
   JNI runtime adapters and device evidence remain required before it can report connected.
+- [x] The Android JNI plan ABI now carries a non-zero opaque, payload-only Keystore challenge
+  callback handle. The Java callback retains key material on Android, Rust retains only the
+  opaque handle after exact-host admission, and focused JVM/Rust tests prove the ABI rejects
+  missing handles without exposing signing inputs or outputs through plan metadata.
+- [x] A generated-key Android-shaped `git.status` acceptance reaches the fixed
+  `choosh-host rpc --stdio` SSH command through a bounded native-stream composition and returns
+  a bounded terminal envelope. It rejects a non-request envelope before SSH. This proves the
+  Rust composition seam only; it does not yet bind a JVM socket, invoke the Java callback, or
+  reach `chooshd`'s private socket from Android.
 - [x] Blob capability completion consumes a bounded reader and stops an oversized source
   after the first byte above its declared limit; daemon fixture roots are unique under
   parallel headless test execution.
@@ -117,7 +126,7 @@ public-1.0 milestone has passed.
 
 | Milestone | State | Evidence / remaining gate |
 |---|---|---|
-| M0 — Foundation | **In progress** | Build, editor seams, bridge/RPC, release, SSH channel evidence, and a protocol multiplex harness exist. The shipped M0 UI is a Java/View connection-status screen, not the future Compose shell. M0-R5/R6 still need one composed Android-to-daemon proof; M0-R7/R15 remain blocked on terminal provenance and device implementation. |
+| M0 — Foundation | **In progress** | Build, editor seams, bridge/RPC, release, SSH channel evidence, and a generated-key Android-shaped fixed-RPC proof exist. The shipped M0 UI is a Java/View connection-status screen, not the future Compose shell. M0-R5/R6 still need the real JVM callback/socket-to-`chooshd` proof; M0-R7/R15 remain blocked on terminal provenance and device implementation. |
 | M1 — Remote workspace | **Not started** | Depends on M0 SSH and terminal gates. Profile/known-host and root-confined SFTP read seams exist, but a concrete live transport, safe atomic writes, Zellij, Markdown, reconnect, and lifecycle acceptance remain future work. |
 | M2 — Agents and notifications | **Not started** | Adapter/event and Android notification slices await the M1 remote foundation. |
 | M3 — Pinning and services | **Not started** | Depends on M2 snapshots and verified SSH `direct-tcpip`. |
@@ -130,16 +139,12 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **Join the first vertical composition.** Exercise the existing bounded `git.status`
-   daemon/private-socket slice through the Android connector boundary; do not claim it is
-   live until exact host-key admission and Keystore signing are present.
-2. **Complete the native Android connector.** Turn the opaque JNI plan into a real
-   exact-host-key-before-signing connection using a reviewed Keystore callback and a
-   bounded stream adapter; add deterministic reconnect/recovery while continuing to expose
-   no private key material.
-3. **M0-R5/M0-R6 vertical proof.** Exercise the real Android/native connector,
-   credential use, the fixed daemon method, bounded cancellation, and negotiated
-   stdio-to-private-socket RPC in one harness—not only protocol fakes.
+1. **Bind the real native Android connector.** Turn the opaque JNI plan into a real
+   exact-host-key-before-signing connection using the reviewed Java Keystore callback and a
+   bounded JVM socket adapter; no credential material may cross the ABI.
+2. **Finish M0-R5/M0-R6.** Exercise that real Android/native connector, credential use,
+   bounded cancellation, the fixed `git.status` daemon method, and negotiated
+   stdio-to-private-socket RPC in one harness—not only generated-key protocol fakes.
 4. **Then widen host/SFTP operations.** Compose the injected host process adapter and add
    only server-proven root-confined/atomic SFTP operations after the first vertical thread
    is reachable.
