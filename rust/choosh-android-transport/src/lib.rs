@@ -467,9 +467,14 @@ where
 mod tests {
     use super::*;
     use choosh_core::ssh_identity::PublicKeyFingerprint;
+    use choosh_host::bridge::BridgeLimits;
+    use choosh_host::socket_relay::run_unix_socket_relay;
     use choosh_protocol::envelope::{EnvelopeId, Response, Terminal};
-    use choosh_protocol::framing::encode_frame;
-    use choosh_protocol::wire::encode_response;
+    use choosh_protocol::framing::{FrameDecoder, FrameLimits, encode_frame};
+    use choosh_protocol::handshake::{
+        PeerIdentity, ProtocolLimits, ProtocolVersion, ServerNegotiator,
+    };
+    use choosh_protocol::wire::{decode_hello, encode_response, encode_server_reply};
     use choosh_ssh::{CredentialSigner, SessionLimits, presented_fingerprint};
     use russh::keys::agent::AgentIdentity;
     use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
@@ -478,11 +483,14 @@ mod tests {
     use signature::Signer as _;
     use std::collections::VecDeque;
     use std::convert::Infallible;
-    use std::io;
+    use std::io::{self, Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
+    use std::thread;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 
     #[test]
@@ -613,6 +621,7 @@ mod tests {
         expected_credential: PublicKeyFingerprint,
         command_accepted: bool,
         input: Vec<u8>,
+        daemon_socket: PathBuf,
     }
     impl server::Handler for GitStatusServer {
         type Error = russh::Error;
@@ -682,28 +691,16 @@ mod tests {
             session: &mut Session,
         ) -> Result<(), Self::Error> {
             assert!(self.command_accepted);
-            let request = fixed_command_stdin(&self.input);
-            let request = &request[4..];
-            let response = encode_response(
-                &Response {
-                    id: EnvelopeId::new("00000000-0000-0000-0000-000000000052").unwrap(),
-                    terminal: Terminal::Result(serde_json::json!({
-                        "workspace_id": "00000000-0000-0000-0000-000000000051",
-                        "entries": [{
-                            "staged": "unmodified",
-                            "unstaged": "modified",
-                            "new_path_b64": "c3JjL_8ucnM"
-                        }]
-                    })),
-                },
-                1024,
+            let input = fixed_command_stdin(&self.input);
+            let mut output = Vec::new();
+            run_unix_socket_relay(
+                input,
+                &mut output,
+                &self.daemon_socket,
+                BridgeLimits::default(),
             )
-            .unwrap();
-            assert_eq!(
-                request,
-                br#"{"id":"00000000-0000-0000-0000-000000000052","kind":"request","method":"git.status","params":{"workspace_id":"00000000-0000-0000-0000-000000000051"}}"#
-            );
-            session.data(channel, encode_frame(&response, 1024).unwrap())?;
+            .expect("fixed SSH command reaches the private daemon socket");
+            session.data(channel, output)?;
             session.exit_status_request(channel, 0)?;
             session.eof(channel)?;
             session.close(channel)?;
@@ -736,6 +733,74 @@ mod tests {
         *cursor += size;
         value
     }
+
+    fn daemon_socket_fixture() -> (PathBuf, thread::JoinHandle<()>) {
+        let path = std::env::temp_dir().join(format!(
+            "choosh-android-rpc-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = UnixListener::bind(&path).expect("unique private daemon fixture socket");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("host relay connects");
+            let hello = read_single_frame(&mut stream);
+            let hello = decode_hello(&hello, 1024).expect("host relay sends typed hello");
+            let reply = ServerNegotiator::new(
+                ProtocolVersion::new(1, 0),
+                PeerIdentity::new("chooshd", "test").unwrap(),
+                PeerIdentity::new("fixture-host", "test").unwrap(),
+                [],
+                ProtocolLimits::new(1024, 4).unwrap(),
+            )
+            .unwrap()
+            .receive_hello(&hello)
+            .expect("host relay hello negotiates");
+            let reply = encode_server_reply(&reply, 1024).unwrap();
+            stream
+                .write_all(&encode_frame(&reply, 1024).unwrap())
+                .unwrap();
+
+            let request = read_single_frame(&mut stream);
+            assert_eq!(
+                request,
+                br#"{"id":"00000000-0000-0000-0000-000000000052","kind":"request","method":"git.status","params":{"workspace_id":"00000000-0000-0000-0000-000000000051"}}"#
+            );
+            let response = encode_response(
+                &Response {
+                    id: EnvelopeId::new("00000000-0000-0000-0000-000000000052").unwrap(),
+                    terminal: Terminal::Result(serde_json::json!({
+                        "workspace_id": "00000000-0000-0000-0000-000000000051",
+                        "entries": [{"staged": "unmodified", "unstaged": "modified", "new_path_b64": "c3JjL_8ucnM"}]
+                    })),
+                },
+                1024,
+            )
+            .unwrap();
+            stream
+                .write_all(&encode_frame(&response, 1024).unwrap())
+                .unwrap();
+        });
+        (path, worker)
+    }
+
+    fn read_single_frame(stream: &mut UnixStream) -> Vec<u8> {
+        let mut decoder = FrameDecoder::new(FrameLimits::new(1024, 2).unwrap());
+        let mut buffer = [0; 128];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("fixture socket is readable");
+            assert_ne!(read, 0, "fixture socket must not end before its frame");
+            let frames = decoder
+                .feed(&buffer[..read])
+                .expect("fixture frame is bounded");
+            if let Some(frame) = frames.into_iter().next() {
+                return frame;
+            }
+        }
+    }
+
+    static NEXT_SOCKET_ID: AtomicUsize = AtomicUsize::new(1);
 
     #[derive(Debug)]
     struct FixtureSignerError;
@@ -914,6 +979,7 @@ mod tests {
         let expected_credential =
             PublicKeyFingerprint::parse(presented_fingerprint(credential.public_key())).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
+        let (daemon_socket, daemon) = daemon_socket_fixture();
         let (client, server_stream) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(server::run_stream(
             Arc::new(server::Config {
@@ -925,6 +991,7 @@ mod tests {
                 expected_credential,
                 command_accepted: false,
                 input: Vec::new(),
+                daemon_socket: daemon_socket.clone(),
             },
         ));
         let mut runtime = FixtureRuntime {
@@ -959,6 +1026,8 @@ mod tests {
         );
         drop(session);
         server.abort();
+        daemon.join().expect("daemon fixture completes");
+        std::fs::remove_file(daemon_socket).expect("daemon fixture socket is removed");
     }
 
     #[test]

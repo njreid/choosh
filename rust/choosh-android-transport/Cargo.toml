@@ -13,6 +13,7 @@ tokio = { version = "=1.53.0", features = ["io-util"] }
 
 [dev-dependencies]
 choosh-core = { path = "../choosh-core" }
+choosh-host = { path = "../choosh-host" }
 rand = "=0.10.2"
 russh = { version = "=0.62.2", default-features = false, features = ["ring"] }
 serde_json = "=1.0.150"
