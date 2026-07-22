@@ -64,7 +64,7 @@ public final class RustNativeConnectorJni {
         }
     }
 
-    /** Six separately typed opaque IDs; no Java object, string, or byte buffer crosses JNI. */
+    /** Seven separately typed opaque IDs; no Java object, string, or byte buffer crosses JNI. */
     public static final class NativeHandles {
         private final long endpoint;
         private final long username;
@@ -72,13 +72,14 @@ public final class RustNativeConnectorJni {
         private final long credentialRef;
         private final long publicKey;
         private final long signingCallback;
+        private final long runtimeLease;
 
         public NativeHandles(
             long endpoint, long username, long knownHost, long credentialRef, long publicKey,
-            long signingCallback
+            long signingCallback, long runtimeLease
         ) {
             if (endpoint <= 0 || username <= 0 || knownHost <= 0 || credentialRef <= 0 || publicKey <= 0
-                || signingCallback <= 0) {
+                || signingCallback <= 0 || runtimeLease <= 0) {
                 throw new IllegalArgumentException("native handles must be positive");
             }
             this.endpoint = endpoint;
@@ -87,6 +88,7 @@ public final class RustNativeConnectorJni {
             this.credentialRef = credentialRef;
             this.publicKey = publicKey;
             this.signingCallback = signingCallback;
+            this.runtimeLease = runtimeLease;
         }
 
         @Override public String toString() { return "NativeHandles(REDACTED)"; }
@@ -94,7 +96,7 @@ public final class RustNativeConnectorJni {
 
     /** Factory for a bounded native plan token. It does not open a socket or credential. */
     public static final class PlanFactory {
-        private static final int ABI_VERSION = 2;
+        private static final int ABI_VERSION = 3;
         private final NativePlanBridge bridge;
         private final NativeRuntime runtime;
 
@@ -182,7 +184,7 @@ public final class RustNativeConnectorJni {
         @Override public long beginAuthenticatedPlan(int generation, NativeHandles handles) {
             return nativeBeginAuthenticatedPlan(
                 generation, handles.endpoint, handles.username, handles.knownHost,
-                handles.credentialRef, handles.publicKey, handles.signingCallback
+                handles.credentialRef, handles.publicKey, handles.signingCallback, handles.runtimeLease
             );
         }
 
@@ -197,7 +199,7 @@ public final class RustNativeConnectorJni {
         private static native int nativeAbiVersion();
         private static native long nativeBeginAuthenticatedPlan(
             int generation, long endpoint, long username, long knownHost, long credentialRef, long publicKey,
-            long signingCallback
+            long signingCallback, long runtimeLease
         );
         private static native int nativeCancelAuthenticatedPlan(int generation, long plan);
         private static native int nativeOpenAuthenticatedPlan(int generation, long plan);

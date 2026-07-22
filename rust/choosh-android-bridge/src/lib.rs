@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-const ABI_VERSION: u32 = 2;
+const ABI_VERSION: u32 = 3;
 const STATUS_OK: i32 = 0;
 const STATUS_STALE_GENERATION: i32 = 1;
 const STATUS_UNKNOWN_REQUEST: i32 = 2;
@@ -58,6 +58,7 @@ opaque_handle!(KnownHostHandle);
 opaque_handle!(CredentialReferenceHandle);
 opaque_handle!(PublicKeyHandle);
 opaque_handle!(SigningCallbackHandle);
+opaque_handle!(RuntimeLeaseHandle);
 
 /// A validated, Android-owned connection description before host-key admission.
 ///
@@ -72,6 +73,7 @@ pub struct NativeAuthenticatedPlan {
     credential_reference: CredentialReferenceHandle,
     public_key: PublicKeyHandle,
     signing_callback: SigningCallbackHandle,
+    runtime_lease: RuntimeLeaseHandle,
 }
 
 impl NativeAuthenticatedPlan {
@@ -84,6 +86,7 @@ impl NativeAuthenticatedPlan {
         credential_reference: u64,
         public_key: u64,
         signing_callback: u64,
+        runtime_lease: u64,
     ) -> Option<Self> {
         Some(Self {
             endpoint: EndpointHandle::new(endpoint)?,
@@ -92,6 +95,7 @@ impl NativeAuthenticatedPlan {
             credential_reference: CredentialReferenceHandle::new(credential_reference)?,
             public_key: PublicKeyHandle::new(public_key)?,
             signing_callback: SigningCallbackHandle::new(signing_callback)?,
+            runtime_lease: RuntimeLeaseHandle::new(runtime_lease)?,
         })
     }
 
@@ -226,7 +230,8 @@ pub extern "C" fn choosh_bridge_request_begin(generation: u32, status: u32) -> u
 
 /// Begins an opaque Android-to-Rust authenticated-connection plan.
 ///
-/// Every input is a non-zero opaque handle owned by Android. In particular,
+/// Every input is a non-zero opaque handle owned by Android. `runtime_lease` is the
+/// per-attempt callback registration which owns the socket and signer callback. In particular,
 /// this ABI accepts neither a private key nor any pointer to credential,
 /// hostname, user name, or fingerprint bytes. A plan is not a verified SSH
 /// session and cannot perform an operation; a later bridge slice must consume
@@ -240,6 +245,7 @@ pub extern "C" fn choosh_bridge_authenticated_plan_begin(
     credential_ref: u64,
     public_key: u64,
     signing_callback: u64,
+    runtime_lease: u64,
 ) -> u64 {
     if NativeAuthenticatedPlan::new(
         endpoint,
@@ -248,6 +254,7 @@ pub extern "C" fn choosh_bridge_authenticated_plan_begin(
         credential_ref,
         public_key,
         signing_callback,
+        runtime_lease,
     )
     .is_none()
     {
@@ -314,6 +321,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenti
     credential_ref: i64,
     public_key: i64,
     signing_callback: i64,
+    runtime_lease: i64,
 ) -> i64 {
     if generation <= 0
         || endpoint <= 0
@@ -322,6 +330,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenti
         || credential_ref <= 0
         || public_key <= 0
         || signing_callback <= 0
+        || runtime_lease <= 0
     {
         return 0;
     }
@@ -333,6 +342,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenti
         credential_ref.cast_unsigned(),
         public_key.cast_unsigned(),
         signing_callback.cast_unsigned(),
+        runtime_lease.cast_unsigned(),
     )
     .cast_signed()
 }
@@ -490,7 +500,7 @@ mod tests {
     #[test]
     fn typed_plan_cannot_request_keystore_authentication_before_exact_host_key_admission() {
         let events = Mutex::new(Vec::new());
-        let plan = NativeAuthenticatedPlan::new(1, 2, 3, 4, 5, 6).expect("non-zero handles");
+        let plan = NativeAuthenticatedPlan::new(1, 2, 3, 4, 5, 6, 7).expect("non-zero handles");
         let error = plan
             .admit_exact_host_key(&mut RecordingAdmission {
                 events: &events,
@@ -504,7 +514,7 @@ mod tests {
     #[test]
     fn typed_plan_requests_keystore_authentication_only_after_exact_host_key_admission() {
         let events = Mutex::new(Vec::new());
-        let plan = NativeAuthenticatedPlan::new(1, 2, 3, 4, 5, 6).expect("non-zero handles");
+        let plan = NativeAuthenticatedPlan::new(1, 2, 3, 4, 5, 6, 7).expect("non-zero handles");
         let admitted = plan
             .admit_exact_host_key(&mut RecordingAdmission {
                 events: &events,
@@ -523,7 +533,7 @@ mod tests {
     #[test]
     fn abi_request_cancel_and_recreation_are_typed_and_bounded() {
         let _guard = ABI_TEST_LOCK.lock().unwrap();
-        assert_eq!(choosh_bridge_abi_version(), 2);
+        assert_eq!(choosh_bridge_abi_version(), 3);
         let generation = choosh_bridge_generation();
         let request = choosh_bridge_request_begin(generation, 7);
         assert_ne!(request, 0);
@@ -547,14 +557,18 @@ mod tests {
         let _guard = ABI_TEST_LOCK.lock().unwrap();
         let generation = choosh_bridge_generation();
         assert_eq!(
-            choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 0, 5, 6),
+            choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 0, 5, 6, 7),
             0
         );
         assert_eq!(
-            choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 4, 5, 0),
+            choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 4, 5, 0, 7),
             0
         );
-        let plan = choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 4, 5, 6);
+        assert_eq!(
+            choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 4, 5, 6, 0),
+            0
+        );
+        let plan = choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 4, 5, 6, 7);
         assert_ne!(plan, 0);
         assert_eq!(
             choosh_bridge_authenticated_plan_open(generation, plan),

@@ -8,7 +8,7 @@ import org.junit.Test;
 /** Headless lifecycle checks for the plan-to-native-transport composition seam. */
 public final class PlannedNativeConnectorPortTest {
     @Test public void admits_opaque_plan_before_transport_and_cancels_on_completion() throws Exception {
-        RecordingBridge bridge = new RecordingBridge(2, 29, 0);
+        RecordingBridge bridge = new RecordingBridge(3, 29, 0);
         RecordingTransport transport = new RecordingTransport();
         PlannedNativeConnectorPort port = port(bridge, transport);
         Outcome outcome = new Outcome();
@@ -29,14 +29,14 @@ public final class PlannedNativeConnectorPortTest {
 
     @Test public void plan_rejection_never_invokes_transport() {
         RecordingTransport transport = new RecordingTransport();
-        PlannedNativeConnectorPort port = port(new RecordingBridge(2, 0, 0), transport);
+        PlannedNativeConnectorPort port = port(new RecordingBridge(3, 0, 0), transport);
         assertThrows(NativeAuthenticatedSshConnector.NativeBridgeException.class,
             () -> port.open(input(), result -> { }));
         assertEquals(0, transport.opens);
     }
 
     @Test public void transport_throw_cancels_plan_before_propagating() {
-        RecordingBridge bridge = new RecordingBridge(2, 29, 0);
+        RecordingBridge bridge = new RecordingBridge(3, 29, 0);
         RecordingTransport transport = new RecordingTransport();
         PlannedNativeConnectorPort port = port(bridge, (plan, callback) -> {
             transport.callback = callback;
@@ -53,7 +53,7 @@ public final class PlannedNativeConnectorPortTest {
     }
 
     @Test public void production_jni_transport_fails_closed_without_a_verified_native_session() throws Exception {
-        RecordingBridge bridge = new RecordingBridge(2, 29, 0);
+        RecordingBridge bridge = new RecordingBridge(3, 29, 0);
         PlannedNativeConnectorPort port = port(bridge, new PlannedNativeConnectorPort.JniPlannedTransport());
         Outcome outcome = new Outcome();
 
@@ -66,20 +66,20 @@ public final class PlannedNativeConnectorPortTest {
 
     @Test public void injected_runtime_registrations_are_independent_until_their_own_callbacks_finish()
         throws Exception {
-        RecordingBridge firstBridge = new RecordingBridge(2, 29, 0);
-        RecordingBridge secondBridge = new RecordingBridge(2, 31, 0);
+        RecordingBridge firstBridge = new RecordingBridge(3, 29, 0);
+        RecordingBridge secondBridge = new RecordingBridge(3, 31, 0);
         RecordingTransport firstTransport = new RecordingTransport();
         RecordingTransport secondTransport = new RecordingTransport();
         PlannedNativeConnectorPort first = new PlannedNativeConnectorPort(
             () -> 7,
             RustNativeConnectorJni.PlanFactory.fromHandleResolver(firstBridge,
-                ignored -> new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6)),
+                ignored -> new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6, 7)),
             firstTransport
         );
         PlannedNativeConnectorPort second = new PlannedNativeConnectorPort(
             () -> 11,
             RustNativeConnectorJni.PlanFactory.fromHandleResolver(secondBridge,
-                ignored -> new RustNativeConnectorJni.NativeHandles(11, 12, 13, 14, 15, 16)),
+                ignored -> new RustNativeConnectorJni.NativeHandles(11, 12, 13, 14, 15, 16, 17)),
             secondTransport
         );
         Outcome firstOutcome = new Outcome();
@@ -111,7 +111,7 @@ public final class PlannedNativeConnectorPortTest {
         return new PlannedNativeConnectorPort(
             () -> 7,
             RustNativeConnectorJni.PlanFactory.fromHandleResolver(bridge,
-                ignored -> new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6)),
+                ignored -> new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6, 7)),
             transport
         );
     }
