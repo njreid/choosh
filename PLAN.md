@@ -90,9 +90,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] A generated-key Android-shaped `git.status` acceptance reaches the fixed
   `choosh-host rpc --stdio` SSH command through a bounded native-stream composition and returns
   a bounded terminal envelope. Its SSH fixture invokes the real host stdio relay, which completes
-  hello/welcome against a private Unix-socket daemon fixture before forwarding the request. It
-  rejects a non-request envelope before SSH. This proves the Rust composition seam and relay only;
-  it does not yet bind a JVM socket, invoke the Java callback, or reach a real `chooshd` from Android.
+  hello/welcome and forwards the request to a registered real `chooshd` `git.status` handler on a
+  private Unix socket. It rejects a non-request envelope before SSH. This proves the Rust
+  composition seam and real daemon method only; it does not yet bind a JVM socket or invoke the
+  Java callback from Android.
 - [x] Blob capability completion consumes a bounded reader and stops an oversized source
   after the first byte above its declared limit; daemon fixture roots are unique under
   parallel headless test execution.
