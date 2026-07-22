@@ -60,6 +60,32 @@ public final class KeystoreCredentialSignerTest {
             () -> callback.sign(new byte[] {1}));
     }
 
+    @Test public void native_callback_accepts_only_payloads_and_maps_signer_failures() throws Exception {
+        RecordingBackend backend = new RecordingBackend();
+        KeystoreCredentialSigner signer = new KeystoreCredentialSigner(backend);
+        KeystoreCredentialSigner.NativeChallengeCallback callback = signer.nativeChallengeCallback(
+            signer.beginChallengeSigning(
+                KeystoreCredentialSigner.admitExactHost(knownHost(), presentedHost()),
+                credential(), publicKey()
+            )
+        );
+
+        byte[] payload = new byte[] {7, 8};
+        assertArrayEquals(new byte[] {9, 8}, callback.sign(payload));
+        payload[0] = 0;
+        assertArrayEquals(new byte[] {7, 8}, backend.payload);
+
+        KeystoreCredentialSigner failing = new KeystoreCredentialSigner((ref, key, bytes) -> null);
+        KeystoreCredentialSigner.NativeChallengeCallback failingCallback = failing.nativeChallengeCallback(
+            failing.beginChallengeSigning(
+                KeystoreCredentialSigner.admitExactHost(knownHost(), presentedHost()),
+                credential(), publicKey()
+            )
+        );
+        assertThrows(KeystoreCredentialSigner.NativeSigningException.class,
+            () -> failingCallback.sign(new byte[] {1}));
+    }
+
     @Test public void changed_or_different_algorithm_host_never_reaches_signer() {
         RecordingBackend backend = new RecordingBackend();
 

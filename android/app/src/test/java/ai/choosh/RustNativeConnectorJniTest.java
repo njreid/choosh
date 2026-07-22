@@ -16,7 +16,7 @@ public final class RustNativeConnectorJniTest {
             input -> {
                 assertEquals("NativeConnectionInput(endpoint=REDACTED, username=REDACTED, knownHost=ED25519, credential=REDACTED, publicKey=ED25519)",
                     input.toString());
-                return new RustNativeConnectorJni.NativeHandles(11, 12, 13, 14, 15);
+                return new RustNativeConnectorJni.NativeHandles(11, 12, 13, 14, 15, 16);
             }
         );
 
@@ -38,13 +38,13 @@ public final class RustNativeConnectorJniTest {
             throw new AssertionError(exception);
         }
         RustNativeConnectorJni.PlanFactory incompatible = new RustNativeConnectorJni.PlanFactory(
-            new RecordingBridge(2, 99), input -> new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5)
+            new RecordingBridge(1, 99), input -> new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6)
         );
         assertThrows(RustNativeConnectorJni.NativePlanException.class,
             () -> incompatible.begin(1, connector.input));
 
         RustNativeConnectorJni.PlanFactory rejected = new RustNativeConnectorJni.PlanFactory(
-            new RecordingBridge(1, 0), input -> new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5)
+            new RecordingBridge(2, 0), input -> new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6)
         );
         assertThrows(RustNativeConnectorJni.NativePlanException.class,
             () -> rejected.begin(1, connector.input));
@@ -84,7 +84,7 @@ public final class RustNativeConnectorJniTest {
         RustNativeConnectorJni.NativeHandles handles;
         int cancels;
 
-        RecordingBridge() { this(1, 99); }
+        RecordingBridge() { this(2, 99); }
         RecordingBridge(int abi, long plan) { this.abi = abi; this.plan = plan; }
         @Override public int abiVersion() { return abi; }
         @Override public long beginAuthenticatedPlan(int generation, RustNativeConnectorJni.NativeHandles handles) {

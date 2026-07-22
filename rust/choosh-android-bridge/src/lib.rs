@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 const STATUS_OK: i32 = 0;
 const STATUS_STALE_GENERATION: i32 = 1;
 const STATUS_UNKNOWN_REQUEST: i32 = 2;
@@ -57,6 +57,7 @@ opaque_handle!(UsernameHandle);
 opaque_handle!(KnownHostHandle);
 opaque_handle!(CredentialReferenceHandle);
 opaque_handle!(PublicKeyHandle);
+opaque_handle!(SigningCallbackHandle);
 
 /// A validated, Android-owned connection description before host-key admission.
 ///
@@ -70,6 +71,7 @@ pub struct NativeAuthenticatedPlan {
     known_host: KnownHostHandle,
     credential_reference: CredentialReferenceHandle,
     public_key: PublicKeyHandle,
+    signing_callback: SigningCallbackHandle,
 }
 
 impl NativeAuthenticatedPlan {
@@ -81,6 +83,7 @@ impl NativeAuthenticatedPlan {
         known_host: u64,
         credential_reference: u64,
         public_key: u64,
+        signing_callback: u64,
     ) -> Option<Self> {
         Some(Self {
             endpoint: EndpointHandle::new(endpoint)?,
@@ -88,6 +91,7 @@ impl NativeAuthenticatedPlan {
             known_host: KnownHostHandle::new(known_host)?,
             credential_reference: CredentialReferenceHandle::new(credential_reference)?,
             public_key: PublicKeyHandle::new(public_key)?,
+            signing_callback: SigningCallbackHandle::new(signing_callback)?,
         })
     }
 
@@ -154,6 +158,7 @@ impl HostKeyAdmittedPlan {
             self.plan.username,
             self.plan.credential_reference,
             self.plan.public_key,
+            self.plan.signing_callback,
         )
     }
 }
@@ -176,6 +181,7 @@ pub trait KeystorePublicKeyAuthentication {
         username: UsernameHandle,
         credential_reference: CredentialReferenceHandle,
         public_key: PublicKeyHandle,
+        signing_callback: SigningCallbackHandle,
     ) -> Result<(), Self::Error>;
 }
 
@@ -233,9 +239,17 @@ pub extern "C" fn choosh_bridge_authenticated_plan_begin(
     known_host: u64,
     credential_ref: u64,
     public_key: u64,
+    signing_callback: u64,
 ) -> u64 {
-    if NativeAuthenticatedPlan::new(endpoint, username, known_host, credential_ref, public_key)
-        .is_none()
+    if NativeAuthenticatedPlan::new(
+        endpoint,
+        username,
+        known_host,
+        credential_ref,
+        public_key,
+        signing_callback,
+    )
+    .is_none()
     {
         return 0;
     }
@@ -299,6 +313,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenti
     known_host: i64,
     credential_ref: i64,
     public_key: i64,
+    signing_callback: i64,
 ) -> i64 {
     if generation <= 0
         || endpoint <= 0
@@ -306,6 +321,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenti
         || known_host <= 0
         || credential_ref <= 0
         || public_key <= 0
+        || signing_callback <= 0
     {
         return 0;
     }
@@ -316,6 +332,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenti
         known_host.cast_unsigned(),
         credential_ref.cast_unsigned(),
         public_key.cast_unsigned(),
+        signing_callback.cast_unsigned(),
     )
     .cast_signed()
 }
@@ -463,6 +480,7 @@ mod tests {
             _username: UsernameHandle,
             _credential_reference: CredentialReferenceHandle,
             _public_key: PublicKeyHandle,
+            _signing_callback: SigningCallbackHandle,
         ) -> Result<(), Self::Error> {
             self.events.lock().unwrap().push(Event::SignatureRequested);
             Ok(())
@@ -472,7 +490,7 @@ mod tests {
     #[test]
     fn typed_plan_cannot_request_keystore_authentication_before_exact_host_key_admission() {
         let events = Mutex::new(Vec::new());
-        let plan = NativeAuthenticatedPlan::new(1, 2, 3, 4, 5).expect("non-zero handles");
+        let plan = NativeAuthenticatedPlan::new(1, 2, 3, 4, 5, 6).expect("non-zero handles");
         let error = plan
             .admit_exact_host_key(&mut RecordingAdmission {
                 events: &events,
@@ -486,7 +504,7 @@ mod tests {
     #[test]
     fn typed_plan_requests_keystore_authentication_only_after_exact_host_key_admission() {
         let events = Mutex::new(Vec::new());
-        let plan = NativeAuthenticatedPlan::new(1, 2, 3, 4, 5).expect("non-zero handles");
+        let plan = NativeAuthenticatedPlan::new(1, 2, 3, 4, 5, 6).expect("non-zero handles");
         let admitted = plan
             .admit_exact_host_key(&mut RecordingAdmission {
                 events: &events,
@@ -505,7 +523,7 @@ mod tests {
     #[test]
     fn abi_request_cancel_and_recreation_are_typed_and_bounded() {
         let _guard = ABI_TEST_LOCK.lock().unwrap();
-        assert_eq!(choosh_bridge_abi_version(), 1);
+        assert_eq!(choosh_bridge_abi_version(), 2);
         let generation = choosh_bridge_generation();
         let request = choosh_bridge_request_begin(generation, 7);
         assert_ne!(request, 0);
@@ -529,10 +547,14 @@ mod tests {
         let _guard = ABI_TEST_LOCK.lock().unwrap();
         let generation = choosh_bridge_generation();
         assert_eq!(
-            choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 0, 5),
+            choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 0, 5, 6),
             0
         );
-        let plan = choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 4, 5);
+        assert_eq!(
+            choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 4, 5, 0),
+            0
+        );
+        let plan = choosh_bridge_authenticated_plan_begin(generation, 1, 2, 3, 4, 5, 6);
         assert_ne!(plan, 0);
         assert_eq!(
             choosh_bridge_authenticated_plan_open(generation, plan),

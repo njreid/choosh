@@ -59,6 +59,30 @@ public final class KeystoreCredentialSigner {
         );
     }
 
+    /**
+     * Adapts an admitted Java challenge signer to the native callback contract.
+     *
+     * <p>The JNI registry retains this callback behind a non-zero opaque handle. Rust receives
+     * that handle, never this Java object, credential reference, public-key metadata, or private
+     * key material. The eventual JNI registry MUST expose the callback to Russh only after the
+     * Rust host-key verifier has admitted the connection.</p>
+     */
+    public NativeChallengeCallback nativeChallengeCallback(ChallengeSigner signer) {
+        ChallengeSigner checked = Objects.requireNonNull(signer, "signer");
+        return payload -> {
+            try {
+                return checked.sign(payload).copyForNativeCallback();
+            } catch (SigningException exception) {
+                throw new NativeSigningException();
+            }
+        };
+    }
+
+    /** Payload-only callback retained by the Android JNI registry behind an opaque handle. */
+    public interface NativeChallengeCallback {
+        byte[] sign(byte[] payload) throws NativeSigningException;
+    }
+
     /** Produces one non-secret SSH signature after exact host admission. */
     public Signature sign(SigningRequest request) throws SigningException {
         Objects.requireNonNull(request, "request");
@@ -206,5 +230,10 @@ public final class KeystoreCredentialSigner {
 
     public static final class SigningException extends Exception {
         public SigningException() { super(); }
+    }
+
+    /** Content-free result exposed by the JNI callback boundary. */
+    public static final class NativeSigningException extends Exception {
+        public NativeSigningException() { super(); }
     }
 }

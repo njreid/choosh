@@ -34,9 +34,14 @@ public final class RustNativeConnectorJni {
         private final long knownHost;
         private final long credentialRef;
         private final long publicKey;
+        private final long signingCallback;
 
-        public NativeHandles(long endpoint, long username, long knownHost, long credentialRef, long publicKey) {
-            if (endpoint <= 0 || username <= 0 || knownHost <= 0 || credentialRef <= 0 || publicKey <= 0) {
+        public NativeHandles(
+            long endpoint, long username, long knownHost, long credentialRef, long publicKey,
+            long signingCallback
+        ) {
+            if (endpoint <= 0 || username <= 0 || knownHost <= 0 || credentialRef <= 0 || publicKey <= 0
+                || signingCallback <= 0) {
                 throw new IllegalArgumentException("native handles must be positive");
             }
             this.endpoint = endpoint;
@@ -44,6 +49,7 @@ public final class RustNativeConnectorJni {
             this.knownHost = knownHost;
             this.credentialRef = credentialRef;
             this.publicKey = publicKey;
+            this.signingCallback = signingCallback;
         }
 
         @Override public String toString() { return "NativeHandles(REDACTED)"; }
@@ -51,7 +57,7 @@ public final class RustNativeConnectorJni {
 
     /** Factory for a bounded native plan token. It does not open a socket or credential. */
     public static final class PlanFactory {
-        private static final int ABI_VERSION = 1;
+        private static final int ABI_VERSION = 2;
         private final NativePlanBridge bridge;
         private final NativeHandleResolver handles;
 
@@ -116,7 +122,7 @@ public final class RustNativeConnectorJni {
         @Override public long beginAuthenticatedPlan(int generation, NativeHandles handles) {
             return nativeBeginAuthenticatedPlan(
                 generation, handles.endpoint, handles.username, handles.knownHost,
-                handles.credentialRef, handles.publicKey
+                handles.credentialRef, handles.publicKey, handles.signingCallback
             );
         }
 
@@ -130,7 +136,8 @@ public final class RustNativeConnectorJni {
 
         private static native int nativeAbiVersion();
         private static native long nativeBeginAuthenticatedPlan(
-            int generation, long endpoint, long username, long knownHost, long credentialRef, long publicKey
+            int generation, long endpoint, long username, long knownHost, long credentialRef, long publicKey,
+            long signingCallback
         );
         private static native int nativeCancelAuthenticatedPlan(int generation, long plan);
         private static native int nativeOpenAuthenticatedPlan(int generation, long plan);
