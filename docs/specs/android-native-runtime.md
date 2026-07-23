@@ -6,8 +6,9 @@ Status: Draft
 
 This contract defines the Android/JNI outer composition root for one admitted
 Choosh SSH attempt. It joins Android-owned socket and Keystore operations to
-Rust's verified SSH transport without exposing a private key, a Java object
-reference, a host path, or a shell command to shared/domain code.
+Rust's verified SSH transport without exposing a private key, a host path, or
+a shell command to shared/domain code. Java callback objects are confined to
+the bridge allocation described in [ADR 0008](../adr/0008-jni-runtime-callback-ownership.md).
 
 ## Ownership
 
@@ -19,10 +20,12 @@ runtime registration and returns a non-zero opaque lease ID. The lease owns:
 - separately typed opaque endpoint, username, known-host, credential, and
   public-key references.
 
-Rust MAY retain only the opaque lease and its typed IDs. Android MUST release
-the registration exactly once when the native plan is rejected, cancelled,
-completed, or superseded. A late callback for a released lease MUST fail with
-a stable content-free status and MUST NOT recreate the registration.
+Rust transport MAY retain only the opaque lease and its typed IDs. The JNI
+bridge MAY retain the per-plan callback object only for that plan's native
+allocation. Android MUST release the registration exactly once when the native
+plan is rejected, cancelled, completed, or superseded. A late callback for a
+released lease MUST fail with a stable content-free status and MUST NOT
+recreate the registration.
 
 ## Callback surface
 
@@ -60,7 +63,9 @@ retry a host-key or signing failure as a network retry.
 Concrete JNI environment access is confined to `choosh-android-bridge`; shared
 transport code receives narrow injected stream and signer capabilities. The
 Android app assembles the runtime in its composition root using constructor
-injection. No mutable global registry or service locator is permitted.
+injection. No mutable global registry or service locator is permitted. The
+currently shipped v3 ABI validates and carries the lease ID only; it does not
+yet retain or invoke Java callbacks and therefore remains fail-closed.
 
 Headless acceptance MUST prove all of the following with deterministic fakes:
 

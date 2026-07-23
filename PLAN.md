@@ -148,9 +148,10 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **Bind the real native Android connector.** Turn the opaque JNI plan into a real
-   exact-host-key-before-signing connection using the reviewed Java Keystore callback and a
-   bounded JVM socket adapter; no credential material may cross the ABI.
+1. **Bind the real native Android connector.** Implement the [per-plan JNI callback
+   ownership](docs/adr/0008-jni-runtime-callback-ownership.md) allocation, then turn the opaque
+   plan into a real exact-host-key-before-signing connection using the reviewed Java Keystore
+   callback and bounded JVM socket adapter; no credential material may cross the ABI.
 2. **Finish M0-R5/M0-R6.** Exercise that real Android/native connector, credential use,
    bounded cancellation, the fixed `git.status` daemon method, and negotiated
    stdio-to-real-`chooshd` private-socket RPC in one harness—not only generated-key fixtures.

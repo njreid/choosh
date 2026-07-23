@@ -9,3 +9,4 @@
 | [0005](0005-native-terminal.md) | Zelland-derived GPU terminal and Android input accessory | Accepted |
 | [0006](0006-android-min-sdk.md) | Android 8.0/API 26 minimum compatibility floor | Accepted |
 | [0007](0007-russh-crypto-exception.md) | Time-bounded Russh cryptography exception | Accepted; expires 2026-10-17 |
+| [0008](0008-jni-runtime-callback-ownership.md) | Per-plan JNI runtime callback ownership | Accepted |
