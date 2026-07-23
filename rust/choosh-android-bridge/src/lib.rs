@@ -5,6 +5,8 @@
 
 #![allow(unsafe_code)] // Required only for Edition 2024's `no_mangle` ABI attribute.
 
+use jni::objects::{Global, JByteArray, JObject, JValue};
+use jni::{Env, JavaVM, jni_sig, jni_str};
 use std::ffi::c_void;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -197,10 +199,146 @@ pub trait KeystorePublicKeyAuthentication {
 pub trait RuntimeCallbacks {
     type Error;
 
+    /// # Errors
+    ///
+    /// Returns the callback's content-free transport failure.
     fn read(&mut self, lease: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error>;
+    /// # Errors
+    ///
+    /// Returns the callback's content-free transport failure.
     fn write(&mut self, lease: RuntimeLeaseHandle, input: &[u8]) -> Result<(), Self::Error>;
+    /// # Errors
+    ///
+    /// Returns the callback's content-free signing failure.
     fn sign(&mut self, lease: RuntimeLeaseHandle, payload: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    /// # Errors
+    ///
+    /// Returns the callback's content-free release failure.
     fn close(&mut self, lease: RuntimeLeaseHandle) -> Result<(), Self::Error>;
+}
+
+/// Plan-owned JNI adapter for the Android runtime callback object.
+///
+/// The global reference belongs to this value rather than a process-wide callback registry.
+/// Calls attach the current worker thread only for their JNI scope and copy every byte array
+/// before its local reference is released. The object must implement the narrow methods declared
+/// by `AndroidRuntimeCallbackPort` on the Android side.
+#[derive(Debug)]
+pub struct JniRuntimeCallbacks {
+    vm: JavaVM,
+    callbacks: Global<JObject<'static>>,
+}
+
+impl JniRuntimeCallbacks {
+    /// Retains exactly one callback object for the owning native plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JNI failure when the VM or a global reference cannot be acquired.
+    pub fn retain<'local>(
+        environment: &mut Env<'local>,
+        callbacks: JObject<'local>,
+    ) -> jni::errors::Result<Self> {
+        Ok(Self {
+            vm: environment.get_java_vm()?,
+            callbacks: environment.new_global_ref(callbacks)?,
+        })
+    }
+
+    fn with_environment<T>(
+        &self,
+        callback: impl FnOnce(&mut Env<'_>) -> jni::errors::Result<T>,
+    ) -> jni::errors::Result<T> {
+        self.vm.attach_current_thread(callback)
+    }
+}
+
+impl RuntimeCallbacks for JniRuntimeCallbacks {
+    type Error = JniRuntimeCallbackError;
+
+    fn read(&mut self, lease: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error> {
+        let requested =
+            i32::try_from(output.len()).map_err(|_| JniRuntimeCallbackError::OversizedResult)?;
+        let bytes = self
+            .with_environment(|environment| {
+                let result = environment
+                    .call_method(
+                        &self.callbacks,
+                        jni_str!("read"),
+                        jni_sig!("(JI)[B"),
+                        &[
+                            JValue::Long(lease.0.get().cast_signed()),
+                            JValue::Int(requested),
+                        ],
+                    )?
+                    .l()?;
+                let bytes = JByteArray::cast_local(environment, result)?;
+                environment.convert_byte_array(&bytes)
+            })
+            .map_err(JniRuntimeCallbackError::Jni)?;
+        if bytes.len() > output.len() {
+            return Err(JniRuntimeCallbackError::OversizedResult);
+        }
+        output[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
+
+    fn write(&mut self, lease: RuntimeLeaseHandle, input: &[u8]) -> Result<(), Self::Error> {
+        self.with_environment(|environment| {
+            let bytes = environment.byte_array_from_slice(input)?;
+            environment.call_method(
+                &self.callbacks,
+                jni_str!("write"),
+                jni_sig!("(J[B)V"),
+                &[
+                    JValue::Long(lease.0.get().cast_signed()),
+                    JValue::Object(&bytes),
+                ],
+            )?;
+            Ok(())
+        })
+        .map_err(JniRuntimeCallbackError::Jni)
+    }
+
+    fn sign(&mut self, lease: RuntimeLeaseHandle, payload: &[u8]) -> Result<Vec<u8>, Self::Error> {
+        self.with_environment(|environment| {
+            let bytes = environment.byte_array_from_slice(payload)?;
+            let result = environment
+                .call_method(
+                    &self.callbacks,
+                    jni_str!("sign"),
+                    jni_sig!("(J[B)[B"),
+                    &[
+                        JValue::Long(lease.0.get().cast_signed()),
+                        JValue::Object(&bytes),
+                    ],
+                )?
+                .l()?;
+            let signature = JByteArray::cast_local(environment, result)?;
+            environment.convert_byte_array(&signature)
+        })
+        .map_err(JniRuntimeCallbackError::Jni)
+    }
+
+    fn close(&mut self, lease: RuntimeLeaseHandle) -> Result<(), Self::Error> {
+        self.with_environment(|environment| {
+            environment.call_method(
+                &self.callbacks,
+                jni_str!("close"),
+                jni_sig!("(J)V"),
+                &[JValue::Long(lease.0.get().cast_signed())],
+            )?;
+            Ok(())
+        })
+        .map_err(JniRuntimeCallbackError::Jni)
+    }
+}
+
+/// Content-free JNI callback failure classification.
+#[derive(Debug)]
+pub enum JniRuntimeCallbackError {
+    Jni(jni::errors::Error),
+    OversizedResult,
 }
 
 /// One-close-only native owner for callbacks associated with an authenticated plan.
@@ -221,6 +359,9 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns a bounds, closed-allocation, or callback failure.
     pub fn read(&mut self, output: &mut [u8]) -> Result<usize, RuntimeAllocationError<C::Error>> {
         self.validate(output.len())?;
         self.callbacks
@@ -228,6 +369,9 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
             .map_err(RuntimeAllocationError::Callback)
     }
 
+    /// # Errors
+    ///
+    /// Returns a bounds, closed-allocation, or callback failure.
     pub fn write(&mut self, input: &[u8]) -> Result<(), RuntimeAllocationError<C::Error>> {
         self.validate(input.len())?;
         self.callbacks
@@ -235,13 +379,22 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
             .map_err(RuntimeAllocationError::Callback)
     }
 
+    /// # Errors
+    ///
+    /// Returns a bounds, closed-allocation, or callback failure.
     pub fn sign(&mut self, payload: &[u8]) -> Result<Vec<u8>, RuntimeAllocationError<C::Error>> {
         self.validate(payload.len())?;
-        self.callbacks
+        let signature = self
+            .callbacks
             .sign(self.lease, payload)
-            .map_err(RuntimeAllocationError::Callback)
+            .map_err(RuntimeAllocationError::Callback)?;
+        self.validate(signature.len())?;
+        Ok(signature)
     }
 
+    /// # Errors
+    ///
+    /// Returns the callback's content-free release failure.
     pub fn close(&mut self) -> Result<(), RuntimeAllocationError<C::Error>> {
         if self.closed {
             return Ok(());
