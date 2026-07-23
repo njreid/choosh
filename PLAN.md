@@ -158,6 +158,13 @@ bounded resources, and a commit/push after verification.
 2. **Finish M0-R5/M0-R6.** Exercise that real Android/native connector, credential use,
    bounded cancellation, the fixed `git.status` daemon method, and negotiated
    stdio-to-real-`chooshd` private-socket RPC in one harness—not only generated-key fixtures.
+3. **Deploy and update `chooshd` without SSH session ownership.** Specify and implement a
+   fixed-command, SSH/SFTP-only release installer: Android verifies GitHub-release metadata and
+   artifacts before upload; the host stages immutable version directories, verifies the digest,
+   atomically activates a per-user service-manager unit, health-checks through the private
+   socket, and rolls back to the previous version on failure. Support `systemd --user` and
+   `launchd` explicitly; unsupported hosts fail closed rather than using shell backgrounding.
+   The service and Zellij processes must survive Android transport loss.
 4. **Then widen host/SFTP operations.** Compose the injected host process adapter and add
    only server-proven root-confined/atomic SFTP operations after the first vertical thread
    is reachable.
@@ -168,6 +175,10 @@ bounded resources, and a commit/push after verification.
 6. **M1 profile/workspace slice.** Persist profiles securely, pin known hosts, list
    explicit registrations, create/adopt Zellij sessions, and exercise reconnect and
    separated destructive lifecycle actions in one black-box scenario.
+7. **M0 exit review and release candidate.** Run every M0 headless gate from a clean checkout,
+   then the required emulator/device gates for the native terminal and connection lifecycle.
+   Publish a release candidate only after the evidence manifest, SBOM, notices, updater
+   verification, and Obtainium discovery checks are current.
 
 ## Completion rule
 
