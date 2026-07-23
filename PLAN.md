@@ -87,6 +87,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   native-runtime lease. The lease releases opaque socket and signer registrations exactly once
   after plan rejection, cancellation, completion, or a late callback; headless JVM fakes cover
   the lifecycle. The JNI bridge still does not invoke those registrations from Rust.
+- [x] The bridge now owns a bounded, one-close-only per-plan runtime callback allocation with
+  deterministic bounds and released-lease tests. A JNI `GlobalRef` adapter remains required to
+  supply its socket and signing callbacks on Android.
 - [x] A generated-key Android-shaped `git.status` acceptance reaches the fixed
   `choosh-host rpc --stdio` SSH command through a bounded native-stream composition and returns
   a bounded terminal envelope. Its SSH fixture invokes the real host stdio relay, which completes
