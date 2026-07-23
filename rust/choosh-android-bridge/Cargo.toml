@@ -8,6 +8,9 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[dependencies]
+jni = { version = "=0.22.4", default-features = false }
+
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
