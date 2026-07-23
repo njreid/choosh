@@ -275,6 +275,7 @@ dependencies = [
  "choosh-protocol",
  "nix",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
