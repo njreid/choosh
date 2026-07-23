@@ -189,6 +189,87 @@ pub trait KeystorePublicKeyAuthentication {
     ) -> Result<(), Self::Error>;
 }
 
+/// Bounded Android runtime callbacks retained by one native plan allocation.
+///
+/// Concrete JNI code is an outer adapter for this trait. Shared transport never
+/// receives a JVM reference: it receives only the stream and signer built from
+/// this allocation after exact-host admission.
+pub trait RuntimeCallbacks {
+    type Error;
+
+    fn read(&mut self, lease: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error>;
+    fn write(&mut self, lease: RuntimeLeaseHandle, input: &[u8]) -> Result<(), Self::Error>;
+    fn sign(&mut self, lease: RuntimeLeaseHandle, payload: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    fn close(&mut self, lease: RuntimeLeaseHandle) -> Result<(), Self::Error>;
+}
+
+/// One-close-only native owner for callbacks associated with an authenticated plan.
+pub struct RuntimeAllocation<C> {
+    callbacks: C,
+    lease: RuntimeLeaseHandle,
+    max_operation_bytes: NonZeroU64,
+    closed: bool,
+}
+
+impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
+    pub fn new(callbacks: C, lease: RuntimeLeaseHandle, max_operation_bytes: u64) -> Option<Self> {
+        Some(Self {
+            callbacks,
+            lease,
+            max_operation_bytes: NonZeroU64::new(max_operation_bytes)?,
+            closed: false,
+        })
+    }
+
+    pub fn read(&mut self, output: &mut [u8]) -> Result<usize, RuntimeAllocationError<C::Error>> {
+        self.validate(output.len())?;
+        self.callbacks
+            .read(self.lease, output)
+            .map_err(RuntimeAllocationError::Callback)
+    }
+
+    pub fn write(&mut self, input: &[u8]) -> Result<(), RuntimeAllocationError<C::Error>> {
+        self.validate(input.len())?;
+        self.callbacks
+            .write(self.lease, input)
+            .map_err(RuntimeAllocationError::Callback)
+    }
+
+    pub fn sign(&mut self, payload: &[u8]) -> Result<Vec<u8>, RuntimeAllocationError<C::Error>> {
+        self.validate(payload.len())?;
+        self.callbacks
+            .sign(self.lease, payload)
+            .map_err(RuntimeAllocationError::Callback)
+    }
+
+    pub fn close(&mut self) -> Result<(), RuntimeAllocationError<C::Error>> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.callbacks
+            .close(self.lease)
+            .map_err(RuntimeAllocationError::Callback)
+    }
+
+    fn validate(&self, length: usize) -> Result<(), RuntimeAllocationError<C::Error>> {
+        if self.closed {
+            return Err(RuntimeAllocationError::Closed);
+        }
+        if length == 0 || (length as u64) > self.max_operation_bytes.get() {
+            return Err(RuntimeAllocationError::Bounds);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum RuntimeAllocationError<E> {
+    Bounds,
+    Closed,
+    Callback(E),
+}
+
 /// Returns the stable ABI contract version.
 #[unsafe(no_mangle)]
 pub extern "C" fn choosh_bridge_abi_version() -> u32 {
@@ -604,5 +685,43 @@ mod tests {
             STATUS_INVALID_ARGUMENT
         );
         assert_eq!(choosh_bridge_request_cancel(generation, generic), STATUS_OK);
+    }
+
+    #[derive(Default)]
+    struct RecordingCallbacks {
+        closes: usize,
+    }
+    impl RuntimeCallbacks for RecordingCallbacks {
+        type Error = ();
+        fn read(&mut self, _: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error> {
+            output[0] = 7;
+            Ok(1)
+        }
+        fn write(&mut self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn sign(&mut self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<Vec<u8>, Self::Error> {
+            Ok(vec![9])
+        }
+        fn close(&mut self, _: RuntimeLeaseHandle) -> Result<(), Self::Error> {
+            self.closes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn runtime_allocation_bounds_and_closes_its_lease_once() {
+        let mut allocation = RuntimeAllocation::new(
+            RecordingCallbacks::default(),
+            RuntimeLeaseHandle::new(9).unwrap(),
+            4,
+        )
+        .unwrap();
+        assert_eq!(allocation.read(&mut [0; 1]), Ok(1));
+        assert_eq!(allocation.write(&[]), Err(RuntimeAllocationError::Bounds));
+        allocation.close().unwrap();
+        allocation.close().unwrap();
+        assert_eq!(allocation.callbacks.closes, 1);
+        assert_eq!(allocation.sign(&[1]), Err(RuntimeAllocationError::Closed));
     }
 }
