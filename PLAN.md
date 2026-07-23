@@ -91,6 +91,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and
   user-mediated package installation remain outer adapters.
+- [x] Host upgrade orchestration now has a filesystem-backed deterministic acceptance fixture:
+  an immutable staged artifact is SHA-256 verified before atomic activation, health is checked
+  only for the candidate version, corrupt staging is discarded without touching the active
+  artifact, and an unhealthy activation rolls back exactly once to the prior verified artifact.
 - [x] The bridge now owns a bounded, one-close-only per-plan runtime callback allocation with
   deterministic bounds and released-lease tests. A JNI `GlobalRef` adapter remains required to
   supply its socket and signing callbacks on Android.
