@@ -87,6 +87,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   native-runtime lease. The lease releases opaque socket and signer registrations exactly once
   after plan rejection, cancellation, completion, or a late callback; headless JVM fakes cover
   the lifecycle. The JNI bridge still does not invoke those registrations from Rust.
+- [x] Android release selection now has a headless bounded planner that selects a canonical
+  newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
+  boundaries, and returns data-only staging instructions. Download, app-private writing, and
+  user-mediated package installation remain outer adapters.
 - [x] The bridge now owns a bounded, one-close-only per-plan runtime callback allocation with
   deterministic bounds and released-lease tests. A JNI `GlobalRef` adapter remains required to
   supply its socket and signing callbacks on Android.
