@@ -95,6 +95,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   an immutable staged artifact is SHA-256 verified before atomic activation, health is checked
   only for the candidate version, corrupt staging is discarded without touching the active
   artifact, and an unhealthy activation rolls back exactly once to the prior verified artifact.
+- [x] Authenticated updater wiring is explicitly gated: the current workspace-confined SFTP
+  surface cannot perform atomic writes and the fixed SSH dispatcher exposes only RPC, so neither
+  can be repurposed for deployment. A versioned immutable-upload and host-owned activation
+  protocol remains required before Android deployment wiring can begin.
 - [x] The bridge now owns a bounded, one-close-only per-plan runtime callback allocation with
   deterministic bounds and released-lease tests. A JNI `GlobalRef` adapter remains required to
   supply its socket and signing callbacks on Android.

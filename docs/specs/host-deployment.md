@@ -36,3 +36,26 @@ MUST redact deployment paths and manager arguments.
 
 This document defines the manager boundary only. Upload, digest verification, socket health, and
 rollback orchestration are separate increments.
+
+## Authenticated updater wiring gate
+
+The current authenticated [`VerifiedConnection`](../../rust/choosh-ssh/src/connection.rs)
+capabilities are deliberately insufficient to perform this deployment transaction:
+
+- Its admitted SFTP surface is bound to a server-attested workspace root. It MUST NOT be used
+  for release directories, service units, or daemon state.
+- That SFTP surface returns `atomic_write_not_proven` for every write. An updater MUST NOT
+  emulate atomic installation with overwrite, rename-by-assumption, or a shell command.
+- Its fixed SSH exec surface currently admits the existing host RPC dispatcher only. An updater
+  MUST NOT invent a `choosh-host` subcommand or pass deployment paths, release bytes, or service
+  manager arguments through the generic fixed-command encoder.
+
+Before Android can wire an authenticated updater, a versioned host deployment protocol MUST add
+both of these separately admitted capabilities:
+
+1. an immutable, digest-addressed upload/stage operation with server-proven atomic publication;
+2. a fixed deployment activation/health operation that owns the host paths and service-manager
+   argv entirely on the host.
+
+The Android transport then supplies only verified release bytes and metadata to those capability
+ports. It MUST retain no host deployment path, service-manager argument vector, or shell text.
