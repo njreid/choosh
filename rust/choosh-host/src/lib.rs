@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod exec_stdio;
 pub mod handshake;
 pub mod request;
+pub mod service_manager;
 #[cfg(unix)]
 pub mod socket_relay;
 

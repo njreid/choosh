@@ -10,6 +10,7 @@ acceptance harnesses are defined in the [detailed milestone designs](../design/R
 | --- | --- | --- |
 | [Android and Kotlin toolchain](android-toolchain.md) | Stable SDK/toolchain baseline, compatibility and update policy | Draft |
 | [Android native runtime callbacks](android-native-runtime.md) | JNI socket/signer lease ownership, bounds and failure contract | Draft |
+| [Android release updater](release-updater.md) | Release selection, APK evidence verification, and staging boundary | Draft |
 | [Terminal rendering and input](terminal-experience.md) | Zelland GPU port, Android IME, extra keys, gestures and recovery | Draft |
 | [Host protocol](host-protocol.md) | SSH stdio framing, handshake, RPC, events, errors | Draft |
 | [Native SSH reconnect](native-ssh-reconnect.md) | Re-admission, retry, generation invalidation, and recovery after network loss | Draft |
@@ -17,6 +18,7 @@ acceptance harnesses are defined in the [detailed milestone designs](../design/R
 | [Agent interoperability](agent-events.md) | Codex, OpenCode, Claude hooks and notifications | Draft |
 | [Client-side Git diff](git-diff.md) | Status, version retrieval, diff model, limits | Draft |
 | [Development services](service-tunnels.md) | Explicit launch, lifecycle, SSH/WebView tunnel | Draft |
+| [Host deployment](host-deployment.md) | Per-user daemon manager activation and ownership | Draft |
 | [Android navigation](android-navigation.md) | Explorer, pinning, deep links, page restoration | Draft |
 | [Diagnostics and support bundles](diagnostics.md) | Opt-in redacted local diagnostics and crash/support evidence | Draft |
 
