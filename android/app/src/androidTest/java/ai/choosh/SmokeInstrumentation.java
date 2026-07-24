@@ -22,8 +22,12 @@ public final class SmokeInstrumentation extends Instrumentation {
     @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); start(); }
     @Override public void onStart() {
         Bundle evidence = new Bundle();
-        verifySoraLifecycle(evidence);
-        verifySoraEventTranslation(evidence);
+        // Sora constructs Android gesture handlers, so both widget fixtures
+        // must run on the main looper rather than the instrumentation thread.
+        runOnMainSync(() -> {
+            verifySoraLifecycle(evidence);
+            verifySoraEventTranslation(evidence);
+        });
         verifyControlledConnectorFixture(evidence);
         String expectedPackage = BuildIdentity.packageName();
         require("ai.choosh".equals(expectedPackage), "build identity changed");
