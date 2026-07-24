@@ -20,12 +20,19 @@ runtime registration and returns a non-zero opaque lease ID. The lease owns:
 - separately typed opaque endpoint, username, known-host, credential, and
   public-key references.
 
-Rust transport MAY retain only the opaque lease and its typed IDs. The JNI
-bridge MAY retain the per-plan callback object only for that plan's native
+Rust transport MAY retain only a plan-owned capability lease and typed IDs. The
+JNI bridge MAY retain the per-plan callback object only for that plan's native
 allocation. Android MUST release the registration exactly once when the native
 plan is rejected, cancelled, completed, or superseded. A late callback for a
 released lease MUST fail with a stable content-free status and MUST NOT
 recreate the registration.
+
+Opaque IDs alone are insufficient to open SSH: the outer adapter also needs
+validated endpoint, username, exact-host, public-key, and credential metadata.
+That adapter MUST resolve those values from the Android-owned registration,
+validate them at the JNI boundary, and pass only typed stream, exact-host
+session, and signer capabilities to shared transport. It MUST NOT make shared
+transport dereference an opaque ID or call back into a mutable global registry.
 
 ## Callback surface
 
@@ -63,11 +70,13 @@ retry a host-key or signing failure as a network retry.
 Concrete JNI environment access is confined to `choosh-android-bridge`; shared
 transport code receives narrow injected stream and signer capabilities. The
 Android app assembles the runtime in its composition root using constructor
-injection. No mutable global registry or service locator is permitted. The
-v3 runtime overload retains its Java callback object in the plan-token-owned
-bridge allocation and releases it on cancellation or generation recreation.
-It remains fail-closed until that allocation is composed into the verified
-stream and signer transport.
+injection. No mutable global registry or service locator is permitted. The JNI
+bridge is therefore the dependency-direction outer root: it may depend on the
+transport composition crate, but the transport crate must not depend on JNI.
+The v3 runtime overload retains its Java callback object in the plan-token-owned
+bridge allocation and releases it on cancellation or generation recreation. It
+remains fail-closed until that allocation is composed into the verified stream
+and signer transport.
 
 Headless acceptance MUST prove all of the following with deterministic fakes:
 

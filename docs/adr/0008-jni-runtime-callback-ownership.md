@@ -28,6 +28,12 @@ array slice. It has no method for selecting an endpoint, host path, command,
 credential, public key, or channel type. The bridge validates every lease,
 offset, length, and status before constructing a shared transport result.
 
+The bridge is the dependency-direction outer composition root. It may depend
+on the framework-free Android transport crate, but that crate must not depend
+on JNI. Opaque handles are resolved by the Android-owned registration into
+validated typed inputs at this edge; shared transport receives only its stream,
+exact-host session, and signer capabilities.
+
 Worker threads attach to the Java VM only for the duration of a callback and
 delete local references before returning. `JNIEnv` and JNI object references
 remain confined to `choosh-android-bridge`; `choosh-android-transport`,

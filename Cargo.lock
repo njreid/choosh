@@ -209,7 +209,6 @@ dependencies = [
 name = "choosh-android-transport"
 version = "0.0.0"
 dependencies = [
- "choosh-android-bridge",
  "choosh-core",
  "choosh-host",
  "choosh-protocol",

@@ -6,7 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-choosh-android-bridge = { path = "../choosh-android-bridge" }
 choosh-protocol = { path = "../choosh-protocol" }
 choosh-ssh = { path = "../choosh-ssh" }
 tokio = { version = "=1.53.0", features = ["io-util"] }

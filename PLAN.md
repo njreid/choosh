@@ -91,6 +91,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The JNI runtime overload now retains its bounded callback object only in the owning plan
   allocation and releases it before token reuse or on generation recreation. The bridge remains
   fail-closed until that allocation drives the verified stream and signer transport.
+- [x] The Android transport crate no longer depends on the JNI bridge, making the bridge the
+  explicit outer composition root for the remaining JNI-to-Russh adapter. The runtime contract
+  now records that opaque IDs alone cannot establish a session: Android-owned registrations must
+  resolve validated metadata into injected stream, exact-host-session, and signer capabilities.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and
