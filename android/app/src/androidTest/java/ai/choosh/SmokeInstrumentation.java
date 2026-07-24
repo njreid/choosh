@@ -4,8 +4,13 @@ import android.app.Instrumentation;
 import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.TextView;
 import android.view.ViewGroup;
 
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.github.rosemoe.sora.event.ContentChangeEvent;
@@ -19,6 +24,7 @@ public final class SmokeInstrumentation extends Instrumentation {
         Bundle evidence = new Bundle();
         verifySoraLifecycle(evidence);
         verifySoraEventTranslation(evidence);
+        verifyControlledConnectorFixture(evidence);
         String expectedPackage = BuildIdentity.packageName();
         require("ai.choosh".equals(expectedPackage), "build identity changed");
         require(expectedPackage.equals(getTargetContext().getPackageName()), "target package mismatch");
@@ -35,16 +41,33 @@ public final class SmokeInstrumentation extends Instrumentation {
         require(activity.findViewById(android.R.id.content) != null, "content root missing");
         require(activity.findViewById(android.R.id.content).getRootView().isAttachedToWindow(), "content not attached");
 
-        CodeEditor editor = (CodeEditor) ((ViewGroup) activity.findViewById(android.R.id.content)).getChildAt(0);
-        require("Choosh".contentEquals(editor.getText()), "visible application label mismatch");
-        require("Choosh".contentEquals(editor.getContentDescription()), "accessible label mismatch");
+        ViewGroup content = (ViewGroup) activity.findViewById(android.R.id.content);
+        require(content.getChildCount() == 1, "unexpected content hierarchy");
+        require(content.getChildAt(0) instanceof LinearLayout, "connection layout missing");
+        LinearLayout screen = (LinearLayout) content.getChildAt(0);
+        require(screen.getChildCount() == 4, "connection controls missing");
+        TextView heading = (TextView) screen.getChildAt(0);
+        EditText profile = (EditText) screen.getChildAt(1);
+        Button connect = (Button) screen.getChildAt(2);
+        TextView status = (TextView) screen.getChildAt(3);
+        require("Choosh".contentEquals(heading.getText()), "visible application label mismatch");
+        require("Profile ID".contentEquals(profile.getHint()), "profile input label mismatch");
+        require("Connect".contentEquals(connect.getText()), "connect label mismatch");
+        runOnMainSync(() -> profile.setText("fixture_profile"));
+        waitForIdleSync();
+        require(connect.isEnabled(), "valid profile did not enable connection action");
+        runOnMainSync(connect::performClick);
+        waitForIdleSync();
+        require("This saved profile is unavailable.".contentEquals(status.getText()),
+                "default unavailable connector state mismatch");
         runOnMainSync(activity::finish);
         waitForIdleSync();
         require(activity.isFinishing() || activity.isDestroyed(), "activity teardown was not observed");
         evidence.putString("package", expectedPackage);
         evidence.putString("activity", MainActivity.class.getName());
         evidence.putString("lifecycle", "active-then-finished");
-        evidence.putString("accessibility_label", "Choosh");
+        evidence.putString("connection_screen", "labels-and-unavailable-profile");
+        evidence.putString("controlled_connector", "planned-native-git-status-ready");
         finish(Activity.RESULT_OK, evidence);
     }
 
@@ -115,6 +138,85 @@ public final class SmokeInstrumentation extends Instrumentation {
             require("unsupported_sora_content_action".equals(expected.getMessage()),
                     "unexpected Sora translation failure");
         }
+    }
+
+    private void verifyControlledConnectorFixture(Bundle evidence) {
+        ControlledBridge bridge = new ControlledBridge();
+        ControlledRuntime runtime = new ControlledRuntime();
+        ControlledSession session = new ControlledSession();
+        AndroidGitStatusComposition composition = AndroidGitStatusComposition.fromNativeRuntime(
+                ignored -> request(), () -> 7, bridge, runtime,
+                (plan, callback) -> callback.onComplete(
+                        NativeAuthenticatedSshConnector.NativeOpenResult.connected(session)),
+                () -> GitStatusRpc.request(
+                        new GitStatusRpc.WorkspaceId("00000000-0000-4000-8000-000000000001"),
+                        new GitStatusRpc.RequestId("00000000-0000-4000-8000-000000000002")));
+        ControlledListener listener = new ControlledListener();
+        composition.refresh(new AuthenticatedSshOperationCoordinator.ProfileId("fixture_profile"), listener);
+        require(bridge.generation == 7 && bridge.cancels == 1, "planned connector lifecycle mismatch");
+        require(runtime.releases == 1, "runtime lease was not released");
+        require(listener.failure == null && listener.state != null,
+                "controlled connector did not reach Git status");
+        require(listener.state.phase() == GitStatusController.Phase.READY,
+                "controlled Git status was not ready");
+        require(session.request != null && new String(session.request, StandardCharsets.UTF_8)
+                .contains("\"method\":\"git.status\""), "fixed Git RPC was not emitted");
+        evidence.putString("controlled_connector_lifecycle", "lease-released-fixed-git-status");
+    }
+
+    private static AuthenticatedSshOperationCoordinator.ConnectionRequest request() {
+        return new AuthenticatedSshOperationCoordinator.ConnectionRequest(
+                new AuthenticatedSshOperationCoordinator.ProfileId("fixture_profile"),
+                new ProfileConnectionMetadataSource.SshEndpoint("ssh-fixture.example", 22),
+                new ProfileConnectionMetadataSource.SshUsername("fixture_user"),
+                new ProfileConnectionMetadataSource.KnownHost(
+                        ProfileConnectionMetadataSource.HostKeyAlgorithm.ED25519,
+                        "SHA256:0123456789012345678901234567890123456789012"),
+                new SshKeyImportCoordinator.OpaqueCredentialRef("android_keystore_fixture_42"),
+                new SshKeyImportCoordinator.PublicKeyMetadata(
+                        SshKeyImportCoordinator.SshPublicKeyAlgorithm.ED25519,
+                        "SHA256:0123456789012345678901234567890123456789012"));
+    }
+
+    private static final class ControlledBridge implements RustNativeConnectorJni.NativePlanBridge {
+        int generation;
+        int cancels;
+        @Override public int abiVersion() { return 3; }
+        @Override public long beginAuthenticatedPlan(int generation, RustNativeConnectorJni.NativeHandles handles) {
+            this.generation = generation;
+            return 29;
+        }
+        @Override public int openAuthenticatedPlan(int generation, long plan) { return 5; }
+        @Override public int cancelAuthenticatedPlan(int generation, long plan) { cancels++; return 0; }
+    }
+
+    private static final class ControlledRuntime implements RustNativeConnectorJni.NativeRuntime {
+        int releases;
+        @Override public RustNativeConnectorJni.NativeLease acquire(
+            NativeAuthenticatedSshConnector.NativeConnectionInput input
+        ) {
+            return new RustNativeConnectorJni.NativeLease(
+                    new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6, 7),
+                    () -> releases++);
+        }
+    }
+
+    private static final class ControlledSession implements NativeAuthenticatedSshConnector.NativeSession {
+        byte[] request;
+        @Override public void executeRpc(byte[] request, NativeAuthenticatedSshConnector.NativeRpcCallback callback) {
+            this.request = request.clone();
+            callback.onComplete(new NativeAuthenticatedSshConnector.NativeRpcResult(
+                    "{\"id\":\"00000000-0000-4000-8000-000000000002\",\"kind\":\"response\",\"result\":{\"workspace_id\":\"00000000-0000-4000-8000-000000000001\",\"entries\":[]}}"
+                            .getBytes(StandardCharsets.UTF_8)));
+        }
+    }
+
+    private static final class ControlledListener implements AndroidGitStatusComposition.Listener {
+        AuthenticatedSshOperationCoordinator.OpenCode failure;
+        GitStatusController.State state;
+        @Override public void onConnectionFailure(AuthenticatedSshOperationCoordinator.OpenCode value) { failure = value; }
+        @Override public void onGitStatusController(GitStatusController controller) { }
+        @Override public void onGitStatusState(GitStatusController.State value) { state = value; }
     }
 
     private static void require(boolean condition, String message) {
