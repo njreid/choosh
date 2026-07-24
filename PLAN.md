@@ -99,6 +99,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   surface cannot perform atomic writes and the fixed SSH dispatcher exposes only RPC, so neither
   can be repurposed for deployment. A versioned immutable-upload and host-owned activation
   protocol remains required before Android deployment wiring can begin.
+- [x] The host now has an injected immutable deployment transaction that accepts only bounded
+  release version/digest/bytes and keeps release paths, atomic selection, service activation,
+  and private-socket health inside host adapters; digest failures discard stages and every
+  post-activation service or health failure rolls back once.
 - [x] The bridge now owns a bounded, one-close-only per-plan runtime callback allocation with
   deterministic bounds and released-lease tests. A JNI `GlobalRef` adapter remains required to
   supply its socket and signing callbacks on Android.

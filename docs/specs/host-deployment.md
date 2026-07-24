@@ -59,3 +59,11 @@ both of these separately admitted capabilities:
 
 The Android transport then supplies only verified release bytes and metadata to those capability
 ports. It MUST retain no host deployment path, service-manager argument vector, or shell text.
+
+The first host-owned capability is `choosh_host::deployment::HostDeployment`. It accepts a
+bounded `DeploymentUpload` containing only release version, SHA-256 digest, and artifact bytes;
+its `ImmutableDeploymentStore`, `DeploymentService`, and `DeploymentHealth` adapters retain all
+paths, atomic publication, manager argv, and private-socket health authority. Its transaction is
+stage → digest → activate → service activation → version health, with one rollback after any
+post-activation failure. A future versioned SSH stdin envelope MUST decode to this upload type
+and invoke no broader capability.
