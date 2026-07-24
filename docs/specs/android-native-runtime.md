@@ -64,8 +64,10 @@ Concrete JNI environment access is confined to `choosh-android-bridge`; shared
 transport code receives narrow injected stream and signer capabilities. The
 Android app assembles the runtime in its composition root using constructor
 injection. No mutable global registry or service locator is permitted. The
-currently shipped v3 ABI validates and carries the lease ID only; it does not
-yet retain or invoke Java callbacks and therefore remains fail-closed.
+v3 runtime overload retains its Java callback object in the plan-token-owned
+bridge allocation and releases it on cancellation or generation recreation.
+It remains fail-closed until that allocation is composed into the verified
+stream and signer transport.
 
 Headless acceptance MUST prove all of the following with deterministic fakes:
 

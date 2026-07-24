@@ -17,6 +17,12 @@ public final class RustNativeConnectorJni {
     public interface NativePlanBridge {
         int abiVersion();
         long beginAuthenticatedPlan(int generation, NativeHandles handles);
+        /** Retains one Android callback object only when this bridge supports the native lease ABI. */
+        default long beginAuthenticatedPlan(
+            int generation, NativeHandles handles, AndroidRuntimeCallbackPort callbacks
+        ) {
+            return beginAuthenticatedPlan(generation, handles);
+        }
         int openAuthenticatedPlan(int generation, long plan);
         int cancelAuthenticatedPlan(int generation, long plan);
     }
@@ -42,15 +48,25 @@ public final class RustNativeConnectorJni {
     /** One-close-only ownership lease for Android runtime registrations. */
     public static final class NativeLease implements AutoCloseable {
         private final NativeHandles handles;
+        private final AndroidRuntimeCallbackPort callbacks;
         private final Releaser releaser;
         private boolean closed;
 
         public NativeLease(NativeHandles handles, Releaser releaser) {
+            this(handles, null, releaser);
+        }
+
+        /** Owns one callback object whose lifetime is bound to this native plan. */
+        public NativeLease(
+            NativeHandles handles, AndroidRuntimeCallbackPort callbacks, Releaser releaser
+        ) {
             this.handles = Objects.requireNonNull(handles, "handles");
+            this.callbacks = callbacks;
             this.releaser = Objects.requireNonNull(releaser, "releaser");
         }
 
         NativeHandles handles() { return handles; }
+        AndroidRuntimeCallbackPort callbacks() { return callbacks; }
 
         @Override public synchronized void close() throws NativePlanException {
             if (closed) return;
@@ -118,7 +134,7 @@ public final class RustNativeConnectorJni {
             if (generation <= 0 || bridge.abiVersion() != ABI_VERSION) throw new NativePlanException();
             NativeLease lease = runtime.acquire(Objects.requireNonNull(input, "input"));
             try {
-                long plan = bridge.beginAuthenticatedPlan(generation, lease.handles());
+                long plan = bridge.beginAuthenticatedPlan(generation, lease.handles(), lease.callbacks());
                 if (plan <= 0) throw new NativePlanException();
                 return new Plan(bridge, generation, plan, lease);
             } catch (NativePlanException exception) {
@@ -188,6 +204,17 @@ public final class RustNativeConnectorJni {
             );
         }
 
+        @Override public long beginAuthenticatedPlan(
+            int generation, NativeHandles handles, AndroidRuntimeCallbackPort callbacks
+        ) {
+            if (callbacks == null) return beginAuthenticatedPlan(generation, handles);
+            return nativeBeginAuthenticatedPlanWithRuntime(
+                generation, handles.endpoint, handles.username, handles.knownHost,
+                handles.credentialRef, handles.publicKey, handles.signingCallback, handles.runtimeLease,
+                callbacks
+            );
+        }
+
         @Override public int openAuthenticatedPlan(int generation, long plan) {
             return nativeOpenAuthenticatedPlan(generation, plan);
         }
@@ -200,6 +227,10 @@ public final class RustNativeConnectorJni {
         private static native long nativeBeginAuthenticatedPlan(
             int generation, long endpoint, long username, long knownHost, long credentialRef, long publicKey,
             long signingCallback, long runtimeLease
+        );
+        private static native long nativeBeginAuthenticatedPlanWithRuntime(
+            int generation, long endpoint, long username, long knownHost, long credentialRef, long publicKey,
+            long signingCallback, long runtimeLease, AndroidRuntimeCallbackPort callbacks
         );
         private static native int nativeCancelAuthenticatedPlan(int generation, long plan);
         private static native int nativeOpenAuthenticatedPlan(int generation, long plan);

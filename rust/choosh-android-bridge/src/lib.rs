@@ -5,11 +5,12 @@
 
 #![allow(unsafe_code)] // Required only for Edition 2024's `no_mangle` ABI attribute.
 
-use jni::objects::{Global, JByteArray, JObject, JValue};
-use jni::{Env, JavaVM, jni_sig, jni_str};
+use jni::objects::{Global, JByteArray, JClass, JObject, JValue};
+use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
 use std::ffi::c_void;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 const ABI_VERSION: u32 = 3;
 const STATUS_OK: i32 = 0;
@@ -20,6 +21,7 @@ const STATUS_INVALID_ARGUMENT: i32 = 4;
 const STATUS_TRANSPORT_UNAVAILABLE: i32 = 5;
 const AUTHENTICATED_PLAN_STATUS: u32 = 8;
 const SLOT_COUNT: usize = 64;
+const MAX_RUNTIME_CALLBACK_BYTES: u64 = 65_536;
 // Request tokens are process-local opaque capabilities, not serialized IDs. Keeping the
 // request kind in the atomically stored token prevents a generic bridge request from being
 // reinterpreted as an authenticated plan during a slot reuse race.
@@ -34,6 +36,10 @@ const TOKEN_GENERATION_MASK: u32 = (1 << TOKEN_GENERATION_BITS) - 1;
 static GENERATION: AtomicU32 = AtomicU32::new(1);
 static NEXT_REQUEST: AtomicU32 = AtomicU32::new(1);
 static REQUESTS: [AtomicU64; SLOT_COUNT] = [const { AtomicU64::new(0) }; SLOT_COUNT];
+type RuntimeAllocationSlot = Option<(u64, RuntimeAllocation<JniRuntimeCallbacks>)>;
+type RuntimeAllocationTable = [RuntimeAllocationSlot; SLOT_COUNT];
+/// The bridge's token table owns allocations; it is not an ambient callback lookup service.
+static RUNTIME_ALLOCATIONS: OnceLock<Mutex<RuntimeAllocationTable>> = OnceLock::new();
 
 macro_rules! opaque_handle {
     ($name:ident) => {
@@ -423,6 +429,59 @@ pub enum RuntimeAllocationError<E> {
     Callback(E),
 }
 
+fn runtime_allocations() -> &'static Mutex<RuntimeAllocationTable> {
+    RUNTIME_ALLOCATIONS.get_or_init(|| Mutex::new([const { None }; SLOT_COUNT]))
+}
+
+fn retain_runtime_allocation(
+    plan: u64,
+    allocation: RuntimeAllocation<JniRuntimeCallbacks>,
+) -> bool {
+    let Ok(mut allocations) = runtime_allocations().lock() else {
+        return false;
+    };
+    for slot in allocations.iter_mut() {
+        if slot.is_none() {
+            *slot = Some((plan, allocation));
+            return true;
+        }
+    }
+    false
+}
+
+/// Releases the plan-owned global reference and asks Android to invalidate its lease.
+///
+/// The allocation is removed even if the Java close callback fails, so a failed close cannot
+/// retain a callback object or make a later token reuse invoke it.
+fn release_runtime_allocation(plan: u64) -> bool {
+    let allocation = {
+        let Ok(mut allocations) = runtime_allocations().lock() else {
+            return false;
+        };
+        let Some(slot) = allocations
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|(owned, _)| *owned == plan))
+        else {
+            return true;
+        };
+        slot.take().map(|(_, allocation)| allocation)
+    };
+    allocation.is_none_or(|mut allocation| allocation.close().is_ok())
+}
+
+fn release_all_runtime_allocations() -> bool {
+    let allocations = {
+        let Ok(mut slots) = runtime_allocations().lock() else {
+            return false;
+        };
+        std::mem::replace(&mut *slots, [const { None }; SLOT_COUNT])
+    };
+    allocations
+        .into_iter()
+        .flatten()
+        .all(|(_, mut allocation)| allocation.close().is_ok())
+}
+
 /// Returns the stable ABI contract version.
 #[unsafe(no_mangle)]
 pub extern "C" fn choosh_bridge_abi_version() -> u32 {
@@ -500,7 +559,11 @@ pub extern "C" fn choosh_bridge_authenticated_plan_begin(
 /// Cancels one opaque authenticated-connection plan.
 #[unsafe(no_mangle)]
 pub extern "C" fn choosh_bridge_authenticated_plan_cancel(generation: u32, plan: u64) -> i32 {
-    choosh_bridge_request_cancel(generation, plan)
+    let status = choosh_bridge_request_cancel(generation, plan);
+    if status == STATUS_OK && !release_runtime_allocation(plan) {
+        return STATUS_TRANSPORT_UNAVAILABLE;
+    }
+    status
 }
 
 /// Attempts to advance an admitted plan into the native transport.
@@ -581,6 +644,77 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenti
     .cast_signed()
 }
 
+/// Begins a plan while retaining its callback object in the token-owned allocation.
+///
+/// The Java object remains confined to this bridge. Failure to retain it cancels the just-minted
+/// token and returns zero, preserving the fail-closed Java plan contract.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenticatedPlanWithRuntime<
+    'local,
+>(
+    mut unowned_environment: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    generation: i32,
+    endpoint: i64,
+    username: i64,
+    known_host: i64,
+    credential_ref: i64,
+    public_key: i64,
+    signing_callback: i64,
+    runtime_lease: i64,
+    callbacks: JObject<'local>,
+) -> i64 {
+    if generation <= 0
+        || endpoint <= 0
+        || username <= 0
+        || known_host <= 0
+        || credential_ref <= 0
+        || public_key <= 0
+        || signing_callback <= 0
+        || runtime_lease <= 0
+        || callbacks.is_null()
+    {
+        return 0;
+    }
+    match unowned_environment
+        .with_env(|environment| -> jni::errors::Result<i64> {
+            let runtime = JniRuntimeCallbacks::retain(environment, callbacks)?;
+            let Some(allocation) = RuntimeAllocation::new(
+                runtime,
+                RuntimeLeaseHandle::new(runtime_lease.cast_unsigned()).ok_or(
+                    jni::errors::Error::JniCall(jni::errors::JniError::InvalidArguments),
+                )?,
+                MAX_RUNTIME_CALLBACK_BYTES,
+            ) else {
+                return Ok(0);
+            };
+            let plan = choosh_bridge_authenticated_plan_begin(
+                generation.cast_unsigned(),
+                endpoint.cast_unsigned(),
+                username.cast_unsigned(),
+                known_host.cast_unsigned(),
+                credential_ref.cast_unsigned(),
+                public_key.cast_unsigned(),
+                signing_callback.cast_unsigned(),
+                runtime_lease.cast_unsigned(),
+            );
+            if plan == 0 {
+                return Ok(0);
+            }
+            if !retain_runtime_allocation(plan, allocation) {
+                let _ = choosh_bridge_request_cancel(generation.cast_unsigned(), plan);
+                return Ok(0);
+            }
+            Ok(plan.cast_signed())
+        })
+        .into_outcome()
+    {
+        jni::Outcome::Ok(plan) => plan,
+        jni::Outcome::Err(_) | jni::Outcome::Panic(_) => 0,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeCancelAuthenticatedPlan(
     _environment: *mut c_void,
@@ -650,7 +784,11 @@ pub extern "C" fn choosh_bridge_recreate(expected_generation: u32) -> i32 {
     for slot in &REQUESTS {
         slot.store(0, Ordering::Release);
     }
-    STATUS_OK
+    if release_all_runtime_allocations() {
+        STATUS_OK
+    } else {
+        STATUS_TRANSPORT_UNAVAILABLE
+    }
 }
 
 /// Exposes numeric status identities without allocating strings across the ABI.

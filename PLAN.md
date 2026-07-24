@@ -86,7 +86,11 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Android now has a constructor-injected bounded socket adapter and an explicit per-attempt
   native-runtime lease. The lease releases opaque socket and signer registrations exactly once
   after plan rejection, cancellation, completion, or a late callback; headless JVM fakes cover
-  the lifecycle. The JNI bridge still does not invoke those registrations from Rust.
+  the lifecycle. The JNI bridge does not yet invoke those registrations during a verified
+  transport operation.
+- [x] The JNI runtime overload now retains its bounded callback object only in the owning plan
+  allocation and releases it before token reuse or on generation recreation. The bridge remains
+  fail-closed until that allocation drives the verified stream and signer transport.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and

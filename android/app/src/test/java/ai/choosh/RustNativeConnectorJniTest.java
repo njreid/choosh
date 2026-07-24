@@ -89,6 +89,22 @@ public final class RustNativeConnectorJniTest {
         assertEquals(1, released[0]);
     }
 
+    @Test public void callback_object_is_bound_to_its_plan_lifecycle() throws Exception {
+        CapturingConnector connector = new CapturingConnector();
+        new NativeAuthenticatedSshConnector(connector).openVerified(request(), result -> { });
+        RuntimeAwareBridge bridge = new RuntimeAwareBridge();
+        AndroidRuntimeCallbackPort callbacks = new NoopRuntimeCallbacks();
+        RustNativeConnectorJni.PlanFactory factory = new RustNativeConnectorJni.PlanFactory(bridge,
+            (RustNativeConnectorJni.NativeRuntime) input -> new RustNativeConnectorJni.NativeLease(
+                new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6, 7), callbacks, () -> { }
+            ));
+
+        RustNativeConnectorJni.Plan plan = factory.begin(7, connector.input);
+        assertEquals(callbacks, bridge.callbacks);
+        plan.close();
+        assertEquals(1, bridge.cancels);
+    }
+
     private static AuthenticatedSshOperationCoordinator.ConnectionRequest request() {
         return new AuthenticatedSshOperationCoordinator.ConnectionRequest(
             new AuthenticatedSshOperationCoordinator.ProfileId("fixture_profile"),
@@ -116,7 +132,7 @@ public final class RustNativeConnectorJniTest {
         }
     }
 
-    private static final class RecordingBridge implements RustNativeConnectorJni.NativePlanBridge {
+    private static class RecordingBridge implements RustNativeConnectorJni.NativePlanBridge {
         final int abi;
         final long plan;
         int generation;
@@ -136,5 +152,23 @@ public final class RustNativeConnectorJniTest {
             cancels++;
             return 0;
         }
+    }
+
+    private static final class RuntimeAwareBridge extends RecordingBridge {
+        AndroidRuntimeCallbackPort callbacks;
+        RuntimeAwareBridge() { super(3, 99); }
+        @Override public long beginAuthenticatedPlan(
+            int generation, RustNativeConnectorJni.NativeHandles handles, AndroidRuntimeCallbackPort callbacks
+        ) {
+            this.callbacks = callbacks;
+            return super.beginAuthenticatedPlan(generation, handles);
+        }
+    }
+
+    private static final class NoopRuntimeCallbacks implements AndroidRuntimeCallbackPort {
+        @Override public byte[] read(long lease, int maximumBytes) { return new byte[0]; }
+        @Override public void write(long lease, byte[] bytes) { }
+        @Override public byte[] sign(long lease, byte[] payload) { return new byte[] { 1 }; }
+        @Override public void close(long lease) { }
     }
 }
