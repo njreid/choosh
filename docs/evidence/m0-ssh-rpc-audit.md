@@ -17,13 +17,22 @@ Audit date: 2026-07-17. This is an implementation evidence inventory, not an M0-
   directory, binds only an injected Unix socket with mode `0600`, and performs identity-checked
   cleanup.
 - Shell-free `choosh-host rpc --stdio` parsing exists.
+- `choosh-android-transport` now composes a bounded Android-shaped callback stream with Russh,
+  exact generated-host admission, a payload-only generated signer, and `AndroidRpcSession`.
+  Its deterministic fixture carries `git.status` through the fixed SSH stdio command and the real
+  private `chooshd` socket, returning a bounded terminal envelope. A changed generated host key
+  invokes no signer callback.
+- The JNI bridge consumes a plan-owned Java callback allocation into that transport only after
+  metadata/public-key validation. A successful native open retains a one-slot fixed-RPC actor;
+  Java transfers it to one-close-only `JniNativeSession`. The Android instrumentation lane loads
+  the packaged nested `JniPlanBridge` ABI before UI smoke assertions.
 
 ## Missing M0-R5/R6 evidence
 
-- There is no concrete SSH transport adapter, local SSH server harness, or black-box multiplex test
-  for concurrent PTY, exec/RPC, SFTP, and direct-tcpip channels on one verified connection.
-- Host-key policy is a tested state machine, not yet connected to a cryptographic SSH library or a
-  persisted known-host store.
+- There is not yet a black-box multiplex test for concurrent PTY, exec/RPC, SFTP, and direct-tcpip
+  channels on one verified connection, nor fairness/fault evidence for all channel types.
+- The generated-key fixture exercises cryptographic exact-host admission, but it does not yet
+  prove persisted Android known-host storage or a JVM callback/socket to real `chooshd` path.
 - `chooshd` now has a minimal composition-root binary with mandatory injected
   `--state-dir` and `--socket` paths. It binds the existing private Unix socket
   lifecycle and accepts exactly one bounded, typed JSON `hello` as the first
@@ -42,8 +51,6 @@ Audit date: 2026-07-17. This is an implementation evidence inventory, not an M0-
 - PTY latency/fairness under throttled SFTP, disconnect injection for every channel type, and
   direct-tcpip HTTP/WebSocket/SSE fidelity remain unimplemented.
 
-Therefore M0-R5 and M0-R6 remain blocked. The daemon black-box harness proves
-private-socket permissions and first-frame typed negotiation. The next vertical
-gate must compose that negotiation through the stdio relay and a verified SSH
-transport; only after that should the repository claim end-to-end SSH
-stdio-to-`0600`-socket behavior.
+Therefore M0-R5 and M0-R6 remain blocked on the full JVM/device callback path and the
+multi-channel acceptance matrix. The generated-key transport fixture proves the bounded Rust
+vertical path to a real private socket; it must not be presented as Android-device evidence.

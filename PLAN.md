@@ -211,7 +211,8 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **Finish M0-R5/M0-R6.** Exercise the real Android/native connector, credential use,
+1. **Finish M0-R5/M0-R6.** Run `scripts/run-android-instrumentation.sh` on an accelerated
+   x86_64 emulator or arm64 device, then exercise the real Android/native connector, credential use,
    bounded cancellation, the fixed `git.status` daemon method, and negotiated
    stdio-to-real-`chooshd` private-socket RPC in one harness—not only generated-key fixtures.
 2. **Deploy and update `chooshd` without SSH session ownership.** Specify and implement a
