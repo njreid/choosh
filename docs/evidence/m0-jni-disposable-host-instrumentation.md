@@ -50,9 +50,10 @@ Keystore Ed25519 alias and reports only its public `authorized_keys` line to
 the disposable-host provisioner. The provisioner then starts OpenSSH with that
 generated public identity. The connection invocation reports only redacted
 outcome categories; neither invocation emits private-key bytes or the alias.
-`DisposableHostKeyInstrumentation` is the dedicated non-UI bootstrap runner;
-it emits the public line under `fixture_authorized_key` and otherwise reports
-only a success/unavailable category.
+The existing `SmokeInstrumentation` exposes this as a strict
+`choosh.mode=key-bootstrap` invocation; it emits the public line under
+`fixture_authorized_key` and otherwise reports only a success/unavailable
+category.
 
 ## Required assertions
 

@@ -19,8 +19,27 @@ import io.github.rosemoe.sora.text.CharPosition;
 import io.github.rosemoe.sora.widget.CodeEditor;
 
 public final class SmokeInstrumentation extends Instrumentation {
-    @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); start(); }
+    private String mode;
+
+    @Override public void onCreate(Bundle arguments) {
+        super.onCreate(arguments);
+        mode = arguments == null ? null : arguments.getString("choosh.mode");
+        start();
+    }
     @Override public void onStart() {
+        if ("key-bootstrap".equals(mode)) {
+            Bundle evidence = new Bundle();
+            try {
+                DisposableHostKeystoreIdentity identity = DisposableHostKeystoreIdentity.open();
+                evidence.putString("fixture_authorized_key", identity.authorizedKeyLine());
+                evidence.putString("fixture_identity", "android-keystore-ed25519-public-only");
+                finish(Activity.RESULT_OK, evidence);
+            } catch (Exception failure) {
+                evidence.putString("fixture_identity", "android-keystore-unavailable");
+                finish(Activity.RESULT_CANCELED, evidence);
+            }
+            return;
+        }
         Bundle evidence = new Bundle();
         verifyJniBridgeLibrary(evidence);
         // Sora constructs Android gesture handlers, so both widget fixtures
