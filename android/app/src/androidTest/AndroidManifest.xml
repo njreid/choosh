@@ -1,5 +1,0 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <instrumentation
-        android:name="ai.choosh.DisposableHostKeyInstrumentation"
-        android:targetPackage="ai.choosh" />
-</manifest>
