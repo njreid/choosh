@@ -1647,4 +1647,27 @@ mod tests {
         sessions.clear();
         assert_eq!(sessions.remove(12), None);
     }
+
+    #[test]
+    fn session_actor_serializes_fixed_rpc_without_registry_locking() {
+        struct Echo;
+        impl FixedRpcExecutor for Echo {
+            fn execute(
+                &mut self,
+                payload: Vec<u8>,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ()>> + Send + '_>> {
+                Box::pin(async move { Ok(payload) })
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let actor = SessionActor::spawn(Echo);
+            assert_eq!(actor.execute(vec![1, 2]).await, Ok(vec![1, 2]));
+            actor.close();
+            assert_eq!(actor.execute(vec![3]).await, Err(()));
+        });
+    }
 }
