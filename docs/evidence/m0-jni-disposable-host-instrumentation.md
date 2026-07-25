@@ -55,6 +55,12 @@ The existing `SmokeInstrumentation` exposes this as a strict
 `fixture_authorized_key` and otherwise reports only a success/unavailable
 category.
 
+The headless command
+`scripts/bootstrap-disposable-host-android.sh` installs both debug APKs,
+invokes that mode, validates the `ssh-ed25519` public-key grammar, and prints
+only the public line for the fixture provisioner. Missing ADB/device state is
+reported as `android_bootstrap_device_unavailable` with exit 69.
+
 ## Required assertions
 
 One test run MUST prove all of the following:
