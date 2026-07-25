@@ -176,6 +176,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   `host.describe` responses. Its hermetic fake-SSH test verifies the exact safe argv and rejects
   unsafe remote-path configuration before any connection. It remains infrastructure, not a claim
   that an Android callback/socket or `git.status` has reached the host.
+- [x] The disposable-host runner also has an optional headless real-OpenSSH lane: it creates
+  loopback-only server/client keys, a private-socket `chooshd`, and an ephemeral `sshd`, verifies
+  two actual SSH stdio relays, then proves a changed known-host entry fails without stdout. It
+  leaves no account, service, listener, or key outside its temporary fixture.
 - [x] Blob capability completion consumes a bounded reader and stops an oversized source
   after the first byte above its declared limit; daemon fixture roots are unique under
   parallel headless test execution.
