@@ -123,6 +123,8 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The bridge now has a bounded per-session fixed-RPC actor foundation: a one-slot command
   queue, one-shot replies, and explicit close. It keeps session I/O out of registry locks; JNI
   export wiring and the actor acceptance fixture remain the next increment.
+- [x] Plan-owned session lookup now clones the fixed-RPC actor before awaiting its reply, so no
+  registry borrow or lock spans I/O. Unknown plan capabilities are rejected deterministically.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and

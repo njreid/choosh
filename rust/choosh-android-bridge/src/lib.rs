@@ -841,6 +841,21 @@ impl<S> SessionRegistry<S> {
         Ok(operation(session))
     }
 
+    /// Clones one plan-owned operation capability without retaining a registry borrow.
+    pub fn capability(&self, plan: u64) -> Result<S, SessionRegistryError>
+    where
+        S: Clone,
+    {
+        self.slots
+            .iter()
+            .find_map(|slot| {
+                slot.as_ref()
+                    .filter(|(owned, _)| *owned == plan)
+                    .map(|(_, session)| session.clone())
+            })
+            .ok_or(SessionRegistryError::InvalidPlan)
+    }
+
     /// Drops every session before its owning generation's leases are released.
     pub fn clear(&mut self) {
         self.slots = [const { None }; SLOT_COUNT];
@@ -908,6 +923,16 @@ impl SessionActor {
 
     pub fn close(&self) {
         let _ = self.sender.try_send(SessionCommand::Close);
+    }
+}
+
+impl SessionRegistry<SessionActor> {
+    /// Executes fixed RPC after cloning the owner capability and dropping the registry borrow.
+    pub async fn execute_rpc(&self, plan: u64, payload: Vec<u8>) -> Result<Vec<u8>, ()> {
+        self.capability(plan)
+            .map_err(|_| ())?
+            .execute(payload)
+            .await
     }
 }
 
@@ -1665,7 +1690,10 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let actor = SessionActor::spawn(Echo);
-            assert_eq!(actor.execute(vec![1, 2]).await, Ok(vec![1, 2]));
+            let mut sessions = SessionRegistry::new();
+            sessions.insert(44, actor.clone()).unwrap();
+            assert_eq!(sessions.execute_rpc(44, vec![1, 2]).await, Ok(vec![1, 2]));
+            assert_eq!(sessions.execute_rpc(45, vec![1]).await, Err(()));
             actor.close();
             assert_eq!(actor.execute(vec![3]).await, Err(()));
         });
