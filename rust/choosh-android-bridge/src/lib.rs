@@ -1223,7 +1223,7 @@ pub extern "C" fn choosh_bridge_authenticated_plan_open(generation: u32, plan: u
 // resolves typed profile metadata to opaque handles before this boundary, so
 // Rust never dereferences a JVM object or receives credential material.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeAbiVersion(
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_00024JniPlanBridge_nativeAbiVersion(
     _environment: *mut c_void,
     _class: *mut c_void,
 ) -> i32 {
@@ -1232,7 +1232,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeAbiVersion(
 
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenticatedPlan(
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_00024JniPlanBridge_nativeBeginAuthenticatedPlan(
     _environment: *mut c_void,
     _class: *mut c_void,
     generation: i32,
@@ -1274,7 +1274,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenti
 /// token and returns zero, preserving the fail-closed Java plan contract.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenticatedPlanWithRuntime<
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_00024JniPlanBridge_nativeBeginAuthenticatedPlanWithRuntime<
     'local,
 >(
     mut unowned_environment: EnvUnowned<'local>,
@@ -1340,7 +1340,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeBeginAuthenti
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeCancelAuthenticatedPlan(
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_00024JniPlanBridge_nativeCancelAuthenticatedPlan(
     _environment: *mut c_void,
     _class: *mut c_void,
     generation: i32,
@@ -1353,7 +1353,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeCancelAuthent
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeOpenAuthenticatedPlan(
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_00024JniPlanBridge_nativeOpenAuthenticatedPlan(
     _environment: *mut c_void,
     _class: *mut c_void,
     generation: i32,
@@ -1370,7 +1370,7 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeOpenAuthentic
 /// A null return is the Java boundary's content-free failure signal; Java maps it to its typed
 /// bridge exception and never exposes a partial native response.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeExecuteAuthenticatedSession<'local>(
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_00024JniPlanBridge_nativeExecuteAuthenticatedSession<'local>(
     mut unowned_environment: EnvUnowned<'local>,
     _class: JClass<'local>,
     generation: i32,

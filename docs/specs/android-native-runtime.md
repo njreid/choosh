@@ -83,9 +83,10 @@ injection. No mutable global registry or service locator is permitted. The JNI
 bridge is therefore the dependency-direction outer root: it may depend on the
 transport composition crate, but the transport crate must not depend on JNI.
 The v3 runtime overload retains its Java callback object in the plan-token-owned
-bridge allocation and releases it on cancellation or generation recreation. It
-remains fail-closed until that allocation is composed into the verified stream
-and signer transport.
+bridge allocation and releases it on cancellation or generation recreation. The
+JNI outer root consumes that allocation into the verified stream and signer
+transport; it reports success only after SSH authentication has completed and
+the resulting fixed-RPC actor is retained under that same plan token.
 
 `BoundedAndroidNativeRuntime` is the Android-side constructor-injected owner for
 this callback object. It opens the already validated endpoint, binds the fixed
