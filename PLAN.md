@@ -125,6 +125,12 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   export wiring and the actor acceptance fixture remain the next increment.
 - [x] Plan-owned session lookup now clones the fixed-RPC actor before awaiting its reply, so no
   registry borrow or lock spans I/O. Unknown plan capabilities are rejected deterministically.
+- [x] The JNI native open now consumes its exact plan-owned callback allocation, composes the
+  bounded Android stream through exact-host SSH admission and Keystore signing, then retains the
+  authenticated `AndroidRpcSession` behind a one-slot fixed-RPC actor. Java transfers only a
+  successful plan to `JniNativeSession`; its bounded RPC and exactly-once close retain the sole
+  native token and Android lease. JVM and Rust headless tests cover the ownership transition and
+  actor lifecycle. A full JVM callback/socket-to-real-`chooshd` acceptance remains required.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and
@@ -205,24 +211,20 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **Bind the real native Android connector.** Implement the [per-plan JNI callback
-   ownership](docs/adr/0008-jni-runtime-callback-ownership.md) allocation, then turn the opaque
-   plan into a real exact-host-key-before-signing connection using the reviewed Java Keystore
-   callback and bounded JVM socket adapter; no credential material may cross the ABI.
-2. **Finish M0-R5/M0-R6.** Exercise that real Android/native connector, credential use,
+1. **Finish M0-R5/M0-R6.** Exercise the real Android/native connector, credential use,
    bounded cancellation, the fixed `git.status` daemon method, and negotiated
    stdio-to-real-`chooshd` private-socket RPC in one harness—not only generated-key fixtures.
-3. **Deploy and update `chooshd` without SSH session ownership.** Specify and implement a
+2. **Deploy and update `chooshd` without SSH session ownership.** Specify and implement a
    fixed-command, SSH/SFTP-only release installer: Android verifies GitHub-release metadata and
    artifacts before upload; the host stages immutable version directories, verifies the digest,
    atomically activates a per-user service-manager unit, health-checks through the private
    socket, and rolls back to the previous version on failure. Support `systemd --user` and
    `launchd` explicitly; unsupported hosts fail closed rather than using shell backgrounding.
    The service and Zellij processes must survive Android transport loss.
-4. **Then widen host/SFTP operations.** Compose the injected host process adapter and add
+3. **Then widen host/SFTP operations.** Compose the injected host process adapter and add
    only server-proven root-confined/atomic SFTP operations after the first vertical thread
    is reachable.
-5. **Terminal go/no-go.** Preserve the recorded Zelland grant, close native and
+4. **Terminal go/no-go.** Preserve the recorded Zelland grant, close native and
    font provenance gates, then implement the wgpu renderer behind the existing
    interface (or approve the specified CPU cell-grid fallback by ADR) and run
    headless conformance plus isolated device instrumentation.

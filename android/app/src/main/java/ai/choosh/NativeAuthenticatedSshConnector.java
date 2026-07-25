@@ -93,6 +93,9 @@ public final class NativeAuthenticatedSshConnector
             if (code == Code.CONNECTED) throw new IllegalArgumentException("failure requires a failure code");
             return new NativeOpenResult(Objects.requireNonNull(code, "code"), null);
         }
+
+        /** Returns the sole session capability for a connected result. */
+        NativeSession session() { return session; }
     }
 
     public enum Code { CONNECTED, HOST_KEY_REJECTED, AUTHENTICATION_FAILED, TRANSPORT_UNAVAILABLE }
@@ -100,6 +103,9 @@ public final class NativeAuthenticatedSshConnector
     /** Opaque native session with only the existing bounded RPC capability. */
     public interface NativeSession {
         void executeRpc(byte[] framedRequest, NativeRpcCallback callback) throws NativeBridgeException;
+
+        /** Releases this session's sole native-plan and Android-runtime lease exactly once. */
+        default void close() throws NativeBridgeException { }
     }
 
     public interface NativeRpcCallback {

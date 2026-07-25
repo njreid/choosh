@@ -63,13 +63,10 @@ public final class PlannedNativeConnectorPort
     }
 
     /**
-     * First production transport adapter. The current native bridge is intentionally fail-closed
-     * while its handle registry cannot yet compose an injected stream, exact host-key verifier,
-     * and Keystore signer. This adapter therefore never reports a connected session from plan
-     * admission alone.
+     * Production adapter from an opened native plan into its sole session owner.
      */
     public static final class JniPlannedTransport implements PlannedTransportPort {
-        private static final int STATUS_TRANSPORT_UNAVAILABLE = 5;
+        private static final int STATUS_OK = 0;
 
         @Override public void open(
             RustNativeConnectorJni.Plan plan,
@@ -78,11 +75,46 @@ public final class PlannedNativeConnectorPort
             Objects.requireNonNull(plan, "plan");
             Objects.requireNonNull(callback, "callback");
             try {
-                if (plan.open() != STATUS_TRANSPORT_UNAVAILABLE) {
+                if (plan.open() != STATUS_OK) {
                     throw new NativeAuthenticatedSshConnector.NativeBridgeException();
                 }
-                callback.onComplete(NativeAuthenticatedSshConnector.NativeOpenResult.failure(
-                    NativeAuthenticatedSshConnector.Code.TRANSPORT_UNAVAILABLE));
+                callback.onComplete(NativeAuthenticatedSshConnector.NativeOpenResult.connected(
+                    new JniNativeSession(plan.transferToSession())
+                ));
+            } catch (RustNativeConnectorJni.NativePlanException exception) {
+                throw new NativeAuthenticatedSshConnector.NativeBridgeException();
+            }
+        }
+    }
+
+    /** Bounded Java facade over the sole native session lease. */
+    static final class JniNativeSession implements NativeAuthenticatedSshConnector.NativeSession {
+        private final RustNativeConnectorJni.SessionLease lease;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        JniNativeSession(RustNativeConnectorJni.SessionLease lease) {
+            this.lease = Objects.requireNonNull(lease, "lease");
+        }
+
+        @Override public void executeRpc(
+            byte[] framedRequest, NativeAuthenticatedSshConnector.NativeRpcCallback callback
+        ) throws NativeAuthenticatedSshConnector.NativeBridgeException {
+            if (closed.get() || framedRequest == null || callback == null) {
+                throw new NativeAuthenticatedSshConnector.NativeBridgeException();
+            }
+            try {
+                callback.onComplete(new NativeAuthenticatedSshConnector.NativeRpcResult(
+                    lease.executeRpc(framedRequest)
+                ));
+            } catch (RustNativeConnectorJni.NativePlanException exception) {
+                throw new NativeAuthenticatedSshConnector.NativeBridgeException();
+            }
+        }
+
+        @Override public void close() throws NativeAuthenticatedSshConnector.NativeBridgeException {
+            if (!closed.compareAndSet(false, true)) return;
+            try {
+                lease.close();
             } catch (RustNativeConnectorJni.NativePlanException exception) {
                 throw new NativeAuthenticatedSshConnector.NativeBridgeException();
             }
@@ -102,6 +134,8 @@ public final class PlannedNativeConnectorPort
         void complete(NativeAuthenticatedSshConnector.NativeOpenResult result) {
             if (!complete.compareAndSet(false, true)) return;
             NativeAuthenticatedSshConnector.NativeOpenCallback completion = takeCallback();
+            // JniNativeSession transfers the plan before invoking this callback, making closePlan
+            // a harmless no-op there. Other transports retain the original cancellation rule.
             if (!closePlan()) {
                 completion.onComplete(NativeAuthenticatedSshConnector.NativeOpenResult.failure(
                     NativeAuthenticatedSshConnector.Code.TRANSPORT_UNAVAILABLE

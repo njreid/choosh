@@ -52,16 +52,20 @@ public final class PlannedNativeConnectorPortTest {
         assertEquals(0, outcome.completions);
     }
 
-    @Test public void production_jni_transport_fails_closed_without_a_verified_native_session() throws Exception {
-        RecordingBridge bridge = new RecordingBridge(3, 29, 0);
+    @Test public void production_jni_transport_transfers_a_verified_session_lease() throws Exception {
+        RecordingBridge bridge = new RecordingBridge(3, 29, 0, 0);
         PlannedNativeConnectorPort port = port(bridge, new PlannedNativeConnectorPort.JniPlannedTransport());
         Outcome outcome = new Outcome();
 
         port.open(input(), outcome);
 
         assertEquals(1, bridge.opens);
-        assertEquals(1, bridge.cancels);
         assertEquals(1, outcome.completions);
+        outcome.result.session().executeRpc(new byte[] { 1 }, ignored -> { });
+        assertEquals(1, bridge.executes);
+        outcome.result.session().close();
+        outcome.result.session().close();
+        assertEquals(1, bridge.cancels);
     }
 
     @Test public void injected_runtime_registrations_are_independent_until_their_own_callbacks_finish()
@@ -159,17 +163,26 @@ public final class PlannedNativeConnectorPortTest {
         final int abi;
         final long plan;
         final int cancelResult;
+        final int openResult;
         int generation;
         int cancels;
         int opens;
+        int executes;
         RecordingBridge(int abi, long plan, int cancelResult) {
-            this.abi = abi; this.plan = plan; this.cancelResult = cancelResult;
+            this(abi, plan, cancelResult, 5);
+        }
+        RecordingBridge(int abi, long plan, int cancelResult, int openResult) {
+            this.abi = abi; this.plan = plan; this.cancelResult = cancelResult; this.openResult = openResult;
         }
         @Override public int abiVersion() { return abi; }
         @Override public long beginAuthenticatedPlan(int generation, RustNativeConnectorJni.NativeHandles handles) {
             this.generation = generation; return plan;
         }
-        @Override public int openAuthenticatedPlan(int generation, long plan) { opens++; return 5; }
+        @Override public int openAuthenticatedPlan(int generation, long plan) { opens++; return openResult; }
+        @Override public byte[] executeAuthenticatedSession(int generation, long plan, byte[] request) {
+            executes++;
+            return new byte[] { 9 };
+        }
         @Override public int cancelAuthenticatedPlan(int generation, long plan) {
             cancels++; return cancelResult;
         }

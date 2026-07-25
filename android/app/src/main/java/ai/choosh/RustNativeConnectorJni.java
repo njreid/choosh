@@ -24,6 +24,11 @@ public final class RustNativeConnectorJni {
             return beginAuthenticatedPlan(generation, handles);
         }
         int openAuthenticatedPlan(int generation, long plan);
+        /** Executes one already-framed, bounded RPC on a connected plan-owned session. */
+        default byte[] executeAuthenticatedSession(int generation, long plan, byte[] framedRequest)
+            throws NativePlanException {
+            throw new NativePlanException();
+        }
         int cancelAuthenticatedPlan(int generation, long plan);
     }
 
@@ -216,6 +221,18 @@ public final class RustNativeConnectorJni {
             return value;
         }
 
+        byte[] executeRpc(byte[] framedRequest) throws NativePlanException {
+            if (value == 0 || framedRequest == null || framedRequest.length == 0
+                || framedRequest.length > 1_048_576) {
+                throw new NativePlanException();
+            }
+            byte[] response = bridge.executeAuthenticatedSession(generation, value, framedRequest.clone());
+            if (response == null || response.length == 0 || response.length > 1_048_576) {
+                throw new NativePlanException();
+            }
+            return response.clone();
+        }
+
         @Override public void close() throws NativePlanException {
             if (value == 0) return;
             long closing = value;
@@ -265,6 +282,12 @@ public final class RustNativeConnectorJni {
             return nativeOpenAuthenticatedPlan(generation, plan);
         }
 
+        @Override public byte[] executeAuthenticatedSession(
+            int generation, long plan, byte[] framedRequest
+        ) {
+            return nativeExecuteAuthenticatedSession(generation, plan, framedRequest);
+        }
+
         @Override public int cancelAuthenticatedPlan(int generation, long plan) {
             return nativeCancelAuthenticatedPlan(generation, plan);
         }
@@ -280,5 +303,8 @@ public final class RustNativeConnectorJni {
         );
         private static native int nativeCancelAuthenticatedPlan(int generation, long plan);
         private static native int nativeOpenAuthenticatedPlan(int generation, long plan);
+        private static native byte[] nativeExecuteAuthenticatedSession(
+            int generation, long plan, byte[] framedRequest
+        );
     }
 }

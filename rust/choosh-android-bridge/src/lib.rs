@@ -5,7 +5,7 @@
 
 #![allow(unsafe_code)] // Required only for Edition 2024's `no_mangle` ABI attribute.
 
-use choosh_android_transport::{BlockingAndroidIo, BlockingAndroidStream, StreamChunkLimits};
+use choosh_android_transport::{AndroidRpcSession, BlockingAndroidIo, BlockingAndroidStream, StreamChunkLimits};
 use choosh_core::ssh_identity::{PublicKeyFingerprint, PublicKeyMetadata, SshPublicKeyAlgorithm};
 use choosh_ssh::SshUsername;
 use jni::objects::{Global, JByteArray, JClass, JObject, JValue};
@@ -16,6 +16,7 @@ use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use tokio::runtime::Runtime;
 
 const ABI_VERSION: u32 = 3;
 const STATUS_OK: i32 = 0;
@@ -44,10 +45,38 @@ const TOKEN_GENERATION_MASK: u32 = (1 << TOKEN_GENERATION_BITS) - 1;
 static GENERATION: AtomicU32 = AtomicU32::new(1);
 static NEXT_REQUEST: AtomicU32 = AtomicU32::new(1);
 static REQUESTS: [AtomicU64; SLOT_COUNT] = [const { AtomicU64::new(0) }; SLOT_COUNT];
-type RuntimeAllocationSlot = Option<(u64, RuntimeAllocation<JniRuntimeCallbacks>)>;
+type RuntimeAllocationSlot = Option<(u64, RuntimeState)>;
 type RuntimeAllocationTable = [RuntimeAllocationSlot; SLOT_COUNT];
 /// The bridge's token table owns allocations; it is not an ambient callback lookup service.
 static RUNTIME_ALLOCATIONS: OnceLock<Mutex<RuntimeAllocationTable>> = OnceLock::new();
+
+/// JNI composition-root state owned by exactly one authenticated plan token.
+///
+/// The C ABI is necessarily process-addressable, but this table never exposes a lookup service:
+/// callers may only advance, execute through, or cancel their exact opaque plan capability.
+enum RuntimeState {
+    Pending(RuntimeAllocation<JniRuntimeCallbacks>),
+    Connected(NativeSessionCapability),
+}
+
+/// Cloneable fixed-RPC capability. Cloning it cannot select another plan or gain a raw stream.
+#[derive(Clone)]
+struct NativeSessionCapability {
+    runtime: Arc<Runtime>,
+    actor: SessionActor,
+    allocation: Arc<RuntimeAllocation<JniRuntimeCallbacks>>,
+}
+
+impl NativeSessionCapability {
+    fn execute(&self, payload: Vec<u8>) -> Result<Vec<u8>, ()> {
+        self.runtime.block_on(self.actor.execute(payload))
+    }
+
+    fn close(&self) -> bool {
+        self.actor.close();
+        self.allocation.close().is_ok()
+    }
+}
 
 macro_rules! opaque_handle {
     ($name:ident) => {
@@ -936,6 +965,15 @@ impl SessionRegistry<SessionActor> {
     }
 }
 
+impl FixedRpcExecutor for AndroidRpcSession {
+    fn execute(
+        &mut self,
+        payload: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ()>> + Send + '_>> {
+        Box::pin(async move { AndroidRpcSession::execute(self, &payload).await.map_err(|_| ()) })
+    }
+}
+
 fn runtime_allocations() -> &'static Mutex<RuntimeAllocationTable> {
     RUNTIME_ALLOCATIONS.get_or_init(|| Mutex::new([const { None }; SLOT_COUNT]))
 }
@@ -949,7 +987,7 @@ fn retain_runtime_allocation(
     };
     for slot in allocations.iter_mut() {
         if slot.is_none() {
-            *slot = Some((plan, allocation));
+            *slot = Some((plan, RuntimeState::Pending(allocation)));
             return true;
         }
     }
@@ -973,7 +1011,10 @@ fn release_runtime_allocation(plan: u64) -> bool {
         };
         slot.take().map(|(_, allocation)| allocation)
     };
-    allocation.is_none_or(|allocation| allocation.close().is_ok())
+    allocation.is_none_or(|allocation| match allocation {
+        RuntimeState::Pending(allocation) => allocation.close().is_ok(),
+        RuntimeState::Connected(session) => session.close(),
+    })
 }
 
 fn release_all_runtime_allocations() -> bool {
@@ -986,7 +1027,49 @@ fn release_all_runtime_allocations() -> bool {
     allocations
         .into_iter()
         .flatten()
-        .all(|(_, allocation)| allocation.close().is_ok())
+        .all(|(_, allocation)| match allocation {
+            RuntimeState::Pending(allocation) => allocation.close().is_ok(),
+            RuntimeState::Connected(session) => session.close(),
+        })
+}
+
+/// Takes a pending allocation so an SSH handshake never holds the registry mutex.
+fn take_pending_runtime_allocation(plan: u64) -> Option<RuntimeAllocation<JniRuntimeCallbacks>> {
+    let Ok(mut allocations) = runtime_allocations().lock() else {
+        return None;
+    };
+    let slot = allocations
+        .iter_mut()
+        .find(|slot| slot.as_ref().is_some_and(|(owned, _)| *owned == plan))?;
+    match slot.take() {
+        Some((_, RuntimeState::Pending(allocation))) => Some(allocation),
+        Some(entry) => {
+            *slot = Some(entry);
+            None
+        }
+        None => None,
+    }
+}
+
+fn retain_connected_session(plan: u64, session: NativeSessionCapability) -> bool {
+    let Ok(mut allocations) = runtime_allocations().lock() else {
+        return false;
+    };
+    let Some(slot) = allocations.iter_mut().find(|slot| slot.is_none()) else {
+        return false;
+    };
+    *slot = Some((plan, RuntimeState::Connected(session)));
+    true
+}
+
+fn session_capability(plan: u64) -> Option<NativeSessionCapability> {
+    let Ok(allocations) = runtime_allocations().lock() else {
+        return None;
+    };
+    allocations.iter().find_map(|slot| match slot {
+        Some((owned, RuntimeState::Connected(session))) if *owned == plan => Some(session.clone()),
+        _ => None,
+    })
 }
 
 /// Returns the stable ABI contract version.
@@ -1073,14 +1156,12 @@ pub extern "C" fn choosh_bridge_authenticated_plan_cancel(generation: u32, plan:
     status
 }
 
-/// Attempts to advance an admitted plan into the native transport.
+/// Advances a plan-owned Android lease through verified SSH and into one fixed-RPC actor.
 ///
-/// This deliberately fails closed until a later composition root can resolve
-/// the opaque Android handles into an injected stream, exact-host-key verifier,
-/// and Keystore-backed signer. In particular it never asks Android to provide
-/// credential material and it never treats plan creation as authentication.
-/// The request remains owned by the Java plan lifecycle and must be cancelled
-/// by its caller after this result.
+/// The callback stream presents the SSH host key to `RuntimeLeaseTransport`, which admits it
+/// against the exact persisted fingerprint before the Keystore signing callback is reachable.
+/// A successful return means the opaque plan now owns exactly one live actor; Java transfers the
+/// same token to `SessionLease` immediately afterwards. Every other outcome remains fail-closed.
 #[unsafe(no_mangle)]
 pub extern "C" fn choosh_bridge_authenticated_plan_open(generation: u32, plan: u64) -> i32 {
     if generation == 0 || generation != GENERATION.load(Ordering::Acquire) {
@@ -1092,14 +1173,50 @@ pub extern "C" fn choosh_bridge_authenticated_plan_open(generation: u32, plan: u
     {
         return STATUS_INVALID_ARGUMENT;
     }
-    if REQUESTS
-        .iter()
-        .any(|slot| slot.load(Ordering::Acquire) == plan)
-    {
-        STATUS_TRANSPORT_UNAVAILABLE
-    } else {
-        STATUS_UNKNOWN_REQUEST
+    if !REQUESTS.iter().any(|slot| slot.load(Ordering::Acquire) == plan) {
+        return STATUS_UNKNOWN_REQUEST;
     }
+    let Some(allocation) = take_pending_runtime_allocation(plan) else {
+        return STATUS_TRANSPORT_UNAVAILABLE;
+    };
+    let allocation = Arc::new(allocation);
+    let runtime = match Runtime::new() {
+        Ok(runtime) => Arc::new(runtime),
+        Err(_) => {
+            let _ = allocation.close();
+            return STATUS_TRANSPORT_UNAVAILABLE;
+        }
+    };
+    let transport = match RuntimeLeaseTransport::new(
+        Arc::clone(&allocation),
+        StreamChunkLimits::new(16 * 1024, 16 * 1024).expect("constant chunk limits are valid"),
+    ) {
+        Ok(transport) => transport,
+        Err(_) => {
+            let _ = allocation.close();
+            return STATUS_TRANSPORT_UNAVAILABLE;
+        }
+    };
+    let connection = match runtime.block_on(transport.connect()) {
+        Ok(connection) => connection,
+        Err(_) => {
+            let _ = allocation.close();
+            return STATUS_TRANSPORT_UNAVAILABLE;
+        }
+    };
+    let actor = runtime.block_on(async { SessionActor::spawn(AndroidRpcSession::new(connection)) });
+    let capability = NativeSessionCapability {
+        runtime,
+        actor,
+        allocation,
+    };
+    if !REQUESTS.iter().any(|slot| slot.load(Ordering::Acquire) == plan)
+        || !retain_connected_session(plan, capability.clone())
+    {
+        let _ = capability.close();
+        return STATUS_TRANSPORT_UNAVAILABLE;
+    }
+    STATUS_OK
 }
 
 // JNI wrappers intentionally accept only primitive values. The Java side
@@ -1246,6 +1363,52 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeOpenAuthentic
         return STATUS_INVALID_ARGUMENT;
     }
     choosh_bridge_authenticated_plan_open(generation.cast_unsigned(), plan.cast_unsigned())
+}
+
+/// Executes one bounded RPC through the actor owned by exactly this connected plan.
+///
+/// A null return is the Java boundary's content-free failure signal; Java maps it to its typed
+/// bridge exception and never exposes a partial native response.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_nativeExecuteAuthenticatedSession<'local>(
+    mut unowned_environment: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    generation: i32,
+    plan: i64,
+    request: JByteArray<'local>,
+) -> JByteArray<'local> {
+    if generation <= 0 || plan <= 0 {
+        return JByteArray::default();
+    }
+    match unowned_environment
+        .with_env(|environment| -> jni::errors::Result<JByteArray<'local>> {
+            let payload = environment.convert_byte_array(&request)?;
+            if payload.is_empty() || payload.len() > 1_048_576 {
+                return Ok(JByteArray::default());
+            }
+            let plan = plan.cast_unsigned();
+            if generation.cast_unsigned() != GENERATION.load(Ordering::Acquire)
+                || generation_of(plan) != generation.cast_unsigned()
+                || !REQUESTS.iter().any(|slot| slot.load(Ordering::Acquire) == plan)
+            {
+                return Ok(JByteArray::default());
+            }
+            let Some(session) = session_capability(plan) else {
+                return Ok(JByteArray::default());
+            };
+            let Ok(response) = session.execute(payload) else {
+                return Ok(JByteArray::default());
+            };
+            if response.is_empty() || response.len() > 1_048_576 {
+                return Ok(JByteArray::default());
+            }
+            environment.byte_array_from_slice(&response)
+        })
+        .into_outcome()
+    {
+        jni::Outcome::Ok(response) => response,
+        jni::Outcome::Err(_) | jni::Outcome::Panic(_) => JByteArray::default(),
+    }
 }
 
 /// Cancels a request at most once and returns a stable typed status code.
