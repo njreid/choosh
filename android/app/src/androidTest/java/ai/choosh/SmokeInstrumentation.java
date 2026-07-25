@@ -22,6 +22,7 @@ public final class SmokeInstrumentation extends Instrumentation {
     @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); start(); }
     @Override public void onStart() {
         Bundle evidence = new Bundle();
+        verifyJniBridgeLibrary(evidence);
         // Sora constructs Android gesture handlers, so both widget fixtures
         // must run on the main looper rather than the instrumentation thread.
         runOnMainSync(() -> {
@@ -73,6 +74,13 @@ public final class SmokeInstrumentation extends Instrumentation {
         evidence.putString("connection_screen", "labels-and-unavailable-profile");
         evidence.putString("controlled_connector", "planned-native-git-status-ready");
         finish(Activity.RESULT_OK, evidence);
+    }
+
+    /** Loads the packaged JNI bridge and resolves its nested-class ABI entry point on-device. */
+    private static void verifyJniBridgeLibrary(Bundle evidence) {
+        require(new RustNativeConnectorJni.JniPlanBridge().abiVersion() == 3,
+                "native bridge ABI mismatch");
+        evidence.putString("jni_bridge", "nested-class-abi-v3-resolved");
     }
 
     private void verifySoraLifecycle(Bundle evidence) {
