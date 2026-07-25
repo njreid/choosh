@@ -775,6 +775,70 @@ pub enum RuntimeLeaseCompositionError {
     PublicKey,
 }
 
+/// Explicit bounded owner for live sessions transferred from native plans.
+///
+/// This is deliberately an ordinary constructor-injected value rather than a
+/// global lookup service. The JNI outer root will own one instance and clear it
+/// before it invalidates the associated Android lease generation.
+pub struct SessionRegistry<S> {
+    slots: [Option<(u64, S)>; SLOT_COUNT],
+}
+
+impl<S> SessionRegistry<S> {
+    /// Creates an empty bounded session owner.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { None }; SLOT_COUNT],
+        }
+    }
+
+    /// Inserts one plan-owned session without replacing another plan's session.
+    pub fn insert(&mut self, plan: u64, session: S) -> Result<(), SessionRegistryError> {
+        if plan == 0
+            || self
+                .slots
+                .iter()
+                .any(|slot| slot.as_ref().is_some_and(|(owned, _)| *owned == plan))
+        {
+            return Err(SessionRegistryError::InvalidPlan);
+        }
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(SessionRegistryError::Capacity);
+        };
+        *slot = Some((plan, session));
+        Ok(())
+    }
+
+    /// Removes the sole session owned by a plan.
+    pub fn remove(&mut self, plan: u64) -> Option<S> {
+        self.slots.iter_mut().find_map(|slot| {
+            (slot.as_ref().is_some_and(|(owned, _)| *owned == plan))
+                .then(|| slot.take())
+                .flatten()
+                .map(|(_, session)| session)
+        })
+    }
+
+    /// Drops every session before its owning generation's leases are released.
+    pub fn clear(&mut self) {
+        self.slots = [const { None }; SLOT_COUNT];
+    }
+}
+
+impl<S> Default for SessionRegistry<S> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stable session-owner failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionRegistryError {
+    InvalidPlan,
+    Capacity,
+}
+
 fn runtime_allocations() -> &'static Mutex<RuntimeAllocationTable> {
     RUNTIME_ALLOCATIONS.get_or_init(|| Mutex::new([const { None }; SLOT_COUNT]))
 }
@@ -1490,5 +1554,20 @@ mod tests {
             "composition must not reach the payload-only signer"
         );
         drop(transport);
+    }
+
+    #[test]
+    fn session_registry_keeps_plan_ownership_explicit_and_bounded() {
+        let mut sessions = SessionRegistry::new();
+        sessions.insert(11, "first").unwrap();
+        assert_eq!(
+            sessions.insert(11, "second"),
+            Err(SessionRegistryError::InvalidPlan)
+        );
+        assert_eq!(sessions.remove(11), Some("first"));
+        assert_eq!(sessions.remove(11), None);
+        sessions.insert(12, "second").unwrap();
+        sessions.clear();
+        assert_eq!(sessions.remove(12), None);
     }
 }

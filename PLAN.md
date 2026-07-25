@@ -117,6 +117,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Java JNI plans now support an explicit one-way transfer to a `SessionLease`; headless
   coverage proves the transferred session, not the connection-completion plan, owns exactly one
   native cancellation and Android runtime release.
+- [x] The Rust bridge now has a constructor-owned bounded session registry with deterministic
+  plan-ownership and clear-before-release coverage, ready to retain the verified fixed-RPC
+  session without another ambient callback lookup service.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and
