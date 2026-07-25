@@ -5,8 +5,8 @@
     {
       "id": "zelland-licence",
       "status": "passed",
-      "evidence": ["../licenses/zelland-grant.md"],
-      "next_action": "Grant recorded; retain it with the exact copied source provenance."
+      "evidence": ["../licenses/zelland-grant.md", "../evidence/zelland-source-audit.json"],
+      "next_action": "Grant and exact source audit recorded; retain both with any copied source provenance."
     },
     {
       "id": "libghostty-pin",

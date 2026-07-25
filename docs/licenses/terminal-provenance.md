@@ -23,6 +23,22 @@ implementation. `libghostty-vt`, `wgpu`, or `glyphon` source MUST NOT be copied 
 repository until its row has authoritative evidence. Font distribution MUST NOT be treated as
 fully provenance-ready until the missing upstream identity evidence is recorded.
 
+## Zelland adoption boundary
+
+The permitted Zelland source was independently fetched at the recorded `v0.2.3` lightweight tag,
+which resolves to `8bf9cf55911588451804a39526f8ae869da021b6`. Its Git tree and deterministic
+`git archive --format=tar` digest are retained in
+[`zelland-source-audit.json`](../evidence/zelland-source-audit.json). This establishes an exact,
+re-auditable source candidate; it does **not** add the source as a submodule or a dependency.
+
+The audit identifies four candidate terminal files only. They remain outside Choosh because the
+pinned tree's `libghostty-source` gitlink has no `.gitmodules` mapping, its Cargo graph contains
+Tauri plus the historical `wgpu 23.0.1`/`glyphon 0.7.0` pair, and its JNI layer is coupled to
+package-specific global renderer/application state. Copying it would violate both the unresolved
+dependency audit and Choosh's explicit composition rule. The next admissible implementation
+increment is therefore a separately pinned, reproducible libghostty input and a newly resolved
+Choosh-only renderer graph—not an import of this application tree.
+
 ## Primary-source dependency findings
 
 The pinned Zelland commit itself used registry `glyphon 0.7.0` (crate checksum
@@ -65,6 +81,8 @@ renderer crates appear in **any** Cargo manifest or the lockfile while the machi
 is blocked. It also validates
 [`terminal-go-no-go.json`](../evidence/terminal-go-no-go.json), including the four prerequisite
 gates, exact device classes, required conformance scenarios, evidence paths, and derived decision.
+It validates the Zelland audit's exact source pin and the fact that its integration boundary remains
+blocked until those separate dependency and composition prerequisites are resolved.
 
 The JSON file is the authoritative machine-readable handoff state. A reviewer clears one prerequisite only by changing
 its status to `passed`, retaining a non-empty repository-owned evidence path, and replacing the

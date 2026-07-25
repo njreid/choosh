@@ -4,6 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 record="$root/docs/licenses/terminal-provenance.md"
 decision="$root/docs/evidence/terminal-go-no-go.json"
+zelland_audit="$root/docs/evidence/zelland-source-audit.json"
 
 check_hash() {
   expected=$1
@@ -41,6 +42,31 @@ for component in Zelland libghostty-vt wgpu glyphon 'Iosevka Charon Mono' Geomin
     exit 1
   }
 done
+jq -e '
+  type == "object" and
+  keys == ["integration", "ownership", "schema_version", "source"] and
+  .schema_version == 1 and
+  (.source | keys == ["git_archive_sha256", "release_tag", "revision", "tree", "url"] and
+    .url == "https://github.com/njreid/zelland.git" and
+    .release_tag == "v0.2.3" and
+    .revision == "8bf9cf55911588451804a39526f8ae869da021b6" and
+    .tree == "0960b9f788f1bb9da9b74d8e8f88f77274e24962" and
+    (.git_archive_sha256 | test("^[0-9a-f]{64}$"))) and
+  (.ownership | keys == ["evidence", "status"] and
+    .status == "granted" and .evidence == "../licenses/zelland-grant.md") and
+  (.integration | keys == ["blockers", "candidate_paths", "status"] and
+    .status == "blocked" and
+    .candidate_paths == [
+      "src-tauri/src/ghostty.rs",
+      "src-tauri/src/renderer/android.rs",
+      "src-tauri/src/renderer/mod.rs",
+      "src-tauri/src/terminal.rs"
+    ] and
+    (.blockers | type == "array" and length == 3 and all(.[]; type == "string" and length > 0)))
+' "$zelland_audit" >/dev/null || {
+  echo "Zelland source audit is malformed or does not preserve the pinned blocked boundary" >&2
+  exit 1
+}
 jq -e '
   type == "object" and
   keys == ["decision", "device_conformance", "gates", "schema_version"] and
