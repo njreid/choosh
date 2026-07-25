@@ -99,6 +99,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   validates canonical username, exact host fingerprint, and public-key identity metadata before
   a future session can be composed; endpoint, credential selection, key material, signatures,
   paths, and commands remain outside the capsule.
+- [x] The JNI runtime callback now also supplies a bounded canonical public SSH key. Rust parses
+  it and requires its SHA-256 fingerprint to match the fixed lease metadata before a future
+  signer can be created, with deterministic mismatch coverage.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and

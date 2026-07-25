@@ -167,6 +167,7 @@ public final class RustNativeConnectorJniTest {
 
     private static final class NoopRuntimeCallbacks implements AndroidRuntimeCallbackPort {
         @Override public byte[] metadata(long lease) { return new byte[] { 1, 1, 'u', 1, 'h', 1, 'k', 1, 'p' }; }
+        @Override public byte[] publicKey(long lease) { return new byte[] { 1 }; }
         @Override public byte[] read(long lease, int maximumBytes) { return new byte[0]; }
         @Override public void write(long lease, byte[] bytes) { }
         @Override public byte[] sign(long lease, byte[] payload) { return new byte[] { 1 }; }

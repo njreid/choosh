@@ -17,6 +17,15 @@ public interface AndroidRuntimeCallbackPort {
      */
     byte[] metadata(long runtimeLease) throws CallbackException;
 
+    /**
+     * Returns the canonical OpenSSH public key fixed to this signing lease.
+     *
+     * <p>This is public identity material only. Rust parses it and compares its SHA-256
+     * fingerprint with {@link #metadata(long)} before it can create the signer; mismatches are
+     * rejected without a signing callback.</p>
+     */
+    byte[] publicKey(long runtimeLease) throws CallbackException;
+
     /** Returns at most {@code maximumBytes} socket bytes; an empty array is EOF. */
     byte[] read(long runtimeLease, int maximumBytes) throws CallbackException;
 

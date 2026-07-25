@@ -12,6 +12,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 choosh-core = { path = "../choosh-core" }
 choosh-ssh = { path = "../choosh-ssh" }
 jni = { version = "=0.22.4", default-features = false }
+russh = { version = "=0.62.2", default-features = false, features = ["ring"] }
 
 [lints.clippy]
 all = "warn"

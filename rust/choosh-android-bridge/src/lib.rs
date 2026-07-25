@@ -25,6 +25,7 @@ const AUTHENTICATED_PLAN_STATUS: u32 = 8;
 const SLOT_COUNT: usize = 64;
 const MAX_RUNTIME_CALLBACK_BYTES: u64 = 65_536;
 const MAX_RUNTIME_METADATA_BYTES: usize = 256;
+const MAX_RUNTIME_PUBLIC_KEY_BYTES: usize = 8 * 1024;
 const RUNTIME_METADATA_VERSION: u8 = 1;
 // Request tokens are process-local opaque capabilities, not serialized IDs. Keeping the
 // request kind in the atomically stored token prevents a generic bridge request from being
@@ -212,6 +213,9 @@ pub trait RuntimeCallbacks {
     /// Returns the fixed, non-secret identity metadata for this lease.
     fn metadata(&mut self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error>;
 
+    /// Returns the canonical OpenSSH public key fixed to this signing lease.
+    fn public_key(&mut self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error>;
+
     /// # Errors
     ///
     /// Returns the callback's content-free transport failure.
@@ -285,6 +289,27 @@ impl RuntimeCallbacks for JniRuntimeCallbacks {
             })
             .map_err(JniRuntimeCallbackError::Jni)?;
         if bytes.is_empty() || bytes.len() > MAX_RUNTIME_METADATA_BYTES {
+            return Err(JniRuntimeCallbackError::OversizedResult);
+        }
+        Ok(bytes)
+    }
+
+    fn public_key(&mut self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+        let bytes = self
+            .with_environment(|environment| {
+                let result = environment
+                    .call_method(
+                        &self.callbacks,
+                        jni_str!("publicKey"),
+                        jni_sig!("(J)[B"),
+                        &[JValue::Long(lease.0.get().cast_signed())],
+                    )?
+                    .l()?;
+                let bytes = JByteArray::cast_local(environment, result)?;
+                environment.convert_byte_array(&bytes)
+            })
+            .map_err(JniRuntimeCallbackError::Jni)?;
+        if bytes.is_empty() || bytes.len() > MAX_RUNTIME_PUBLIC_KEY_BYTES {
             return Err(JniRuntimeCallbackError::OversizedResult);
         }
         Ok(bytes)
@@ -411,6 +436,41 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
         RuntimeConnectionMetadata::parse(&bytes).map_err(RuntimeAllocationError::Metadata)
     }
 
+    /// Resolves the public key only if it matches the fixed lease metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a callback, invalid-key, identity-mismatch, or released-allocation failure.
+    pub fn public_key(
+        &mut self,
+        metadata: &RuntimeConnectionMetadata,
+    ) -> Result<russh::keys::PublicKey, RuntimeAllocationError<C::Error>> {
+        if self.closed {
+            return Err(RuntimeAllocationError::Closed);
+        }
+        let bytes = self
+            .callbacks
+            .public_key(self.lease)
+            .map_err(RuntimeAllocationError::Callback)?;
+        if bytes.is_empty() || bytes.len() > MAX_RUNTIME_PUBLIC_KEY_BYTES {
+            return Err(RuntimeAllocationError::PublicKey(
+                RuntimePublicKeyError::InvalidEncoding,
+            ));
+        }
+        let encoded = std::str::from_utf8(&bytes).map_err(|_| {
+            RuntimeAllocationError::PublicKey(RuntimePublicKeyError::InvalidEncoding)
+        })?;
+        let key = encoded.parse().map_err(|_| {
+            RuntimeAllocationError::PublicKey(RuntimePublicKeyError::InvalidEncoding)
+        })?;
+        if choosh_ssh::presented_fingerprint(&key) != metadata.public_key().fingerprint().as_str() {
+            return Err(RuntimeAllocationError::PublicKey(
+                RuntimePublicKeyError::FingerprintMismatch,
+            ));
+        }
+        Ok(key)
+    }
+
     /// # Errors
     ///
     /// Returns a bounds, closed-allocation, or callback failure.
@@ -473,6 +533,7 @@ pub enum RuntimeAllocationError<E> {
     Bounds,
     Closed,
     Metadata(RuntimeMetadataError),
+    PublicKey(RuntimePublicKeyError),
     Callback(E),
 }
 
@@ -572,6 +633,13 @@ fn read_metadata_field<'a>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeMetadataError {
     InvalidEncoding,
+}
+
+/// Stable classification for an untrusted public key returned by a runtime lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimePublicKeyError {
+    InvalidEncoding,
+    FingerprintMismatch,
 }
 
 fn runtime_allocations() -> &'static Mutex<RuntimeAllocationTable> {
@@ -1132,6 +1200,9 @@ mod tests {
         fn metadata(&mut self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
             Ok(runtime_metadata_fixture())
         }
+        fn public_key(&mut self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+            Ok(fixture_public_key())
+        }
         fn read(&mut self, _: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error> {
             output[0] = 7;
             Ok(1)
@@ -1161,6 +1232,11 @@ mod tests {
             allocation.metadata().unwrap().username(),
             &SshUsername::parse("fixture-user").unwrap()
         );
+        let metadata = allocation.metadata().unwrap();
+        assert_eq!(
+            choosh_ssh::presented_fingerprint(&allocation.public_key(&metadata).unwrap()),
+            metadata.public_key().fingerprint().as_str()
+        );
         assert_eq!(allocation.write(&[]), Err(RuntimeAllocationError::Bounds));
         allocation.close().unwrap();
         allocation.close().unwrap();
@@ -1173,7 +1249,7 @@ mod tests {
             b"fixture-user".as_slice(),
             b"SHA256:0123456789012345678901234567890123456789012".as_slice(),
             b"ED25519".as_slice(),
-            b"SHA256:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO12".as_slice(),
+            b"SHA256:UCUiLr7Pjs9wFFJMDByLgc3NrtdU344OgUM45wZPcIQ".as_slice(),
         ];
         let mut bytes = vec![RUNTIME_METADATA_VERSION];
         for field in fields {
@@ -1181,6 +1257,10 @@ mod tests {
             bytes.extend_from_slice(field);
         }
         bytes
+    }
+
+    fn fixture_public_key() -> Vec<u8> {
+        b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti".to_vec()
     }
 
     #[test]
@@ -1194,6 +1274,42 @@ mod tests {
         assert_eq!(
             RuntimeConnectionMetadata::parse(&[RUNTIME_METADATA_VERSION]),
             Err(RuntimeMetadataError::InvalidEncoding)
+        );
+    }
+
+    #[test]
+    fn runtime_public_key_rejects_identity_mismatch() {
+        struct MismatchedCallbacks;
+        impl RuntimeCallbacks for MismatchedCallbacks {
+            type Error = ();
+            fn metadata(&mut self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+                Ok(runtime_metadata_fixture())
+            }
+            fn public_key(&mut self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+                Ok(b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID6hVSJVNnvDT3Iy7h+hdMdV40l0oTbXvHhUKeZp30iU".to_vec())
+            }
+            fn read(&mut self, _: RuntimeLeaseHandle, _: &mut [u8]) -> Result<usize, Self::Error> {
+                Ok(1)
+            }
+            fn write(&mut self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn sign(&mut self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<Vec<u8>, Self::Error> {
+                Ok(vec![1])
+            }
+            fn close(&mut self, _: RuntimeLeaseHandle) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+        let mut allocation =
+            RuntimeAllocation::new(MismatchedCallbacks, RuntimeLeaseHandle::new(9).unwrap(), 4)
+                .unwrap();
+        let metadata = allocation.metadata().unwrap();
+        assert_eq!(
+            allocation.public_key(&metadata),
+            Err(RuntimeAllocationError::PublicKey(
+                RuntimePublicKeyError::FingerprintMismatch
+            ))
         );
     }
 }
