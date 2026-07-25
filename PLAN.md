@@ -133,8 +133,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   actor lifecycle. A full JVM callback/socket-to-real-`chooshd` acceptance remains required.
 - [ ] Device evidence was attempted on 2026-07-25 using a one-hour, SSM-managed `m6i.metal`
   runner after `m7i.metal` was unavailable in-region. The runner accepted its bounded shutdown
-  command and began Android toolchain setup, but AWS credentials expired during the system-image
-  download, so no instrumentation result was retrieved and this is not acceptance evidence.
+  command and began Android toolchain setup; after AWS authentication was restored, its captured
+  result showed the API 36 Google Play image plus NDK exhausted the default root volume before an
+  AVD could boot. The runner was terminated with no instrumentation result, so this is not
+  acceptance evidence. A retry requires a 50 GiB-or-larger root volume.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and
@@ -215,9 +217,9 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **Finish M0-R5/M0-R6.** Restore AWS authentication, retrieve/terminate the bounded metal
-   runner if it is still present, then run `scripts/run-android-instrumentation.sh` on an accelerated
-   x86_64 emulator or arm64 device and exercise the real Android/native connector, credential use,
+1. **Finish M0-R5/M0-R6.** Provision an accelerated x86_64 metal runner with a 50 GiB-or-larger
+   root volume (or use an arm64 device), then run `scripts/run-android-instrumentation.sh` and
+   exercise the real Android/native connector, credential use,
    bounded cancellation, the fixed `git.status` daemon method, and negotiated
    stdio-to-real-`chooshd` private-socket RPC in one harness—not only generated-key fixtures.
 2. **Deploy and update `chooshd` without SSH session ownership.** Specify and implement a
