@@ -137,6 +137,13 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   result showed the API 36 Google Play image plus NDK exhausted the default root volume before an
   AVD could boot. The runner was terminated with no instrumentation result, so this is not
   acceptance evidence. A retry requires a 50 GiB-or-larger root volume.
+- [x] Device evidence subsequently passed on 2026-07-25 using an SSM-managed `m7i.metal-24xl`
+  runner with a 60 GiB root volume and an API 36 x86_64 KVM emulator. Connected instrumentation
+  reported `ai.choosh.MainActivity`, the nested JNI ABI v3, Sora lifecycle/UTF-16 translation,
+  and the controlled `git.status` connector lifecycle. Automated UI hierarchy inspection also
+  confirmed empty-profile disabled Connect, valid-profile enabled Connect/“Ready to connect.”,
+  and Connect's fail-closed “This saved profile is unavailable.” state. The runner was terminated
+  after evidence collection. This validates the M0 device smoke, not a real Android-host session.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and
@@ -204,7 +211,7 @@ public-1.0 milestone has passed.
 
 | Milestone | State | Evidence / remaining gate |
 |---|---|---|
-| M0 — Foundation | **In progress** | Build, editor seams, bridge/RPC, release, SSH channel evidence, and a generated-key Android-shaped fixed-RPC proof exist. The shipped M0 UI is a Java/View connection-status screen, not the future Compose shell. M0-R5/R6 still need the real JVM callback/socket-to-`chooshd` proof; M0-R7/R15 remain blocked on terminal provenance and device implementation. |
+| M0 — Foundation | **In progress** | Build, editor seams, bridge/RPC, release, SSH channel evidence, a generated-key Android-shaped fixed-RPC proof, and API 36 x86_64 KVM device smoke exist. The shipped M0 UI is a Java/View connection-status screen, not the future Compose shell. M0-R5/R6 still need the real JVM callback/socket-to-`chooshd` proof; M0-R7/R15 remain blocked on terminal provenance and device implementation. |
 | M1 — Remote workspace | **Not started** | Depends on M0 SSH and terminal gates. Profile/known-host and root-confined SFTP read seams exist, but a concrete live transport, safe atomic writes, Zellij, Markdown, reconnect, and lifecycle acceptance remain future work. |
 | M2 — Agents and notifications | **Not started** | Adapter/event and Android notification slices await the M1 remote foundation. |
 | M3 — Pinning and services | **Not started** | Depends on M2 snapshots and verified SSH `direct-tcpip`. |
@@ -217,9 +224,7 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **Finish M0-R5/M0-R6.** Provision an accelerated x86_64 metal runner with a 50 GiB-or-larger
-   root volume (or use an arm64 device), then run `scripts/run-android-instrumentation.sh` and
-   exercise the real Android/native connector, credential use,
+1. **Finish M0-R5/M0-R6.** Exercise the real Android/native connector, credential use,
    bounded cancellation, the fixed `git.status` daemon method, and negotiated
    stdio-to-real-`chooshd` private-socket RPC in one harness—not only generated-key fixtures.
 2. **Deploy and update `chooshd` without SSH session ownership.** Specify and implement a

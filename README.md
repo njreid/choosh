@@ -24,6 +24,11 @@ configure a host, establish a user session, or provide a usable terminal/workspa
 - Headless generated-key acceptance proves `git.status` crosses authenticated SSH, the fixed
   `choosh-host rpc --stdio` command, and a real private `chooshd` Unix socket. This is not yet a
   claim of a configured, end-user Android host connection.
+- Device evidence on an API 36 x86_64 KVM emulator confirms the packaged debug APK launches
+  `ai.choosh.MainActivity`, resolves the nested JNI bridge ABI, and presents the connection-status
+  flow deterministically: empty profile → disabled Connect, valid profile → enabled Connect and
+  “Ready to connect.”, then Connect → “This saved profile is unavailable.” No visual inspection is
+  used as the test oracle.
 
 ## Core decisions
 
