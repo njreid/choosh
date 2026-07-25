@@ -7,8 +7,23 @@ A workspace is an explicitly registered project root plus a Zellij session with 
 ## Status
 
 Choosh is an early engineering preview. Signed preview APK releases, a private-socket
-host daemon, and deterministic boundary tests exist, but the application cannot yet
-establish a live Android-to-host session or provide a usable terminal/workspace flow.
+host daemon, and deterministic boundary tests exist. The native Android connection path now
+has a bounded callback stream, exact-host SSH admission, payload-only signing, fixed RPC, and
+one-close-only session ownership. The shipped M0 screen deliberately remains a connection-status
+surface: it validates a profile ID and reports an unavailable saved profile; it does not yet
+configure a host, establish a user session, or provide a usable terminal/workspace flow.
+
+## What currently works
+
+- The installable `ai.choosh` app launches a non-visual-testable Java/View screen with a labelled
+  profile field and Connect action. A valid profile string enables Connect; the default composition
+  fails closed as an unavailable saved profile.
+- The Android/Rust bridge accepts only a plan-owned, bounded runtime callback capability. It checks
+  the exact SSH host key before requesting a Keystore signature, exposes only framed fixed RPC, and
+  releases the Android socket/runtime lease exactly once when a session closes.
+- Headless generated-key acceptance proves `git.status` crosses authenticated SSH, the fixed
+  `choosh-host rpc --stdio` command, and a real private `chooshd` Unix socket. This is not yet a
+  claim of a configured, end-user Android host connection.
 
 ## Core decisions
 
@@ -38,6 +53,7 @@ establish a live Android-to-host session or provide a usable terminal/workspace 
 - [Architecture decisions](docs/adr/README.md)
 - [Threat model](docs/threat-model.md)
 - [Android release and Obtainium distribution](docs/release-android.md)
+- [Android runtime callback contract](docs/specs/android-native-runtime.md)
 
 ## Planned repository layout
 
