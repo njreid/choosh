@@ -164,7 +164,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The host now has an injected immutable deployment transaction that accepts only bounded
   release version/digest/bytes and keeps release paths, atomic selection, service activation,
   and private-socket health inside host adapters; digest failures discard stages and every
-  post-activation service or health failure rolls back once.
+  post-activation service or health failure rolls back once. Its service boundary now composes
+  the fixed, fail-closed per-user systemd/launchd adapter directly; headless evidence proves
+  deployment emits only the `systemctl --user` activation vectors before private health.
 - [x] The bridge now owns a bounded, one-close-only per-plan runtime callback allocation with
   deterministic bounds and released-lease tests. A JNI `GlobalRef` adapter remains required to
   supply its socket and signing callbacks on Android.
