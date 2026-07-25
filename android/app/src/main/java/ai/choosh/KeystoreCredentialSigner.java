@@ -13,7 +13,10 @@ import java.util.Objects;
  * the same gate; this Java seam is deliberately not a substitute for transport-side admission.</p>
  */
 public final class KeystoreCredentialSigner {
-    private static final int MAX_SIGNING_PAYLOAD_BYTES = 65_536;
+    // The native callback result is capped at 65,536 bytes. An Ed25519 SSH signature envelope
+    // consumes 87 bytes, so accepting a larger transcript would make a valid provider result
+    // impossible to return through the bounded ABI.
+    private static final int MAX_SIGNING_PAYLOAD_BYTES = SshWireSignature.maximumEd25519PayloadBytes();
     private static final int MAX_SIGNATURE_BYTES = 16_384;
 
     private final SigningBackend backend;
@@ -135,7 +138,14 @@ public final class KeystoreCredentialSigner {
         }
     }
 
-    /** Android outer adapter. Implementations resolve the opaque reference without exporting a key. */
+    /**
+     * Android outer adapter. Implementations resolve the opaque reference without exporting a key.
+     *
+     * <p>For {@code ED25519}, Android Keystore's raw 64-byte {@code Signature} result MUST be
+     * converted with {@link SshWireSignature#appendEd25519(byte[], byte[])} before returning. The
+     * result is the Russh custom-signer value: the original payload followed by one SSH
+     * wire-encoded signature. It is not an Android provider signature alone.</p>
+     */
     public interface SigningBackend {
         byte[] sign(
             SshKeyImportCoordinator.OpaqueCredentialRef credentialRef,

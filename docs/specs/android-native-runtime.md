@@ -52,6 +52,14 @@ host, port, file descriptor, command, or channel type. The signing callback
 MUST NOT accept a credential reference or public-key selector: its identity is
 fixed when Android creates the lease.
 
+For Russh public-key authentication, the signing callback result is not a raw
+provider signature. It MUST retain the supplied SSH signing payload and append
+one SSH wire `string` whose contents are the algorithm `string` and signature
+`string`. For Ed25519, Android Keystore's 64-byte provider result is encoded
+using `SshWireSignature.appendEd25519`. The combined result MUST fit the
+65,536-byte callback bound; therefore an Ed25519 signing payload is at most
+65,449 bytes.
+
 The metadata capsule MUST NOT contain an endpoint, path, command, credential
 reference, private key, or signature. Rust MUST reject unknown versions, empty
 fields, trailing bytes, invalid usernames, invalid fingerprints, unknown
