@@ -2,6 +2,7 @@ package ai.choosh;
 
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Constructor-injected Android owner for one bounded native SSH runtime lease.
@@ -110,7 +111,7 @@ public final class BoundedAndroidNativeRuntime implements RustNativeConnectorJni
         private final byte[] metadata;
         private final byte[] publicKey;
         private final LeaseSigner signer;
-        private boolean closed;
+        private final AtomicBoolean closed = new AtomicBoolean();
 
         RuntimeCallbacks(
             RustNativeConnectorJni.NativeHandles handles,
@@ -126,17 +127,17 @@ public final class BoundedAndroidNativeRuntime implements RustNativeConnectorJni
             this.signer = Objects.requireNonNull(signer, "signer");
         }
 
-        @Override public synchronized byte[] metadata(long lease) throws CallbackException {
+        @Override public byte[] metadata(long lease) throws CallbackException {
             ensureLease(lease);
             return metadata.clone();
         }
 
-        @Override public synchronized byte[] publicKey(long lease) throws CallbackException {
+        @Override public byte[] publicKey(long lease) throws CallbackException {
             ensureLease(lease);
             return publicKey.clone();
         }
 
-        @Override public synchronized byte[] read(long lease, int maximumBytes) throws CallbackException {
+        @Override public byte[] read(long lease, int maximumBytes) throws CallbackException {
             ensureLease(lease);
             if (maximumBytes <= 0 || maximumBytes > MAX_OPERATION_BYTES) throw new CallbackException();
             byte[] bytes = new byte[maximumBytes];
@@ -148,7 +149,7 @@ public final class BoundedAndroidNativeRuntime implements RustNativeConnectorJni
             }
         }
 
-        @Override public synchronized void write(long lease, byte[] bytes) throws CallbackException {
+        @Override public void write(long lease, byte[] bytes) throws CallbackException {
             ensureLease(lease);
             if (bytes == null || bytes.length == 0 || bytes.length > MAX_OPERATION_BYTES) {
                 throw new CallbackException();
@@ -160,7 +161,7 @@ public final class BoundedAndroidNativeRuntime implements RustNativeConnectorJni
             }
         }
 
-        @Override public synchronized byte[] sign(long lease, byte[] payload) throws CallbackException {
+        @Override public byte[] sign(long lease, byte[] payload) throws CallbackException {
             ensureLease(lease);
             if (payload == null || payload.length == 0 || payload.length > MAX_OPERATION_BYTES) {
                 throw new CallbackException();
@@ -176,14 +177,13 @@ public final class BoundedAndroidNativeRuntime implements RustNativeConnectorJni
             }
         }
 
-        @Override public synchronized void close(long lease) throws CallbackException {
+        @Override public void close(long lease) throws CallbackException {
             ensureLease(lease);
             close();
         }
 
-        @Override public synchronized void close() throws CallbackException {
-            if (closed) return;
-            closed = true;
+        @Override public void close() throws CallbackException {
+            if (!closed.compareAndSet(false, true)) return;
             try {
                 socket.close();
             } catch (BoundedAndroidSocketAdapter.SocketIoException | RuntimeException exception) {
@@ -192,7 +192,7 @@ public final class BoundedAndroidNativeRuntime implements RustNativeConnectorJni
         }
 
         private void ensureLease(long lease) throws CallbackException {
-            if (closed || lease != handles.runtimeLease()) throw new CallbackException();
+            if (closed.get() || lease != handles.runtimeLease()) throw new CallbackException();
         }
     }
 }

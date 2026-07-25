@@ -11,7 +11,7 @@ use jni::objects::{Global, JByteArray, JClass, JObject, JValue};
 use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
 use std::ffi::c_void;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const ABI_VERSION: u32 = 3;
@@ -211,27 +211,27 @@ pub trait RuntimeCallbacks {
     type Error;
 
     /// Returns the fixed, non-secret identity metadata for this lease.
-    fn metadata(&mut self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error>;
+    fn metadata(&self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error>;
 
     /// Returns the canonical OpenSSH public key fixed to this signing lease.
-    fn public_key(&mut self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error>;
+    fn public_key(&self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error>;
 
     /// # Errors
     ///
     /// Returns the callback's content-free transport failure.
-    fn read(&mut self, lease: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error>;
+    fn read(&self, lease: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error>;
     /// # Errors
     ///
     /// Returns the callback's content-free transport failure.
-    fn write(&mut self, lease: RuntimeLeaseHandle, input: &[u8]) -> Result<(), Self::Error>;
+    fn write(&self, lease: RuntimeLeaseHandle, input: &[u8]) -> Result<(), Self::Error>;
     /// # Errors
     ///
     /// Returns the callback's content-free signing failure.
-    fn sign(&mut self, lease: RuntimeLeaseHandle, payload: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    fn sign(&self, lease: RuntimeLeaseHandle, payload: &[u8]) -> Result<Vec<u8>, Self::Error>;
     /// # Errors
     ///
     /// Returns the callback's content-free release failure.
-    fn close(&mut self, lease: RuntimeLeaseHandle) -> Result<(), Self::Error>;
+    fn close(&self, lease: RuntimeLeaseHandle) -> Result<(), Self::Error>;
 }
 
 /// Plan-owned JNI adapter for the Android runtime callback object.
@@ -273,7 +273,7 @@ impl JniRuntimeCallbacks {
 impl RuntimeCallbacks for JniRuntimeCallbacks {
     type Error = JniRuntimeCallbackError;
 
-    fn metadata(&mut self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+    fn metadata(&self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
         let bytes = self
             .with_environment(|environment| {
                 let result = environment
@@ -294,7 +294,7 @@ impl RuntimeCallbacks for JniRuntimeCallbacks {
         Ok(bytes)
     }
 
-    fn public_key(&mut self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+    fn public_key(&self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
         let bytes = self
             .with_environment(|environment| {
                 let result = environment
@@ -315,7 +315,7 @@ impl RuntimeCallbacks for JniRuntimeCallbacks {
         Ok(bytes)
     }
 
-    fn read(&mut self, lease: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error> {
+    fn read(&self, lease: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error> {
         let requested =
             i32::try_from(output.len()).map_err(|_| JniRuntimeCallbackError::OversizedResult)?;
         let bytes = self
@@ -342,7 +342,7 @@ impl RuntimeCallbacks for JniRuntimeCallbacks {
         Ok(bytes.len())
     }
 
-    fn write(&mut self, lease: RuntimeLeaseHandle, input: &[u8]) -> Result<(), Self::Error> {
+    fn write(&self, lease: RuntimeLeaseHandle, input: &[u8]) -> Result<(), Self::Error> {
         self.with_environment(|environment| {
             let bytes = environment.byte_array_from_slice(input)?;
             environment.call_method(
@@ -359,7 +359,7 @@ impl RuntimeCallbacks for JniRuntimeCallbacks {
         .map_err(JniRuntimeCallbackError::Jni)
     }
 
-    fn sign(&mut self, lease: RuntimeLeaseHandle, payload: &[u8]) -> Result<Vec<u8>, Self::Error> {
+    fn sign(&self, lease: RuntimeLeaseHandle, payload: &[u8]) -> Result<Vec<u8>, Self::Error> {
         self.with_environment(|environment| {
             let bytes = environment.byte_array_from_slice(payload)?;
             let result = environment
@@ -379,7 +379,7 @@ impl RuntimeCallbacks for JniRuntimeCallbacks {
         .map_err(JniRuntimeCallbackError::Jni)
     }
 
-    fn close(&mut self, lease: RuntimeLeaseHandle) -> Result<(), Self::Error> {
+    fn close(&self, lease: RuntimeLeaseHandle) -> Result<(), Self::Error> {
         self.with_environment(|environment| {
             environment.call_method(
                 &self.callbacks,
@@ -405,7 +405,7 @@ pub struct RuntimeAllocation<C> {
     callbacks: C,
     lease: RuntimeLeaseHandle,
     max_operation_bytes: NonZeroU64,
-    closed: bool,
+    closed: AtomicBool,
 }
 
 impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
@@ -414,7 +414,7 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
             callbacks,
             lease,
             max_operation_bytes: NonZeroU64::new(max_operation_bytes)?,
-            closed: false,
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -423,10 +423,8 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
     /// # Errors
     ///
     /// Returns a callback, malformed-capsule, or released-allocation failure.
-    pub fn metadata(
-        &mut self,
-    ) -> Result<RuntimeConnectionMetadata, RuntimeAllocationError<C::Error>> {
-        if self.closed {
+    pub fn metadata(&self) -> Result<RuntimeConnectionMetadata, RuntimeAllocationError<C::Error>> {
+        if self.closed.load(Ordering::Acquire) {
             return Err(RuntimeAllocationError::Closed);
         }
         let bytes = self
@@ -442,10 +440,10 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
     ///
     /// Returns a callback, invalid-key, identity-mismatch, or released-allocation failure.
     pub fn public_key(
-        &mut self,
+        &self,
         metadata: &RuntimeConnectionMetadata,
     ) -> Result<russh::keys::PublicKey, RuntimeAllocationError<C::Error>> {
-        if self.closed {
+        if self.closed.load(Ordering::Acquire) {
             return Err(RuntimeAllocationError::Closed);
         }
         let bytes = self
@@ -474,7 +472,7 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
     /// # Errors
     ///
     /// Returns a bounds, closed-allocation, or callback failure.
-    pub fn read(&mut self, output: &mut [u8]) -> Result<usize, RuntimeAllocationError<C::Error>> {
+    pub fn read(&self, output: &mut [u8]) -> Result<usize, RuntimeAllocationError<C::Error>> {
         self.validate(output.len())?;
         self.callbacks
             .read(self.lease, output)
@@ -484,7 +482,7 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
     /// # Errors
     ///
     /// Returns a bounds, closed-allocation, or callback failure.
-    pub fn write(&mut self, input: &[u8]) -> Result<(), RuntimeAllocationError<C::Error>> {
+    pub fn write(&self, input: &[u8]) -> Result<(), RuntimeAllocationError<C::Error>> {
         self.validate(input.len())?;
         self.callbacks
             .write(self.lease, input)
@@ -494,7 +492,7 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
     /// # Errors
     ///
     /// Returns a bounds, closed-allocation, or callback failure.
-    pub fn sign(&mut self, payload: &[u8]) -> Result<Vec<u8>, RuntimeAllocationError<C::Error>> {
+    pub fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, RuntimeAllocationError<C::Error>> {
         self.validate(payload.len())?;
         let signature = self
             .callbacks
@@ -507,18 +505,21 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
     /// # Errors
     ///
     /// Returns the callback's content-free release failure.
-    pub fn close(&mut self) -> Result<(), RuntimeAllocationError<C::Error>> {
-        if self.closed {
+    pub fn close(&self) -> Result<(), RuntimeAllocationError<C::Error>> {
+        if self
+            .closed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Ok(());
         }
-        self.closed = true;
         self.callbacks
             .close(self.lease)
             .map_err(RuntimeAllocationError::Callback)
     }
 
     fn validate(&self, length: usize) -> Result<(), RuntimeAllocationError<C::Error>> {
-        if self.closed {
+        if self.closed.load(Ordering::Acquire) {
             return Err(RuntimeAllocationError::Closed);
         }
         if length == 0 || (length as u64) > self.max_operation_bytes.get() {
@@ -679,7 +680,7 @@ fn release_runtime_allocation(plan: u64) -> bool {
         };
         slot.take().map(|(_, allocation)| allocation)
     };
-    allocation.is_none_or(|mut allocation| allocation.close().is_ok())
+    allocation.is_none_or(|allocation| allocation.close().is_ok())
 }
 
 fn release_all_runtime_allocations() -> bool {
@@ -692,7 +693,7 @@ fn release_all_runtime_allocations() -> bool {
     allocations
         .into_iter()
         .flatten()
-        .all(|(_, mut allocation)| allocation.close().is_ok())
+        .all(|(_, allocation)| allocation.close().is_ok())
 }
 
 /// Returns the stable ABI contract version.
@@ -1193,35 +1194,35 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingCallbacks {
-        closes: usize,
+        closes: std::sync::atomic::AtomicUsize,
     }
     impl RuntimeCallbacks for RecordingCallbacks {
         type Error = ();
-        fn metadata(&mut self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+        fn metadata(&self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
             Ok(runtime_metadata_fixture())
         }
-        fn public_key(&mut self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+        fn public_key(&self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
             Ok(fixture_public_key())
         }
-        fn read(&mut self, _: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error> {
+        fn read(&self, _: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error> {
             output[0] = 7;
             Ok(1)
         }
-        fn write(&mut self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<(), Self::Error> {
+        fn write(&self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
-        fn sign(&mut self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<Vec<u8>, Self::Error> {
+        fn sign(&self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<Vec<u8>, Self::Error> {
             Ok(vec![9])
         }
-        fn close(&mut self, _: RuntimeLeaseHandle) -> Result<(), Self::Error> {
-            self.closes += 1;
+        fn close(&self, _: RuntimeLeaseHandle) -> Result<(), Self::Error> {
+            self.closes.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
 
     #[test]
     fn runtime_allocation_bounds_and_closes_its_lease_once() {
-        let mut allocation = RuntimeAllocation::new(
+        let allocation = RuntimeAllocation::new(
             RecordingCallbacks::default(),
             RuntimeLeaseHandle::new(9).unwrap(),
             4,
@@ -1240,7 +1241,7 @@ mod tests {
         assert_eq!(allocation.write(&[]), Err(RuntimeAllocationError::Bounds));
         allocation.close().unwrap();
         allocation.close().unwrap();
-        assert_eq!(allocation.callbacks.closes, 1);
+        assert_eq!(allocation.callbacks.closes.load(Ordering::Relaxed), 1);
         assert_eq!(allocation.sign(&[1]), Err(RuntimeAllocationError::Closed));
     }
 
@@ -1282,26 +1283,26 @@ mod tests {
         struct MismatchedCallbacks;
         impl RuntimeCallbacks for MismatchedCallbacks {
             type Error = ();
-            fn metadata(&mut self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+            fn metadata(&self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
                 Ok(runtime_metadata_fixture())
             }
-            fn public_key(&mut self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+            fn public_key(&self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
                 Ok(b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID6hVSJVNnvDT3Iy7h+hdMdV40l0oTbXvHhUKeZp30iU".to_vec())
             }
-            fn read(&mut self, _: RuntimeLeaseHandle, _: &mut [u8]) -> Result<usize, Self::Error> {
+            fn read(&self, _: RuntimeLeaseHandle, _: &mut [u8]) -> Result<usize, Self::Error> {
                 Ok(1)
             }
-            fn write(&mut self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<(), Self::Error> {
+            fn write(&self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<(), Self::Error> {
                 Ok(())
             }
-            fn sign(&mut self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<Vec<u8>, Self::Error> {
+            fn sign(&self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<Vec<u8>, Self::Error> {
                 Ok(vec![1])
             }
-            fn close(&mut self, _: RuntimeLeaseHandle) -> Result<(), Self::Error> {
+            fn close(&self, _: RuntimeLeaseHandle) -> Result<(), Self::Error> {
                 Ok(())
             }
         }
-        let mut allocation =
+        let allocation =
             RuntimeAllocation::new(MismatchedCallbacks, RuntimeLeaseHandle::new(9).unwrap(), 4)
                 .unwrap();
         let metadata = allocation.metadata().unwrap();

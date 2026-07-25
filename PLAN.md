@@ -105,6 +105,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Android now has a concrete constructor-injected bounded runtime lease adapter. It owns one
   validated socket, fixed identity capsule, public key, and payload-only signer callback without
   a static registry; headless tests cover stale-lease rejection and exactly-once socket release.
+- [x] Runtime callback ownership is now thread-safe rather than mutable-borrow serialized. This
+  permits independent bounded read and write workers without allowing a blocked socket read to
+  prevent SSH progress; close remains one-way and exactly once.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and

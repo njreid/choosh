@@ -91,7 +91,9 @@ and signer transport.
 this callback object. It opens the already validated endpoint, binds the fixed
 identity capsule and canonical public key, and binds a payload-only signer
 before returning one `NativeLease`. It has no static registry; rejecting lease
-construction closes the socket, and lease close closes it once.
+construction closes the socket, and lease close closes it once. Read and write
+callbacks are independent after lease validation; a blocked socket read MUST
+NOT serialize or prevent a bounded write.
 
 Headless acceptance MUST prove all of the following with deterministic fakes:
 
