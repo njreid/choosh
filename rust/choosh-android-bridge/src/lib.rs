@@ -820,6 +820,25 @@ impl<S> SessionRegistry<S> {
         })
     }
 
+    /// Executes one fixed capability operation against the session owned by a plan.
+    ///
+    /// The closure receives no token table or registry access, so it cannot select another
+    /// plan's session or insert a replacement while an operation is in flight.
+    pub fn with_session<T>(
+        &mut self,
+        plan: u64,
+        operation: impl FnOnce(&mut S) -> T,
+    ) -> Result<T, SessionRegistryError> {
+        let Some(Some((_, session))) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|(owned, _)| *owned == plan))
+        else {
+            return Err(SessionRegistryError::InvalidPlan);
+        };
+        Ok(operation(session))
+    }
+
     /// Drops every session before its owning generation's leases are released.
     pub fn clear(&mut self) {
         self.slots = [const { None }; SLOT_COUNT];
@@ -1566,6 +1585,11 @@ mod tests {
         );
         assert_eq!(sessions.remove(11), Some("first"));
         assert_eq!(sessions.remove(11), None);
+        sessions.insert(12, "second").unwrap();
+        sessions
+            .with_session(12, |session| *session = "updated")
+            .unwrap();
+        assert_eq!(sessions.remove(12), Some("updated"));
         sessions.insert(12, "second").unwrap();
         sessions.clear();
         assert_eq!(sessions.remove(12), None);
