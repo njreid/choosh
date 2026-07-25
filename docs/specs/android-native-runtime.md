@@ -39,6 +39,8 @@ transport dereference an opaque ID or call back into a mutable global registry.
 The native callback ABI is versioned and accepts only:
 
 - a non-zero lease ID;
+- one bounded, versioned non-secret identity capsule containing canonical username, the exact
+  persisted host fingerprint, and public-key algorithm/fingerprint metadata;
 - a byte array plus offset and length for one socket read or write; or
 - a byte array plus offset and length for one SSH signing challenge.
 
@@ -48,6 +50,12 @@ JNI local reference. Socket callbacks MUST NOT permit the caller to select a
 host, port, file descriptor, command, or channel type. The signing callback
 MUST NOT accept a credential reference or public-key selector: its identity is
 fixed when Android creates the lease.
+
+The metadata capsule MUST NOT contain an endpoint, path, command, credential
+reference, private key, signature, or public-key wire bytes. Rust MUST reject
+unknown versions, empty fields, trailing bytes, invalid usernames, invalid
+fingerprints, or unknown algorithms before constructing the exact-host session
+or signer capability.
 
 Rust MUST call the signing callback only from the credential signer that is
 created after exact host-key admission. Unknown, changed, rejected, and

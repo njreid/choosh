@@ -8,6 +8,15 @@ package ai.choosh;
  * cannot receive a host, path, command, credential selector, or public-key selector.</p>
  */
 public interface AndroidRuntimeCallbackPort {
+    /**
+     * Returns the versioned, non-secret connection metadata fixed when this lease was created.
+     *
+     * <p>The capsule contains only canonical username, exact persisted host-key identity, and
+     * public-key identity metadata. It contains no endpoint, path, command, credential reference,
+     * private-key material, or signature.</p>
+     */
+    byte[] metadata(long runtimeLease) throws CallbackException;
+
     /** Returns at most {@code maximumBytes} socket bytes; an empty array is EOF. */
     byte[] read(long runtimeLease, int maximumBytes) throws CallbackException;
 

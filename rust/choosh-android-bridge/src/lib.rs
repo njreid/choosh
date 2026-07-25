@@ -5,6 +5,8 @@
 
 #![allow(unsafe_code)] // Required only for Edition 2024's `no_mangle` ABI attribute.
 
+use choosh_core::ssh_identity::{PublicKeyFingerprint, PublicKeyMetadata, SshPublicKeyAlgorithm};
+use choosh_ssh::SshUsername;
 use jni::objects::{Global, JByteArray, JClass, JObject, JValue};
 use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
 use std::ffi::c_void;
@@ -22,6 +24,8 @@ const STATUS_TRANSPORT_UNAVAILABLE: i32 = 5;
 const AUTHENTICATED_PLAN_STATUS: u32 = 8;
 const SLOT_COUNT: usize = 64;
 const MAX_RUNTIME_CALLBACK_BYTES: u64 = 65_536;
+const MAX_RUNTIME_METADATA_BYTES: usize = 256;
+const RUNTIME_METADATA_VERSION: u8 = 1;
 // Request tokens are process-local opaque capabilities, not serialized IDs. Keeping the
 // request kind in the atomically stored token prevents a generic bridge request from being
 // reinterpreted as an authenticated plan during a slot reuse race.
@@ -205,6 +209,9 @@ pub trait KeystorePublicKeyAuthentication {
 pub trait RuntimeCallbacks {
     type Error;
 
+    /// Returns the fixed, non-secret identity metadata for this lease.
+    fn metadata(&mut self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error>;
+
     /// # Errors
     ///
     /// Returns the callback's content-free transport failure.
@@ -261,6 +268,27 @@ impl JniRuntimeCallbacks {
 
 impl RuntimeCallbacks for JniRuntimeCallbacks {
     type Error = JniRuntimeCallbackError;
+
+    fn metadata(&mut self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+        let bytes = self
+            .with_environment(|environment| {
+                let result = environment
+                    .call_method(
+                        &self.callbacks,
+                        jni_str!("metadata"),
+                        jni_sig!("(J)[B"),
+                        &[JValue::Long(lease.0.get().cast_signed())],
+                    )?
+                    .l()?;
+                let bytes = JByteArray::cast_local(environment, result)?;
+                environment.convert_byte_array(&bytes)
+            })
+            .map_err(JniRuntimeCallbackError::Jni)?;
+        if bytes.is_empty() || bytes.len() > MAX_RUNTIME_METADATA_BYTES {
+            return Err(JniRuntimeCallbackError::OversizedResult);
+        }
+        Ok(bytes)
+    }
 
     fn read(&mut self, lease: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error> {
         let requested =
@@ -365,6 +393,24 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
         })
     }
 
+    /// Returns the validated fixed identity associated with this one lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns a callback, malformed-capsule, or released-allocation failure.
+    pub fn metadata(
+        &mut self,
+    ) -> Result<RuntimeConnectionMetadata, RuntimeAllocationError<C::Error>> {
+        if self.closed {
+            return Err(RuntimeAllocationError::Closed);
+        }
+        let bytes = self
+            .callbacks
+            .metadata(self.lease)
+            .map_err(RuntimeAllocationError::Callback)?;
+        RuntimeConnectionMetadata::parse(&bytes).map_err(RuntimeAllocationError::Metadata)
+    }
+
     /// # Errors
     ///
     /// Returns a bounds, closed-allocation, or callback failure.
@@ -426,7 +472,106 @@ impl<C: RuntimeCallbacks> RuntimeAllocation<C> {
 pub enum RuntimeAllocationError<E> {
     Bounds,
     Closed,
+    Metadata(RuntimeMetadataError),
     Callback(E),
+}
+
+/// Validated non-secret identity fixed to one Android runtime lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeConnectionMetadata {
+    username: SshUsername,
+    expected_host: PublicKeyFingerprint,
+    public_key: PublicKeyMetadata,
+}
+
+impl RuntimeConnectionMetadata {
+    /// Parses the versioned Android runtime metadata capsule.
+    ///
+    /// # Errors
+    ///
+    /// Returns only a stable classification for malformed or unsupported metadata.
+    pub fn parse(bytes: &[u8]) -> Result<Self, RuntimeMetadataError> {
+        if bytes.len() > MAX_RUNTIME_METADATA_BYTES
+            || bytes.first() != Some(&RUNTIME_METADATA_VERSION)
+        {
+            return Err(RuntimeMetadataError::InvalidEncoding);
+        }
+        let mut cursor = 1;
+        let username = read_metadata_field(bytes, &mut cursor)?;
+        let expected_host = read_metadata_field(bytes, &mut cursor)?;
+        let algorithm = read_metadata_field(bytes, &mut cursor)?;
+        let fingerprint = read_metadata_field(bytes, &mut cursor)?;
+        if cursor != bytes.len() {
+            return Err(RuntimeMetadataError::InvalidEncoding);
+        }
+        let username =
+            std::str::from_utf8(username).map_err(|_| RuntimeMetadataError::InvalidEncoding)?;
+        let expected_host = std::str::from_utf8(expected_host)
+            .map_err(|_| RuntimeMetadataError::InvalidEncoding)?;
+        let algorithm = match std::str::from_utf8(algorithm)
+            .map_err(|_| RuntimeMetadataError::InvalidEncoding)?
+        {
+            "ED25519" => SshPublicKeyAlgorithm::Ed25519,
+            "ECDSA" => SshPublicKeyAlgorithm::Ecdsa,
+            "RSA" => SshPublicKeyAlgorithm::Rsa,
+            _ => return Err(RuntimeMetadataError::InvalidEncoding),
+        };
+        let fingerprint =
+            std::str::from_utf8(fingerprint).map_err(|_| RuntimeMetadataError::InvalidEncoding)?;
+        Ok(Self {
+            username: SshUsername::parse(username)
+                .map_err(|_| RuntimeMetadataError::InvalidEncoding)?,
+            expected_host: PublicKeyFingerprint::parse(expected_host)
+                .map_err(|_| RuntimeMetadataError::InvalidEncoding)?,
+            public_key: PublicKeyMetadata::new(
+                algorithm,
+                PublicKeyFingerprint::parse(fingerprint)
+                    .map_err(|_| RuntimeMetadataError::InvalidEncoding)?,
+            ),
+        })
+    }
+
+    #[must_use]
+    pub const fn username(&self) -> &SshUsername {
+        &self.username
+    }
+
+    #[must_use]
+    pub const fn expected_host(&self) -> &PublicKeyFingerprint {
+        &self.expected_host
+    }
+
+    #[must_use]
+    pub const fn public_key(&self) -> &PublicKeyMetadata {
+        &self.public_key
+    }
+}
+
+fn read_metadata_field<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+) -> Result<&'a [u8], RuntimeMetadataError> {
+    let Some(&length) = bytes.get(*cursor) else {
+        return Err(RuntimeMetadataError::InvalidEncoding);
+    };
+    *cursor += 1;
+    let end = cursor
+        .checked_add(usize::from(length))
+        .ok_or(RuntimeMetadataError::InvalidEncoding)?;
+    let field = bytes
+        .get(*cursor..end)
+        .ok_or(RuntimeMetadataError::InvalidEncoding)?;
+    if field.is_empty() {
+        return Err(RuntimeMetadataError::InvalidEncoding);
+    }
+    *cursor = end;
+    Ok(field)
+}
+
+/// Stable classification for runtime metadata rejected at the JNI edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeMetadataError {
+    InvalidEncoding,
 }
 
 fn runtime_allocations() -> &'static Mutex<RuntimeAllocationTable> {
@@ -984,6 +1129,9 @@ mod tests {
     }
     impl RuntimeCallbacks for RecordingCallbacks {
         type Error = ();
+        fn metadata(&mut self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+            Ok(runtime_metadata_fixture())
+        }
         fn read(&mut self, _: RuntimeLeaseHandle, output: &mut [u8]) -> Result<usize, Self::Error> {
             output[0] = 7;
             Ok(1)
@@ -1009,10 +1157,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(allocation.read(&mut [0; 1]), Ok(1));
+        assert_eq!(
+            allocation.metadata().unwrap().username(),
+            &SshUsername::parse("fixture-user").unwrap()
+        );
         assert_eq!(allocation.write(&[]), Err(RuntimeAllocationError::Bounds));
         allocation.close().unwrap();
         allocation.close().unwrap();
         assert_eq!(allocation.callbacks.closes, 1);
         assert_eq!(allocation.sign(&[1]), Err(RuntimeAllocationError::Closed));
+    }
+
+    fn runtime_metadata_fixture() -> Vec<u8> {
+        let fields = [
+            b"fixture-user".as_slice(),
+            b"SHA256:0123456789012345678901234567890123456789012".as_slice(),
+            b"ED25519".as_slice(),
+            b"SHA256:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO12".as_slice(),
+        ];
+        let mut bytes = vec![RUNTIME_METADATA_VERSION];
+        for field in fields {
+            bytes.push(u8::try_from(field.len()).unwrap());
+            bytes.extend_from_slice(field);
+        }
+        bytes
+    }
+
+    #[test]
+    fn runtime_metadata_rejects_trailing_or_invalid_identity_values() {
+        let mut fixture = runtime_metadata_fixture();
+        fixture.push(0);
+        assert_eq!(
+            RuntimeConnectionMetadata::parse(&fixture),
+            Err(RuntimeMetadataError::InvalidEncoding)
+        );
+        assert_eq!(
+            RuntimeConnectionMetadata::parse(&[RUNTIME_METADATA_VERSION]),
+            Err(RuntimeMetadataError::InvalidEncoding)
+        );
     }
 }

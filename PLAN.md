@@ -95,6 +95,10 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   explicit outer composition root for the remaining JNI-to-Russh adapter. The runtime contract
   now records that opaque IDs alone cannot establish a session: Android-owned registrations must
   resolve validated metadata into injected stream, exact-host-session, and signer capabilities.
+- [x] The JNI runtime callback now has a versioned, bounded non-secret metadata capsule. Rust
+  validates canonical username, exact host fingerprint, and public-key identity metadata before
+  a future session can be composed; endpoint, credential selection, key material, signatures,
+  paths, and commands remain outside the capsule.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and
