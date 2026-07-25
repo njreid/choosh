@@ -49,6 +49,9 @@ jobs:
       - name: Typed session with sequential host.describe requests through private RPC seam
         if: matrix.host == 'linux-x86_64'
         run: ./scripts/test-rpc-socket.sh
+      - name: Disposable-host acceptance runner fixture
+        if: matrix.host == 'linux-x86_64'
+        run: ./scripts/test-host-acceptance-runner.sh
       - name: Rust formatting
         run: cargo fmt --all -- --check
       - name: Rust lint

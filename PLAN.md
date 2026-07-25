@@ -170,6 +170,12 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   private Unix socket. It rejects a non-request envelope before SSH. This proves the Rust
   composition seam and real daemon method only; it does not yet bind a JVM socket or invoke the
   Java callback from Android.
+- [x] A versioned disposable-host acceptance runner now proves the host half of the remaining
+  vertical gate without provisioning or shell deployment: strict known-host SSH invokes only a
+  validated fixed `choosh-host rpc --stdio --socket` argv and verifies two framed private-socket
+  `host.describe` responses. Its hermetic fake-SSH test verifies the exact safe argv and rejects
+  unsafe remote-path configuration before any connection. It remains infrastructure, not a claim
+  that an Android callback/socket or `git.status` has reached the host.
 - [x] Blob capability completion consumes a bounded reader and stops an oversized source
   after the first byte above its declared limit; daemon fixture roots are unique under
   parallel headless test execution.
@@ -224,7 +230,8 @@ public-1.0 milestone has passed.
 Each increment must have a deterministic headless command, negative-path test,
 bounded resources, and a commit/push after verification.
 
-1. **Finish M0-R5/M0-R6.** Exercise the real Android/native connector, credential use,
+1. **Finish M0-R5/M0-R6.** Use the disposable-host acceptance runner with the real
+   Android/native connector, then exercise credential use,
    bounded cancellation, the fixed `git.status` daemon method, and negotiated
    stdio-to-real-`chooshd` private-socket RPC in one harness—not only generated-key fixtures.
 2. **Deploy and update `chooshd` without SSH session ownership.** Specify and implement a
