@@ -11,8 +11,10 @@ use choosh_protocol::wire::{WireEnvelope, WireError, decode_envelope, encode_res
 use std::io;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::task::JoinHandle;
 
 /// Marker for the outer Android/Russh composition root.
 ///
@@ -65,6 +67,151 @@ pub struct BoundedAndroidStream<S> {
     inner: S,
     limits: StreamChunkLimits,
     read_scratch: Box<[u8]>,
+}
+
+/// Thread-safe, bounded byte capability supplied by an Android runtime lease.
+///
+/// Implementors may block while entering their platform socket API. The
+/// adapter below runs each operation on Tokio's blocking pool so a Russh worker
+/// is never held by an Android socket read. Read and write are intentionally
+/// separate operations, allowing TCP's independent directions to make progress.
+pub trait BlockingAndroidIo: Send + Sync + 'static {
+    /// Performs one bounded read, returning zero for EOF.
+    fn read(&self, output: &mut [u8]) -> Result<usize, ()>;
+
+    /// Performs one bounded write.
+    fn write(&self, input: &[u8]) -> Result<(), ()>;
+}
+
+/// Asynchronous stream adapter for one Android-owned blocking socket lease.
+///
+/// The adapter retains no endpoint, credential, or JVM reference. It copies
+/// each bounded operation into a blocking task and converts all callback
+/// failures into a content-free `io::Error`.
+pub struct BlockingAndroidStream<C> {
+    callbacks: Arc<C>,
+    limits: StreamChunkLimits,
+    read_task: Option<JoinHandle<Result<Vec<u8>, ()>>>,
+    write_task: Option<JoinHandle<Result<usize, ()>>>,
+}
+
+impl<C: BlockingAndroidIo> BlockingAndroidStream<C> {
+    /// Creates an async stream over one thread-safe Android callback capability.
+    #[must_use]
+    pub const fn new(callbacks: Arc<C>, limits: StreamChunkLimits) -> Self {
+        Self {
+            callbacks,
+            limits,
+            read_task: None,
+            write_task: None,
+        }
+    }
+
+    fn poll_pending_write(&mut self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(task) = &mut self.write_task else {
+            return Poll::Ready(Ok(()));
+        };
+        match Pin::new(task).poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Ok(_))) => {
+                self.write_task = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(Err(())) | Err(_)) => {
+                self.write_task = None;
+                Poll::Ready(Err(callback_io_error()))
+            }
+        }
+    }
+}
+
+impl<C: BlockingAndroidIo> AsyncRead for BlockingAndroidStream<C> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.read_task.is_none() {
+            let requested = output.remaining().min(this.limits.read_bytes());
+            if requested == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let callbacks = Arc::clone(&this.callbacks);
+            this.read_task = Some(tokio::task::spawn_blocking(move || {
+                let mut bytes = vec![0; requested];
+                let length = callbacks.read(&mut bytes)?;
+                if length > bytes.len() {
+                    return Err(());
+                }
+                bytes.truncate(length);
+                Ok(bytes)
+            }));
+        }
+        let Some(task) = &mut this.read_task else {
+            return Poll::Ready(Err(callback_io_error()));
+        };
+        match Pin::new(task).poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Ok(bytes))) => {
+                this.read_task = None;
+                output.put_slice(&bytes);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(Err(())) | Err(_)) => {
+                this.read_task = None;
+                Poll::Ready(Err(callback_io_error()))
+            }
+        }
+    }
+}
+
+impl<C: BlockingAndroidIo> AsyncWrite for BlockingAndroidStream<C> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.write_task.is_none() {
+            let length = input.len().min(this.limits.write_bytes());
+            if length == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            let bytes = input[..length].to_vec();
+            let callbacks = Arc::clone(&this.callbacks);
+            this.write_task = Some(tokio::task::spawn_blocking(move || {
+                callbacks.write(&bytes)?;
+                Ok(bytes.len())
+            }));
+        }
+        let Some(task) = &mut this.write_task else {
+            return Poll::Ready(Err(callback_io_error()));
+        };
+        match Pin::new(task).poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Ok(length))) => {
+                this.write_task = None;
+                Poll::Ready(Ok(length))
+            }
+            Poll::Ready(Ok(Err(())) | Err(_)) => {
+                this.write_task = None;
+                Poll::Ready(Err(callback_io_error()))
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().poll_pending_write(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().poll_pending_write(context)
+    }
+}
+
+fn callback_io_error() -> io::Error {
+    io::Error::other("android runtime callback unavailable")
 }
 
 impl<S> BoundedAndroidStream<S> {
@@ -492,6 +639,7 @@ mod tests {
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::thread;
@@ -502,6 +650,51 @@ mod tests {
         assert_eq!(COMPOSITION_BOUNDARY, "android-opaque-handles-to-russh");
         assert!(super::AndroidHandle::new(0).is_none());
         assert!(super::AndroidHandle::new(1).is_some());
+    }
+
+    #[derive(Default)]
+    struct RecordingBlockingIo {
+        reads: Mutex<VecDeque<Vec<u8>>>,
+        writes: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl BlockingAndroidIo for RecordingBlockingIo {
+        fn read(&self, output: &mut [u8]) -> Result<usize, ()> {
+            let bytes = self
+                .reads
+                .lock()
+                .map_err(|_| ())?
+                .pop_front()
+                .unwrap_or_default();
+            if bytes.len() > output.len() {
+                return Err(());
+            }
+            output[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+
+        fn write(&self, input: &[u8]) -> Result<(), ()> {
+            self.writes.lock().map_err(|_| ())?.push(input.to_vec());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_android_stream_bounds_callbacks_off_the_async_worker() {
+        let callbacks = Arc::new(RecordingBlockingIo {
+            reads: Mutex::new(VecDeque::from([vec![1, 2]])),
+            writes: Mutex::new(Vec::new()),
+        });
+        let mut stream = BlockingAndroidStream::new(
+            Arc::clone(&callbacks),
+            StreamChunkLimits::new(2, 2).unwrap(),
+        );
+        stream.write_all(&[7, 8, 9]).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut received = [0; 2];
+        stream.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, [1, 2]);
+        assert_eq!(*callbacks.writes.lock().unwrap(), vec![vec![7, 8], vec![9]]);
     }
 
     #[derive(Default)]

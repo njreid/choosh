@@ -108,6 +108,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] Runtime callback ownership is now thread-safe rather than mutable-borrow serialized. This
   permits independent bounded read and write workers without allowing a blocked socket read to
   prevent SSH progress; close remains one-way and exactly once.
+- [x] The Android transport now has a headlessly tested asynchronous adapter for a blocking
+  runtime lease. It runs each bounded read/write on Tokio's blocking pool, keeps the two socket
+  directions independent, enforces the configured chunk limits, and maps failures to opaque I/O.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and

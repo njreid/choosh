@@ -8,7 +8,7 @@ rust-version.workspace = true
 [dependencies]
 choosh-protocol = { path = "../choosh-protocol" }
 choosh-ssh = { path = "../choosh-ssh" }
-tokio = { version = "=1.53.0", features = ["io-util"] }
+tokio = { version = "=1.53.0", features = ["io-util", "rt"] }
 
 [dev-dependencies]
 choosh-core = { path = "../choosh-core" }

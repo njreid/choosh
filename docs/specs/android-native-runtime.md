@@ -95,6 +95,12 @@ construction closes the socket, and lease close closes it once. Read and write
 callbacks are independent after lease validation; a blocked socket read MUST
 NOT serialize or prevent a bounded write.
 
+`choosh-android-transport` adapts the lease's blocking read and write
+capabilities through separately scheduled bounded operations. It MUST NOT run
+an Android socket callback on a Russh/Tokio worker. Each callback failure maps
+to a content-free I/O failure and does not retry authentication or host-key
+admission.
+
 Headless acceptance MUST prove all of the following with deterministic fakes:
 
 1. each callback rejects zero, oversized, stale, and released lease inputs;
