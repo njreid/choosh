@@ -31,6 +31,13 @@ an Android RPC, shell command, URI, or path. The disposable host has:
   `chooshd`; and
 - a bounded lifetime with cleanup owned by the runner.
 
+The test-only `DisposableHostInstrumentationComposition` accepts exactly four
+runner arguments: `choosh.fixture.host`, `.port`, `.username`, and
+`.host_fingerprint`. It parses them into a fixed test profile and builds the
+real native connector only from constructor-injected Android runtime and
+Keystore capabilities. This avoids production profile UI, static test state,
+and any endpoint/path/command selection from the app protocol.
+
 The Android test creates a test-only Keystore credential through the Android
 platform API, imports only its public OpenSSH identity into the runtime lease,
 and injects the resulting `BoundedAndroidNativeRuntime` at the composition
