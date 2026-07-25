@@ -102,6 +102,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The JNI runtime callback now also supplies a bounded canonical public SSH key. Rust parses
   it and requires its SHA-256 fingerprint to match the fixed lease metadata before a future
   signer can be created, with deterministic mismatch coverage.
+- [x] Android now has a concrete constructor-injected bounded runtime lease adapter. It owns one
+  validated socket, fixed identity capsule, public key, and payload-only signer callback without
+  a static registry; headless tests cover stale-lease rejection and exactly-once socket release.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and

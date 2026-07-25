@@ -87,6 +87,12 @@ bridge allocation and releases it on cancellation or generation recreation. It
 remains fail-closed until that allocation is composed into the verified stream
 and signer transport.
 
+`BoundedAndroidNativeRuntime` is the Android-side constructor-injected owner for
+this callback object. It opens the already validated endpoint, binds the fixed
+identity capsule and canonical public key, and binds a payload-only signer
+before returning one `NativeLease`. It has no static registry; rejecting lease
+construction closes the socket, and lease close closes it once.
+
 Headless acceptance MUST prove all of the following with deterministic fakes:
 
 1. each callback rejects zero, oversized, stale, and released lease inputs;

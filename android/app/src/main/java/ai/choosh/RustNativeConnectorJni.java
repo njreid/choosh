@@ -107,6 +107,8 @@ public final class RustNativeConnectorJni {
             this.runtimeLease = runtimeLease;
         }
 
+        long runtimeLease() { return runtimeLease; }
+
         @Override public String toString() { return "NativeHandles(REDACTED)"; }
     }
 
