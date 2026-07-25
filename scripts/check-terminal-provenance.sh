@@ -24,6 +24,17 @@ check_hash 58b40bf4152bcb93ecc20489aad21093b5b1e67d64e6814e7f1cb6615cf50784 andr
 grep -Fq 'SIL OPEN FONT LICENSE Version 1.1' "$root/android/app/src/main/res/raw/geomini_ofl.txt"
 grep -Fq 'SIL OPEN FONT LICENSE Version 1.1' "$root/android/app/src/main/res/raw/iosevka_charon_mono_ofl.txt"
 
+# Keep the checked artifacts tied to the resources actually selected by the
+# application.  Hashing an unused font (or accidentally selecting the wrong
+# family for headings) is not useful distribution evidence.
+grep -Fq 'android:font="@font/geomini"' "$root/android/app/src/main/res/font/choosh_ui.xml"
+grep -Fq 'android:font="@font/iosevka_charon_mono"' "$root/android/app/src/main/res/font/choosh_terminal.xml"
+grep -Fq 'android:font="@font/iosevka_charon_mono_bold"' "$root/android/app/src/main/res/font/choosh_terminal.xml"
+grep -Fq '@font/choosh_ui' "$root/android/app/src/main/res/values/styles.xml"
+grep -Fq '@font/choosh_terminal' "$root/android/app/src/main/res/values/styles.xml"
+grep -Fq '@raw/geomini_ofl' "$root/android/app/src/main/res/raw/keep.xml"
+grep -Fq '@raw/iosevka_charon_mono_ofl' "$root/android/app/src/main/res/raw/keep.xml"
+
 for component in Zelland libghostty-vt wgpu glyphon 'Iosevka Charon Mono' Geomini; do
   grep -Fq "$component" "$record" || {
     echo "terminal provenance record missing component: $component" >&2
@@ -84,10 +95,15 @@ done <<EOF
 $(jq -r '.gates[].evidence[], .device_conformance.targets[].evidence[]' "$decision")
 EOF
 
-if test "$decision_state" = blocked && rg -n '\b(libghostty[-_]vt|wgpu|glyphon)\b' \
-  "$root/Cargo.toml" "$root/Cargo.lock" "$root/rust"/*/Cargo.toml >/dev/null; then
-  echo "terminal renderer dependency added while the provenance decision is blocked" >&2
-  exit 1
+if test "$decision_state" = blocked; then
+  # Scan every manifest, rather than assuming a one-level Rust workspace. This
+  # makes a new nested crate fail closed until the recorded decision is cleared.
+  manifest_files=$(rg --files "$root" -g Cargo.toml)
+  if printf '%s\n' "$manifest_files" | xargs -r rg -n \
+    '\b(libghostty[-_]vt|wgpu|glyphon)\b' "$root/Cargo.lock" >/dev/null; then
+    echo "terminal renderer dependency added while the provenance decision is blocked" >&2
+    exit 1
+  fi
 fi
 
 echo "Terminal provenance evidence checks passed; go/no-go decision: $decision_state."

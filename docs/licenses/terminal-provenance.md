@@ -58,9 +58,11 @@ against the exact loaded faces.
 ## Deterministic evidence
 
 Run `./scripts/check-terminal-provenance.sh`. It verifies the five recorded hashes, checks that the
-packaged texts identify SIL Open Font License 1.1, confirms this record retains every required
-component, and fails if terminal renderer crates appear in Cargo manifests or the lockfile while
-the machine-readable decision is blocked. It also validates
+packaged texts identify SIL Open Font License 1.1, and verifies that the checked font resources,
+font families, heading/terminal styles, and retained OFL notices are the ones the Android package
+actually selects. It confirms this record retains every required component, and fails if terminal
+renderer crates appear in **any** Cargo manifest or the lockfile while the machine-readable decision
+is blocked. It also validates
 [`terminal-go-no-go.json`](../evidence/terminal-go-no-go.json), including the four prerequisite
 gates, exact device classes, required conformance scenarios, evidence paths, and derived decision.
 
