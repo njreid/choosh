@@ -131,6 +131,11 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   successful plan to `JniNativeSession`; its bounded RPC and exactly-once close retain the sole
   native token and Android lease. JVM and Rust headless tests cover the ownership transition and
   actor lifecycle. A full JVM callback/socket-to-real-`chooshd` acceptance remains required.
+- [x] The remaining M0-R5/R6 join is explicitly recorded as an Android instrumentation gate:
+  JVM tests cannot load the packaged Android ABI, Android Keystore, and native worker-thread
+  callback lifecycle together. The gate's disposable-host configuration, exact assertions,
+  redaction, and deterministic preflight requirements are in
+  [the instrumentation evidence contract](docs/evidence/m0-jni-disposable-host-instrumentation.md).
 - [ ] Device evidence was attempted on 2026-07-25 using a one-hour, SSM-managed `m6i.metal`
   runner after `m7i.metal` was unavailable in-region. The runner accepted its bounded shutdown
   command and began Android toolchain setup; after AWS authentication was restored, its captured
