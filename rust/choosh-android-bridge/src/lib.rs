@@ -5,6 +5,7 @@
 
 #![allow(unsafe_code)] // Required only for Edition 2024's `no_mangle` ABI attribute.
 
+use choosh_android_transport::{BlockingAndroidIo, BlockingAndroidStream, StreamChunkLimits};
 use choosh_core::ssh_identity::{PublicKeyFingerprint, PublicKeyMetadata, SshPublicKeyAlgorithm};
 use choosh_ssh::SshUsername;
 use jni::objects::{Global, JByteArray, JClass, JObject, JValue};
@@ -12,7 +13,7 @@ use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
 use std::ffi::c_void;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const ABI_VERSION: u32 = 3;
 const STATUS_OK: i32 = 0;
@@ -641,6 +642,137 @@ pub enum RuntimeMetadataError {
 pub enum RuntimePublicKeyError {
     InvalidEncoding,
     FingerprintMismatch,
+}
+
+/// Content-free signer failure from a bounded Android runtime lease.
+#[derive(Debug)]
+pub enum RuntimeLeaseSignerError {
+    Callback,
+    Send(russh::SendError),
+}
+
+impl From<russh::SendError> for RuntimeLeaseSignerError {
+    fn from(value: russh::SendError) -> Self {
+        Self::Send(value)
+    }
+}
+
+/// Russh signer whose only secret-bearing operation is the bound lease callback.
+pub struct RuntimeLeaseSigner<C> {
+    allocation: Arc<RuntimeAllocation<C>>,
+    public_key: russh::keys::PublicKey,
+}
+
+impl<C> RuntimeLeaseSigner<C> {
+    /// Creates a signer after the lease's canonical public key has been validated.
+    #[must_use]
+    pub fn new(allocation: Arc<RuntimeAllocation<C>>, public_key: russh::keys::PublicKey) -> Self {
+        Self {
+            allocation,
+            public_key,
+        }
+    }
+}
+
+impl<C> choosh_ssh::CredentialSigner for RuntimeLeaseSigner<C>
+where
+    C: RuntimeCallbacks + Send + Sync + 'static,
+{
+    type Error = RuntimeLeaseSignerError;
+
+    fn public_key(&self) -> russh::keys::PublicKey {
+        self.public_key.clone()
+    }
+
+    async fn sign(
+        &mut self,
+        _identity: &russh::keys::agent::AgentIdentity,
+        _hash_alg: Option<russh::keys::HashAlg>,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, Self::Error> {
+        self.allocation
+            .sign(&payload)
+            .map_err(|_| RuntimeLeaseSignerError::Callback)
+    }
+}
+
+impl<C> BlockingAndroidIo for RuntimeAllocation<C>
+where
+    C: RuntimeCallbacks + Send + Sync + 'static,
+{
+    fn read(&self, output: &mut [u8]) -> Result<usize, ()> {
+        self.read(output).map_err(|_| ())
+    }
+
+    fn write(&self, input: &[u8]) -> Result<(), ()> {
+        self.write(input).map_err(|_| ())
+    }
+}
+
+/// Validated Android lease parts ready for exact-host SSH admission.
+pub struct RuntimeLeaseTransport<C> {
+    session: choosh_ssh::PreAuthenticationSession,
+    username: SshUsername,
+    stream: BlockingAndroidStream<RuntimeAllocation<C>>,
+    signer: RuntimeLeaseSigner<C>,
+}
+
+impl<C> RuntimeLeaseTransport<C>
+where
+    C: RuntimeCallbacks + Send + Sync + 'static,
+{
+    /// Resolves one lease into typed stream, host session, username, and signer capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns only stable validation failures before any SSH network operation or signature.
+    pub fn new(
+        allocation: Arc<RuntimeAllocation<C>>,
+        limits: StreamChunkLimits,
+    ) -> Result<Self, RuntimeLeaseCompositionError> {
+        let metadata = allocation
+            .metadata()
+            .map_err(|_| RuntimeLeaseCompositionError::Metadata)?;
+        let public_key = allocation
+            .public_key(&metadata)
+            .map_err(|_| RuntimeLeaseCompositionError::PublicKey)?;
+        Ok(Self {
+            session: choosh_ssh::PreAuthenticationSession::new(
+                metadata.expected_host().clone(),
+                choosh_ssh::SessionLimits::admission_default(),
+            ),
+            username: metadata.username().clone(),
+            stream: BlockingAndroidStream::new(Arc::clone(&allocation), limits),
+            signer: RuntimeLeaseSigner::new(allocation, public_key),
+        })
+    }
+
+    /// Connects through exact-host admission before the signer can be invoked.
+    ///
+    /// # Errors
+    ///
+    /// Returns only the verified SSH connection's typed failure.
+    pub async fn connect(
+        self,
+    ) -> Result<
+        choosh_ssh::VerifiedConnection,
+        choosh_ssh::VerifiedConnectionError<RuntimeLeaseSignerError>,
+    > {
+        choosh_ssh::VerifiedConnection::connect_stream(
+            self.session,
+            self.stream,
+            self.username,
+            choosh_ssh::CredentialSignerAdapter::new(self.signer),
+        )
+        .await
+    }
+}
+
+/// Stable lease-to-transport composition failures before SSH begins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeLeaseCompositionError {
+    Metadata,
+    PublicKey,
 }
 
 fn runtime_allocations() -> &'static Mutex<RuntimeAllocationTable> {
@@ -1312,5 +1444,51 @@ mod tests {
                 RuntimePublicKeyError::FingerprintMismatch
             ))
         );
+    }
+
+    #[test]
+    fn runtime_transport_composition_validates_identity_without_signing() {
+        struct CountingCallbacks {
+            signs: std::sync::atomic::AtomicUsize,
+        }
+        impl RuntimeCallbacks for CountingCallbacks {
+            type Error = ();
+            fn metadata(&self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+                Ok(runtime_metadata_fixture())
+            }
+            fn public_key(&self, _: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error> {
+                Ok(fixture_public_key())
+            }
+            fn read(&self, _: RuntimeLeaseHandle, _: &mut [u8]) -> Result<usize, Self::Error> {
+                Ok(0)
+            }
+            fn write(&self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn sign(&self, _: RuntimeLeaseHandle, _: &[u8]) -> Result<Vec<u8>, Self::Error> {
+                self.signs.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![1])
+            }
+            fn close(&self, _: RuntimeLeaseHandle) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+        let callbacks = CountingCallbacks {
+            signs: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let allocation = Arc::new(
+            RuntimeAllocation::new(callbacks, RuntimeLeaseHandle::new(9).unwrap(), 65_536).unwrap(),
+        );
+        let transport = RuntimeLeaseTransport::new(
+            Arc::clone(&allocation),
+            StreamChunkLimits::new(1_024, 1_024).unwrap(),
+        )
+        .expect("validated public identity composes without an SSH signature");
+        assert_eq!(
+            allocation.callbacks.signs.load(Ordering::Relaxed),
+            0,
+            "composition must not reach the payload-only signer"
+        );
+        drop(transport);
     }
 }

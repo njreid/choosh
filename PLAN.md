@@ -111,6 +111,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The Android transport now has a headlessly tested asynchronous adapter for a blocking
   runtime lease. It runs each bounded read/write on Tokio's blocking pool, keeps the two socket
   directions independent, enforces the configured chunk limits, and maps failures to opaque I/O.
+- [x] The JNI outer root now composes a validated runtime lease into a bounded asynchronous
+  stream, exact-host Russh session, canonical public key, and payload-only signer. Construction
+  has deterministic coverage proving it cannot invoke the signer; only the verified SSH path may.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and

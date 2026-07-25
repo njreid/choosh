@@ -101,6 +101,12 @@ an Android socket callback on a Russh/Tokio worker. Each callback failure maps
 to a content-free I/O failure and does not retry authentication or host-key
 admission.
 
+The JNI bridge composes that stream only after it has parsed the identity
+capsule and compared the canonical public key with its recorded fingerprint.
+It creates `PreAuthenticationSession` from the exact host fingerprint and a
+payload-only Russh signer from the same lease. Composition itself MUST NOT
+invoke the signer; Russh may do so only after exact-host admission.
+
 Headless acceptance MUST prove all of the following with deterministic fakes:
 
 1. each callback rejects zero, oversized, stale, and released lease inputs;
