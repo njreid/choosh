@@ -44,6 +44,13 @@ and injects the resulting `BoundedAndroidNativeRuntime` at the composition
 root. Private-key bytes, aliases, endpoint text, and host paths do not enter
 the bridge assertion output.
 
+The test-only `DisposableHostKeystoreIdentity` makes this a two-phase runner:
+the first instrumentation invocation creates/reuses a non-exportable Android
+Keystore Ed25519 alias and reports only its public `authorized_keys` line to
+the disposable-host provisioner. The provisioner then starts OpenSSH with that
+generated public identity. The connection invocation reports only redacted
+outcome categories; neither invocation emits private-key bytes or the alias.
+
 ## Required assertions
 
 One test run MUST prove all of the following:
