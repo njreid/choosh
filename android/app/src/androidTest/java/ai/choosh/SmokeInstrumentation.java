@@ -78,9 +78,20 @@ public final class SmokeInstrumentation extends Instrumentation {
 
     /** Loads the packaged JNI bridge and resolves its nested-class ABI entry point on-device. */
     private static void verifyJniBridgeLibrary(Bundle evidence) {
-        require(new RustNativeConnectorJni.JniPlanBridge().abiVersion() == 3,
+        RustNativeConnectorJni.JniPlanBridge bridge = new RustNativeConnectorJni.JniPlanBridge();
+        require(bridge.abiVersion() == 3,
                 "native bridge ABI mismatch");
-        evidence.putString("jni_bridge", "nested-class-abi-v3-resolved");
+        RustNativeConnectorJni.NativeHandles handles = new RustNativeConnectorJni.NativeHandles(
+                1, 2, 3, 4, 5, 6, 7);
+        long plan = bridge.beginAuthenticatedPlan(1, handles);
+        require(plan > 0, "native plan was not allocated");
+        // This pointer-free ABI has no runtime callback lease, so it must fail closed rather than
+        // claim a connected session. Cancellation releases its exact opaque plan once.
+        require(bridge.openAuthenticatedPlan(1, plan) == 5,
+                "callback-less native plan did not fail closed");
+        require(bridge.cancelAuthenticatedPlan(1, plan) == 0,
+                "native plan cancellation failed");
+        evidence.putString("jni_bridge", "nested-class-abi-v3-plan-fail-closed-cancelled");
     }
 
     private void verifySoraLifecycle(Bundle evidence) {
