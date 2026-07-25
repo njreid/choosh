@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::service_manager::ServiceManager;
+
 const MAX_VERSION_BYTES: usize = 64;
 
 /// One verified release upload accepted by the host deployment boundary.
@@ -122,6 +124,16 @@ pub trait DeploymentService {
     ///
     /// Returns the fixed service-manager adapter failure.
     fn activate_selected_release(&mut self) -> Result<(), Self::Error>;
+}
+
+/// Makes a fixed per-user service-manager adapter available to deployment without exposing
+/// service paths, labels, argv, or a shell command to the transaction caller.
+impl<M: ServiceManager> DeploymentService for M {
+    type Error = M::Error;
+
+    fn activate_selected_release(&mut self) -> Result<(), Self::Error> {
+        ServiceManager::activate(self)
+    }
 }
 
 /// Private-socket health capability bound to the selected daemon service.
@@ -268,6 +280,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service_manager::{
+        ProcessOutcome, ServiceInvocation, ServiceProcessRunner, SystemdUserManager,
+    };
+    use std::ffi::OsString;
 
     #[derive(Default)]
     struct Store {
@@ -325,6 +341,20 @@ mod tests {
         DeploymentUpload::new("2.0.0", [7; 32], b"artifact".to_vec(), 32).unwrap()
     }
 
+    #[derive(Default)]
+    struct Process {
+        calls: Vec<ServiceInvocation>,
+    }
+
+    impl ServiceProcessRunner for Process {
+        type Error = &'static str;
+
+        fn run(&mut self, invocation: ServiceInvocation) -> Result<ProcessOutcome, Self::Error> {
+            self.calls.push(invocation);
+            Ok(ProcessOutcome::Success)
+        }
+    }
+
     #[test]
     fn verified_immutable_stage_activates_the_host_service_then_health_checks() {
         let mut deployment = HostDeployment::new(
@@ -340,6 +370,39 @@ mod tests {
             })
         );
         assert_eq!(deployment.into_parts().0.calls, ["stage", "activate"]);
+    }
+
+    #[test]
+    fn deployment_composes_only_fixed_systemd_user_activation_before_private_health() {
+        let mut deployment = HostDeployment::new(
+            Store::default(),
+            Digest(true),
+            SystemdUserManager::new(Process::default()),
+            Health(Ok(true)),
+        );
+
+        assert!(matches!(
+            deployment.deploy(&upload()),
+            Ok(DeploymentOutcome::Activated { .. })
+        ));
+        let (store, _, manager, _) = deployment.into_parts();
+        assert_eq!(store.calls, ["stage", "activate"]);
+        let runner = manager.into_inner();
+        assert_eq!(runner.calls.len(), 2);
+        assert_eq!(runner.calls[0].program(), "systemctl");
+        assert_eq!(
+            runner.calls[0].arguments(),
+            &[OsString::from("--user"), OsString::from("daemon-reload")]
+        );
+        assert_eq!(
+            runner.calls[1].arguments(),
+            &[
+                OsString::from("--user"),
+                OsString::from("enable"),
+                OsString::from("--now"),
+                OsString::from("chooshd.service"),
+            ]
+        );
     }
 
     #[test]
