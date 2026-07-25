@@ -172,6 +172,14 @@ public final class RustNativeConnectorJni {
             return bridge.openAuthenticatedPlan(generation, value);
         }
 
+        /** Transfers this plan's native token and Android lease to one connected-session owner. */
+        SessionLease transferToSession() throws NativePlanException {
+            if (value == 0) throw new NativePlanException();
+            long transferred = value;
+            value = 0;
+            return new SessionLease(bridge, generation, transferred, lease);
+        }
+
         @Override public void close() throws NativePlanException {
             if (value == 0) return;
             long closing = value;
@@ -187,6 +195,42 @@ public final class RustNativeConnectorJni {
         }
 
         @Override public String toString() { return "NativeAuthenticatedPlan(REDACTED)"; }
+    }
+
+    /** One-close-only owner transferred from a plan to a verified native session. */
+    public static final class SessionLease implements AutoCloseable {
+        private final NativePlanBridge bridge;
+        private final int generation;
+        private final NativeLease lease;
+        private long value;
+
+        private SessionLease(NativePlanBridge bridge, int generation, long value, NativeLease lease) {
+            this.bridge = bridge;
+            this.generation = generation;
+            this.value = value;
+            this.lease = lease;
+        }
+
+        long planToken() throws NativePlanException {
+            if (value == 0) throw new NativePlanException();
+            return value;
+        }
+
+        @Override public void close() throws NativePlanException {
+            if (value == 0) return;
+            long closing = value;
+            value = 0;
+            NativePlanException failure = null;
+            if (bridge.cancelAuthenticatedPlan(generation, closing) != 0) failure = new NativePlanException();
+            try {
+                lease.close();
+            } catch (NativePlanException releaseFailure) {
+                if (failure == null) failure = releaseFailure;
+            }
+            if (failure != null) throw failure;
+        }
+
+        @Override public String toString() { return "NativeSessionLease(REDACTED)"; }
     }
 
     public static final class NativePlanException extends Exception {

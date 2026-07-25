@@ -105,6 +105,27 @@ public final class RustNativeConnectorJniTest {
         assertEquals(1, bridge.cancels);
     }
 
+    @Test public void transferred_session_lease_owns_native_and_android_release() throws Exception {
+        CapturingConnector connector = new CapturingConnector();
+        new NativeAuthenticatedSshConnector(connector).openVerified(request(), result -> { });
+        RecordingBridge bridge = new RecordingBridge();
+        int[] releases = { 0 };
+        RustNativeConnectorJni.Plan plan = new RustNativeConnectorJni.PlanFactory(bridge,
+            (RustNativeConnectorJni.NativeRuntime) input -> new RustNativeConnectorJni.NativeLease(
+                new RustNativeConnectorJni.NativeHandles(1, 2, 3, 4, 5, 6, 7), () -> releases[0]++
+            )).begin(7, connector.input);
+
+        RustNativeConnectorJni.SessionLease session = plan.transferToSession();
+        plan.close();
+        assertEquals(0, bridge.cancels);
+        assertEquals(99, session.planToken());
+        session.close();
+        session.close();
+        assertEquals(1, bridge.cancels);
+        assertEquals(1, releases[0]);
+        assertEquals("NativeSessionLease(REDACTED)", session.toString());
+    }
+
     private static AuthenticatedSshOperationCoordinator.ConnectionRequest request() {
         return new AuthenticatedSshOperationCoordinator.ConnectionRequest(
             new AuthenticatedSshOperationCoordinator.ProfileId("fixture_profile"),

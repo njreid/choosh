@@ -107,6 +107,12 @@ It creates `PreAuthenticationSession` from the exact host fingerprint and a
 payload-only Russh signer from the same lease. Composition itself MUST NOT
 invoke the signer; Russh may do so only after exact-host admission.
 
+On successful verified connection, `Plan` MUST transfer its token and Android
+lease to one `SessionLease`. The connection-completion path MUST NOT close the
+plan after that transfer. The session owner is then responsible for exactly one
+native cancellation and Android runtime release when its fixed-RPC capability
+is closed or fails.
+
 Headless acceptance MUST prove all of the following with deterministic fakes:
 
 1. each callback rejects zero, oversized, stale, and released lease inputs;

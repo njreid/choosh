@@ -114,6 +114,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The JNI outer root now composes a validated runtime lease into a bounded asynchronous
   stream, exact-host Russh session, canonical public key, and payload-only signer. Construction
   has deterministic coverage proving it cannot invoke the signer; only the verified SSH path may.
+- [x] Java JNI plans now support an explicit one-way transfer to a `SessionLease`; headless
+  coverage proves the transferred session, not the connection-completion plan, owns exactly one
+  native cancellation and Android runtime release.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and
