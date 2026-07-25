@@ -14,6 +14,7 @@ choosh-ssh = { path = "../choosh-ssh" }
 choosh-android-transport = { path = "../choosh-android-transport" }
 jni = { version = "=0.22.4", default-features = false }
 russh = { version = "=0.62.2", default-features = false, features = ["ring"] }
+tokio = { version = "=1.53.0", features = ["rt", "sync"] }
 
 [lints.clippy]
 all = "warn"

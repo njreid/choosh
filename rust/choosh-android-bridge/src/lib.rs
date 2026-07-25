@@ -11,7 +11,9 @@ use choosh_ssh::SshUsername;
 use jni::objects::{Global, JByteArray, JClass, JObject, JValue};
 use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
 use std::ffi::c_void;
+use std::future::Future;
 use std::num::NonZeroU64;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -856,6 +858,57 @@ impl<S> Default for SessionRegistry<S> {
 pub enum SessionRegistryError {
     InvalidPlan,
     Capacity,
+}
+
+/// Fixed-RPC capability owned by one session actor.
+pub trait FixedRpcExecutor: Send + 'static {
+    fn execute(
+        &mut self,
+        payload: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ()>> + Send + '_>>;
+}
+
+/// Bounded command sender for one plan-owned fixed-RPC session actor.
+#[derive(Clone)]
+pub struct SessionActor {
+    sender: tokio::sync::mpsc::Sender<SessionCommand>,
+}
+
+enum SessionCommand {
+    Execute {
+        payload: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, ()>>,
+    },
+    Close,
+}
+
+impl SessionActor {
+    pub fn spawn<S: FixedRpcExecutor>(mut session: S) -> Self {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    SessionCommand::Execute { payload, reply } => {
+                        let _ = reply.send(session.execute(payload).await);
+                    }
+                    SessionCommand::Close => break,
+                }
+            }
+        });
+        Self { sender }
+    }
+
+    pub async fn execute(&self, payload: Vec<u8>) -> Result<Vec<u8>, ()> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender
+            .try_send(SessionCommand::Execute { payload, reply })
+            .map_err(|_| ())?;
+        response.await.map_err(|_| ())?
+    }
+
+    pub fn close(&self) {
+        let _ = self.sender.try_send(SessionCommand::Close);
+    }
 }
 
 fn runtime_allocations() -> &'static Mutex<RuntimeAllocationTable> {

@@ -207,6 +207,7 @@ dependencies = [
  "choosh-ssh",
  "jni",
  "russh",
+ "tokio",
 ]
 
 [[package]]

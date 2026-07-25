@@ -120,6 +120,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [x] The Rust bridge now has a constructor-owned bounded session registry with deterministic
   plan-ownership and clear-before-release coverage, ready to retain the verified fixed-RPC
   session without another ambient callback lookup service.
+- [x] The bridge now has a bounded per-session fixed-RPC actor foundation: a one-slot command
+  queue, one-shot replies, and explicit close. It keeps session I/O out of registry locks; JNI
+  export wiring and the actor acceptance fixture remain the next increment.
 - [x] Android release selection now has a headless bounded planner that selects a canonical
   newer stable APK, verifies its SHA-256 and pinned signing certificate through injected
   boundaries, and returns data-only staging instructions. Download, app-private writing, and
