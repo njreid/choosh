@@ -177,6 +177,7 @@ public final class ReleaseUpdatePlanner {
             this.version = version; this.apk = apk; this.checksum = checksum; this.signer = signer;
         }
         public String apkAsset() { return apk; }
+        public String version() { return version.toString(); }
         public String checksumAsset() { return checksum; }
         public String signerAsset() { return signer; }
         @Override public String toString() { return "ReleaseCandidate(version=" + version + ", assets=REDACTED)"; }

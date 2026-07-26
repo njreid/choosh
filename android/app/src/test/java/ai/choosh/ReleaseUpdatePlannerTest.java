@@ -3,6 +3,8 @@ package ai.choosh;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertFalse;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -57,4 +59,17 @@ public final class ReleaseUpdatePlannerTest {
     private static ReleaseUpdatePlanner.Release release(String tag, String... assets) { return new ReleaseUpdatePlanner.Release(tag, false, false, List.of(assets)); }
     private static String sha(byte[] bytes) throws Exception { StringBuilder text = new StringBuilder(); for (byte value : MessageDigest.getInstance("SHA-256").digest(bytes)) text.append(String.format("%02x", value)); return text.toString(); }
     private static final class Certificate implements ReleaseUpdatePlanner.ApkCertificateVerifier { private final String digest; Certificate(String digest) { this.digest = digest; } @Override public String certificateSha256(byte[] apk) { return digest; } }
+
+    @Test public void hostEnvelopeContainsOnlyVerifiedReleaseFields() throws Exception {
+        ReleaseUpdatePlanner planner = new ReleaseUpdatePlanner(bytes -> CERT);
+        ReleaseUpdatePlanner.Candidate candidate = planner.select(installed(), index());
+        byte[] apk = "fixture-apk-0.2.0".getBytes(StandardCharsets.US_ASCII);
+        ReleaseUpdatePlanner.StagingPlan plan = planner.verify(installed(), candidate, apk,
+            (sha(apk) + "  choosh-0.2.0.apk\n").getBytes(StandardCharsets.US_ASCII),
+            new ReleaseUpdatePlanner.SignerEvidence("choosh-0.2.0.apk", CERT));
+        String envelope = new String(HostDeploymentEnvelope.encode(plan), StandardCharsets.UTF_8);
+        assertTrue(envelope.contains("\"schema_version\":1"));
+        assertTrue(envelope.contains("\"version\":\"0.2.0\""));
+        assertFalse(envelope.contains("/"));
+    }
 }
