@@ -240,3 +240,66 @@ fn unhealthy_new_version_rolls_back_once_to_the_verified_active_artifact() {
     assert_file(root.0.join("failed-activation"), b"verified-2.0.0");
     assert_eq!(health.checked_versions, ["2.0.0"]);
 }
+
+#[test]
+fn reinstalling_the_active_version_is_a_deterministic_noop() {
+    let root = FixtureRoot::new();
+    write_active(&root, b"verified-2.0.0");
+    let store = LocalStore::new(&root);
+    let health = ScriptedHealth {
+        outcome: Ok(true),
+        expected_version: "2.0.0",
+        checked_versions: Vec::new(),
+    };
+    let mut coordinator = UpgradeCoordinator::new(store, LocalDigest, health);
+
+    assert_eq!(
+        coordinator.install("2.0.0", &release(b"verified-2.0.0")),
+        Ok(UpgradeOutcome::CompatibleNoOp {
+            version: "2.0.0".into()
+        })
+    );
+    let (store, _, health) = coordinator.into_parts();
+    assert!(store.calls.is_empty());
+    assert_file(root.active(), b"verified-2.0.0");
+    assert_eq!(health.checked_versions, Vec::<String>::new());
+}
+
+#[test]
+fn a_failed_health_upgrade_can_be_retried_without_stale_staging_or_previous_state() {
+    let root = FixtureRoot::new();
+    write_active(&root, b"verified-1.0.0");
+    let store = LocalStore::new(&root);
+    let health = ScriptedHealth {
+        outcome: Ok(false),
+        expected_version: "2.0.0",
+        checked_versions: Vec::new(),
+    };
+    let mut coordinator = UpgradeCoordinator::new(store, LocalDigest, health);
+
+    assert_eq!(
+        coordinator.install("1.0.0", &release(b"verified-2.0.0")),
+        Ok(UpgradeOutcome::RolledBack {
+            failed_version: "2.0.0".into()
+        })
+    );
+    let (store, digest, _) = coordinator.into_parts();
+    assert!(!root.0.join("stage-2.0.0").exists());
+    assert!(!root.0.join("previous").exists());
+    assert_file(root.active(), b"verified-1.0.0");
+
+    // A fresh coordinator models a process restart; the restored active artifact is installable.
+    let health = ScriptedHealth {
+        outcome: Ok(true),
+        expected_version: "2.0.0",
+        checked_versions: Vec::new(),
+    };
+    let mut retry = UpgradeCoordinator::new(store, digest, health);
+    assert_eq!(
+        retry.install("1.0.0", &release(b"verified-2.0.0")),
+        Ok(UpgradeOutcome::Activated {
+            version: "2.0.0".into()
+        })
+    );
+    assert_file(root.active(), b"verified-2.0.0");
+}
