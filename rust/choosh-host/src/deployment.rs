@@ -36,6 +36,61 @@ pub fn update_decision(installed: &str, latest: &str) -> Result<UpdateDecision, 
         .unwrap_or(UpdateDecision::UpToDate))
 }
 
+/// Decodes the versioned host-update envelope. The envelope carries no paths or argv.
+pub fn decode_upload_envelope(
+    payload: &[u8],
+    max_bytes: usize,
+) -> Result<DeploymentUpload, DeploymentError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(payload).map_err(|_| DeploymentError::InvalidArtifact)?;
+    let object = value.as_object().ok_or(DeploymentError::InvalidArtifact)?;
+    if object
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err(DeploymentError::InvalidArtifact);
+    }
+    let version = object
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(DeploymentError::InvalidVersion)?;
+    let digest = object
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(DeploymentError::InvalidArtifact)?;
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(DeploymentError::InvalidArtifact);
+    }
+    let mut sha256 = [0_u8; 32];
+    for (index, pair) in digest.as_bytes().chunks_exact(2).enumerate() {
+        sha256[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    let artifact = object
+        .get("artifact")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(DeploymentError::InvalidArtifact)?;
+    let bytes: Result<Vec<u8>, _> = artifact
+        .iter()
+        .map(|v| v.as_u64().filter(|n| *n <= 255).map(|n| n as u8).ok_or(()))
+        .collect();
+    DeploymentUpload::new(
+        version,
+        sha256,
+        bytes.map_err(|_| DeploymentError::InvalidArtifact)?,
+        max_bytes,
+    )
+}
+
+fn hex_nibble(value: u8) -> Result<u8, DeploymentError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(DeploymentError::InvalidArtifact),
+    }
+}
+
 /// One verified release upload accepted by the host deployment boundary.
 #[derive(Clone, Eq, PartialEq)]
 pub struct DeploymentUpload {
