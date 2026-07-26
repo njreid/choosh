@@ -12,6 +12,7 @@ import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.Signature;
+import java.security.spec.ECGenParameterSpec;
 
 /** Test-only non-exportable Ed25519 identity for the disposable-host instrumentation gate. */
 public final class DisposableHostKeystoreIdentity
@@ -40,11 +41,11 @@ public final class DisposableHostKeystoreIdentity
         store.load(null);
         if (!store.containsAlias(ALIAS)) {
             KeyPairGenerator generator = KeyPairGenerator.getInstance(
-                "Ed25519", "AndroidKeyStore"
+                KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore"
             );
             generator.initialize(new KeyGenParameterSpec.Builder(
                 ALIAS, KeyProperties.PURPOSE_SIGN | KeyProperties.PURPOSE_VERIFY
-            ).setDigests(KeyProperties.DIGEST_NONE).build());
+            ).setAlgorithmParameterSpec(new ECGenParameterSpec("Ed25519")).build());
             generator.generateKeyPair();
         }
         PublicKey key = store.getCertificate(ALIAS).getPublicKey();
