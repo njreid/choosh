@@ -26,6 +26,51 @@ pub struct RenderedBlock {
     pub html: String,
 }
 
+/// Stable, bounded identity for a rendered Markdown snapshot.
+///
+/// The identity intentionally includes the workspace and document key as well
+/// as the revision and content digest, preventing annotations from leaking
+/// across hosts or being applied to a different revision of the same path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarkdownDocumentIdentity {
+    pub workspace: String,
+    pub document: String,
+    pub revision: u64,
+    pub content_digest: u64,
+}
+
+/// Computes a deterministic identity without relying on platform or crypto
+/// providers. Callers must still authenticate the workspace/document keys.
+pub fn document_identity(
+    workspace: &str,
+    document: &str,
+    revision: u64,
+    source: &str,
+    max_key_bytes: usize,
+) -> Option<MarkdownDocumentIdentity> {
+    if workspace.is_empty()
+        || document.is_empty()
+        || workspace.len() > max_key_bytes
+        || document.len() > max_key_bytes
+        || workspace.bytes().any(|b| b.is_ascii_control())
+        || document.bytes().any(|b| b.is_ascii_control())
+    {
+        return None;
+    }
+    Some(MarkdownDocumentIdentity {
+        workspace: workspace.to_owned(),
+        document: document.to_owned(),
+        revision,
+        content_digest: fnv1a64(source.as_bytes()),
+    })
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockKind {
     Heading,
@@ -494,5 +539,23 @@ mod tests {
             render_safe_subset("```\ncode", 1, LIMITS),
             Err(MarkdownError::UnterminatedFence)
         );
+    }
+
+    #[test]
+    fn document_identity_is_stable_and_revision_scoped() {
+        let first = document_identity("ws-1", "docs/review.md", 4, "# A", 64).unwrap();
+        let same = document_identity("ws-1", "docs/review.md", 4, "# A", 64).unwrap();
+        let changed = document_identity("ws-1", "docs/review.md", 5, "# A", 64).unwrap();
+        let edited = document_identity("ws-1", "docs/review.md", 4, "# B", 64).unwrap();
+        assert_eq!(first, same);
+        assert_ne!(first.revision, changed.revision);
+        assert_ne!(first.content_digest, edited.content_digest);
+    }
+
+    #[test]
+    fn document_identity_rejects_ambiguous_or_oversized_keys() {
+        assert!(document_identity("", "doc", 1, "x", 16).is_none());
+        assert!(document_identity("ws\n", "doc", 1, "x", 16).is_none());
+        assert!(document_identity("workspace-too-long", "doc", 1, "x", 4).is_none());
     }
 }
