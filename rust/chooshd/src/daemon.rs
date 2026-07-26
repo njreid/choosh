@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use choosh_protocol::framing::{FrameDecoder, FrameError, FrameLimits, encode_frame};
 use choosh_protocol::handshake::{
@@ -19,10 +19,12 @@ use choosh_protocol::wire::{
 use serde_json::{Value, json};
 
 use crate::socket::{self, OwnedUnixListener, SocketError, SocketPlan};
+use crate::state::DaemonCoordinator;
 use crate::{
     git::ChangeKind,
     git_status::{GitStatusError, GitStatusOperation},
 };
+use choosh_core::event_spool::Subscription;
 
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const READ_CHUNK_BYTES: usize = 8192;
@@ -58,12 +60,21 @@ pub trait RpcHandler: Send + Sync {
 #[derive(Default)]
 pub struct DaemonRpc {
     git_status: BTreeMap<choosh_protocol::envelope::EnvelopeId, Arc<dyn GitStatusOperation>>,
+    events: Option<Arc<Mutex<DaemonCoordinator>>>,
 }
 
 impl DaemonRpc {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Adds the coordinator-owned event subscription surface. The mutex is
+    /// deliberately supplied by the composition root so request workers never
+    /// acquire hidden global state.
+    pub fn with_events(mut self, coordinator: Arc<Mutex<DaemonCoordinator>>) -> Self {
+        self.events = Some(coordinator);
+        self
     }
 
     /// Adds the operation for an identity registered by the outer composition root.
@@ -99,6 +110,12 @@ impl RpcHandler for DaemonRpc {
     ) -> Result<Vec<u8>, DaemonError> {
         if request.method.as_str() == "host.describe" {
             return describe_response(request, config, max_frame_bytes);
+        }
+        if request.method.as_str() == "events.subscribe-v1" {
+            return self.subscribe_response(request, max_frame_bytes);
+        }
+        if request.method.as_str() == "events.ack-v1" {
+            return self.ack_response(request, max_frame_bytes);
         }
         if request.method.as_str() != "git.status" {
             return error_response(
@@ -139,6 +156,120 @@ impl RpcHandler for DaemonRpc {
             }
         }
     }
+}
+
+impl DaemonRpc {
+    fn subscribe_response(
+        &self,
+        request: &choosh_protocol::envelope::Request<Value>,
+        max: usize,
+    ) -> Result<Vec<u8>, DaemonError> {
+        let Some(coordinator) = &self.events else {
+            return error_response(request, "unsupported", "events unavailable", max);
+        };
+        let Some((workspace, after)) = event_params(&request.params) else {
+            return error_response(
+                request,
+                "invalid_request",
+                "invalid events.subscribe-v1 request",
+                max,
+            );
+        };
+        let result = coordinator
+            .lock()
+            .map_err(|_| DaemonError::WorkerFailed)?
+            .subscribe(&workspace, after);
+        match result {
+            Ok(Subscription::Replay {
+                retained_low,
+                committed_high,
+                events,
+            }) => {
+                let events: Vec<Value> = events.into_iter().map(|e| json!({"sequence":e.sequence,"received_at":e.received_at,"payload_b64":base64_url_unpadded(&e.payload)})).collect();
+                json_response(
+                    request,
+                    json!({"retained_low":retained_low,"committed_high":committed_high,"events":events}),
+                    max,
+                )
+            }
+            Ok(Subscription::SnapshotRequired {
+                retained_low,
+                committed_high,
+            }) => json_response(
+                request,
+                json!({"retained_low":retained_low,"committed_high":committed_high,"snapshot_required":true}),
+                max,
+            ),
+            Err(_) => error_response(request, "not_found", "workspace not found", max),
+        }
+    }
+
+    fn ack_response(
+        &self,
+        request: &choosh_protocol::envelope::Request<Value>,
+        max: usize,
+    ) -> Result<Vec<u8>, DaemonError> {
+        let Some(coordinator) = &self.events else {
+            return error_response(request, "unsupported", "events unavailable", max);
+        };
+        let Some((workspace, client, sequence)) = ack_params(&request.params) else {
+            return error_response(
+                request,
+                "invalid_request",
+                "invalid events.ack-v1 request",
+                max,
+            );
+        };
+        let result = coordinator
+            .lock()
+            .map_err(|_| DaemonError::WorkerFailed)?
+            .acknowledge_event(&workspace, &client, sequence);
+        match result {
+            Ok(()) => json_response(request, json!({}), max),
+            Err(_) => error_response(
+                request,
+                "invalid_request",
+                "event acknowledgement rejected",
+                max,
+            ),
+        }
+    }
+}
+
+fn event_params(value: &Value) -> Option<(choosh_core::workspace::WorkspaceId, u64)> {
+    let o = value.as_object()?;
+    if o.len() != 2 {
+        return None;
+    }
+    let id =
+        choosh_core::workspace::WorkspaceId::parse(o.get("workspace_id")?.as_str()?, 256).ok()?;
+    Some((id, o.get("after_sequence")?.as_u64()?))
+}
+fn ack_params(value: &Value) -> Option<(choosh_core::workspace::WorkspaceId, String, u64)> {
+    let o = value.as_object()?;
+    if o.len() != 3 {
+        return None;
+    }
+    let id =
+        choosh_core::workspace::WorkspaceId::parse(o.get("workspace_id")?.as_str()?, 256).ok()?;
+    let client = o.get("client_id")?.as_str()?.to_owned();
+    if client.is_empty() {
+        return None;
+    }
+    Some((id, client, o.get("sequence")?.as_u64()?))
+}
+fn json_response(
+    request: &choosh_protocol::envelope::Request<Value>,
+    result: Value,
+    max: usize,
+) -> Result<Vec<u8>, DaemonError> {
+    let bytes =
+        serde_json::to_vec(&json!({"kind":"response","id":request.id.as_str(),"result":result}))
+            .map_err(|_| WireError::MalformedJson)?;
+    if bytes.len() > max {
+        return Err(DaemonError::Wire(WireError::PayloadTooLarge));
+    }
+    Ok(bytes)
 }
 
 impl HandshakeConfig {
