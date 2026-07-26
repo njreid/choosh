@@ -289,6 +289,14 @@ pub enum TargetState {
     Available,
 }
 
+/// Reconnect decision for a previously persisted target. Missing targets are
+/// reported to the caller; reconnect never creates a replacement session/tab.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReattachAction {
+    AttachExisting,
+    MarkUnavailable,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReconcileError {
     SessionAlreadyExists,
@@ -317,6 +325,18 @@ pub fn reconcile_target(observed: &TargetObservation) -> Result<TargetState, Rec
     match observed {
         TargetObservation::Missing => Ok(TargetState::Unavailable),
         TargetObservation::Exact => Ok(TargetState::Available),
+        TargetObservation::Different { .. } => Err(ReconcileError::TargetIdentityMismatch),
+    }
+}
+
+/// Converts a post-reconnect observation into an explicit reattach decision.
+///
+/// A missing target remains unavailable so a reconnect cannot silently spawn a
+/// new process or retarget an item by display name.
+pub fn reattach_target(observed: &TargetObservation) -> Result<ReattachAction, ReconcileError> {
+    match observed {
+        TargetObservation::Missing => Ok(ReattachAction::MarkUnavailable),
+        TargetObservation::Exact => Ok(ReattachAction::AttachExisting),
         TargetObservation::Different { .. } => Err(ReconcileError::TargetIdentityMismatch),
     }
 }
@@ -509,6 +529,14 @@ mod tests {
                 pane: "pane".into()
             }),
             Err(ReconcileError::TargetIdentityMismatch)
+        );
+        assert_eq!(
+            reattach_target(&TargetObservation::Exact),
+            Ok(ReattachAction::AttachExisting)
+        );
+        assert_eq!(
+            reattach_target(&TargetObservation::Missing),
+            Ok(ReattachAction::MarkUnavailable)
         );
     }
 }
