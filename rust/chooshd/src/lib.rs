@@ -1,6 +1,7 @@
 //! Authoritative, headlessly testable host-daemon state.
 
 pub mod adapters;
+pub mod annotation_store;
 pub mod blob;
 pub mod checkpoint;
 pub mod daemon;
