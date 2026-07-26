@@ -228,7 +228,7 @@ public-1.0 milestone has passed.
 
 | Milestone | State | Evidence / remaining gate |
 |---|---|---|
-| M0 — Foundation | **In progress** | Build, editor seams, bridge/RPC, release, SSH channel evidence, a generated-key Android-shaped fixed-RPC proof, API 36 x86_64 KVM device smoke, and bounded Android-Keystore Ed25519-to-Russh wire-signature vectors exist. The shipped M0 UI is a Java/View connection-status screen, not the future Compose shell. M0-R5/R6 still need the real JVM callback/socket-to-`chooshd` proof; M0-R7/R15 remain blocked on terminal provenance and device implementation. |
+| M0 — Foundation | **In progress** | Build, editor seams, bridge/RPC, release, SSH channel evidence, generated-key Android-shaped fixed-RPC proof, API 36 x86_64 KVM device smoke, and bounded Android Keystore/software RSA-to-Russh wire-signature probes exist. The shipped M0 UI is a Java/View connection-status screen, not the future Compose shell. M0-R5/R6 still need the real JVM callback/socket-to-`chooshd` proof; M0-R7/R15 remain blocked on terminal provenance and device implementation. |
 | M1 — Remote workspace | **Not started** | Depends on M0 SSH and terminal gates. Profile/known-host and root-confined SFTP read seams exist, but a concrete live transport, safe atomic writes, Zellij, Markdown, reconnect, and lifecycle acceptance remain future work. |
 | M2 — Agents and notifications | **Not started** | Adapter/event and Android notification slices await the M1 remote foundation. |
 | M3 — Pinning and services | **Not started** | Depends on M2 snapshots and verified SSH `direct-tcpip`. |
