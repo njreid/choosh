@@ -235,6 +235,7 @@ public-1.0 milestone has passed.
 | M4 — Editing and Git diff | **In progress** | Bounded Myers diff now has an identity-retaining `DiffRequest` seam for snapshot/entry/comparison-bound results, with deterministic empty-identity and text-path tests. The real daemon/SFTP/Git adapter and complete acceptance gate do not yet exist. |
 | M5 — Markdown review | **In progress** | Bounded safe-subset rendering and relative-asset gating pass headlessly; Markdown snapshot identity now scopes workspace/document, revision, and deterministic content digest. Annotation CRUD, re-anchoring, bounded export, workspace-scoped navigation, and atomic restart-safe annotation export persistence now have deterministic headless coverage. Android/device acceptance and live document rendering remain. |
 | M6 — Public 1.0 release | **In progress** | Aggregate `scripts/check-m6-release-readiness.sh` now passes specification, reproducibility, release-discovery, and five upgrade acceptance tests. Android connection surfaces expose stable accessibility targets and a polite live status region with headless contract coverage. Device instrumentation, migration, hardened host updates, and all prior gates remain. |
+| M7 — Versioned extensibility | **Planned** | Post-1.0 adapter/agent extension boundary is specified in [M7 extensibility](docs/milestones/M7-extensibility.md). Version negotiation, capability bounds, observational-only behavior, and failure isolation require a concrete headless gate before implementation. |
 
 ## Next increments
 
@@ -266,6 +267,9 @@ bounded resources, and a commit/push after verification.
    then the required emulator/device gates for the native terminal and connection lifecycle.
    Publish a release candidate only after the evidence manifest, SBOM, notices, updater
    verification, and Obtainium discovery checks are current.
+8. **M7 adapter contract.** Implement `adapter.describe-v1` behind explicit constructor-injected
+   capability interfaces, add the negative-path compatibility gate in the M7 acceptance matrix,
+   and document the outer composition root before accepting third-party adapters.
 
 ## Completion rule
 

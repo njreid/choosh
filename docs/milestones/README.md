@@ -6,7 +6,7 @@ Milestones are vertical, testable increments. A milestone is complete only when 
 flowchart TD
  M0["M0: Foundation"] --> M1["M1: Remote workspace"]
  M1 --> M2["M2: Agents"] --> M3["M3: Pinning and services"]
- M3 --> M4["M4: Editing and diff"] --> M5["M5: Markdown review"] --> M6["M6: Release"]
+ M3 --> M4["M4: Editing and diff"] --> M5["M5: Markdown review"] --> M6["M6: Release"] --> M7["M7: Extensibility"]
 ```
 
 | Milestone | Outcome | Detailed design | Channel |
@@ -18,5 +18,6 @@ flowchart TD
 | [M4](M4-editing-git-diff.md) | Safe editing and native Git review | [Design](../design/M4-editing-git-diff.md) | Alpha |
 | [M5](M5-markdown-review.md) | Annotatable project documents | [Design](../design/M5-markdown-review.md) | Beta |
 | [M6](M6-release.md) | Hardened Obtainium-compatible release | [Design](../design/M6-release.md) | Public 1.0 |
+| [M7](M7-extensibility.md) | Versioned, failure-isolated adapters | — | Post-1.0 |
 
 Every milestone MUST update affected specs/ADRs, test deterministic behavior, include an end-to-end acceptance scenario, preserve SSH/root confinement, bound all resources, and leave no ignored failing tests.
