@@ -32,7 +32,7 @@ public final class SmokeInstrumentation extends Instrumentation {
             try {
                 DisposableHostKeystoreIdentity identity = DisposableHostKeystoreIdentity.open();
                 evidence.putString("fixture_authorized_key", identity.authorizedKeyLine());
-                evidence.putString("fixture_identity", "android-keystore-ed25519-public-only");
+                evidence.putString("fixture_identity", "android-keystore-rsa-public-only");
                 finish(Activity.RESULT_OK, evidence);
             } catch (Exception failure) {
                 evidence.putString("fixture_identity", "android-keystore-unavailable");

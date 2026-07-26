@@ -30,11 +30,11 @@ result="$($adb_bin "${adb_args[@]}" shell am instrument -w -r \
   ai.choosh.test/ai.choosh.SmokeInstrumentation 2>/dev/null)"
 key_line="$(printf '%s\n' "$result" | sed -n 's/^INSTRUMENTATION_RESULT: fixture_authorized_key=//p' | tail -n 1)"
 identity="$(printf '%s\n' "$result" | sed -n 's/^INSTRUMENTATION_RESULT: fixture_identity=//p' | tail -n 1)"
-[[ "$identity" == 'android-keystore-ed25519-public-only' ]] || {
+[[ "$identity" == 'android-keystore-rsa-public-only' ]] || {
   echo 'android_bootstrap_keystore_unavailable' >&2
   exit 70
 }
-[[ "$key_line" =~ ^ssh-ed25519[[:space:]][A-Za-z0-9+/]+={0,2}$ ]] || {
+[[ "$key_line" =~ ^ssh-rsa[[:space:]][A-Za-z0-9+/]+={0,2}$ ]] || {
   echo 'android_bootstrap_public_key_invalid' >&2
   exit 70
 }

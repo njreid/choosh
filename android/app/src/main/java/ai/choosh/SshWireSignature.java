@@ -43,4 +43,19 @@ public final class SshWireSignature {
         result.put(rawSignature);
         return result.array();
     }
+
+    /** Returns the Russh signer value for a raw RSA-SHA256 signature. */
+    public static byte[] appendRsaSha256(byte[] payload, byte[] rawSignature) {
+        Objects.requireNonNull(payload, "payload");
+        Objects.requireNonNull(rawSignature, "rawSignature");
+        byte[] algorithm = "rsa-sha2-256".getBytes(StandardCharsets.US_ASCII);
+        if (payload.length == 0 || rawSignature.length == 0) {
+            throw new IllegalArgumentException("invalid SSH RSA signature input");
+        }
+        int content = 4 + algorithm.length + 4 + rawSignature.length;
+        ByteBuffer result = ByteBuffer.allocate(payload.length + 4 + content);
+        result.put(payload).putInt(content).putInt(algorithm.length).put(algorithm)
+            .putInt(rawSignature.length).put(rawSignature);
+        return result.array();
+    }
 }

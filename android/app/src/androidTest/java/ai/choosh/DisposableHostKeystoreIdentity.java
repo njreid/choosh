@@ -12,15 +12,15 @@ import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.Signature;
-import java.security.spec.ECGenParameterSpec;
+import java.math.BigInteger;
 
-/** Test-only non-exportable Ed25519 identity for the disposable-host instrumentation gate. */
+/** Test-only non-exportable RSA identity for the disposable-host instrumentation gate. */
 public final class DisposableHostKeystoreIdentity
     implements DisposableHostInstrumentationComposition.Identity,
         BoundedAndroidNativeRuntime.PublicKeySource,
         BoundedAndroidNativeRuntime.LeaseSignerSource {
-    private static final String ALIAS = "choosh.m0.disposable-host.ed25519";
-    private static final byte[] ALGORITHM = "ssh-ed25519".getBytes(StandardCharsets.US_ASCII);
+    private static final String ALIAS = "choosh.m0.disposable-host.rsa";
+    private static final byte[] ALGORITHM = "ssh-rsa".getBytes(StandardCharsets.US_ASCII);
     private final byte[] openSsh;
     private final String openSshLine;
     private final SshKeyImportCoordinator.OpaqueCredentialRef credential;
@@ -31,7 +31,7 @@ public final class DisposableHostKeystoreIdentity
         this.openSshLine = openSshLine;
         credential = new SshKeyImportCoordinator.OpaqueCredentialRef(ALIAS);
         publicKey = new SshKeyImportCoordinator.PublicKeyMetadata(
-            SshKeyImportCoordinator.SshPublicKeyAlgorithm.ED25519, fingerprint
+            SshKeyImportCoordinator.SshPublicKeyAlgorithm.RSA, fingerprint
         );
     }
 
@@ -40,22 +40,22 @@ public final class DisposableHostKeystoreIdentity
         KeyStore store = KeyStore.getInstance("AndroidKeyStore");
         store.load(null);
         if (!store.containsAlias(ALIAS)) {
-            KeyPairGenerator generator = KeyPairGenerator.getInstance(
-                KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore"
-            );
+            KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA", "AndroidKeyStore");
             generator.initialize(new KeyGenParameterSpec.Builder(
                 ALIAS, KeyProperties.PURPOSE_SIGN | KeyProperties.PURPOSE_VERIFY
-            ).setAlgorithmParameterSpec(new ECGenParameterSpec("Ed25519")).build());
+            ).setKeySize(2048).setDigests(KeyProperties.DIGEST_SHA256)
+                .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1).build());
             generator.generateKeyPair();
         }
         PublicKey key = store.getCertificate(ALIAS).getPublicKey();
         byte[] encoded = key.getEncoded();
-        if (encoded.length != 44) throw new IllegalStateException("unexpected Ed25519 public key");
-        byte[] raw = new byte[32];
-        System.arraycopy(encoded, encoded.length - raw.length, raw, 0, raw.length);
-        byte[] wire = ByteBuffer.allocate(4 + ALGORITHM.length + 4 + raw.length)
-            .putInt(ALGORITHM.length).put(ALGORITHM).putInt(raw.length).put(raw).array();
-        String keyText = "ssh-ed25519 " + Base64.encodeToString(wire, Base64.NO_WRAP);
+        java.security.interfaces.RSAPublicKey rsa = (java.security.interfaces.RSAPublicKey) key;
+        byte[] exponent = mpint(rsa.getPublicExponent());
+        byte[] modulus = mpint(rsa.getModulus());
+        byte[] wire = ByteBuffer.allocate(4 + ALGORITHM.length + 4 + exponent.length + 4 + modulus.length)
+            .putInt(ALGORITHM.length).put(ALGORITHM).putInt(exponent.length).put(exponent)
+            .putInt(modulus.length).put(modulus).array();
+        String keyText = "ssh-rsa " + Base64.encodeToString(wire, Base64.NO_WRAP);
         String fingerprint = "SHA256:" + Base64.encodeToString(
             MessageDigest.getInstance("SHA-256").digest(wire), Base64.NO_WRAP | Base64.NO_PADDING
         );
@@ -78,15 +78,20 @@ public final class DisposableHostKeystoreIdentity
                 store.load(null);
                 PrivateKey key = (PrivateKey) store.getKey(ALIAS, null);
                 if (key == null) throw new RustNativeConnectorJni.NativePlanException();
-                Signature signature = Signature.getInstance("Ed25519");
+                Signature signature = Signature.getInstance("SHA256withRSA");
                 signature.initSign(key);
                 signature.update(payload);
-                return SshWireSignature.appendEd25519(payload, signature.sign());
+                return SshWireSignature.appendRsaSha256(payload, signature.sign());
             } catch (RustNativeConnectorJni.NativePlanException exception) {
                 throw exception;
             } catch (Exception exception) {
                 throw new RustNativeConnectorJni.NativePlanException();
             }
         };
+    }
+
+    private static byte[] mpint(BigInteger value) {
+        byte[] bytes = value.toByteArray();
+        return bytes[0] == 0 ? java.util.Arrays.copyOfRange(bytes, 1, bytes.length) : bytes;
     }
 }
