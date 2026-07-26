@@ -36,6 +36,7 @@ public final class SmokeInstrumentation extends Instrumentation {
                 finish(Activity.RESULT_OK, evidence);
             } catch (Exception failure) {
                 evidence.putString("fixture_identity", "android-keystore-unavailable");
+                evidence.putString("fixture_failure_category", keyBootstrapFailureCategory(failure));
                 finish(Activity.RESULT_CANCELED, evidence);
             }
             return;
@@ -93,6 +94,15 @@ public final class SmokeInstrumentation extends Instrumentation {
         evidence.putString("connection_screen", "labels-and-unavailable-profile");
         evidence.putString("controlled_connector", "planned-native-git-status-ready");
         finish(Activity.RESULT_OK, evidence);
+    }
+
+    private static String keyBootstrapFailureCategory(Exception failure) {
+        String name = failure.getClass().getSimpleName();
+        if (name.contains("Algorithm")) return "algorithm-unavailable";
+        if (name.contains("Parameter")) return "curve-unavailable";
+        if (name.contains("KeyStore")) return "keystore-unavailable";
+        if (name.contains("Signature")) return "signature-unavailable";
+        return "provider-unavailable";
     }
 
     /** Loads the packaged JNI bridge and resolves its nested-class ABI entry point on-device. */
