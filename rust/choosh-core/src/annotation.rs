@@ -218,6 +218,11 @@ impl AnnotationRegistry {
         self.records.get(key)
     }
 
+    /// Returns records in stable key order for deterministic projections.
+    pub fn iter(&self) -> impl Iterator<Item = &Annotation> {
+        self.records.values()
+    }
+
     /// Updates an annotation body using optimistic concurrency.
     ///
     /// # Errors

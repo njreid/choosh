@@ -7,6 +7,7 @@ pub mod accessibility_evidence;
 pub mod actor;
 pub mod annotation;
 pub mod annotation_export;
+pub mod annotation_view;
 pub mod asset;
 pub mod backoff;
 pub mod backup_restore;
