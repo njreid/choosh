@@ -399,7 +399,10 @@ mod tests {
         ));
         let runner = manager.into_inner();
         assert_eq!(runner.calls.len(), 1);
-        assert_eq!(argv(&runner.calls[0]), ["bootstrap", "gui/501", "/opt/choosh/current/chooshd.plist"]);
+        assert_eq!(
+            argv(&runner.calls[0]),
+            ["bootstrap", "gui/501", "/opt/choosh/current/chooshd.plist"]
+        );
     }
 
     #[test]

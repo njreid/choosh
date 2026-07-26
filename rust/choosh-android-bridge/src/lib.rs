@@ -5,7 +5,9 @@
 
 #![allow(unsafe_code)] // Required only for Edition 2024's `no_mangle` ABI attribute.
 
-use choosh_android_transport::{AndroidRpcSession, BlockingAndroidIo, BlockingAndroidStream, StreamChunkLimits};
+use choosh_android_transport::{
+    AndroidRpcSession, BlockingAndroidIo, BlockingAndroidStream, StreamChunkLimits,
+};
 use choosh_core::ssh_identity::{PublicKeyFingerprint, PublicKeyMetadata, SshPublicKeyAlgorithm};
 use choosh_ssh::SshUsername;
 use jni::objects::{Global, JByteArray, JClass, JObject, JValue};
@@ -970,7 +972,11 @@ impl FixedRpcExecutor for AndroidRpcSession {
         &mut self,
         payload: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, ()>> + Send + '_>> {
-        Box::pin(async move { AndroidRpcSession::execute(self, &payload).await.map_err(|_| ()) })
+        Box::pin(async move {
+            AndroidRpcSession::execute(self, &payload)
+                .await
+                .map_err(|_| ())
+        })
     }
 }
 
@@ -1173,7 +1179,10 @@ pub extern "C" fn choosh_bridge_authenticated_plan_open(generation: u32, plan: u
     {
         return STATUS_INVALID_ARGUMENT;
     }
-    if !REQUESTS.iter().any(|slot| slot.load(Ordering::Acquire) == plan) {
+    if !REQUESTS
+        .iter()
+        .any(|slot| slot.load(Ordering::Acquire) == plan)
+    {
         return STATUS_UNKNOWN_REQUEST;
     }
     let Some(allocation) = take_pending_runtime_allocation(plan) else {
@@ -1210,7 +1219,9 @@ pub extern "C" fn choosh_bridge_authenticated_plan_open(generation: u32, plan: u
         actor,
         allocation,
     };
-    if !REQUESTS.iter().any(|slot| slot.load(Ordering::Acquire) == plan)
+    if !REQUESTS
+        .iter()
+        .any(|slot| slot.load(Ordering::Acquire) == plan)
         || !retain_connected_session(plan, capability.clone())
     {
         let _ = capability.close();
@@ -1370,7 +1381,9 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_00024JniPlanBridge_
 /// A null return is the Java boundary's content-free failure signal; Java maps it to its typed
 /// bridge exception and never exposes a partial native response.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_00024JniPlanBridge_nativeExecuteAuthenticatedSession<'local>(
+pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_00024JniPlanBridge_nativeExecuteAuthenticatedSession<
+    'local,
+>(
     mut unowned_environment: EnvUnowned<'local>,
     _class: JClass<'local>,
     generation: i32,
@@ -1389,7 +1402,9 @@ pub extern "system" fn Java_ai_choosh_RustNativeConnectorJni_00024JniPlanBridge_
             let plan = plan.cast_unsigned();
             if generation.cast_unsigned() != GENERATION.load(Ordering::Acquire)
                 || generation_of(plan) != generation.cast_unsigned()
-                || !REQUESTS.iter().any(|slot| slot.load(Ordering::Acquire) == plan)
+                || !REQUESTS
+                    .iter()
+                    .any(|slot| slot.load(Ordering::Acquire) == plan)
             {
                 return Ok(JByteArray::default());
             }
