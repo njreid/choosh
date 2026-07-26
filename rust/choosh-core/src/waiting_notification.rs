@@ -203,6 +203,20 @@ impl WaitingNotifications {
             .collect()
     }
 
+    /// Projects durable waiting state into bounded notification intents.
+    ///
+    /// The payload is fixed and redacted; agent-provided text is never forwarded.
+    #[must_use]
+    pub fn notification_intents(&self) -> Vec<crate::ports::NotificationIntent> {
+        self.notifications()
+            .into_iter()
+            .map(|notification| crate::ports::NotificationIntent::Upsert {
+                stable_id: format!("{}:{}", notification.agent.workspace(), notification.agent.item()),
+                coarse_reason: notification.text.to_owned(),
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> WaitingSnapshot {
         WaitingSnapshot {
@@ -284,6 +298,21 @@ mod tests {
         assert_eq!(notifications[0].text, WAITING_NOTIFICATION_TEXT);
         assert_eq!(notifications[0].activation.workspace, "workspace");
         assert_eq!(notifications[0].activation.item, "agent-a");
+    }
+
+    #[test]
+    fn notification_intents_are_redacted_and_stable() {
+        let mut projection = WaitingNotifications::new(1).unwrap();
+        projection
+            .apply(event(4, "agent", AgentProjectionState::Waiting))
+            .unwrap();
+        assert_eq!(
+            projection.notification_intents(),
+            vec![crate::ports::NotificationIntent::Upsert {
+                stable_id: "workspace:agent".into(),
+                coarse_reason: WAITING_NOTIFICATION_TEXT.into(),
+            }]
+        );
     }
 
     #[test]
