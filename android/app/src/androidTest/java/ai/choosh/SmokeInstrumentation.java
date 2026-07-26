@@ -29,6 +29,25 @@ public final class SmokeInstrumentation extends Instrumentation {
         start();
     }
     @Override public void onStart() {
+        if ("software-signer".equals(mode)) {
+            Bundle evidence = new Bundle();
+            try {
+                DisposableHostSoftwareIdentity identity =
+                    DisposableHostSoftwareIdentity.open(getTargetContext());
+                byte[] payload = new byte[] {1, 2, 3, 4};
+                byte[] signed = identity.bind(null).sign(payload);
+                require(signed.length > payload.length, "software signer returned no SSH envelope");
+                for (int index = 0; index < payload.length; index++) {
+                    require(signed[index] == payload[index], "software signer changed transcript");
+                }
+                evidence.putString("software_signer", "rsa-sha2-256-framed-payload");
+                finish(Activity.RESULT_OK, evidence);
+            } catch (Exception failure) {
+                evidence.putString("software_signer", "unavailable");
+                finish(Activity.RESULT_CANCELED, evidence);
+            }
+            return;
+        }
         if ("key-bootstrap".equals(mode)) {
             Bundle evidence = new Bundle();
             try {
