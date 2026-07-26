@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -155,6 +155,29 @@ impl RegisteredProjectRoot {
         self.open_prepared(&prepared)
     }
 
+    /// Reads a prepared file with a strict byte cap, rechecking identity first.
+    ///
+    /// This is the bounded primitive used by future SFTP/blob adapters; it
+    /// never returns a partial result when the cap is exceeded.
+    pub fn read_prepared(
+        &self,
+        prepared: &PreparedProjectFile,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ProjectFsError> {
+        if max_bytes == 0 {
+            return Err(ProjectFsError::InvalidConfiguration);
+        }
+        let file = self.open_prepared(prepared)?;
+        let mut bytes = Vec::with_capacity(max_bytes.min(8192));
+        file.take((max_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error(ProjectFsOperation::ReadTarget, &error))?;
+        if bytes.len() > max_bytes {
+            return Err(ProjectFsError::ReadLimitExceeded);
+        }
+        Ok(bytes)
+    }
+
     fn validate_root_identity(&self) -> Result<(), ProjectFsError> {
         let metadata = fs::symlink_metadata(&self.canonical)
             .map_err(|error| io_error(ProjectFsOperation::InspectRoot, &error))?;
@@ -217,6 +240,7 @@ pub enum ProjectFsOperation {
     OpenTarget,
     InspectOpenedTarget,
     CanonicalizeOpenedTarget,
+    ReadTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,6 +253,7 @@ pub enum ProjectFsError {
     NotRegularFile,
     WrongRoot,
     IdentityChanged,
+    ReadLimitExceeded,
     Io {
         operation: ProjectFsOperation,
         kind: io::ErrorKind,
@@ -253,6 +278,7 @@ impl fmt::Display for ProjectFsError {
             Self::NotRegularFile => formatter.write_str("project target is not a regular file"),
             Self::WrongRoot => formatter.write_str("prepared file belongs to another root"),
             Self::IdentityChanged => formatter.write_str("project filesystem identity changed"),
+            Self::ReadLimitExceeded => formatter.write_str("project file read limit exceeded"),
             Self::Io { operation, kind } => {
                 write!(
                     formatter,
@@ -322,6 +348,18 @@ mod tests {
         let mut contents = String::new();
         file.read_to_string(&mut contents).expect("read");
         assert_eq!(contents, "inside");
+    }
+
+    #[test]
+    fn bounded_read_is_all_or_nothing() {
+        let fixture = Fixture::new();
+        let root = fixture.registered();
+        let prepared = root.prepare("src/main.rs").expect("prepare");
+        assert_eq!(root.read_prepared(&prepared, 6).expect("read"), b"inside");
+        assert_eq!(
+            root.read_prepared(&prepared, 5),
+            Err(ProjectFsError::ReadLimitExceeded)
+        );
     }
 
     #[test]
