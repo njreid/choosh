@@ -20,19 +20,28 @@ import io.github.rosemoe.sora.widget.CodeEditor;
 
 public final class SmokeInstrumentation extends Instrumentation {
     private String mode;
+    private boolean softwareFixture;
 
     @Override public void onCreate(Bundle arguments) {
         super.onCreate(arguments);
         mode = arguments == null ? null : arguments.getString("choosh.mode");
+        softwareFixture = arguments != null && "true".equals(arguments.getString("choosh.fixture.software"));
         start();
     }
     @Override public void onStart() {
         if ("key-bootstrap".equals(mode)) {
             Bundle evidence = new Bundle();
             try {
-                DisposableHostKeystoreIdentity identity = DisposableHostKeystoreIdentity.open();
-                evidence.putString("fixture_authorized_key", identity.authorizedKeyLine());
-                evidence.putString("fixture_identity", "android-keystore-rsa-public-only");
+                boolean software = modeSoftwareFallback();
+                String identity;
+                if (software) {
+                    identity = DisposableHostSoftwareIdentity.open(getTargetContext()).authorizedKeyLine();
+                    evidence.putString("fixture_identity", "software-rsa-test-only");
+                } else {
+                    identity = DisposableHostKeystoreIdentity.open().authorizedKeyLine();
+                    evidence.putString("fixture_identity", "android-keystore-rsa-public-only");
+                }
+                evidence.putString("fixture_authorized_key", identity);
                 finish(Activity.RESULT_OK, evidence);
             } catch (Exception failure) {
                 evidence.putString("fixture_identity", "android-keystore-unavailable");
@@ -95,6 +104,8 @@ public final class SmokeInstrumentation extends Instrumentation {
         evidence.putString("controlled_connector", "planned-native-git-status-ready");
         finish(Activity.RESULT_OK, evidence);
     }
+
+    private boolean modeSoftwareFallback() { return softwareFixture; }
 
     private static String keyBootstrapFailureCategory(Exception failure) {
         String name = failure.getClass().getSimpleName();
