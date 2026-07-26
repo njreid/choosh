@@ -377,6 +377,22 @@ mod tests {
         );
         assert!(update_decision("1.2", "1.2.3").is_err());
     }
+
+    #[test]
+    fn upload_envelope_is_bounded_and_path_free() {
+        let payload = br#"{"schema_version":1,"version":"2.0.0","sha256":"0000000000000000000000000000000000000000000000000000000000000000","artifact":[1,2,3]}"#;
+        let upload = decode_upload_envelope(payload, 8).unwrap();
+        assert_eq!(upload.version(), "2.0.0");
+        assert!(
+            decode_upload_envelope(
+                br#"{"schema_version":1,"version":"2.0.0","sha256":"bad","artifact":[1]}"#,
+                8
+            )
+            .is_err()
+        );
+        assert!(decode_upload_envelope(br#"{"schema_version":1,"version":"2.0.0;sh","sha256":"0000000000000000000000000000000000000000000000000000000000000000","artifact":[1]}"#, 8).is_err());
+        assert!(decode_upload_envelope(br#"{"schema_version":1,"version":"2.0.0","sha256":"0000000000000000000000000000000000000000000000000000000000000000","artifact":[1,2,3]}"#, 2).is_err());
+    }
     use crate::service_manager::{
         ProcessOutcome, ServiceInvocation, ServiceProcessRunner, SystemdUserManager,
     };

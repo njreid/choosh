@@ -67,3 +67,9 @@ paths, atomic publication, manager argv, and private-socket health authority. It
 stage → digest → activate → service activation → version health, with one rollback after any
 post-activation failure. A future versioned SSH stdin envelope MUST decode to this upload type
 and invoke no broader capability.
+
+The schema-1 envelope contains only the release version, lowercase hexadecimal SHA-256 digest,
+and bounded artifact bytes. GitHub release discovery remains an Android-side authority: it selects
+the newest stable release, verifies checksum and signer evidence, then serializes this envelope over
+the authenticated SSH capability. The host never contacts GitHub and never accepts caller-supplied
+paths, executables, or service-manager arguments.
