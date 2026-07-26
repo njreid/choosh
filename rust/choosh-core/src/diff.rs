@@ -15,6 +15,53 @@ pub struct DiffLimits {
     pub context_lines: usize,
 }
 
+/// Immutable identity attached to one diff computation.
+///
+/// The host protocol addresses blobs by snapshot and entry rather than by a
+/// display path. Keeping that identity beside the bytes prevents callers from
+/// accidentally rendering a diff for a newer snapshot under an older entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffRequest {
+    pub snapshot_id: String,
+    pub entry_id: String,
+    pub comparison: Comparison,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Comparison {
+    Working,
+    Staged,
+    Combined,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentifiedDiff {
+    pub request: DiffRequest,
+    pub result: DiffResult,
+}
+
+/// Computes a diff while retaining the immutable request identity.
+///
+/// Empty identities are rejected before any bytes are inspected. The actual
+/// diff remains pure and bounded; this wrapper is the seam used by protocol
+/// adapters and navigation caches.
+#[must_use]
+pub fn compute_identified_diff(
+    request: DiffRequest,
+    metadata: DiffMetadata,
+    old: &[u8],
+    new: &[u8],
+    limits: DiffLimits,
+) -> Option<IdentifiedDiff> {
+    if request.snapshot_id.is_empty() || request.entry_id.is_empty() {
+        return None;
+    }
+    Some(IdentifiedDiff {
+        request,
+        result: compute_diff(metadata, old, new, limits),
+    })
+}
+
 impl Default for DiffLimits {
     fn default() -> Self {
         Self {
@@ -521,6 +568,44 @@ mod tests {
             new_mode: None,
             unsupported: None,
         }
+    }
+
+    #[test]
+    fn identified_diff_retains_snapshot_entry_and_comparison() {
+        let request = DiffRequest {
+            snapshot_id: "snap-1".into(),
+            entry_id: "entry-1".into(),
+            comparison: Comparison::Working,
+        };
+        let identified = compute_identified_diff(
+            request.clone(),
+            meta(ChangeKind::Modified),
+            b"old\n",
+            b"new\n",
+            DiffLimits::default(),
+        )
+        .expect("non-empty identity");
+        assert_eq!(identified.request, request);
+        assert!(matches!(identified.result, DiffResult::Text(_)));
+    }
+
+    #[test]
+    fn identified_diff_rejects_empty_identity_without_reading_bytes() {
+        let request = DiffRequest {
+            snapshot_id: String::new(),
+            entry_id: "entry-1".into(),
+            comparison: Comparison::Combined,
+        };
+        assert!(
+            compute_identified_diff(
+                request,
+                meta(ChangeKind::Modified),
+                &[0],
+                &[0],
+                DiffLimits::default(),
+            )
+            .is_none()
+        );
     }
     fn text(old: &[u8], new: &[u8]) -> TextDiff {
         match compute_diff(meta(ChangeKind::Modified), old, new, DiffLimits::default()) {
