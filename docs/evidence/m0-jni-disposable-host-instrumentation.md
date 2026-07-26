@@ -44,20 +44,25 @@ and injects the resulting `BoundedAndroidNativeRuntime` at the composition
 root. Private-key bytes, aliases, endpoint text, and host paths do not enter
 the bridge assertion output.
 
-The test-only `DisposableHostKeystoreIdentity` makes this a two-phase runner:
-the first instrumentation invocation creates/reuses a non-exportable Android
-Keystore Ed25519 alias and reports only its public `authorized_keys` line to
-the disposable-host provisioner. The provisioner then starts OpenSSH with that
-generated public identity. The connection invocation reports only redacted
-outcome categories; neither invocation emits private-key bytes or the alias.
+The preferred two-phase runner creates/reuses a non-exportable Android Keystore
+identity and reports only its public `authorized_keys` line to the disposable-
+host provisioner. The provisioner then starts OpenSSH with that generated
+public identity. The connection invocation reports only redacted outcome
+categories; neither invocation emits private-key bytes or the alias.
 The existing `SmokeInstrumentation` exposes this as a strict
 `choosh.mode=key-bootstrap` invocation; it emits the public line under
 `fixture_authorized_key` and otherwise reports only a success/unavailable
 category.
 
+When emulator Keystore remote provisioning is unavailable, the explicit
+`choosh.fixture.software=true` mode uses a temporary RSA key in the
+instrumentation sandbox. It is labeled `software-rsa-test-only`, never enters
+the production composition, and may validate transport/JNI/RPC ordering only;
+it MUST NOT be counted as Android Keystore evidence or an M0 exit.
+
 The headless command
 `scripts/bootstrap-disposable-host-android.sh` installs both debug APKs,
-invokes that mode, validates the `ssh-ed25519` public-key grammar, and prints
+invokes that mode, validates the `ssh-rsa` public-key grammar, and prints
 only the public line for the fixture provisioner. Missing ADB/device state is
 reported as `android_bootstrap_device_unavailable` with exit 69.
 
