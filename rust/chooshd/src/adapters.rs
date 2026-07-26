@@ -80,6 +80,83 @@ pub enum AdapterError {
     TooManyPaths,
     FieldTooLarge,
     UnsafePath,
+    InvalidHookInput,
+}
+
+/// Ingests one bounded JSON hook payload from a fixed-argv stdin adapter.
+///
+/// The adapter accepts exactly one argument naming the installed adapter and
+/// treats all stdin fields as untrusted observations. It never executes an
+/// agent command or emits a control decision.
+pub fn ingest_hook_stdin(
+    adapter: AdapterKind,
+    argv: &[&str],
+    stdin: &[u8],
+    limits: ObservationLimits,
+) -> Result<NormalizedObservation, AdapterError> {
+    let expected = match adapter {
+        AdapterKind::Codex => "codex",
+        AdapterKind::OpenCode => "opencode",
+        AdapterKind::ClaudeCode => "claude",
+    };
+    if argv.len() != 1 || argv[0] != expected || stdin.len() > limits.max_payload_bytes {
+        return Err(AdapterError::InvalidHookInput);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(stdin).map_err(|_| AdapterError::InvalidHookInput)?;
+    let object = value.as_object().ok_or(AdapterError::InvalidHookInput)?;
+    let kind = match object.get("kind").and_then(serde_json::Value::as_str) {
+        Some("input_required") => ObservationKind::InputRequired,
+        Some("turn_completed") => ObservationKind::TurnCompleted,
+        Some("files_changed") => ObservationKind::FilesChanged,
+        Some("busy") => ObservationKind::Busy,
+        Some("stopped") => ObservationKind::Stopped,
+        Some("failed") => ObservationKind::Failed,
+        _ => return Err(AdapterError::InvalidHookInput),
+    };
+    let string_field = |name: &str| {
+        object
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or(AdapterError::InvalidHookInput)
+    };
+    let paths = object
+        .get("paths")
+        .map(|v| {
+            v.as_array()
+                .ok_or(AdapterError::InvalidHookInput)
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .map(|item| {
+                            item.as_str()
+                                .map(str::to_owned)
+                                .ok_or(AdapterError::InvalidHookInput)
+                        })
+                        .collect()
+                })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let diagnostic_code = object
+        .get("diagnostic_code")
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or(AdapterError::InvalidHookInput)
+        })
+        .transpose()?;
+    normalize_observation(
+        HookObservation {
+            kind,
+            workspace_id: string_field("workspace_id")?,
+            item_id: string_field("item_id")?,
+            paths,
+            diagnostic_code,
+        },
+        limits,
+    )
 }
 
 /// Plans an explicit opt-in install without replacing unrelated bytes.
@@ -372,6 +449,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(event.paths, ["src/main.rs"]);
+    }
+
+    #[test]
+    fn stdin_hook_requires_fixed_argv_and_normalizes_json() {
+        let payload = br#"{"kind":"files_changed","workspace_id":"workspace-1","item_id":"item-1","paths":["src/lib.rs"]}"#;
+        let event = ingest_hook_stdin(
+            AdapterKind::Codex,
+            &["codex"],
+            payload,
+            ObservationLimits {
+                max_payload_bytes: 256,
+                ..limits()
+            },
+        )
+        .unwrap();
+        assert_eq!(event.kind, ObservationKind::FilesChanged);
+        assert_eq!(event.paths, ["src/lib.rs"]);
+        assert_eq!(
+            ingest_hook_stdin(AdapterKind::Codex, &["--approve"], payload, limits()),
+            Err(AdapterError::InvalidHookInput)
+        );
+    }
+
+    #[test]
+    fn stdin_hook_rejects_malformed_or_oversized_json() {
+        assert_eq!(
+            ingest_hook_stdin(AdapterKind::ClaudeCode, &["claude"], br"[]", limits()),
+            Err(AdapterError::InvalidHookInput)
+        );
+        let oversized = vec![b'x'; 81];
+        assert_eq!(
+            ingest_hook_stdin(AdapterKind::OpenCode, &["opencode"], &oversized, limits()),
+            Err(AdapterError::InvalidHookInput)
+        );
     }
 
     #[test]
