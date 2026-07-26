@@ -387,12 +387,14 @@ mod tests {
         pins.reconcile([agent("same")]);
 
         assert!(pins.focus_target(&agent("same")).unwrap());
-        assert!(!pins
-            .focus_target(&PinTarget::Service {
-                workspace: "workspace".into(),
-                item: "same".into(),
-            })
-            .unwrap());
+        assert!(
+            !pins
+                .focus_target(&PinTarget::Service {
+                    workspace: "workspace".into(),
+                    item: "same".into(),
+                })
+                .unwrap()
+        );
         assert!(!pins.focus_target(&agent("missing")).unwrap());
         assert!(pins.views()[0].focused);
     }

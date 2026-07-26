@@ -211,7 +211,11 @@ impl WaitingNotifications {
         self.notifications()
             .into_iter()
             .map(|notification| crate::ports::NotificationIntent::Upsert {
-                stable_id: format!("{}:{}", notification.agent.workspace(), notification.agent.item()),
+                stable_id: format!(
+                    "{}:{}",
+                    notification.agent.workspace(),
+                    notification.agent.item()
+                ),
                 coarse_reason: notification.text.to_owned(),
             })
             .collect()
