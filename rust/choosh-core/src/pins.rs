@@ -217,6 +217,23 @@ impl PinSet {
         Ok(())
     }
 
+    /// Focuses an exact target only when it is both pinned and currently available.
+    ///
+    /// This is the pinning-side activation seam: callers cannot substitute a similarly
+    /// named target, and unavailable placeholders remain untouched. The boolean result is
+    /// deliberately idempotent so reconnect/notification retries can safely repeat it.
+    pub fn focus_target(&mut self, target: &PinTarget) -> Result<bool, PinError> {
+        target.validate()?;
+        let Some(ordinal) = self.pins.iter().position(|pin| &pin.target == target) else {
+            return Ok(false);
+        };
+        if !self.available.contains(target) {
+            return Ok(false);
+        }
+        self.focused = Some(ordinal);
+        Ok(true)
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> Vec<StoredPin> {
         self.pins
@@ -356,5 +373,27 @@ mod tests {
         pins.toggle(agent("same")).unwrap();
         pins.toggle(service).unwrap();
         assert_eq!(pins.views().len(), 2);
+    }
+
+    #[test]
+    fn exact_target_activation_never_substitutes_unavailable_or_same_named_pin() {
+        let mut pins = PinSet::new(3).unwrap();
+        pins.toggle(agent("same")).unwrap();
+        pins.toggle(PinTarget::Service {
+            workspace: "workspace".into(),
+            item: "same".into(),
+        })
+        .unwrap();
+        pins.reconcile([agent("same")]);
+
+        assert!(pins.focus_target(&agent("same")).unwrap());
+        assert!(!pins
+            .focus_target(&PinTarget::Service {
+                workspace: "workspace".into(),
+                item: "same".into(),
+            })
+            .unwrap());
+        assert!(!pins.focus_target(&agent("missing")).unwrap());
+        assert!(pins.views()[0].focused);
     }
 }
