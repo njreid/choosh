@@ -41,6 +41,7 @@ pub struct MarkdownDocumentIdentity {
 
 /// Computes a deterministic identity without relying on platform or crypto
 /// providers. Callers must still authenticate the workspace/document keys.
+#[must_use]
 pub fn document_identity(
     workspace: &str,
     document: &str,
@@ -66,8 +67,8 @@ pub fn document_identity(
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
     })
 }
 

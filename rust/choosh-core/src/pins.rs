@@ -222,6 +222,10 @@ impl PinSet {
     /// This is the pinning-side activation seam: callers cannot substitute a similarly
     /// named target, and unavailable placeholders remain untouched. The boolean result is
     /// deliberately idempotent so reconnect/notification retries can safely repeat it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PinError::InvalidTarget`] when the target contains invalid fields.
     pub fn focus_target(&mut self, target: &PinTarget) -> Result<bool, PinError> {
         target.validate()?;
         let Some(ordinal) = self.pins.iter().position(|pin| &pin.target == target) else {
