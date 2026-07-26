@@ -6,6 +6,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 for command in cargo jq ssh sshd ssh-keygen python3 xxd; do
   command -v "$command" >/dev/null || { echo "host_acceptance_local_${command}_required" >&2; exit 69; }
 done
+sshd_bin="$(command -v sshd)"
 # OpenSSH builds used by Linux distributions commonly require this root-owned
 # privilege-separation directory even when the test server itself is unprivileged.
 [[ -d /run/sshd && -x /run/sshd ]] || { echo 'host_acceptance_local_sshd_privsep_unavailable' >&2; exit 69; }
@@ -77,8 +78,8 @@ done
 # Validate the generated server configuration before starting it, then keep its
 # only listener on loopback. No account, key, known-host record, or daemon state
 # escapes the fixture directory.
-sshd -t -f "$fixture/sshd_config"
-sshd -D -e -f "$fixture/sshd_config" >"$fixture/sshd.log" 2>&1 &
+"$sshd_bin" -t -f "$fixture/sshd_config"
+"$sshd_bin" -D -e -f "$fixture/sshd_config" >"$fixture/sshd.log" 2>&1 &
 sshd_pid=$!
 ready=false
 for _ in $(seq 1 100); do
@@ -87,7 +88,14 @@ for _ in $(seq 1 100); do
     "$username@127.0.0.1" true >/dev/null 2>&1 && { ready=true; break; }
   sleep 0.02
 done
-kill -0 "$sshd_pid" 2>/dev/null || { echo 'host_acceptance_local_sshd_unavailable' >&2; exit 70; }
+if ! kill -0 "$sshd_pid" 2>/dev/null; then
+  # Keep the failure class stable while exposing only daemon diagnostics with
+  # fixture paths removed; this distinguishes startup failure from login denial.
+  sed -E 's#(/tmp/)?choosh-host-acceptance-local[^ ]*#<fixture>#g' "$fixture/sshd.log" 2>/dev/null \
+    | tail -n 8 >&2 || true
+  echo 'host_acceptance_local_sshd_unavailable' >&2
+  exit 70
+fi
 "$ready" || { echo 'host_acceptance_local_ssh_login_unavailable' >&2; exit 70; }
 
 cat >"$fixture/config.json" <<EOF
