@@ -383,6 +383,26 @@ mod tests {
     }
 
     #[test]
+    fn launchd_rejection_stops_before_kickstart_or_path_reuse() {
+        let plist = LaunchdPlist::new("/opt/choosh/current/chooshd.plist").unwrap();
+        let mut manager = LaunchdManager::new(
+            RecordingRunner {
+                calls: Vec::new(),
+                reject_at: Some(1),
+            },
+            LaunchdUser::new(501).unwrap(),
+            plist,
+        );
+        assert!(matches!(
+            manager.activate(),
+            Err(ServiceManagerError::Rejected)
+        ));
+        let runner = manager.into_inner();
+        assert_eq!(runner.calls.len(), 1);
+        assert_eq!(argv(&runner.calls[0]), ["bootstrap", "gui/501", "/opt/choosh/current/chooshd.plist"]);
+    }
+
+    #[test]
     fn invalid_or_unsupported_hosts_fail_closed_without_invocation() {
         assert!(LaunchdUser::new(0).is_none());
         for path in [
