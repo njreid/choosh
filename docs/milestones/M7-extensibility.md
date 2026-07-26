@@ -1,6 +1,6 @@
 # M7 — Versioned extensibility
 
-Status: planned (post-1.0)
+Status: in progress (post-1.0 contract; acceptance gate pending)
 
 M7 defines a deliberately small extension boundary for host adapters and agent
 event providers. Extensions are optional capabilities, never a replacement for
@@ -41,4 +41,3 @@ The headless gate must prove, deterministically and without network access:
 Device and live-host work is deferred until this contract has a concrete outer
 composition root. No DI framework is introduced for M7; shared contracts stay
 framework-agnostic.
-

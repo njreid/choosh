@@ -1,6 +1,6 @@
 # Choosh delivery plan
 
-Status date: 2026-07-20
+Status date: 2026-07-26
 
 This is the operational status ledger.  The [delivery milestones](docs/milestones/README.md)
 remain the source of scope and exit gates; the [detailed designs](docs/design/README.md)
@@ -217,9 +217,12 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [ ] Bundled-font authoritative upstream identity, deterministic fallback layout
   evidence, and Sora distribution evidence remain release blockers; see
   [terminal provenance](docs/licenses/terminal-provenance.md) and [Sora packaging](docs/licenses/sora-packaging.md).
-- [ ] No preview currently supplies the opt-in redacted diagnostic bundle required
-  for supportable public distribution; its headless-first contract is in
-  [diagnostics](docs/specs/diagnostics.md).
+- [x] `chooshd` now has a bounded, allow-listed, redacted diagnostics manifest
+  serializer with deterministic headless coverage; it emits no paths, credentials,
+  payloads, or free-form exception text.
+- [ ] No preview currently wires that serializer to an opt-in user-controlled
+  diagnostic export required for supportable public distribution; its
+  headless-first contract is in [diagnostics](docs/specs/diagnostics.md).
 
 `v0.0.1` is an early signed distribution slice, not an assertion that M0 or a
 public-1.0 milestone has passed.
@@ -235,7 +238,7 @@ public-1.0 milestone has passed.
 | M4 — Editing and Git diff | **In progress** | Bounded Myers diff now has an identity-retaining `DiffRequest` seam for snapshot/entry/comparison-bound results, with deterministic empty-identity and text-path tests. The real daemon/SFTP/Git adapter and complete acceptance gate do not yet exist. |
 | M5 — Markdown review | **In progress** | Bounded safe-subset rendering and relative-asset gating pass headlessly; Markdown snapshot identity now scopes workspace/document, revision, and deterministic content digest. Annotation CRUD, re-anchoring, bounded export, workspace-scoped navigation, and atomic restart-safe annotation export persistence now have deterministic headless coverage. Android/device acceptance and live document rendering remain. |
 | M6 — Public 1.0 release | **In progress** | Aggregate `scripts/check-m6-release-readiness.sh` now passes specification, reproducibility, release-discovery, and five upgrade acceptance tests. Android connection surfaces expose stable accessibility targets and a polite live status region with headless contract coverage. Device instrumentation, migration, hardened host updates, and all prior gates remain. |
-| M7 — Versioned extensibility | **Planned** | Post-1.0 adapter/agent extension boundary is specified in [M7 extensibility](docs/milestones/M7-extensibility.md). Version negotiation, capability bounds, observational-only behavior, and failure isolation require a concrete headless gate before implementation. |
+| M7 — Versioned extensibility | **In progress** | The post-1.0 adapter/agent extension boundary is specified in [M7 extensibility](docs/milestones/M7-extensibility.md); bounded diagnostics export is covered by the [diagnostics specification](docs/specs/diagnostics.md). Version negotiation, capability bounds, observational-only behavior, and failure isolation still require a concrete headless gate. |
 
 ## Next increments
 
