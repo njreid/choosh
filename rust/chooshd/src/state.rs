@@ -427,4 +427,36 @@ mod tests {
         );
         assert!(state.workspace_snapshot().workspaces.is_empty());
     }
+
+    #[test]
+    fn subscription_replay_and_ack_survive_reconnect_cursor() {
+        let mut state = DaemonCoordinator::new(limits()).unwrap();
+        state.register_workspace(0, register("alpha")).unwrap();
+        state.append_event(&workspace("alpha"), 1, vec![1]).unwrap();
+        state.append_event(&workspace("alpha"), 2, vec![2]).unwrap();
+
+        let first = state.subscribe(&workspace("alpha"), 0).unwrap();
+        assert!(
+            matches!(first, Subscription::Replay { committed_high: 2, ref events, .. } if events.len() == 2)
+        );
+        state
+            .acknowledge_event(&workspace("alpha"), "android", 2)
+            .unwrap();
+
+        // A reconnect resumes strictly after the durable cursor and does not
+        // redeliver already acknowledged events.
+        state.append_event(&workspace("alpha"), 3, vec![3]).unwrap();
+        let resumed = state.subscribe(&workspace("alpha"), 2).unwrap();
+        assert!(
+            matches!(resumed, Subscription::Replay { committed_high: 3, ref events, .. } if events.iter().map(|e| e.sequence).collect::<Vec<_>>() == vec![3])
+        );
+        assert_eq!(
+            state
+                .event_checkpoint(&workspace("alpha"))
+                .unwrap()
+                .client_acks
+                .get("android"),
+            Some(&2)
+        );
+    }
 }
