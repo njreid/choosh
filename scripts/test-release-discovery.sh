@@ -6,6 +6,16 @@ source_fixture="$root/scripts/fixtures/release-discovery"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+"$root/scripts/check-release-reproducibility.sh" "$source_fixture" |
+  grep -Eq '^release_reproducibility_ok artifacts=7 manifest=[0-9a-f]{64}$'
+
+cp -R "$source_fixture" "$work/tampered-artifact"
+printf x >> "$work/tampered-artifact/releases.json"
+if "$root/scripts/check-release-reproducibility.sh" "$work/tampered-artifact" >/dev/null 2>&1; then
+  echo 'tampered release artifact was accepted' >&2
+  exit 1
+fi
+
 "$root/scripts/check-release-discovery.sh" "$source_fixture" |
   grep -Eq '^release_discovery_ok tag=v0\.2\.0 apk=choosh-0\.2\.0\.apk sha256=[0-9a-f]{64}$'
 

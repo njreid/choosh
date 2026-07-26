@@ -234,7 +234,7 @@ public-1.0 milestone has passed.
 | M3 — Pinning and services | **In progress** | PinSet now exposes an exact-target activation seam: unavailable placeholders and same-named different kinds are never substituted; deterministic headless coverage passes. Service gateway, terminal rebinding, and verified SSH `direct-tcpip` acceptance remain. |
 | M4 — Editing and Git diff | **In progress** | Bounded Myers diff now has an identity-retaining `DiffRequest` seam for snapshot/entry/comparison-bound results, with deterministic empty-identity and text-path tests. The real daemon/SFTP/Git adapter and complete acceptance gate do not yet exist. |
 | M5 — Markdown review | **In progress** | Bounded safe-subset rendering and relative-asset gating pass headlessly; Markdown snapshot identity now scopes workspace/document, revision, and deterministic content digest. Annotation CRUD, re-anchoring, bounded export, and a constructor-injected workspace-scoped navigation projection now have deterministic headless coverage. Android/device acceptance and live persistence wiring remain. |
-| M6 — Public 1.0 release | **Not started** | 0.0.1 proves a release lane only; reproducibility, device/accessibility, migration, hardened host updates, and all prior gates remain. |
+| M6 — Public 1.0 release | **In progress** | Release discovery now has a deterministic artifact manifest gate (`scripts/check-release-reproducibility.sh`) covering every bounded fixture asset and rejecting tampering. Device/accessibility, migration, hardened host updates, and all prior gates remain. |
 
 ## Next increments
 
