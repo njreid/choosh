@@ -11,6 +11,31 @@ use crate::service_manager::ServiceManager;
 
 const MAX_VERSION_BYTES: usize = 64;
 
+/// Result of comparing a verified GitHub release with the host's active version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateDecision {
+    UpToDate,
+    Install,
+}
+
+/// Compares canonical `MAJOR.MINOR.PATCH` versions without accepting paths or shell text.
+pub fn update_decision(installed: &str, latest: &str) -> Result<UpdateDecision, DeploymentError> {
+    fn parse(value: &str) -> Option<[u64; 3]> {
+        let mut parts = value.strip_prefix('v').unwrap_or(value).split('.');
+        let parsed = [
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        ];
+        parts.next().is_none().then_some(parsed)
+    }
+    let installed = parse(installed).ok_or(DeploymentError::InvalidVersion)?;
+    let latest = parse(latest).ok_or(DeploymentError::InvalidVersion)?;
+    Ok((latest > installed)
+        .then_some(UpdateDecision::Install)
+        .unwrap_or(UpdateDecision::UpToDate))
+}
+
 /// One verified release upload accepted by the host deployment boundary.
 #[derive(Clone, Eq, PartialEq)]
 pub struct DeploymentUpload {
@@ -280,6 +305,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_decision_is_strict_and_monotonic() {
+        assert_eq!(
+            update_decision("v1.2.3", "1.2.3").unwrap(),
+            UpdateDecision::UpToDate
+        );
+        assert_eq!(
+            update_decision("1.2.3", "1.2.4").unwrap(),
+            UpdateDecision::Install
+        );
+        assert_eq!(
+            update_decision("1.3.0", "1.2.99").unwrap(),
+            UpdateDecision::UpToDate
+        );
+        assert!(update_decision("1.2", "1.2.3").is_err());
+    }
     use crate::service_manager::{
         ProcessOutcome, ServiceInvocation, ServiceProcessRunner, SystemdUserManager,
     };
