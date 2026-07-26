@@ -25,22 +25,27 @@ public final class MainActivity extends Activity {
         root.setPadding(inset, inset, inset, inset);
 
         TextView heading = new TextView(this);
+        heading.setContentDescription(AccessibilitySemantics.HEADING);
         heading.setText(R.string.app_name);
         heading.setTextSize(32);
         heading.setTypeface(getResources().getFont(R.font.choosh_terminal), Typeface.BOLD);
         root.addView(heading, new LinearLayout.LayoutParams(-1, -2));
 
         EditText profile = new EditText(this);
+        profile.setContentDescription(AccessibilitySemantics.PROFILE_FIELD);
         profile.setHint(R.string.profile_hint);
         profile.setSingleLine(true);
         profile.setInputType(android.text.InputType.TYPE_CLASS_TEXT);
         root.addView(profile, new LinearLayout.LayoutParams(-1, -2));
 
         connect = new Button(this);
+        connect.setContentDescription(AccessibilitySemantics.CONNECT_ACTION);
         connect.setText(R.string.connect);
         root.addView(connect, new LinearLayout.LayoutParams(-1, -2));
 
         status = new TextView(this);
+        status.setContentDescription(AccessibilitySemantics.STATUS);
+        status.setLiveRegion(android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE);
         status.setTypeface(getResources().getFont(R.font.choosh_ui));
         status.setPadding(0, inset, 0, 0);
         root.addView(status, new LinearLayout.LayoutParams(-1, -2));
