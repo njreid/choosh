@@ -1,6 +1,6 @@
 # Choosh delivery plan
 
-Status date: 2026-07-26
+Status date: 2026-07-31
 
 This is the operational status ledger.  The [delivery milestones](docs/milestones/README.md)
 remain the source of scope and exit gates; the [detailed designs](docs/design/README.md)
@@ -192,9 +192,9 @@ named slice has evidence, **not** that its enclosing milestone is complete.
   parallel headless test execution.
 - [x] Handshake, request, and socket-relay readers admit two coalesced frames solely to
   classify duplicate replies explicitly, then fail closed before accepting either result.
-- [x] Linux daemon accepts verify `SO_PEERCRED` against the daemon effective UID before
-  protocol reads. Non-Linux Unix builds fail closed until an equivalent credential adapter
-  is implemented.
+- [x] Linux daemon accepts verify `SO_PEERCRED` and macOS accepts verify `getpeereid`,
+  both against the daemon effective UID before protocol reads. Unix platforms other than
+  those two fail closed until an equivalent credential adapter is implemented.
 - [x] Reconnect policy now rejects first-trust downgrade after an authenticated generation;
   a deterministic headless acceptance test proves logical retry timing, stale-channel
   invalidation, terminal changed-key handling, and replay-versus-snapshot recovery actions.
@@ -223,6 +223,34 @@ named slice has evidence, **not** that its enclosing milestone is complete.
 - [ ] No preview currently wires that serializer to an opt-in user-controlled
   diagnostic export required for supportable public distribution; its
   headless-first contract is in [diagnostics](docs/specs/diagnostics.md).
+- [ ] `chooshd`'s own outer composition root does not exist. The shipped `chooshd serve`
+  binary constructs the default RPC graph with no registered workspace and no events
+  coordinator, and its CLI accepts only `--state-dir` and `--socket`. A deployed daemon
+  therefore answers `host.describe` only: `git.status` returns `not_found` and both
+  `events.*` methods return `unsupported`. Every passing `git.status` and events result
+  is evidence for the protocol and adapter seams, not for a daemon a user could run.
+  Workspace registration, durable state load, Git adapter construction, and event-spool
+  wiring remain unwritten.
+- [ ] M0-R13 is not met. The build applies no Kotlin plugin and declares no Compose
+  dependency, and every Android source is Java, so only the AGP/Sora/bridge portion of
+  that requirement is proven; the [toolchain specification](docs/specs/android-toolchain.md)
+  now records this adoption state explicitly.
+- [ ] The M2 notification stack has no Android component. `AndroidNotificationSink` and
+  `NotificationServiceLifecycle` have headless JVM coverage, but the manifest declares no
+  service or receiver and nothing constructs them outside tests. Their runtime permissions
+  are deliberately undeclared until that component exists.
+- [x] A review on 2026-07-31 found the workspace clippy gate red since 2026-07-25 and the
+  Android Java sources non-compiling since `d2290af` (`TextView.setLiveRegion` is not an
+  Android API) and again since `a805502` (a missing `StagingPlan.version()` accessor). Both
+  are fixed. `just check` now runs clippy, a new `scripts/check-android-sources.sh` compiles
+  the Android sources against the pinned platform SDK, and the host deployment, aggregate
+  M6 readiness, and loopback OpenSSH gates now run in CI instead of only locally.
+- [x] The packaged app now declares `android.permission.INTERNET`; the manifest previously
+  declared no permission at all, so no SSH transport could have opened a socket on a device.
+  The static policy gate pins the declared set to exactly that one permission.
+- [x] The host update envelope carries its artifact as canonical unpadded base64url rather
+  than a JSON decimal array, with a golden Android-produced envelope pinned in the host
+  decoder tests.
 
 `v0.0.1` is an early signed distribution slice, not an assertion that M0 or a
 public-1.0 milestone has passed.
@@ -231,12 +259,12 @@ public-1.0 milestone has passed.
 
 | Milestone | State | Evidence / remaining gate |
 |---|---|---|
-| M0 — Foundation | **In progress** | Build, editor seams, bridge/RPC, release, SSH channel evidence, generated-key Android-shaped fixed-RPC proof, API 36 x86_64 KVM device smoke, bounded Android Keystore/software RSA-to-Russh wire-signature probes, real local `chooshd` private-socket framing, and loopback OpenSSH/`chooshd` acceptance now pass headlessly. The shipped M0 UI is a Java/View connection-status screen, not the future Compose shell. M0-R5/R6 still need the real JVM callback/socket-to-`chooshd` proof; M0-R7/R15 remain blocked on terminal provenance and device implementation. |
-| M1 — Remote workspace | **In progress** | Host-owned immutable deployment transaction now has a deterministic headless gate (`scripts/test-host-deployment.sh`): bounded version/artifact admission, digest verification, atomic activation, fixed per-user service-manager activation, private health check, and one rollback are covered with injected fakes. Profile/known-host, root-confined SFTP read, exact-target Zellij reattach, Zellij command smoke, and a framework-agnostic relative-asset safety gate pass headlessly; reconnect marks missing targets unavailable and never recreates or retargets them. A concrete live transport, safe atomic writes, full Markdown rendering/CSP, and lifecycle acceptance remain future work. |
-| M2 — Agents and notifications | **In progress** | Core event spool, adapter normalization, fixed-argv bounded hook ingestion, redacted waiting-notification projection into stable notification intents, exact-target notification activation, Android constructor-injected notification lifecycle, API-safe keyed `NotificationManager` sink, and bounded replay/ack tests pass headlessly. Versioned `events.subscribe-v1` and `events.ack-v1` RPCs now provide bounded replay or `snapshot_required` responses with typed validation. Device acceptance remains the final gate. |
+| M0 — Foundation | **In progress** | Build, editor seams, bridge/RPC, release, SSH channel evidence, generated-key Android-shaped fixed-RPC proof, API 36 x86_64 KVM device smoke, bounded Android Keystore/software RSA-to-Russh wire-signature probes, real local `chooshd` private-socket framing, and loopback OpenSSH/`chooshd` acceptance now pass headlessly. The shipped M0 UI is a Java/View connection-status screen, not the future Compose shell. M0-R5/R6 still need the real JVM callback/socket-to-`chooshd` proof; M0-R7/R10/R15 have no implementation at all (no renderer, gateway listener, or native terminal graph is present); M0-R13 is unmet while Kotlin and Compose are unadopted. |
+| M1 — Remote workspace | **In progress** | Host-owned immutable deployment transaction now has a deterministic headless gate (`scripts/test-host-deployment.sh`): bounded version/artifact admission, digest verification, atomic activation, fixed per-user service-manager activation, private health check, and one rollback are covered with injected fakes. Profile/known-host, root-confined SFTP read, exact-target Zellij reattach, Zellij command smoke, and a framework-agnostic relative-asset safety gate pass headlessly; reconnect marks missing targets unavailable and never recreates or retargets them. None of R1–R8 is reachable from a running binary: these are decision functions awaiting `chooshd`'s composition root. A concrete live transport, safe atomic writes, full Markdown rendering/CSP, and lifecycle acceptance remain future work. |
+| M2 — Agents and notifications | **In progress** | Core event spool, adapter normalization, fixed-argv bounded hook ingestion, redacted waiting-notification projection into stable notification intents, exact-target notification activation, Android constructor-injected notification lifecycle, API-safe keyed `NotificationManager` sink, and bounded replay/ack tests pass headlessly. Versioned `events.subscribe-v1` and `events.ack-v1` RPCs are implemented and typed, but the shipped daemon registers no events coordinator, so they answer `unsupported` in a real deployment. No Android service or receiver is declared, so the notification sink has no runtime caller. An Android component and daemon composition root precede device acceptance. |
 | M3 — Pinning and services | **In progress** | PinSet now exposes an exact-target activation seam: unavailable placeholders and same-named different kinds are never substituted; deterministic headless coverage passes. Service gateway, terminal rebinding, and verified SSH `direct-tcpip` acceptance remain. |
 | M4 — Editing and Git diff | **In progress** | Bounded Myers diff now has an identity-retaining `DiffRequest` seam for snapshot/entry/comparison-bound results, with deterministic empty-identity and text-path tests. The real daemon/SFTP/Git adapter and complete acceptance gate do not yet exist. |
-| M5 — Markdown review | **In progress** | Bounded safe-subset rendering and relative-asset gating pass headlessly; Markdown snapshot identity now scopes workspace/document, revision, and deterministic content digest. Annotation CRUD, re-anchoring, bounded export, workspace-scoped navigation, and atomic restart-safe annotation export persistence now have deterministic headless coverage. Android/device acceptance and live document rendering remain. |
+| M5 — Markdown review | **In progress** | Bounded safe-subset rendering and relative-asset gating pass headlessly; Markdown snapshot identity now scopes workspace/document, revision, and deterministic content digest. Annotation CRUD, re-anchoring, bounded export, workspace-scoped navigation, and atomic restart-safe annotation export persistence now have deterministic headless coverage. M5-R2 has no implementation: there is no Maud or Datastar dependency and `choosh-web` exposes no listener. Android/device acceptance and live document rendering remain. |
 | M6 — Public 1.0 release | **In progress** | Aggregate `scripts/check-m6-release-readiness.sh` now passes specification, reproducibility, release-discovery, and five upgrade acceptance tests. Android connection surfaces expose stable accessibility targets and a polite live status region with headless contract coverage. Device instrumentation, migration, hardened host updates, and all prior gates remain. |
 | M7 — Versioned extensibility | **In progress** | The post-1.0 adapter/agent extension boundary is specified in [M7 extensibility](docs/milestones/M7-extensibility.md); bounded diagnostics export is covered by the [diagnostics specification](docs/specs/diagnostics.md). Version negotiation, capability bounds, observational-only behavior, and failure isolation still require a concrete headless gate. |
 
@@ -256,10 +284,17 @@ bounded resources, and a commit/push after verification.
    socket, and rolls back to the previous version on failure. Support `systemd --user` and
    `launchd` explicitly; unsupported hosts fail closed rather than using shell backgrounding.
    The service and Zellij processes must survive Android transport loss.
-3. **Then widen host/SFTP operations.** Compose the injected host process adapter and add
+3. **Give `chooshd` an outer composition root.** This now gates M1 and M2 more than any
+   remaining domain work. The daemon must load durable state, register workspaces from
+   explicit configuration, construct the Git adapter, and attach the events coordinator, so
+   that `git.status` and `events.*` answer from a binary a user can run rather than only from
+   a handler graph assembled inside a test. The ratio of dependency-free policy in
+   `choosh-core` to composed capability keeps growing; each new domain module raises the cost
+   of this pass.
+4. **Then widen host/SFTP operations.** Compose the injected host process adapter and add
    only server-proven root-confined/atomic SFTP operations after the first vertical thread
    is reachable.
-4. **Terminal go/no-go.** Preserve the recorded Zelland grant, close native and
+5. **Terminal go/no-go.** Preserve the recorded Zelland grant, close native and
    font provenance gates, then implement the wgpu renderer behind the existing
    interface (or approve the specified CPU cell-grid fallback by ADR) and run
    headless conformance plus isolated device instrumentation.
@@ -273,6 +308,8 @@ bounded resources, and a commit/push after verification.
 8. **M7 adapter contract.** Implement `adapter.describe-v1` behind explicit constructor-injected
    capability interfaces, add the negative-path compatibility gate in the M7 acceptance matrix,
    and document the outer composition root before accepting third-party adapters.
+9. **Pin a Zellij version and checksum** so `scripts/test-zellij-smoke.sh` can run in CI
+   instead of only on a developer machine.
 
 ## Completion rule
 
