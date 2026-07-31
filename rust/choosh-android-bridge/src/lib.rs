@@ -6,7 +6,8 @@
 #![allow(unsafe_code)] // Required only for Edition 2024's `no_mangle` ABI attribute.
 
 use choosh_android_transport::{
-    AndroidRpcSession, BlockingAndroidIo, BlockingAndroidStream, StreamChunkLimits,
+    AndroidIoFailure, AndroidRpcSession, BlockingAndroidIo, BlockingAndroidStream,
+    StreamChunkLimits,
 };
 use choosh_core::ssh_identity::{PublicKeyFingerprint, PublicKeyMetadata, SshPublicKeyAlgorithm};
 use choosh_ssh::SshUsername;
@@ -30,6 +31,10 @@ const STATUS_TRANSPORT_UNAVAILABLE: i32 = 5;
 const AUTHENTICATED_PLAN_STATUS: u32 = 8;
 const SLOT_COUNT: usize = 64;
 const MAX_RUNTIME_CALLBACK_BYTES: u64 = 65_536;
+/// Bytes requested from one Android socket callback. Stays under
+/// [`MAX_RUNTIME_CALLBACK_BYTES`] so a single bounded read or write can never
+/// exceed the callback's own admission limit.
+const CALLBACK_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_RUNTIME_METADATA_BYTES: usize = 256;
 const MAX_RUNTIME_PUBLIC_KEY_BYTES: usize = 8 * 1024;
 const RUNTIME_METADATA_VERSION: u8 = 1;
@@ -245,9 +250,17 @@ pub trait RuntimeCallbacks {
     type Error;
 
     /// Returns the fixed, non-secret identity metadata for this lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns the callback's content-free failure for a stale or released lease.
     fn metadata(&self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error>;
 
     /// Returns the canonical OpenSSH public key fixed to this signing lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns the callback's content-free failure for a stale or released lease.
     fn public_key(&self, lease: RuntimeLeaseHandle) -> Result<Vec<u8>, Self::Error>;
 
     /// # Errors
@@ -733,12 +746,12 @@ impl<C> BlockingAndroidIo for RuntimeAllocation<C>
 where
     C: RuntimeCallbacks + Send + Sync + 'static,
 {
-    fn read(&self, output: &mut [u8]) -> Result<usize, ()> {
-        self.read(output).map_err(|_| ())
+    fn read(&self, output: &mut [u8]) -> Result<usize, AndroidIoFailure> {
+        self.read(output).map_err(|_| AndroidIoFailure)
     }
 
-    fn write(&self, input: &[u8]) -> Result<(), ()> {
-        self.write(input).map_err(|_| ())
+    fn write(&self, input: &[u8]) -> Result<(), AndroidIoFailure> {
+        self.write(input).map_err(|_| AndroidIoFailure)
     }
 }
 
@@ -827,6 +840,11 @@ impl<S> SessionRegistry<S> {
     }
 
     /// Inserts one plan-owned session without replacing another plan's session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionRegistryError::InvalidPlan`] for a zero or already-owning
+    /// plan and [`SessionRegistryError::Capacity`] when every slot is occupied.
     pub fn insert(&mut self, plan: u64, session: S) -> Result<(), SessionRegistryError> {
         if plan == 0
             || self
@@ -844,6 +862,7 @@ impl<S> SessionRegistry<S> {
     }
 
     /// Removes the sole session owned by a plan.
+    #[must_use]
     pub fn remove(&mut self, plan: u64) -> Option<S> {
         self.slots.iter_mut().find_map(|slot| {
             (slot.as_ref().is_some_and(|(owned, _)| *owned == plan))
@@ -857,6 +876,10 @@ impl<S> SessionRegistry<S> {
     ///
     /// The closure receives no token table or registry access, so it cannot select another
     /// plan's session or insert a replacement while an operation is in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionRegistryError::InvalidPlan`] when the plan owns no session.
     pub fn with_session<T>(
         &mut self,
         plan: u64,
@@ -873,6 +896,10 @@ impl<S> SessionRegistry<S> {
     }
 
     /// Clones one plan-owned operation capability without retaining a registry borrow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionRegistryError::InvalidPlan`] when the plan owns no session.
     pub fn capability(&self, plan: u64) -> Result<S, SessionRegistryError>
     where
         S: Clone,
@@ -944,6 +971,12 @@ impl SessionActor {
         Self { sender }
     }
 
+    /// Runs one bounded fixed-RPC payload through this session's command queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns the actor's content-free failure when the queue is full, the
+    /// session has closed, or the RPC did not produce a reply.
     pub async fn execute(&self, payload: Vec<u8>) -> Result<Vec<u8>, ()> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.sender
@@ -959,6 +992,11 @@ impl SessionActor {
 
 impl SessionRegistry<SessionActor> {
     /// Executes fixed RPC after cloning the owner capability and dropping the registry borrow.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content-free failure when the plan owns no session or the RPC
+    /// did not complete.
     pub async fn execute_rpc(&self, plan: u64, payload: Vec<u8>) -> Result<Vec<u8>, ()> {
         self.capability(plan)
             .map_err(|_| ())?
@@ -1189,29 +1227,24 @@ pub extern "C" fn choosh_bridge_authenticated_plan_open(generation: u32, plan: u
         return STATUS_TRANSPORT_UNAVAILABLE;
     };
     let allocation = Arc::new(allocation);
-    let runtime = match Runtime::new() {
-        Ok(runtime) => Arc::new(runtime),
-        Err(_) => {
-            let _ = allocation.close();
-            return STATUS_TRANSPORT_UNAVAILABLE;
-        }
+    // This is an `extern "C"` entry point, so every failure below fails closed with a
+    // status code. Nothing here may panic and unwind across the JNI boundary.
+    let Some(limits) = StreamChunkLimits::new(CALLBACK_CHUNK_BYTES, CALLBACK_CHUNK_BYTES) else {
+        let _ = allocation.close();
+        return STATUS_TRANSPORT_UNAVAILABLE;
     };
-    let transport = match RuntimeLeaseTransport::new(
-        Arc::clone(&allocation),
-        StreamChunkLimits::new(16 * 1024, 16 * 1024).expect("constant chunk limits are valid"),
-    ) {
-        Ok(transport) => transport,
-        Err(_) => {
-            let _ = allocation.close();
-            return STATUS_TRANSPORT_UNAVAILABLE;
-        }
+    let Ok(runtime) = Runtime::new() else {
+        let _ = allocation.close();
+        return STATUS_TRANSPORT_UNAVAILABLE;
     };
-    let connection = match runtime.block_on(transport.connect()) {
-        Ok(connection) => connection,
-        Err(_) => {
-            let _ = allocation.close();
-            return STATUS_TRANSPORT_UNAVAILABLE;
-        }
+    let runtime = Arc::new(runtime);
+    let Ok(transport) = RuntimeLeaseTransport::new(Arc::clone(&allocation), limits) else {
+        let _ = allocation.close();
+        return STATUS_TRANSPORT_UNAVAILABLE;
+    };
+    let Ok(connection) = runtime.block_on(transport.connect()) else {
+        let _ = allocation.close();
+        return STATUS_TRANSPORT_UNAVAILABLE;
     };
     let actor = runtime.block_on(async { SessionActor::spawn(AndroidRpcSession::new(connection)) });
     let capability = NativeSessionCapability {

@@ -72,6 +72,7 @@ impl DaemonRpc {
     /// Adds the coordinator-owned event subscription surface. The mutex is
     /// deliberately supplied by the composition root so request workers never
     /// acquire hidden global state.
+    #[must_use]
     pub fn with_events(mut self, coordinator: Arc<Mutex<DaemonCoordinator>>) -> Self {
         self.events = Some(coordinator);
         self
@@ -188,7 +189,7 @@ impl DaemonRpc {
                 let events: Vec<Value> = events.into_iter().map(|e| json!({"sequence":e.sequence,"received_at":e.received_at,"payload_b64":base64_url_unpadded(&e.payload)})).collect();
                 json_response(
                     request,
-                    json!({"retained_low":retained_low,"committed_high":committed_high,"events":events}),
+                    &json!({"retained_low":retained_low,"committed_high":committed_high,"events":events}),
                     max,
                 )
             }
@@ -197,7 +198,7 @@ impl DaemonRpc {
                 committed_high,
             }) => json_response(
                 request,
-                json!({"retained_low":retained_low,"committed_high":committed_high,"snapshot_required":true}),
+                &json!({"retained_low":retained_low,"committed_high":committed_high,"snapshot_required":true}),
                 max,
             ),
             Err(_) => error_response(request, "not_found", "workspace not found", max),
@@ -225,7 +226,7 @@ impl DaemonRpc {
             .map_err(|_| DaemonError::WorkerFailed)?
             .acknowledge_event(&workspace, &client, sequence);
         match result {
-            Ok(()) => json_response(request, json!({}), max),
+            Ok(()) => json_response(request, &json!({}), max),
             Err(_) => error_response(
                 request,
                 "invalid_request",
@@ -260,7 +261,7 @@ fn ack_params(value: &Value) -> Option<(choosh_core::workspace::WorkspaceId, Str
 }
 fn json_response(
     request: &choosh_protocol::envelope::Request<Value>,
-    result: Value,
+    result: &Value,
     max: usize,
 ) -> Result<Vec<u8>, DaemonError> {
     let bytes =

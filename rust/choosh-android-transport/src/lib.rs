@@ -69,6 +69,14 @@ pub struct BoundedAndroidStream<S> {
     read_scratch: Box<[u8]>,
 }
 
+/// Opaque failure of one Android callback operation.
+///
+/// The Android side deliberately reports no message, path, errno, or byte
+/// content across this boundary. The type carries no payload so a callback
+/// cannot widen the boundary by attaching diagnostic text to a failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AndroidIoFailure;
+
 /// Thread-safe, bounded byte capability supplied by an Android runtime lease.
 ///
 /// Implementors may block while entering their platform socket API. The
@@ -77,10 +85,20 @@ pub struct BoundedAndroidStream<S> {
 /// separate operations, allowing TCP's independent directions to make progress.
 pub trait BlockingAndroidIo: Send + Sync + 'static {
     /// Performs one bounded read, returning zero for EOF.
-    fn read(&self, output: &mut [u8]) -> Result<usize, ()>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AndroidIoFailure`] when the Android callback cannot complete
+    /// the read. The failure is deliberately opaque.
+    fn read(&self, output: &mut [u8]) -> Result<usize, AndroidIoFailure>;
 
     /// Performs one bounded write.
-    fn write(&self, input: &[u8]) -> Result<(), ()>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AndroidIoFailure`] when the Android callback cannot complete
+    /// the write. The failure is deliberately opaque.
+    fn write(&self, input: &[u8]) -> Result<(), AndroidIoFailure>;
 }
 
 /// Asynchronous stream adapter for one Android-owned blocking socket lease.
@@ -91,8 +109,8 @@ pub trait BlockingAndroidIo: Send + Sync + 'static {
 pub struct BlockingAndroidStream<C> {
     callbacks: Arc<C>,
     limits: StreamChunkLimits,
-    read_task: Option<JoinHandle<Result<Vec<u8>, ()>>>,
-    write_task: Option<JoinHandle<Result<usize, ()>>>,
+    read_task: Option<JoinHandle<Result<Vec<u8>, AndroidIoFailure>>>,
+    write_task: Option<JoinHandle<Result<usize, AndroidIoFailure>>>,
 }
 
 impl<C: BlockingAndroidIo> BlockingAndroidStream<C> {
@@ -117,7 +135,7 @@ impl<C: BlockingAndroidIo> BlockingAndroidStream<C> {
                 self.write_task = None;
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Ok(Err(())) | Err(_)) => {
+            Poll::Ready(Ok(Err(AndroidIoFailure)) | Err(_)) => {
                 self.write_task = None;
                 Poll::Ready(Err(callback_io_error()))
             }
@@ -142,7 +160,7 @@ impl<C: BlockingAndroidIo> AsyncRead for BlockingAndroidStream<C> {
                 let mut bytes = vec![0; requested];
                 let length = callbacks.read(&mut bytes)?;
                 if length > bytes.len() {
-                    return Err(());
+                    return Err(AndroidIoFailure);
                 }
                 bytes.truncate(length);
                 Ok(bytes)
@@ -158,7 +176,7 @@ impl<C: BlockingAndroidIo> AsyncRead for BlockingAndroidStream<C> {
                 output.put_slice(&bytes);
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Ok(Err(())) | Err(_)) => {
+            Poll::Ready(Ok(Err(AndroidIoFailure)) | Err(_)) => {
                 this.read_task = None;
                 Poll::Ready(Err(callback_io_error()))
             }
@@ -194,7 +212,7 @@ impl<C: BlockingAndroidIo> AsyncWrite for BlockingAndroidStream<C> {
                 this.write_task = None;
                 Poll::Ready(Ok(length))
             }
-            Poll::Ready(Ok(Err(())) | Err(_)) => {
+            Poll::Ready(Ok(Err(AndroidIoFailure)) | Err(_)) => {
                 this.write_task = None;
                 Poll::Ready(Err(callback_io_error()))
             }
@@ -659,22 +677,25 @@ mod tests {
     }
 
     impl BlockingAndroidIo for RecordingBlockingIo {
-        fn read(&self, output: &mut [u8]) -> Result<usize, ()> {
+        fn read(&self, output: &mut [u8]) -> Result<usize, AndroidIoFailure> {
             let bytes = self
                 .reads
                 .lock()
-                .map_err(|_| ())?
+                .map_err(|_| AndroidIoFailure)?
                 .pop_front()
                 .unwrap_or_default();
             if bytes.len() > output.len() {
-                return Err(());
+                return Err(AndroidIoFailure);
             }
             output[..bytes.len()].copy_from_slice(&bytes);
             Ok(bytes.len())
         }
 
-        fn write(&self, input: &[u8]) -> Result<(), ()> {
-            self.writes.lock().map_err(|_| ())?.push(input.to_vec());
+        fn write(&self, input: &[u8]) -> Result<(), AndroidIoFailure> {
+            self.writes
+                .lock()
+                .map_err(|_| AndroidIoFailure)?
+                .push(input.to_vec());
             Ok(())
         }
     }

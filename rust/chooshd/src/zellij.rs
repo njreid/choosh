@@ -333,6 +333,11 @@ pub fn reconcile_target(observed: &TargetObservation) -> Result<TargetState, Rec
 ///
 /// A missing target remains unavailable so a reconnect cannot silently spawn a
 /// new process or retarget an item by display name.
+///
+/// # Errors
+///
+/// Returns [`ReconcileError::TargetIdentityMismatch`] when the observed target
+/// exists under the same name but is not the same target.
 pub fn reattach_target(observed: &TargetObservation) -> Result<ReattachAction, ReconcileError> {
     match observed {
         TargetObservation::Missing => Ok(ReattachAction::MarkUnavailable),

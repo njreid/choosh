@@ -24,6 +24,18 @@ pub enum ExportError {
 }
 
 /// Serializes only the allow-listed fields; no free-form diagnostics are accepted.
+///
+/// # Errors
+///
+/// Returns [`ExportError`] when the manifest holds more than `max_records`
+/// entries, carries a code outside the allow-listed alphabet, or serializes to
+/// more than `max_bytes`.
+///
+/// # Panics
+///
+/// Cannot panic in practice: the serialized value is built here from owned
+/// strings and integers only, and `serde_json` fails to serialize a `Value`
+/// solely for non-string map keys, which this function never constructs.
 pub fn export(
     manifest: &DiagnosticManifest,
     max_records: usize,
@@ -58,6 +70,8 @@ fn valid_code(code: &str) -> bool {
         })
 }
 
+/// Parses a previously exported manifest, returning `None` for malformed bytes.
+#[must_use]
 pub fn parse(bytes: &[u8]) -> Option<Value> {
     serde_json::from_slice(bytes).ok()
 }

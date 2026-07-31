@@ -15,6 +15,11 @@ pub struct AnnotationStore {
 }
 
 impl AnnotationStore {
+    /// Opens the durable annotation-export store at an explicit path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the path or byte cap is not a valid store.
     pub fn new(
         path: impl Into<std::path::PathBuf>,
         max_bytes: usize,
@@ -26,14 +31,28 @@ impl AnnotationStore {
         })
     }
 
+    /// Returns the explicit path this store was constructed with.
+    #[must_use]
     pub fn path(&self) -> &Path {
         self.storage.path()
     }
 
+    /// Atomically replaces the stored export with `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the payload exceeds the store's byte cap or
+    /// the atomic replacement fails.
     pub fn save(&self, bytes: &[u8]) -> Result<(), StorageError> {
         self.storage.replace(bytes, "annotations")
     }
 
+    /// Loads the stored export, returning `None` when nothing has been saved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnnotationStoreError`] when the stored bytes cannot be read or
+    /// do not decode within the configured export limits.
     pub fn load(&self) -> Result<Option<Vec<ExportRecord>>, AnnotationStoreError> {
         self.storage
             .read()?

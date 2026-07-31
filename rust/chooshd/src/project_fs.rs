@@ -159,6 +159,12 @@ impl RegisteredProjectRoot {
     ///
     /// This is the bounded primitive used by future SFTP/blob adapters; it
     /// never returns a partial result when the cap is exceeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectFsError`] for a zero `max_bytes`, for a file whose
+    /// identity no longer matches the prepared entry, for content above the cap,
+    /// and for the underlying read failure.
     pub fn read_prepared(
         &self,
         prepared: &PreparedProjectFile,

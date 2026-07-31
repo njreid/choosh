@@ -88,6 +88,12 @@ pub enum AdapterError {
 /// The adapter accepts exactly one argument naming the installed adapter and
 /// treats all stdin fields as untrusted observations. It never executes an
 /// agent command or emits a control decision.
+///
+/// # Errors
+///
+/// Returns [`AdapterError`] for an argv that is not exactly one known adapter
+/// name, for stdin that is not bounded well-formed JSON, or for an observation
+/// that exceeds `limits`.
 pub fn ingest_hook_stdin(
     adapter: AdapterKind,
     argv: &[&str],

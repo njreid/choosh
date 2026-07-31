@@ -19,6 +19,11 @@ pub enum UpdateDecision {
 }
 
 /// Compares canonical `MAJOR.MINOR.PATCH` versions without accepting paths or shell text.
+///
+/// # Errors
+///
+/// Returns [`DeploymentError::InvalidVersion`] when either side is not exactly
+/// three dot-separated decimal components, with an optional `v` prefix.
 pub fn update_decision(installed: &str, latest: &str) -> Result<UpdateDecision, DeploymentError> {
     fn parse(value: &str) -> Option<[u64; 3]> {
         let mut parts = value.strip_prefix('v').unwrap_or(value).split('.');
@@ -31,12 +36,20 @@ pub fn update_decision(installed: &str, latest: &str) -> Result<UpdateDecision, 
     }
     let installed = parse(installed).ok_or(DeploymentError::InvalidVersion)?;
     let latest = parse(latest).ok_or(DeploymentError::InvalidVersion)?;
-    Ok((latest > installed)
-        .then_some(UpdateDecision::Install)
-        .unwrap_or(UpdateDecision::UpToDate))
+    Ok(if latest > installed {
+        UpdateDecision::Install
+    } else {
+        UpdateDecision::UpToDate
+    })
 }
 
 /// Decodes the versioned host-update envelope. The envelope carries no paths or argv.
+///
+/// # Errors
+///
+/// Returns [`DeploymentError::InvalidVersion`] for a missing or unbounded version
+/// and [`DeploymentError::InvalidArtifact`] for a malformed schema, digest, or
+/// artifact, or for artifact bytes exceeding `max_bytes`.
 pub fn decode_upload_envelope(
     payload: &[u8],
     max_bytes: usize,
@@ -70,16 +83,16 @@ pub fn decode_upload_envelope(
         .get("artifact")
         .and_then(serde_json::Value::as_array)
         .ok_or(DeploymentError::InvalidArtifact)?;
-    let bytes: Result<Vec<u8>, _> = artifact
+    let bytes: Result<Vec<u8>, DeploymentError> = artifact
         .iter()
-        .map(|v| v.as_u64().filter(|n| *n <= 255).map(|n| n as u8).ok_or(()))
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|byte| u8::try_from(byte).ok())
+                .ok_or(DeploymentError::InvalidArtifact)
+        })
         .collect();
-    DeploymentUpload::new(
-        version,
-        sha256,
-        bytes.map_err(|_| DeploymentError::InvalidArtifact)?,
-        max_bytes,
-    )
+    DeploymentUpload::new(version, sha256, bytes?, max_bytes)
 }
 
 fn hex_nibble(value: u8) -> Result<u8, DeploymentError> {
