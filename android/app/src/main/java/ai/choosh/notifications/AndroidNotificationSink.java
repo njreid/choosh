@@ -4,7 +4,6 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.Context;
-import android.os.Build;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
@@ -33,10 +32,9 @@ public final class AndroidNotificationSink implements NotificationSink {
     @Override public void upsert(NotificationIntent intent) {
         Objects.requireNonNull(intent, "intent");
         if (context == null) throw new IllegalStateException("Context required for posting notifications");
-        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(context, CHANNEL_ID)
-                : new Notification.Builder(context);
-        Notification notification = builder.setSmallIcon(android.R.drawable.ic_dialog_info)
+        // minSdk is 26, so the channel-less pre-O Builder is unreachable; see ADR 0006.
+        Notification notification = new Notification.Builder(context, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentTitle(intent.workspaceName() + " · " + intent.agentName())
                 .setContentText(intent.reason())
                 .setAutoCancel(true)
@@ -57,9 +55,7 @@ public final class AndroidNotificationSink implements NotificationSink {
     }
 
     private void ensureChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            manager.createNotificationChannel(new NotificationChannel(
-                    CHANNEL_ID, "Choosh waiting items", NotificationManager.IMPORTANCE_DEFAULT));
-        }
+        manager.createNotificationChannel(new NotificationChannel(
+                CHANNEL_ID, "Choosh waiting items", NotificationManager.IMPORTANCE_DEFAULT));
     }
 }

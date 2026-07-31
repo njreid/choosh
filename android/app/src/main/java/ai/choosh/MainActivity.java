@@ -45,7 +45,7 @@ public final class MainActivity extends Activity {
 
         status = new TextView(this);
         status.setContentDescription(AccessibilitySemantics.STATUS);
-        status.setLiveRegion(android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        status.setAccessibilityLiveRegion(android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE);
         status.setTypeface(getResources().getFont(R.font.choosh_ui));
         status.setPadding(0, inset, 0, 0);
         root.addView(status, new LinearLayout.LayoutParams(-1, -2));

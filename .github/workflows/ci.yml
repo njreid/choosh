@@ -90,6 +90,8 @@ jobs:
           echo "ANDROID_SDK_ROOT=$stable_sdk_root" >> "$GITHUB_ENV"
       - name: Static Android policy checks
         run: ./scripts/check-android.sh
+      - name: Android Java sources compile
+        run: ./scripts/check-android-sources.sh
       - name: Lint and unit test checked-in Android fixtures
         run: ./gradlew :app:lintDebug :app:testDebugUnitTest --stacktrace
       - name: Rebuild and package native Android artifacts

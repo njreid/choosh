@@ -1,4 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+      SSH to a user-configured host is the only network capability Choosh has.
+      There is deliberately no ACCESS_NETWORK_STATE, no foreground-service or
+      notification permission, and no storage permission: each arrives with the
+      milestone that actually composes an Android component needing it.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <application
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"

@@ -25,4 +25,9 @@ grep -Fq 'distributionSha256Sum=9c0f7faeeb306cb14e4279a3e084ca6b596894089a0638e6
 test "$(sha256sum "$root/gradle/wrapper/gradle-wrapper.jar" | cut -d ' ' -f 1)" = \
   '497c8c2a7e5031f6aa847f88104aa80a93532ec32ee17bdb8d1d2f67a194a9c7'
 
+# SSH to a user-configured host requires INTERNET. Every other permission is a
+# reviewed addition, so the declared set must stay exactly this one.
+grep -Fq '<uses-permission android:name="android.permission.INTERNET" />' "$manifest"
+test "$(grep -c 'uses-permission' "$manifest")" = 1
+
 echo "Android static policy checks passed. Device and emulator behavior was not exercised."

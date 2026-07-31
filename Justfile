@@ -18,6 +18,7 @@ clippy:
 
 android-check:
 	./scripts/check-android.sh
+	./scripts/check-android-sources.sh
 
 release-check:
 	./scripts/check-m6-release-readiness.sh
