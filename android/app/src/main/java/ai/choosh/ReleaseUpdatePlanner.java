@@ -193,6 +193,8 @@ public final class ReleaseUpdatePlanner {
             this.version = version; this.apk = apk; this.sha256 = sha256; this.bytes = bytes;
         }
         public String apkAsset() { return apk; }
+        /** Canonical MAJOR.MINOR.PATCH string for the verified candidate. */
+        public String version() { return version.toString(); }
         public String sha256() { return sha256; }
         public byte[] copyApkBytesForStaging() { return bytes.clone(); }
         @Override public String toString() { return "VerifiedApkStagingPlan(version=" + version + ", asset=REDACTED)"; }

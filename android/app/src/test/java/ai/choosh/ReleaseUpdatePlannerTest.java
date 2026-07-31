@@ -70,6 +70,16 @@ public final class ReleaseUpdatePlannerTest {
         String envelope = new String(HostDeploymentEnvelope.encode(plan), StandardCharsets.UTF_8);
         assertTrue(envelope.contains("\"schema_version\":1"));
         assertTrue(envelope.contains("\"version\":\"0.2.0\""));
+        assertTrue(envelope.contains("\"sha256\":\"" + sha(apk) + "\""));
         assertFalse(envelope.contains("/"));
+
+        // The artifact is canonical unpadded base64url and round-trips byte for byte.
+        String artifact = envelope.replaceAll("^.*\"artifact_b64\":\"([^\"]*)\".*$", "$1");
+        assertFalse(artifact.contains("="));
+        assertArrayEquals(apk, java.util.Base64.getUrlDecoder().decode(artifact));
+        assertEquals(artifact,
+            java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(apk));
+        // The pre-base64 decimal-array encoding is gone.
+        assertFalse(envelope.contains("\"artifact\":["));
     }
 }

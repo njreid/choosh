@@ -80,19 +80,64 @@ pub fn decode_upload_envelope(
         sha256[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     let artifact = object
-        .get("artifact")
-        .and_then(serde_json::Value::as_array)
+        .get("artifact_b64")
+        .and_then(serde_json::Value::as_str)
         .ok_or(DeploymentError::InvalidArtifact)?;
-    let bytes: Result<Vec<u8>, DeploymentError> = artifact
-        .iter()
-        .map(|value| {
-            value
-                .as_u64()
-                .and_then(|byte| u8::try_from(byte).ok())
-                .ok_or(DeploymentError::InvalidArtifact)
-        })
-        .collect();
-    DeploymentUpload::new(version, sha256, bytes?, max_bytes)
+    DeploymentUpload::new(
+        version,
+        sha256,
+        decode_base64_url_unpadded(artifact, max_bytes)?,
+        max_bytes,
+    )
+}
+
+/// Decodes canonical unpadded base64url, rejecting anything above `max_bytes`
+/// before allocating the artifact.
+///
+/// Padding, whitespace, the standard `+/` alphabet, and non-zero trailing bits
+/// are all rejected, so exactly one encoding maps to any given artifact.
+fn decode_base64_url_unpadded(input: &str, max_bytes: usize) -> Result<Vec<u8>, DeploymentError> {
+    let input = input.as_bytes();
+    // An unpadded group of 1 character can never carry a whole byte.
+    if input.len() % 4 == 1 {
+        return Err(DeploymentError::InvalidArtifact);
+    }
+    let decoded_len = input.len() / 4 * 3 + (input.len() % 4).saturating_sub(1);
+    if decoded_len > max_bytes {
+        return Err(DeploymentError::InvalidArtifact);
+    }
+    let mut bytes = Vec::with_capacity(decoded_len);
+    for group in input.chunks(4) {
+        let mut accumulator: u32 = 0;
+        let mut last = 0;
+        for symbol in group {
+            last = base64_symbol(*symbol)?;
+            accumulator = (accumulator << 6) | u32::from(last);
+        }
+        // A short final group encodes fewer bits than its symbols can carry. The
+        // unused low bits of its last symbol MUST be zero, otherwise two distinct
+        // encodings would describe the same artifact.
+        let unused_bits = (4 - group.len()) * 2;
+        if unused_bits > 0 && last & ((1_u8 << unused_bits) - 1) != 0 {
+            return Err(DeploymentError::InvalidArtifact);
+        }
+        accumulator <<= (4 - group.len()) * 6;
+        for shift in [16_u32, 8, 0].iter().take(group.len() - 1) {
+            bytes.push(u8::try_from((accumulator >> shift) & 0xff).unwrap_or_default());
+        }
+    }
+    Ok(bytes)
+}
+
+fn base64_symbol(value: u8) -> Result<u8, DeploymentError> {
+    match value {
+        b'A'..=b'Z' => Ok(value - b'A'),
+        b'a'..=b'z' => Ok(value - b'a' + 26),
+        b'0'..=b'9' => Ok(value - b'0' + 52),
+        b'-' => Ok(62),
+        b'_' => Ok(63),
+        _ => Err(DeploymentError::InvalidArtifact),
+    }
 }
 
 fn hex_nibble(value: u8) -> Result<u8, DeploymentError> {
@@ -391,20 +436,103 @@ mod tests {
         assert!(update_decision("1.2", "1.2.3").is_err());
     }
 
+    const ZERO_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn envelope(artifact_b64: &str) -> Vec<u8> {
+        format!(
+            r#"{{"schema_version":1,"version":"2.0.0","sha256":"{ZERO_DIGEST}","artifact_b64":"{artifact_b64}"}}"#
+        )
+        .into_bytes()
+    }
+
     #[test]
     fn upload_envelope_is_bounded_and_path_free() {
-        let payload = br#"{"schema_version":1,"version":"2.0.0","sha256":"0000000000000000000000000000000000000000000000000000000000000000","artifact":[1,2,3]}"#;
-        let upload = decode_upload_envelope(payload, 8).unwrap();
+        // "AQID" is base64url for the bytes 1, 2, 3.
+        let upload = decode_upload_envelope(&envelope("AQID"), 8).unwrap();
         assert_eq!(upload.version(), "2.0.0");
         assert!(
             decode_upload_envelope(
-                br#"{"schema_version":1,"version":"2.0.0","sha256":"bad","artifact":[1]}"#,
+                br#"{"schema_version":1,"version":"2.0.0","sha256":"bad","artifact_b64":"AQ"}"#,
                 8
             )
             .is_err()
         );
-        assert!(decode_upload_envelope(br#"{"schema_version":1,"version":"2.0.0;sh","sha256":"0000000000000000000000000000000000000000000000000000000000000000","artifact":[1]}"#, 8).is_err());
-        assert!(decode_upload_envelope(br#"{"schema_version":1,"version":"2.0.0","sha256":"0000000000000000000000000000000000000000000000000000000000000000","artifact":[1,2,3]}"#, 2).is_err());
+        assert!(
+            decode_upload_envelope(
+                format!(
+                    r#"{{"schema_version":1,"version":"2.0.0;sh","sha256":"{ZERO_DIGEST}","artifact_b64":"AQ"}}"#
+                )
+                .as_bytes(),
+                8
+            )
+            .is_err()
+        );
+        assert!(decode_upload_envelope(&envelope("AQID"), 2).is_err());
+        // The pre-base64 decimal-array encoding is not accepted.
+        assert!(
+            decode_upload_envelope(
+                format!(
+                    r#"{{"schema_version":1,"version":"2.0.0","sha256":"{ZERO_DIGEST}","artifact":[1,2,3]}}"#
+                )
+                .as_bytes(),
+                8
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn artifact_base64_admits_exactly_one_canonical_unpadded_url_encoding() {
+        for (encoded, expected) in [
+            ("AQID", vec![1_u8, 2, 3]),
+            ("AQ", vec![1]),
+            ("AQI", vec![1, 2]),
+            // 0xff 0xff decodes through the URL-safe `-_` alphabet only.
+            ("__8", vec![0xff, 0xff]),
+            ("AAAAAA", vec![0, 0, 0, 0]),
+        ] {
+            assert_eq!(
+                decode_base64_url_unpadded(encoded, 64).unwrap(),
+                expected,
+                "{encoded}"
+            );
+        }
+        for rejected in [
+            "AQ==",   // padded
+            "A",      // an orphan symbol carries no whole byte
+            "AQIDA",  // trailing orphan symbol
+            "AQ I",   // whitespace
+            "//8",    // standard alphabet
+            "+w",     // standard alphabet
+            "AR",     // non-zero unused bits in a two-symbol group
+            "AQJ",    // non-zero unused bits in a three-symbol group
+            "AQID\n", // trailing newline
+        ] {
+            assert!(
+                decode_base64_url_unpadded(rejected, 64).is_err(),
+                "accepted {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_the_golden_envelope_emitted_by_the_android_encoder() {
+        // Produced verbatim by `ai.choosh.HostDeploymentEnvelope.encode` for the
+        // artifact bytes below. Keeping the exact bytes here makes a one-sided
+        // change to either encoder a test failure rather than a runtime reject.
+        let golden = br#"{"schema_version":1,"version":"0.2.0","sha256":"6d3a0f4c7cf38573de9632a0fddf4d9bcdee120eb8e98b3855482bdf94b28aac","artifact_b64":"AAEC_v96"}"#;
+        let upload = decode_upload_envelope(golden, 64).unwrap();
+        assert_eq!(upload.version(), "0.2.0");
+        assert_eq!(upload.bytes, vec![0x00, 0x01, 0x02, 0xfe, 0xff, 0x7a]);
+    }
+
+    #[test]
+    fn artifact_base64_rejects_oversized_input_before_allocating() {
+        let encoded = "A".repeat(4_000);
+        assert_eq!(
+            decode_base64_url_unpadded(&encoded, 8),
+            Err(DeploymentError::InvalidArtifact)
+        );
     }
     use crate::service_manager::{
         ProcessOutcome, ServiceInvocation, ServiceProcessRunner, SystemdUserManager,

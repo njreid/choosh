@@ -69,7 +69,20 @@ post-activation failure. A future versioned SSH stdin envelope MUST decode to th
 and invoke no broader capability.
 
 The schema-1 envelope contains only the release version, lowercase hexadecimal SHA-256 digest,
-and bounded artifact bytes. GitHub release discovery remains an Android-side authority: it selects
+and bounded artifact bytes:
+
+```json
+{"schema_version":1,"version":"0.2.0","sha256":"<64 lowercase hex characters>","artifact_b64":"AAEC_v96"}
+```
+
+`artifact_b64` MUST be canonical unpadded base64url, matching the encoding every other
+byte-preserving wire field uses. The decoder MUST reject padding, whitespace, the standard
+`+/` alphabet, and non-zero unused trailing bits, so exactly one encoding maps to any given
+artifact. It MUST reject an over-cap artifact from the encoded length before allocating.
+A decimal byte array MUST NOT be used: it expands a multi-megabyte release roughly fourfold
+and costs the host one JSON value per artifact byte.
+
+GitHub release discovery remains an Android-side authority: it selects
 the newest stable release, verifies checksum and signer evidence, then serializes this envelope over
 the authenticated SSH capability. The host never contacts GitHub and never accepts caller-supplied
 paths, executables, or service-manager arguments.
