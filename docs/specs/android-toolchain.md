@@ -16,11 +16,28 @@ The release baseline re-resolved on 2026-07-19 is:
 | Next-platform validation | No post-API-36 platform SDK published as of 2026-07-19 | Quarterly previews remain outside the production release baseline. |
 | Android Gradle Plugin | 9.3.0 | Current stable minor release. |
 | Gradle wrapper | 9.6.1 | Current stable wrapper; checksum pinned. |
-| Kotlin | 2.4.10 | Current stable Kotlin bug-fix release. |
+| Kotlin | 2.4.10 | Resolved baseline, **not yet adopted**; see below. |
 | Java toolchain | JDK 17 | AGP 9.3 minimum and default. |
 | SDK Build Tools | 36.0.0 | AGP 9.3 default. |
 | NDK | 28.2.13676358 | AGP 9.3 default; required for the Rust Android bridge. |
-| Compose BOM | 2026.06.01 | Latest stable BOM in the official mapping. |
+| Compose BOM | 2026.06.01 | Resolved baseline, **not yet adopted**; see below. |
+
+### Adoption state
+
+The Kotlin and Compose rows above record the versions Choosh MUST use *when it
+adopts them*. Neither is in the build today: `gradle/libs.versions.toml`
+declares only AGP, JUnit, and Sora Editor, the application applies no Kotlin
+plugin, and every Android source is Java. The shipped M0 surface is a
+programmatic Java/View connection-status screen.
+
+This is a deliberate M0 scope decision, not an oversight, and it has a
+consequence for M0-R13: that requirement asks for proof that Kotlin, AGP, the
+Compose BOM, Sora Editor, and the Kotlin/Rust bridge are mutually compatible.
+Only the AGP, Sora Editor, and bridge portion is proven. **M0-R13 MUST NOT be
+recorded as met until the Kotlin plugin and Compose BOM are actually applied and
+build, test, and package with this baseline.** The Compose navigation shell is
+specified in [Android navigation](android-navigation.md) and is the milestone
+where adoption is expected.
 
 `minSdk` remains an M0 decision. It MUST be chosen from the actual requirements of Sora Editor, SSH, notifications, WebView security, storage, and the supported-device policy. Newer APIs MUST be guarded with AndroidX compatibility layers or explicit runtime SDK checks where the chosen `minSdk` requires them.
 

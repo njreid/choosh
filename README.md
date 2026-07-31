@@ -42,8 +42,8 @@ configure a host, establish a user session, or provide a usable terminal/workspa
 - Persistence: Zellij sessions and tabs
 - Documents: SFTP, with revision-aware saves
 - Markdown: Maud/Datastar fragments in a locked-down WebView
-- Git review: host-supplied metadata/blobs with a bounded native LCS reference diff today;
-  production diff algorithm/fidelity remains pending
+- Git review: host-supplied metadata/blobs with a bounded native `bounded-myers-v1`
+  reference diff today; production diff fidelity and a live Git adapter remain pending
 - Agent adapters: fixture-normalized Codex, OpenCode, and Claude Code lifecycle events;
   each adapter is independently versioned and maintained, and absent/incompatible adapters
   leave the terminal usable without notification integration

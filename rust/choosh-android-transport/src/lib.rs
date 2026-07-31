@@ -18,8 +18,10 @@ use tokio::task::JoinHandle;
 
 /// Marker for the outer Android/Russh composition root.
 ///
-/// The runtime adapter is deliberately not implemented until its JNI stream
-/// and callback contracts have deterministic generated-key acceptance tests.
+/// The generated-key acceptance tests this boundary waited on now exist in this
+/// crate: they drive exact-host admission, Keystore-shaped signing, and a fixed
+/// `git.status` RPC through a real `chooshd` private socket. The concrete JNI
+/// runtime adapter still lives in `choosh-android-bridge`, never here.
 pub const COMPOSITION_BOUNDARY: &str = "android-opaque-handles-to-russh";
 
 /// Per-callback byte limits for the Android-owned stream adapter.
