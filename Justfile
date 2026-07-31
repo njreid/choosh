@@ -4,7 +4,8 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 
 default: check
 
-check: specs rust android-check release-check
+# Mirrors the pre-device CI gates so a local pass predicts a CI pass.
+check: specs rust clippy android-check release-check
 
 specs:
 	./scripts/check-specs.sh
@@ -31,5 +32,5 @@ android-build:
 android-instrument: android-build
 	./scripts/run-android-instrumentation.sh
 
-release: check clippy
+release: check
 	@echo 'release-readiness-verified'
