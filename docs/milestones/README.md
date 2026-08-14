@@ -1,23 +1,24 @@
-# Delivery milestones
+# Milestones
 
-Milestones are vertical, testable increments. A milestone is complete only when every mandatory requirement and exit scenario passes on macOS/arm64, Linux/x86_64, and the stated Android matrix.
+Ordered delivery slices for the architecture in [DESIGN.md](../../DESIGN.md).
+Each milestone names the working, demonstrable slice it adds and the exit
+criteria that prove it — not a time estimate. [PLAN.md](../../PLAN.md) is the
+status ledger that tracks evidence against these.
 
-```mermaid
-flowchart TD
- M0["M0: Foundation"] --> M1["M1: Remote workspace"]
- M1 --> M2["M2: Agents"] --> M3["M3: Pinning and services"]
- M3 --> M4["M4: Editing and diff"] --> M5["M5: Markdown review"] --> M6["M6: Release"] --> M7["M7: Extensibility"]
-```
+Milestones build strictly on their predecessors: nothing later works without
+the relay-brokered connection (M0) and workspace/jj foundation (M1) in place
+first. Within a milestone, independently-failable slices should still be
+split into separate increments per [AGENTS.md](../../AGENTS.md)'s increment
+workflow — a milestone is a checkpoint, not a single commit.
 
-| Milestone | Outcome | Detailed design | Channel |
-|---|---|---|---|
-| [M0](M0-foundation.md) | High-risk boundaries proven | [Design](../design/M0-foundation.md) | Internal |
-| [M1](M1-remote-workspace.md) | Usable SSH/Zellij/file/Markdown slice | [Design](../design/M1-remote-workspace.md) | Developer preview |
-| [M2](M2-agents-notifications.md) | Three agents and Android alerts | [Design](../design/M2-agents-notifications.md) | Internal alpha |
-| [M3](M3-pinning-services.md) | Final pinning UX and web previews | [Design](../design/M3-pinning-services.md) | Alpha |
-| [M4](M4-editing-git-diff.md) | Safe editing and native Git review | [Design](../design/M4-editing-git-diff.md) | Alpha |
-| [M5](M5-markdown-review.md) | Annotatable project documents | [Design](../design/M5-markdown-review.md) | Beta |
-| [M6](M6-release.md) | Hardened Obtainium-compatible release | [Design](../design/M6-release.md) | Public 1.0 |
-| [M7](M7-extensibility.md) | Versioned, failure-isolated adapters | — | Post-1.0 |
-
-Every milestone MUST update affected specs/ADRs, test deterministic behavior, include an end-to-end acceptance scenario, preserve SSH/root confinement, bound all resources, and leave no ignored failing tests.
+| # | Milestone | Adds |
+| --- | --- | --- |
+| [M0](M0-enrollment.md) | Enrollment skeleton | `relayd` up, passkey login, a devhost dials in and appears on the phone |
+| [M1](M1-workspace-and-jj.md) | Workspace and jj foundation | Register a workspace, browse its file tree, backed by `jj-lib` |
+| [M2](M2-terminal-and-agents.md) | Terminal and agent presence | A live agent terminal over the relay, normalized events, FCM `input_required` |
+| [M3](M3-jj-diff-and-graph.md) | jj diff and change graph | Native diff and change-graph views, one-tap `jj undo` |
+| [M4](M4-editing.md) | Safe source editing | Sora editing against the live working copy, conflict-safe saves |
+| [M5](M5-web-and-markdown.md) | Web preview and Markdown | Tunneled dev servers, rendered Markdown |
+| [M6](M6-laptop-and-zed.md) | Laptop proxy and Zed bridge | `ssh <devhost>` and Zed remote editing with zero manual trust steps |
+| [M7](M7-fleet-and-provisioning.md) | Fleet, offload, and provisioning | Multi-devhost fleet view, cross-host task offload, SSO bridge, `mise` provisioning |
+| [M8](M8-security-and-release.md) | Security and release | Threat-model pass, self-update, signed Obtainium releases |

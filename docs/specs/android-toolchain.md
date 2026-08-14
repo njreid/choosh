@@ -1,81 +1,53 @@
 # Android and Kotlin toolchain
 
+Status: Draft
+
 ## Policy
 
-Choosh MUST use the latest mutually compatible **stable** Android and Kotlin toolchain available when a milestone begins. Versions MUST be pinned in the Gradle version catalog and wrapper; dynamic versions such as `+` and unversioned snapshots are forbidden.
+Choosh MUST use the latest mutually compatible **stable** release of
+Kotlin, the Android Gradle Plugin, the Compose BOM, and the target/compile
+SDK available when a milestone begins — matching [AGENTS.md](../../AGENTS.md)'s
+"Android and Kotlin dependencies are pinned stable releases; preview SDKs
+run only in a separate compatibility lane." Versions MUST be pinned in the
+Gradle version catalog (`gradle/libs.versions.toml`) and wrapper; dynamic
+versions such as `+` and unversioned snapshots are forbidden. Specific
+version numbers are deliberately not restated here — they belong in the
+version catalog, where they can't rot into a stale doc.
 
-Preview SDKs and pre-release libraries MAY be exercised in a non-blocking CI lane, but MUST NOT be required to build or release the production application. The minimum supported Android version is a product compatibility decision and MUST NOT rise merely because a newer compile or target SDK exists.
-
-## Baseline
-
-The release baseline re-resolved on 2026-07-19 is:
-
-| Component | Production baseline | Notes |
-| --- | --- | --- |
-| Android platform | `compileSdk = 36`, `targetSdk = 36` | Android 16 is the latest stable platform available to the release SDK channel. |
-| Next-platform validation | No post-API-36 platform SDK published as of 2026-07-19 | Quarterly previews remain outside the production release baseline. |
-| Android Gradle Plugin | 9.3.0 | Current stable minor release. |
-| Gradle wrapper | 9.6.1 | Current stable wrapper; checksum pinned. |
-| Kotlin | 2.4.10 | Resolved baseline, **not yet adopted**; see below. |
-| Java toolchain | JDK 17 | AGP 9.3 minimum and default. |
-| SDK Build Tools | 36.0.0 | AGP 9.3 default. |
-| NDK | 28.2.13676358 | AGP 9.3 default; required for the Rust Android bridge. |
-| Compose BOM | 2026.06.01 | Resolved baseline, **not yet adopted**; see below. |
-
-### Adoption state
-
-The Kotlin and Compose rows above record the versions Choosh MUST use *when it
-adopts them*. Neither is in the build today: `gradle/libs.versions.toml`
-declares only AGP, JUnit, and Sora Editor, the application applies no Kotlin
-plugin, and every Android source is Java. The shipped M0 surface is a
-programmatic Java/View connection-status screen.
-
-This is a deliberate M0 scope decision, not an oversight, and it has a
-consequence for M0-R13: that requirement asks for proof that Kotlin, AGP, the
-Compose BOM, Sora Editor, and the Kotlin/Rust bridge are mutually compatible.
-Only the AGP, Sora Editor, and bridge portion is proven. **M0-R13 MUST NOT be
-recorded as met until the Kotlin plugin and Compose BOM are actually applied and
-build, test, and package with this baseline.** The Compose navigation shell is
-specified in [Android navigation](android-navigation.md) and is the milestone
-where adoption is expected.
-
-`minSdk` remains an M0 decision. It MUST be chosen from the actual requirements of Sora Editor, SSH, notifications, WebView security, storage, and the supported-device policy. Newer APIs MUST be guarded with AndroidX compatibility layers or explicit runtime SDK checks where the chosen `minSdk` requires them.
+Preview SDKs and pre-release libraries MAY be exercised in a non-blocking
+CI lane, but MUST NOT be required to build or release the production
+application. The minimum supported Android version (`minSdk`) is a product
+compatibility decision, chosen from the actual requirements of Sora
+Editor, the relay client transport, notifications, WebView security, and
+storage — it MUST NOT rise merely because a newer compile or target SDK
+exists.
 
 ## Compatibility rule
 
-Sora Editor and the Kotlin/Rust bridge are release-critical dependencies. M0 MUST prove that they compile, test, and package with the baseline. If the newest stable components are not mutually compatible, Choosh MAY pin the newest working stable combination only when:
+Sora Editor and the Kotlin/Rust bridge are release-critical dependencies.
+Each milestone that touches them MUST prove they compile, test, and
+package together at the current pinned baseline before that milestone's
+exit criteria are considered met. If the newest stable components are not
+mutually compatible, Choosh MAY pin the newest working stable combination
+only when:
 
 1. the incompatibility is reproduced in CI;
-2. the exception and security impact are recorded in an ADR;
+2. the exception and its scope are recorded in this file's baseline table
+   (added when the first such exception occurs — none exist yet);
 3. an upgrade issue names the blocked component and removal condition; and
 4. the exception does not require a preview dependency in production.
 
 ## Dependency management
 
-- All plugin and library versions MUST be centralized in `gradle/libs.versions.toml`.
+- All plugin and library versions MUST be centralized in
+  `gradle/libs.versions.toml`.
 - Compose libraries covered by the BOM MUST omit individual versions.
 - Dependency verification and locking MUST be enabled for release builds.
-- Stable AndroidX releases are preferred; alpha, beta, RC, and snapshot artifacts require an ADR and an expiry condition.
-- Automated dependency update pull requests SHOULD run weekly and MUST pass unit, instrumentation, lint, Sora editing, Rust bridge, and packaging tests before merge.
-- New code MUST NOT introduce deprecated Android APIs unless no supported replacement exists and the exception is documented.
-- Each milestone start and release candidate MUST re-resolve this table against official release notes. Upgrades are reviewed changes, never dynamic resolution during a build.
-
-## Preview compatibility lane
-
-The `android-next-platform-preview` CI job queries the preview SDK channel for a
-nonnumeric `platforms;android-<codename>` package. If Google has not published a
-post-API-36 next-platform SDK, the job emits the stable
-`preview_sdk_status=no_next_platform_preview_available` evidence and succeeds
-without pretending that a QPR runtime image is a new compile SDK. When a preview
-package exists, the job installs that exact discovered package, changes only its
-ephemeral checkout to `compileSdkPreview`, and runs lint, unit tests, and debug
-assembly. It has `continue-on-error: true`, receives no publishing credentials,
-uploads no artifacts, and is not a dependency of production or release jobs.
-
-## Sources
-
-- [Android 16 SDK setup](https://developer.android.com/about/versions/16/setup-sdk)
-- [Android Gradle Plugin 9.3 release notes](https://developer.android.com/build/releases/agp-9-3-0-release-notes)
-- [Gradle 9.6.1 release notes](https://docs.gradle.org/9.6.1/release-notes.html)
-- [Kotlin releases](https://kotlinlang.org/docs/releases.html)
-- [Compose BOM mapping](https://developer.android.com/develop/ui/compose/bom/bom-mapping)
+- Stable AndroidX releases are preferred; alpha, beta, RC, and snapshot
+  artifacts require a recorded exception (§ above) and an expiry
+  condition.
+- New code MUST NOT introduce deprecated Android APIs unless no supported
+  replacement exists and the exception is documented.
+- Each milestone start and release candidate MUST re-resolve the pinned
+  versions against official release notes. Upgrades are reviewed changes,
+  never dynamic resolution during a build.

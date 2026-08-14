@@ -1,21 +1,27 @@
 # Repository guidance
 
+See [DESIGN.md](DESIGN.md) for the full architecture. This file states the
+constraints that follow from it.
+
 ## Priorities
 
-1. Preserve the SSH-only trust boundary.
+1. Preserve the relay-brokered trust boundary: no devhost ever accepts an
+   inbound connection; the phone only ever talks to `choosh-relayd`.
 2. Keep durable state ownership explicit.
-3. Treat all host paths, agent events, Git output, and service metadata as untrusted input.
+3. Treat all host paths, agent events, jj output, and service metadata as untrusted input.
 4. Prefer versioned protocols and vertical acceptance tests over speculative features.
 
 ## Architecture constraints
 
 - Android package and namespace are `ai.choosh`.
-- No Node, Svelte, Tauri, public host listener, or agent-specific chat renderer.
-- `chooshd` listens only on a per-user Unix socket.
-- Android reaches `chooshd` through an SSH stdio bridge.
+- No Node, Svelte, Tauri, or agent-specific chat renderer.
+- No devhost ever listens on a public port; `choosh-hostd` always dials outbound to `choosh-relayd`.
+- `choosh-hostd`'s RPC socket and SSH server bind to loopback only; the only way in is a `relayd`-brokered tunnel.
+- No password-based or manually-confirmed-fingerprint authentication anywhere: passkeys for humans, device credentials minted from a passkey session for machines.
 - Agent hooks are observational and never approve, deny, or rewrite operations.
-- Zellij owns PTYs/process persistence; `chooshd` owns workspace and item metadata.
-- Android computes textual Git diffs; the host supplies bounded metadata and blob versions.
+- Zellij owns PTYs/process persistence; `choosh-hostd` owns workspace and item metadata.
+- jj only, via `jj-lib` embedded in `choosh-hostd`; no Git support, no on-device diff engine — diffs are computed host-side and shipped as structured hunks.
+- This repository's own version control is jj too, git-colocated for GitHub interop. Use `jj` commands (`jj new`, `jj describe`, `jj diff`, `jj log`, `jj git push`), never `git`, for local history operations here.
 - Android and Kotlin dependencies are pinned stable releases; preview SDKs run only in a separate compatibility lane.
 - Terminals use the native Rust GPU renderer; terminal modes and input encoding stay out of Compose and WebViews.
 
@@ -37,8 +43,7 @@
 
 ## Documentation
 
-- Update the relevant specification before changing a protocol or trust boundary.
-- Add an ADR for decisions that are expensive to reverse.
+- Update DESIGN.md before changing a protocol or trust boundary.
 - Use RFC 2119 terms only for normative requirements.
 - Examples must not contain real credentials, hostnames, or user paths.
 
@@ -51,9 +56,8 @@
 
 ## Increment workflow
 
-- Treat each independently working, verified slice as a commit boundary; do not accumulate unrelated implementation increments in one commit.
-- Before committing, run the checks relevant to the changed scope plus `git diff --check`, and review the staged file set for unrelated changes or sensitive data.
-- Use a focused commit message that states the working increment delivered.
-- Push each completed increment to the current tracked remote branch after committing, then verify the local and remote refs match and the worktree is clean.
-- Update `PLAN.md` whenever an increment materially changes completed evidence, remaining gates, or the ordered next increments; commit that plan update as a verified focused increment.
-- Do not commit or push a broken increment merely to checkpoint it. If external access prevents a push, preserve the verified local commit and report the exact blocker.
+- Treat each independently working, verified slice as its own `jj` change; use `jj new` to cut the boundary rather than accumulating unrelated increments into one change.
+- Before finalizing a change (`jj describe`), run the checks relevant to the changed scope and review `jj diff` for unrelated edits or sensitive data.
+- Use a focused change description that states the working increment delivered.
+- Push each completed increment (`jj git push`) after describing it, then verify the local and remote bookmarks match and the working copy is clean.
+- Do not finalize or push a broken increment merely to checkpoint it. If external access prevents a push, preserve the verified local change and report the exact blocker.

@@ -1,31 +1,70 @@
-# Choosh specifications
+# Specifications
 
-These documents define the first implementable Choosh contracts.
+Normative detail for the architecture in [DESIGN.md](../../DESIGN.md).
+[docs/milestones/](../milestones/README.md) says what gets built in what
+order and how each slice is proven; these documents say precisely how each
+piece behaves so two independent implementations of the same spec would
+interoperate. RFC 2119 terms are normative here; DESIGN.md's prose is not.
 
-Delivery sequencing and exit gates are defined in the [milestone plan](../milestones/README.md).
-Implementation-level state machines, failure semantics, fixtures, and headless
-acceptance harnesses are defined in the [detailed milestone designs](../design/README.md).
+## Trust boundary and transport
 
-| Specification | Scope | Status |
-| --- | --- | --- |
-| [Android and Kotlin toolchain](android-toolchain.md) | Stable SDK/toolchain baseline, compatibility and update policy | Draft |
-| [Android native runtime callbacks](android-native-runtime.md) | JNI socket/signer lease ownership, bounds and failure contract | Draft |
-| [Android release updater](release-updater.md) | Release selection, APK evidence verification, and staging boundary | Draft |
-| [Terminal rendering and input](terminal-experience.md) | Zelland GPU port, Android IME, extra keys, gestures and recovery | Draft |
-| [Host protocol](host-protocol.md) | SSH stdio framing, handshake, RPC, events, errors | Draft |
-| [Native SSH reconnect](native-ssh-reconnect.md) | Re-admission, retry, generation invalidation, and recovery after network loss | Draft |
-| [Workspace and item model](workspace-items.md) | Explicit workspaces and typed Zellij-backed items | Draft |
-| [Agent interoperability](agent-events.md) | Codex, OpenCode, Claude hooks and notifications | Draft |
-| [Client-side Git diff](git-diff.md) | Status, version retrieval, diff model, limits | Draft |
-| [Development services](service-tunnels.md) | Explicit launch, lifecycle, SSH/WebView tunnel | Draft |
-| [Host deployment](host-deployment.md) | Per-user daemon manager activation and ownership | Draft |
-| [Android navigation](android-navigation.md) | Explorer, pinning, deep links, page restoration | Draft |
-| [Diagnostics and support bundles](diagnostics.md) | Opt-in redacted local diagnostics and crash/support evidence | Draft |
+- [relay-protocol.md](relay-protocol.md) — the wire protocol between
+  `choosh-relayd` and every Identity: framing, control frames, presence,
+  and tunnel lifecycle. Every other spec's transport assumptions trace back
+  to this one.
+- [auth-and-enrollment.md](auth-and-enrollment.md) — passkeys for humans,
+  device credentials for machines: the WebAuthn RP flow, enrollment-token
+  issuance, the devhost/laptop enrollment chain, and revocation.
 
-## Normative language
+## Host daemon
 
-The terms **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are interpreted as described by RFC 2119.
+- [host-rpc.md](host-rpc.md) — the RPC surface `choosh-hostd` exposes to
+  the Android app: workspace/item registry, bounds, error model, and
+  command-construction discipline.
+- [jj-integration.md](jj-integration.md) — browsing and editing a `jj`
+  workspace: revision resolution, the `workspace.tree.*`/`workspace.file.*`/
+  `workspace.diff`/`workspace.log`/`workspace.op.*` RPCs, conflict
+  representation, and one-workspace-per-agent.
+- [agent-events.md](agent-events.md) — the observational hook adapter
+  contract and normalized event set (`input_required`, `turn_completed`,
+  `files_changed`, `agent_status`, `auth_required`, `editor_attached`/
+  `editor_detached`).
+- [notifications.md](notifications.md) — FCM delivery, redaction, and
+  dedup rules for those events once they need to reach a backgrounded
+  phone.
+- [service-tunnels.md](service-tunnels.md) — explicit dev-service launch
+  and the `WebService` tunnel, including the Zellij-web-client break-glass
+  path.
+- [ssh-bridge-and-zed.md](ssh-bridge-and-zed.md) — `choosh-hostd`'s
+  loopback SSH server, the laptop `choosh-hostd proxy` mode, and Zed
+  remote-editing attachment.
+- [toolchain-provisioning.md](toolchain-provisioning.md) — project-pinned
+  vs. host-managed `mise` tooling, and the `ubi` backend path for
+  GitHub-release binaries like `zed-remote-server`.
+- [host-deployment.md](host-deployment.md) — the bootstrap install script,
+  platform service lifecycle (`systemd --user` / `launchd`), and
+  `choosh-hostd` self-update.
 
-## Versioning
+## Android app
 
-The protocol starts at major version `1`. Additive fields are permitted within a major version and must be ignored by older readers. Removing or changing field semantics requires a new major version.
+- [android-navigation.md](android-navigation.md) — the
+  `Explorer → PinnedItem*` shell and the fixed item-type set.
+- [terminal-experience.md](terminal-experience.md) — the Zelland-derived
+  native terminal renderer, rebound to relay tunnel frames.
+- [editor-protocol.md](editor-protocol.md) — Sora's revisioned edit
+  protocol against the jj-backed file RPCs.
+- [android-native-runtime.md](android-native-runtime.md) — the JNI
+  boundary's bounded-capability contract, admitted by relay session
+  credentials rather than SSH host-key verification.
+- [android-toolchain.md](android-toolchain.md) — the pinned-stable-release
+  policy for the Android/Kotlin build.
+
+## Conventions
+
+- Every spec starts with a `Status:` line.
+- Links between repository-owned documents are relative.
+- Examples MUST NOT contain real credentials, hostnames, or user paths.
+- A spec that depends on another's wire shape links to it rather than
+  redefining it — `relay-protocol.md` and `jj-integration.md` in
+  particular are linked from most other documents here and are the ones
+  most likely to need a coordinated update if they change.

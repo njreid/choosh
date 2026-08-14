@@ -1,77 +1,79 @@
 # Choosh
 
-Choosh is an Android-first remote development cockpit for persistent, agent-pluggable workspaces.
+Choosh is a personal control plane for a fleet of development hosts, driven
+from an Android phone. Register a devhost once — a cloud instance in any AWS
+account, a Linux box, a Mac laptop — and Choosh keeps its coding agents and
+dev services running in Zellij, keeps a jj workspace per agent so concurrent
+edits are never a problem, and pushes a notification the instant an agent
+needs a decision, wherever the phone happens to be. Sit down at a keyboard
+and the same fleet opens in Zed and a plain terminal with no extra setup:
+`ssh <devhost>` just works, no keys to copy and no fingerprint to confirm.
 
-A workspace is an explicitly registered project root plus a Zellij session with the same name. Each coding agent and development service runs in its own managed Zellij tab. The Android client presents a fixed explorer followed by swipeable pinned terminals, Markdown previews, source editors, Git diffs, and tunneled web services.
+Full architecture: **[DESIGN.md](DESIGN.md)**.
 
-## Status
+## The experience
 
-Choosh is an early engineering preview. Signed preview APK releases, a private-socket
-host daemon, and deterministic boundary tests exist. The native Android connection path now
-has a bounded callback stream, exact-host SSH admission, payload-only signing, fixed RPC, and
-one-close-only session ownership. The shipped M0 screen deliberately remains a connection-status
-surface: it validates a profile ID and reports an unavailable saved profile; it does not yet
-configure a host, establish a user session, or provide a usable terminal/workspace flow.
+- A devhost's agent needs input. Your phone buzzes — an FCM push, not a
+  fragile background connection — with exactly what's blocked and nothing
+  else (no command text, no file contents). Tap it: the agent's terminal is
+  already pinned and focused.
+- Open the app cold. No password, no PIN — Android's passkey prompt (or
+  nothing at all, if the device credential is already unlocked) and you're
+  looking at your fleet: every devhost across every cloud account, which
+  ones are up, what's running on each.
+- Pin a workspace's `jj` change graph, tap a commit to see the diff, tap
+  `undo` if an agent went sideways. Pin the changed-files list and open one
+  in the built-in editor to make a quick fix from the couch.
+- Later, at a laptop: `zed mbp-home` or plain `ssh build-box-large` just
+  works. No VPN, no manually trusted host key, no password — the trust was
+  already established when that devhost was enrolled.
 
-## What currently works
+## Key deliverables
 
-- The installable `ai.choosh` app launches a non-visual-testable Java/View screen with a labelled
-  profile field and Connect action. A valid profile string enables Connect; the default composition
-  fails closed as an unavailable saved profile.
-- The Android/Rust bridge accepts only a plan-owned, bounded runtime callback capability. It checks
-  the exact SSH host key before requesting a Keystore signature, exposes only framed fixed RPC, and
-  releases the Android socket/runtime lease exactly once when a session closes.
-- Headless generated-key acceptance proves `git.status` crosses authenticated SSH, the fixed
-  `choosh-host rpc --stdio` command, and a real private `chooshd` Unix socket. This is not yet a
-  claim of a configured, end-user Android host connection.
-- Device evidence on an API 36 x86_64 KVM emulator confirms the packaged debug APK launches
-  `ai.choosh.MainActivity`, resolves the nested JNI bridge ABI, and presents the connection-status
-  flow deterministically: empty profile → disabled Connect, valid profile → enabled Connect and
-  “Ready to connect.”, then Connect → “This saved profile is unavailable.” No visual inspection is
-  used as the test oracle.
+- **`choosh-relayd`** — one small Rust binary, deployed once in the cloud.
+  The fleet's rendezvous point: presence, tunnel brokering, FCM dispatch,
+  and the only place a passkey is ever checked.
+- **`choosh-hostd`** — one small Rust binary installed on every devhost
+  (daemon mode: workspace/jj/Zellij ownership, agent event bridge, SSH
+  bridge for Zed) and on any laptop that wants a zero-setup SSH/Zed path
+  into the fleet (proxy mode).
+- **The Choosh Android app** (`ai.choosh`) — installable via Obtainium. The
+  primary way you drive the fleet: fixed explorer, swipeable pinned
+  terminals, jj change graph and diffs, an in-app editor, Markdown preview,
+  and tunneled web previews.
 
 ## Core decisions
 
-- Android application ID: `ai.choosh`
-- Android UI: a programmatic Java/View M0 connection-status screen today; Compose navigation
-  and explorer surfaces remain a future target on the [stable Android/Kotlin toolchain](docs/specs/android-toolchain.md)
-- Terminal: [Zelland-derived native wgpu/glyphon renderer](docs/specs/terminal-experience.md) with libghostty-vt and an Android IME extra-keys bar
-- Source editor: [Sora Editor](https://github.com/Rosemoe/sora-editor)
-- Durable engines: Rust on Android and a small Rust `chooshd` on the host
-- Remote boundary: host-key-verified SSH only
-- Persistence: Zellij sessions and tabs
-- Documents: SFTP, with revision-aware saves
-- Markdown: Maud/Datastar fragments in a locked-down WebView
-- Git review: host-supplied metadata/blobs with a bounded native `bounded-myers-v1`
-  reference diff today; production diff fidelity and a live Git adapter remain pending
-- Agent adapters: fixture-normalized Codex, OpenCode, and Claude Code lifecycle events;
-  each adapter is independently versioned and maintained, and absent/incompatible adapters
-  leave the terminal usable without notification integration
-- Initial host targets: macOS/arm64 and Linux/x86_64
+- Trust boundary: `choosh-relayd` brokers every byte between phone, laptop,
+  and devhost; no devhost ever accepts an inbound connection.
+- Auth: passkeys for humans, device credentials minted from a
+  passkey-authenticated session for machines — no password, no manual SSH
+  fingerprint confirmation, ever.
+- VCS: jj only, via `jj-lib` embedded directly in `choosh-hostd` — no Git
+  support, no on-device diff engine.
+- Persistence: one Zellij session per Workspace (= one `jj workspace`),
+  agents and services each in their own managed tab.
+- Editing: Sora in-app for quick/no-desktop edits; a real Zed remote session
+  tunneled through `relayd` when a laptop is available.
+- Terminal: Zelland-derived native `wgpu`/`glyphon` renderer with
+  `libghostty-vt` and an Android IME extra-keys bar.
+- Notifications: FCM-driven, redacted to workspace/agent/coarse reason.
+- Toolchains: per-project `mise.toml`, provisioned by `choosh-hostd` on
+  workspace registration.
+- Android application ID: `ai.choosh`.
 
-## Documents
+## Status
 
-- [System design and delivery plan](CHOOSH_DESIGN_PLAN.md)
-- [Specification index](docs/specs/README.md)
-- [Current delivery status](PLAN.md)
-- [Milestone plan](docs/milestones/README.md)
-- [Architecture decisions](docs/adr/README.md)
-- [Threat model](docs/threat-model.md)
-- [Android release and Obtainium distribution](docs/release-android.md)
-- [Android runtime callback contract](docs/specs/android-native-runtime.md)
+This repository is being rebuilt against the architecture in
+[DESIGN.md](DESIGN.md). Prior work here (an SSH-only transport, Git-based
+diffing, a two-binary host daemon) predates that architecture and is being
+replaced, not extended — there is no shipped user base and no backwards
+compatibility constraint.
 
-## Planned repository layout
+## Repository layout
 
-```text
-android/app/          Packaging, Java/View M0 screen, and Android composition roots
-rust/choosh-core/     Android-side state engine
-rust/choosh-android-bridge/  Android/Rust bridge
-rust/choosh-web/      Maud, Datastar, and loopback gateways
-rust/chooshd/         Host workspace/item daemon
-rust/choosh-host/     Host CLI, hooks, and SSH stdio bridge
-protocol/             Schemas and protocol fixtures
-docs/                 Specifications, ADRs, and threat model
-```
+See [DESIGN.md §13](DESIGN.md#13-target-repository-layout) for the full
+target layout and what's being repurposed vs. built new.
 
 ## Licence
 
