@@ -24,6 +24,16 @@ import kotlinx.coroutines.launch
 class ConnectionViewModel(
     private val engine: ChooshEngine,
     private val credentialStore: SessionCredentialStore,
+    /**
+     * Returns the current FCM token, or `null` if unavailable (no Play
+     * Services, fetch failed, etc.) — injected rather than a direct
+     * `FirebaseMessaging` call here so this class stays testable without
+     * pulling in the Firebase SDK; the composition root supplies the real
+     * implementation. `null` is a normal, non-fatal outcome: notifications
+     * degrade to foreground-only, per notifications.md, not a connection
+     * failure.
+     */
+    private val fcmTokenProvider: suspend () -> String? = { null },
 ) : ViewModel() {
     private val _state = MutableStateFlow<ConnectionUiState>(ConnectionUiState.CheckingStoredCredential)
     val state: StateFlow<ConnectionUiState> = _state.asStateFlow()
@@ -72,6 +82,7 @@ class ConnectionViewModel(
         _state.value = ConnectionUiState.Connecting
         val connected = runCatching { engine.connect(sessionCredential) }.getOrDefault(false)
         _state.value = if (connected) {
+            registerFcmTokenBestEffort()
             ConnectionUiState.Connected
         } else {
             // A stored credential relayd no longer accepts (revoked, expired) forces a fresh
@@ -80,6 +91,18 @@ class ConnectionViewModel(
             credentialStore.clear()
             ConnectionUiState.NeedsRegistration
         }
+    }
+
+    /**
+     * Best-effort: a failed or unavailable FCM token MUST NOT block reaching
+     * [ConnectionUiState.Connected] — background push is a backstop per
+     * notifications.md, not a precondition for using the app in the
+     * foreground. Failures are swallowed here deliberately, not surfaced as
+     * connection errors.
+     */
+    private suspend fun registerFcmTokenBestEffort() {
+        val token = runCatching { fcmTokenProvider() }.getOrNull() ?: return
+        runCatching { engine.registerFcmToken(token) }
     }
 }
 

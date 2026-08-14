@@ -34,6 +34,14 @@ interface ChooshEngine {
     /** Lists every devhost visible to this authenticated connection. */
     suspend fun listDevhosts(): List<DevHostPresence>
 
+    /**
+     * Registers this phone's current FCM token with `relayd`, per
+     * notifications.md — replaces any previously registered token. `false`
+     * if not connected or the call fails; callers should retry after the
+     * next successful [connect] rather than treat this as fatal.
+     */
+    suspend fun registerFcmToken(fcmToken: String): Boolean
+
     /** Closes the relay connection. Idempotent. */
     fun close()
 }

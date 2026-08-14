@@ -1,11 +1,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!--
-      SSH to a user-configured host is the only network capability Choosh has.
-      There is deliberately no ACCESS_NETWORK_STATE, no foreground-service or
-      notification permission, and no storage permission: each arrives with the
-      milestone that actually composes an Android component needing it.
+      A persistent WebSocket connection to choosh-relayd, plus FCM as the
+      backstop when that connection isn't alive (DESIGN.md §7) is the only
+      network capability Choosh has. POST_NOTIFICATIONS is required from
+      API 33 to actually show an FCM-delivered notification; there is
+      deliberately no foreground-service permission and no storage
+      permission yet — each arrives with the milestone that actually needs
+      it.
     -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -19,5 +23,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <service
+            android:name=".notifications.ChooshFirebaseMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>

@@ -125,6 +125,25 @@ fn native_list_devhosts<'local>(env: &mut Env<'local>, _class: JClass<'local>, h
     JString::new(env, body)
 }
 
+// `fcm_token` must stay `JString<'local>` by value to match the exact
+// signature `native_method!`'s macro expects below (mirroring
+// `native_connect`'s `session_credential` and `native_webauthn_*`'s
+// `credential_json`, both the identical by-value-then-borrow shape) — the
+// lint's own suggested fix (`&JString<'local>`) isn't a safe substitution
+// here, since it's the macro-generated JNI wrapper's argument type this
+// has to match, not a normal Rust call site clippy can freely rewrite.
+#[allow(clippy::needless_pass_by_value)]
+fn native_register_fcm_token<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    fcm_token: JString<'local>,
+) -> Result<jboolean, jni::errors::Error> {
+    let fcm_token = jstring_to_string(env, &fcm_token)?;
+    let registered = with_handle(handle, false, |h| h.runtime.block_on(h.engine.register_fcm_token(&fcm_token)));
+    Ok(jboolean::from(registered))
+}
+
 // `native_method!`'s non-raw mode always expects a `Result` return (it's
 // what gives every other native method here panic-safety and Java
 // exception translation for free) even though this particular method never
@@ -177,6 +196,11 @@ const _CLOSE: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",
     static extern fn NativeBridge::native_close(handle: jlong) -> void,
     fn = native_close,
+};
+const _REGISTER_FCM_TOKEN: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_register_fcm_token(handle: jlong, fcm_token: JString) -> jboolean,
+    fn = native_register_fcm_token,
 };
 
 #[cfg(test)]

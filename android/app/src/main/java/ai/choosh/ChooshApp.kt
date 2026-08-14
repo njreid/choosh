@@ -29,6 +29,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.google.firebase.messaging.FirebaseMessaging
+import kotlinx.coroutines.tasks.await
 
 /**
  * Composition root. This is the single place that chooses [ChooshEngine]'s
@@ -36,7 +38,19 @@ import androidx.lifecycle.viewmodel.compose.viewModel
  * once the native bridge (a sibling increment) is ready to be exercised for
  * real; nothing else in the app needs to change.
  */
+// NativeChooshEngine is real and verified (confirmed against the real
+// choosh-android-bridge .so on a real device — see NativeChooshEngine.kt's
+// NativeBridge doc comment) but needs a live choosh-relayd deployment to be
+// useful; FakeChooshEngine stays the default until one exists to point at.
 private fun buildEngine(): ChooshEngine = FakeChooshEngine()
+
+/**
+ * `null` on any failure (no Play Services, transient error, etc.) — a
+ * missing FCM token is a normal, non-fatal outcome for the caller
+ * ([ai.choosh.connection.ConnectionViewModel] treats it as "notifications
+ * degrade to foreground-only", not a connection failure).
+ */
+private suspend fun fetchFcmToken(): String? = runCatching { FirebaseMessaging.getInstance().token.await() }.getOrNull()
 
 private sealed interface Screen {
     data object Connection : Screen
@@ -59,7 +73,9 @@ fun ChooshApp(context: Context) {
             when (val current = screen) {
                 is Screen.Connection -> {
                     val viewModel: ConnectionViewModel = viewModel(
-                        factory = singleInstanceFactory { ConnectionViewModel(engine, credentialStore) },
+                        factory = singleInstanceFactory {
+                            ConnectionViewModel(engine, credentialStore, fcmTokenProvider = ::fetchFcmToken)
+                        },
                     )
                     ConnectionScreen(viewModel = viewModel, onConnected = { screen = Screen.Fleet })
                 }

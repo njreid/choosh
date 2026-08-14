@@ -9,6 +9,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.google.services)
 }
 
 val localReleaseProperties = Properties().apply {
@@ -61,6 +62,15 @@ android {
             "CHOOSH_RELAYD_URL",
             "\"${releaseValue("CHOOSH_RELAYD_URL") ?: "wss://relay.choosh.ai/connect"}\"",
         )
+        // relayd's WebAuthn ceremony endpoints (/webauthn/register/*,
+        // /webauthn/login/*) are plain HTTPS at the relay host's root, not
+        // under the WS /connect path above — a separate constant rather
+        // than deriving it via string surgery on CHOOSH_RELAYD_URL.
+        buildConfigField(
+            "String",
+            "CHOOSH_RELAYD_HTTP_URL",
+            "\"${releaseValue("CHOOSH_RELAYD_HTTP_URL") ?: "https://relay.choosh.ai"}\"",
+        )
         // The bespoke SSH-era SmokeInstrumentation runner is gone along with the code it
         // exercised; instrumented tests (once this sandbox has an attached device/emulator
         // to run them on) use the standard AndroidX runner.
@@ -103,8 +113,10 @@ android {
 dependencies {
     implementation(platform(libs.composeBom))
     androidTestImplementation(platform(libs.composeBom))
+    implementation(platform(libs.firebaseBom))
 
     implementation(libs.soraEditor)
+    implementation(libs.firebaseMessaging)
     implementation(libs.composeUi)
     implementation(libs.composeUiToolingPreview)
     implementation(libs.composeMaterial3)
@@ -117,6 +129,7 @@ dependencies {
     implementation(libs.credentialsPlayServicesAuth)
     implementation(libs.securityCrypto)
     implementation(libs.kotlinxCoroutinesAndroid)
+    implementation(libs.kotlinxCoroutinesPlayServices)
     implementation(libs.kotlinxSerializationJson)
     debugImplementation(libs.composeUiTooling)
     debugImplementation(libs.composeUiTestManifest)

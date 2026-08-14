@@ -165,6 +165,28 @@ impl PhoneConnection {
         }
     }
 
+    /// Registers this phone's FCM token with `relayd`, per
+    /// relay-protocol.md's `register-fcm-token` — replaces any previously
+    /// registered token for this phone Identity.
+    ///
+    /// # Errors
+    ///
+    /// See [`CallError`].
+    pub async fn register_fcm_token(&mut self, fcm_token: &str) -> Result<(), CallError> {
+        let request_id = new_request_id();
+        self.channel
+            .send(
+                FRAME_CLASS_CONTROL,
+                &ControlRequest::RegisterFcmToken { request_id: request_id.clone(), fcm_token: fcm_token.to_string() },
+            )
+            .await?;
+        match self.channel.recv::<ControlResponse>().await? {
+            ControlResponse::RegisterFcmTokenOk { .. } => Ok(()),
+            ControlResponse::Error { code, message, .. } => Err(CallError::Server { code, message }),
+            _ => Err(CallError::UnexpectedResponse),
+        }
+    }
+
     /// Blocks until the connection drops (or a malformed frame terminates
     /// it, per relay-protocol.md). M0 has no server-pushed frame to react
     /// to on this connection yet (no tunnels, no agent events), so this is

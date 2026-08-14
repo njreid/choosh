@@ -50,6 +50,11 @@ class FakeChooshEngine : ChooshEngine {
         return FIXTURE_DEVHOSTS
     }
 
+    override suspend fun registerFcmToken(fcmToken: String): Boolean {
+        delay(FAKE_LATENCY_MS)
+        return connected
+    }
+
     override fun close() {
         connected = false
     }

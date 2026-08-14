@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "586133370729",
+    "project_id": "choosh",
+    "storage_bucket": "choosh.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:586133370729:android:c0e8cfe5a0f595cf986ff8",
+        "android_client_info": {
+          "package_name": "ai.choosh"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDCcNmGl_yXE8vlxGZ3xhbH4iLfhNi-Guw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

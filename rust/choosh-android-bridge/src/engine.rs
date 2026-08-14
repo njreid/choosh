@@ -109,6 +109,24 @@ impl Engine {
         }
     }
 
+    /// Registers the phone's FCM token with `relayd` over the live
+    /// connection. `false` if not connected or the call fails — the caller
+    /// is expected to retry after the next successful `connect`, not
+    /// treat this as fatal.
+    pub async fn register_fcm_token(&self, fcm_token: &str) -> bool {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return false;
+        };
+        match connection.register_fcm_token(fcm_token).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "register_fcm_token failed");
+                false
+            }
+        }
+    }
+
     pub async fn close(&self) {
         *self.connection.lock().await = None;
     }
