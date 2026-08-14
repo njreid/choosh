@@ -53,6 +53,16 @@ constraints that follow from it.
 - JSON Schemas use draft 2020-12.
 - Markdown links should be relative for repository-owned documents.
 - Protocol examples must conform to their schemas once fixture validation is available.
+- Running `:app:connectedDebugAndroidTest` against a Genymotion cloud Android
+  device: `com.genymotion.tasklocker` (a protected system package that can't
+  be `pm disable-user`'d) steals window focus back to the launcher within
+  ~34ms of any test activity reaching `RESUMED`, before Compose's test
+  framework can register its semantics tree — symptom is "No compose
+  hierarchies found in the app" despite `setContent` genuinely running.
+  A single `adb shell am force-stop com.genymotion.tasklocker` isn't durable
+  across a multi-test run (it can reassert itself between individual test
+  activity launches); run it in a repeating loop for the duration of the
+  test run.
 
 ## Increment workflow
 

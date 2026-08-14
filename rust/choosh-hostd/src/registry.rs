@@ -1,0 +1,390 @@
+//! Persistent Project/Workspace registry for this devhost, per
+//! `docs/specs/host-rpc.md`'s "Registry RPCs" and
+//! `docs/milestones/M1-workspace-and-jj.md`. Explicit registration only —
+//! never filesystem discovery. Persisted atomically (write-then-rename,
+//! same discipline as `credential.rs`) so a `choosh-hostd` restart doesn't
+//! forget what's registered; the M0 `relayd` fork left its analogous
+//! registry in-memory-only as an explicit, noted gap — this one doesn't
+//! repeat it, since a devhost losing track of its own workspaces on
+//! restart would be a real regression, not a nice-to-have.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use choosh_protocol::host_rpc::{AgentKind, ItemStatus, ItemType};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Item {
+    pub item_id: String,
+    pub workspace_id: String,
+    pub item_type: ItemType,
+    pub name: String,
+    pub tab_target: String,
+    pub status: ItemStatus,
+    pub agent: Option<AgentKind>,
+    pub port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Project {
+    pub project_id: String,
+    pub name: String,
+    pub primary_workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Workspace {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub devhost_id: String,
+    pub project_id: String,
+    pub root_path: PathBuf,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct RegistryState {
+    projects: Vec<Project>,
+    workspaces: Vec<Workspace>,
+    #[serde(default)]
+    items: Vec<Item>,
+}
+
+#[derive(Debug)]
+pub enum RegistryError {
+    Io(io::Error),
+    Corrupt(String),
+    WorkspaceNameTaken(String),
+    ItemNameTaken(String),
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "registry file I/O error: {error}"),
+            Self::Corrupt(reason) => write!(f, "registry file is corrupt: {reason}"),
+            Self::WorkspaceNameTaken(name) => {
+                write!(f, "workspace name {name:?} is already registered on this host")
+            }
+            Self::ItemNameTaken(name) => {
+                write!(f, "item name {name:?} is already registered in this workspace")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegistryError {}
+
+impl From<io::Error> for RegistryError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// In-memory registry, loaded from and saved back to a single JSON file.
+/// Not safe for concurrent mutation from multiple processes (single
+/// `choosh-hostd` per devhost, per `DESIGN.md`, so this isn't a real
+/// constraint) — callers within one process should hold this behind a
+/// `tokio::sync::Mutex` if driven from concurrent RPC dispatch.
+pub struct Registry {
+    path: PathBuf,
+    state: RegistryState,
+}
+
+impl Registry {
+    /// Loads the registry at `path`, or starts empty if the file doesn't
+    /// exist yet (this devhost has never registered a workspace).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Corrupt`] for a present, malformed file —
+    /// deliberately distinct from "file missing", same posture
+    /// `credential.rs` takes: a corrupt registry must be a hard error, not
+    /// silently treated as "nothing registered yet".
+    pub fn load(path: &Path) -> Result<Self, RegistryError> {
+        let state = match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| RegistryError::Corrupt(format!("invalid JSON: {error}")))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => RegistryState::default(),
+            Err(error) => return Err(RegistryError::Io(error)),
+        };
+        Ok(Self { path: path.to_path_buf(), state })
+    }
+
+    /// The default per-devhost registry file location:
+    /// `<config dir>/choosh-hostd/workspaces.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if no config directory can be determined.
+    pub fn default_path() -> Result<PathBuf, RegistryError> {
+        let dirs = directories::ProjectDirs::from("ai", "choosh", "hostd").ok_or_else(|| {
+            RegistryError::Io(io::Error::new(io::ErrorKind::NotFound, "no config directory for choosh-hostd"))
+        })?;
+        Ok(dirs.config_dir().join("workspaces.json"))
+    }
+
+    fn save(&self) -> Result<(), RegistryError> {
+        let parent = self.path.parent().ok_or_else(|| {
+            RegistryError::Io(io::Error::new(io::ErrorKind::InvalidInput, "registry path has no parent directory"))
+        })?;
+        fs::create_dir_all(parent)?;
+        let tmp_path = parent.join(format!(
+            ".{}.tmp-{}",
+            self.path.file_name().and_then(|n| n.to_str()).unwrap_or("workspaces.json"),
+            std::process::id()
+        ));
+        let json = serde_json::to_vec_pretty(&self.state)
+            .map_err(|error| RegistryError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+        fs::write(&tmp_path, &json)?;
+        fs::rename(&tmp_path, &self.path)?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn find_workspace_by_name(&self, workspace_name: &str) -> Option<&Workspace> {
+        self.state.workspaces.iter().find(|w| w.workspace_name == workspace_name)
+    }
+
+    #[must_use]
+    pub fn find_workspace(&self, workspace_id: &str) -> Option<&Workspace> {
+        self.state.workspaces.iter().find(|w| w.workspace_id == workspace_id)
+    }
+
+    #[must_use]
+    pub fn list_workspaces(&self) -> &[Workspace] {
+        &self.state.workspaces
+    }
+
+    #[must_use]
+    pub fn find_project_by_source(&self, root_path: &Path) -> Option<&Project> {
+        // A Project is identified, for M1's purposes, by its registered
+        // Workspaces' root paths sharing a common repo — the simplest
+        // correct check available without a richer Project-source model is
+        // "does an existing Workspace's root match", which is exactly the
+        // adopt-vs-fresh-clone distinction `workspace.create` needs.
+        let project_id = self.state.workspaces.iter().find(|w| w.root_path == root_path)?.project_id.clone();
+        self.state.projects.iter().find(|p| p.project_id == *project_id.as_str())
+    }
+
+    #[must_use]
+    pub fn find_project(&self, project_id: &str) -> Option<&Project> {
+        self.state.projects.iter().find(|p| p.project_id == project_id)
+    }
+
+    /// Registers a new Workspace under `project_id` (creating the Project
+    /// record if it doesn't exist yet, with itself as the primary
+    /// Workspace, per `DESIGN.md` §4's "defaults to the first Workspace
+    /// registered for it").
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::WorkspaceNameTaken`] if `workspace_name` is
+    /// already registered on this host, per `host-rpc.md`'s "reject
+    /// collisions... rather than silently adopting it".
+    #[allow(clippy::too_many_arguments)] // registering a workspace genuinely needs all of these; a params struct would just move the count, not reduce it, for a single call site.
+    pub fn register_workspace(
+        &mut self,
+        workspace_id: String,
+        workspace_name: String,
+        devhost_id: String,
+        project_id: String,
+        project_name: String,
+        root_path: PathBuf,
+        created_at: String,
+    ) -> Result<(), RegistryError> {
+        if self.find_workspace_by_name(&workspace_name).is_some() {
+            return Err(RegistryError::WorkspaceNameTaken(workspace_name));
+        }
+        let is_new_project = self.find_project(&project_id).is_none();
+        if is_new_project {
+            self.state.projects.push(Project {
+                project_id: project_id.clone(),
+                name: project_name,
+                primary_workspace_id: Some(workspace_id.clone()),
+            });
+        }
+        self.state.workspaces.push(Workspace {
+            workspace_id,
+            workspace_name,
+            devhost_id,
+            project_id,
+            root_path,
+            created_at,
+        });
+        self.save()
+    }
+
+    #[must_use]
+    pub fn find_item(&self, item_id: &str) -> Option<&Item> {
+        self.state.items.iter().find(|i| i.item_id == item_id)
+    }
+
+    #[must_use]
+    pub fn find_item_by_name(&self, workspace_id: &str, name: &str) -> Option<&Item> {
+        self.state.items.iter().find(|i| i.workspace_id == workspace_id && i.name == name)
+    }
+
+    #[must_use]
+    pub fn list_items(&self, workspace_id: &str) -> Vec<&Item> {
+        self.state.items.iter().filter(|i| i.workspace_id == workspace_id).collect()
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::ItemNameTaken`] if `name` is already
+    /// registered within `workspace_id`, per `host-rpc.md`'s "Unique within
+    /// the workspace" requirement for `item.create`'s `name` field.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_item(
+        &mut self,
+        item_id: String,
+        workspace_id: String,
+        item_type: ItemType,
+        name: String,
+        tab_target: String,
+        agent: Option<AgentKind>,
+        port: Option<u16>,
+    ) -> Result<(), RegistryError> {
+        if self.find_item_by_name(&workspace_id, &name).is_some() {
+            return Err(RegistryError::ItemNameTaken(name));
+        }
+        self.state.items.push(Item {
+            item_id,
+            workspace_id,
+            item_type,
+            name,
+            tab_target,
+            status: ItemStatus::Running,
+            agent,
+            port,
+        });
+        self.save()
+    }
+
+    /// Marks an item `stopped` in place; the record and its Zellij tab's
+    /// scrollback are retained, per `host-rpc.md`'s `item.stop`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Corrupt`] (repurposed as "not found" here —
+    /// there's no dedicated variant and adding one for a single call site
+    /// isn't worth it) if `item_id` isn't registered.
+    pub fn mark_item_stopped(&mut self, item_id: &str) -> Result<(), RegistryError> {
+        let item = self
+            .state
+            .items
+            .iter_mut()
+            .find(|i| i.item_id == item_id)
+            .ok_or_else(|| RegistryError::Corrupt(format!("item {item_id:?} not found")))?;
+        item.status = ItemStatus::Stopped;
+        self.save()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_registry() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspaces.json");
+        (dir, path)
+    }
+
+    #[test]
+    fn missing_file_loads_empty() {
+        let (_dir, path) = temp_registry();
+        let registry = Registry::load(&path).unwrap();
+        assert!(registry.list_workspaces().is_empty());
+    }
+
+    #[test]
+    fn register_then_reload_round_trips() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+        registry
+            .register_workspace(
+                "ws-1".to_string(),
+                "app".to_string(),
+                "dev-1".to_string(),
+                "proj-1".to_string(),
+                "app".to_string(),
+                PathBuf::from("/workspaces/app"),
+                "2026-08-14T00:00:00Z".to_string(),
+            )
+            .unwrap();
+
+        let reloaded = Registry::load(&path).unwrap();
+        assert_eq!(reloaded.list_workspaces().len(), 1);
+        assert_eq!(reloaded.find_workspace("ws-1").unwrap().workspace_name, "app");
+        let project = reloaded.find_project("proj-1").unwrap();
+        assert_eq!(project.primary_workspace_id.as_deref(), Some("ws-1"));
+    }
+
+    #[test]
+    fn duplicate_workspace_name_is_rejected() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+        registry
+            .register_workspace(
+                "ws-1".to_string(),
+                "app".to_string(),
+                "dev-1".to_string(),
+                "proj-1".to_string(),
+                "app".to_string(),
+                PathBuf::from("/workspaces/app"),
+                "2026-08-14T00:00:00Z".to_string(),
+            )
+            .unwrap();
+        let result = registry.register_workspace(
+            "ws-2".to_string(),
+            "app".to_string(),
+            "dev-1".to_string(),
+            "proj-2".to_string(),
+            "app-2".to_string(),
+            PathBuf::from("/workspaces/app-2"),
+            "2026-08-14T00:00:01Z".to_string(),
+        );
+        assert!(matches!(result, Err(RegistryError::WorkspaceNameTaken(name)) if name == "app"));
+    }
+
+    #[test]
+    fn corrupt_file_is_a_hard_error() {
+        let (_dir, path) = temp_registry();
+        fs::write(&path, b"not json").unwrap();
+        assert!(matches!(Registry::load(&path), Err(RegistryError::Corrupt(_))));
+    }
+
+    #[test]
+    fn second_workspace_in_same_project_does_not_change_primary() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+        registry
+            .register_workspace(
+                "ws-1".to_string(),
+                "app".to_string(),
+                "dev-1".to_string(),
+                "proj-1".to_string(),
+                "app".to_string(),
+                PathBuf::from("/workspaces/app"),
+                "2026-08-14T00:00:00Z".to_string(),
+            )
+            .unwrap();
+        registry
+            .register_workspace(
+                "ws-2".to_string(),
+                "app-agent-b".to_string(),
+                "dev-1".to_string(),
+                "proj-1".to_string(),
+                "app".to_string(),
+                PathBuf::from("/workspaces/app-agent-b"),
+                "2026-08-14T00:00:01Z".to_string(),
+            )
+            .unwrap();
+        assert_eq!(registry.find_project("proj-1").unwrap().primary_workspace_id.as_deref(), Some("ws-1"));
+        assert_eq!(registry.list_workspaces().len(), 2);
+    }
+}

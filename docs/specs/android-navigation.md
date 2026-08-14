@@ -2,12 +2,47 @@
 
 Status: Draft
 
+## Fleet drawer
+
+Before a Workspace is open, a left-drawer is how the whole fleet is
+navigated. It has three switchable sort modes, chosen via three icons
+pinned at the top of the drawer:
+
+1. **Project** (default) — `Project → DevHost → Workspace`. Every
+   registered Project, each expandable to the DevHosts holding at least one
+   of its Workspaces, each expandable to those Workspaces.
+2. **Host** — `DevHost → Workspace`, scoped to Projects with current
+   activity (a Project counts as active if any of its Workspaces has a
+   connected agent/service Item or an event within a recent window — the
+   exact staleness bound is an implementation choice, not a wire
+   contract). Every DevHost from `list-devhosts` (see
+   [relay-protocol.md](relay-protocol.md)) still appears even if it
+   currently owns no active Workspace, so the fleet's online/offline state
+   stays visible in this mode too.
+3. **Recent** — a flat list of every Workspace across the whole fleet,
+   most-recently-active first, no grouping.
+
+**Attention flagging is a row property, not a fourth mode.** In every sort
+mode, any row whose subtree contains a Workspace with an outstanding
+(unacknowledged) `input_required` (see [agent-events.md](agent-events.md))
+MUST render a distinct visual marker, propagated up through Project/DevHost
+group rows so it's visible without expanding them. Switching sort order
+MUST NOT cause an attention-needing Workspace to become harder to find.
+
+**Tapping a Project row opens its designated primary Workspace directly**,
+skipping an intermediate Workspace list. A Project's primary Workspace is
+explicit — it defaults to the first Workspace registered for that Project
+and is changeable afterward (an update to the Project record via
+[host-rpc.md](host-rpc.md); this document doesn't repeat that RPC's shape).
+Tapping a DevHost row or a Workspace row (in Host or Recent mode) behaves
+as the flow below.
+
 ## Workspace entry
 
-The top-level flow is:
+Selecting a DevHost or a specific Workspace row is:
 
 ```text
-Fleet (DevHost list) → Workspace list → Workspace
+Fleet drawer → Workspace list → Workspace
 ```
 
 DevHosts and Workspaces are explicit. Selecting a DevHost never scans its

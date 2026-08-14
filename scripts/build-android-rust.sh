@@ -42,11 +42,13 @@ build_one() {
   linker_key="${linker_key//-/_}"
   env "$linker_key=$toolchain/$linker" "$cc_key=$toolchain/$linker" "$ar_key=$toolchain/llvm-ar" cargo build \
     --manifest-path "$root/Cargo.toml" \
-    --locked --release --target "$target" -p choosh-android-bridge -p choosh-ssh
+    --locked --release --target "$target" -p choosh-android-bridge
   local library="$root/target/$target/release/libchoosh_android_bridge.so"
-  for symbol in choosh_bridge_abi_version choosh_bridge_generation \
-    choosh_bridge_request_begin choosh_bridge_request_cancel choosh_bridge_recreate; do
-    nm -D --defined-only "$library" | awk '{print $3}' | grep -Fx -- "$symbol" >/dev/null
+  # ai.choosh.NativeBridge's relay-protocol JNI surface (docs/specs/android-native-runtime.md);
+  # replaces the pre-relay choosh_bridge_* C-ABI symbols this check used to require.
+  for symbol in Java_ai_choosh_NativeBridge_nativeInit Java_ai_choosh_NativeBridge_nativeConnect__JLjava_lang_String_2 \
+    Java_ai_choosh_NativeBridge_nativeListDevhosts__J Java_ai_choosh_NativeBridge_nativeClose__J; do
+    nm -D --defined-only "$library" | awk '{print $3}' | grep -F -- "$symbol" >/dev/null
   done
   mkdir -p "$stage/$abi"
   cp -- "$library" "$stage/$abi/libchoosh_android_bridge.so"

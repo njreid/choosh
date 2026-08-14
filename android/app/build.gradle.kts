@@ -2,7 +2,14 @@ import java.util.Properties
 import java.util.zip.ZipFile
 import org.gradle.api.tasks.testing.Test
 
-plugins { alias(libs.plugins.android.application) }
+// AGP 9's built-in Kotlin support means the separate org.jetbrains.kotlin.android
+// plugin must not be applied (AGP rejects it outright) — only compiler plugins
+// (Compose, serialization) are still applied explicitly.
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization)
+}
 
 val localReleaseProperties = Properties().apply {
     val source = rootProject.file("key.properties")
@@ -47,7 +54,17 @@ android {
         }
         versionCode = releaseVersionCode
         versionName = releaseVersionName
-        testInstrumentationRunner = "ai.choosh.SmokeInstrumentation"
+        // No server-discovery mechanism exists yet (a later increment); the relay
+        // URL is a build-time constant until then.
+        buildConfigField(
+            "String",
+            "CHOOSH_RELAYD_URL",
+            "\"${releaseValue("CHOOSH_RELAYD_URL") ?: "wss://relay.choosh.ai/connect"}\"",
+        )
+        // The bespoke SSH-era SmokeInstrumentation runner is gone along with the code it
+        // exercised; instrumented tests (once this sandbox has an attached device/emulator
+        // to run them on) use the standard AndroidX runner.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildToolsVersion = "36.0.0"
     signingConfigs {
@@ -68,6 +85,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
     testOptions { unitTests.isIncludeAndroidResources = false }
     lint {
         abortOnError = true
@@ -80,8 +101,33 @@ android {
 }
 
 dependencies {
+    implementation(platform(libs.composeBom))
+    androidTestImplementation(platform(libs.composeBom))
+
     implementation(libs.soraEditor)
+    implementation(libs.composeUi)
+    implementation(libs.composeUiToolingPreview)
+    implementation(libs.composeMaterial3)
+    implementation(libs.composeMaterialIconsExtended)
+    implementation(libs.activityCompose)
+    implementation(libs.lifecycleViewmodelCompose)
+    implementation(libs.lifecycleRuntimeKtx)
+    implementation(libs.lifecycleRuntimeCompose)
+    implementation(libs.credentials)
+    implementation(libs.credentialsPlayServicesAuth)
+    implementation(libs.securityCrypto)
+    implementation(libs.kotlinxCoroutinesAndroid)
+    implementation(libs.kotlinxSerializationJson)
+    debugImplementation(libs.composeUiTooling)
+    debugImplementation(libs.composeUiTestManifest)
+
     testImplementation(libs.junit4)
+    testImplementation(libs.kotlinxCoroutinesTest)
+
+    androidTestImplementation(libs.androidxTestRunner)
+    androidTestImplementation(libs.androidxTestExtJunit)
+    androidTestImplementation(libs.espressoCore)
+    androidTestImplementation(libs.composeUiTestJunit4)
 }
 
 dependencyLocking { lockAllConfigurations() }

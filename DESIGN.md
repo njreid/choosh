@@ -112,7 +112,7 @@ flowchart TD
 | Entity | Definition | Owned by |
 | --- | --- | --- |
 | **Repository** | A jj repo (optionally git-colocated for interop with GitHub/GitLab remotes). | The devhost filesystem. |
-| **Project** | Metadata bound to a repository: default `mise.toml`, agent launch config, declared services. | `choosh-hostd` registry. |
+| **Project** | Metadata bound to a repository: default `mise.toml`, agent launch config, declared services, and a designated *primary Workspace* (explicit, defaults to the first Workspace registered for it, changeable later — tapping a Project in the Android fleet drawer opens this one directly). | `choosh-hostd` registry. |
 | **DevHost** | A machine running `choosh-hostd` in daemon mode. Has an identity, a platform (`linux`, `macos`), and a cloud/account label used only for fleet display. | `choosh-relayd` (presence), `choosh-hostd` (local state). |
 | **Workspace** | One named `jj workspace` (an independent working copy of a Project's repo) plus a Zellij session of the same name. This is the unit you register, open, and pin. | `choosh-hostd`. |
 | **Item** | A typed thing living in a workspace's Zellij session: `AgentTerminal`, `Shell`, `WebService`, or an editor/session attachment. | `choosh-hostd`. |
@@ -315,6 +315,17 @@ Single Rust binary, two modes.
   killing.
 - **Auth is passkey-only**, via Android Credential Manager, as described in
   §5. No profile password, ever.
+- **Fleet drawer above the per-workspace Explorer.** Before you're inside a
+  Workspace, a left-drawer navigates the whole fleet with three
+  switchable sort modes: `Project → DevHost → Workspace` (default),
+  `DevHost → Workspace` scoped to Projects with current activity, and a
+  flat list sorted by recency. Every mode flags any Workspace with an
+  outstanding `input_required` the same way — attention state is a
+  property of the row, not a separate mode — so switching sort order never
+  hides something that needs you. Tapping a Project opens its designated
+  primary Workspace directly rather than an intermediate list; tapping a
+  DevHost or a Workspace row behaves as today's `Fleet → Workspace list →
+  Workspace` flow (see [android-navigation.md](docs/specs/android-navigation.md)).
 - **Fixed Explorer, swipeable pinned items** — unchanged UX shape from the
   original design: `Explorer → PinnedItem*`. Item types:
   - `AgentTerminal` — the agent's Zellij tab, full interactive TUI, native

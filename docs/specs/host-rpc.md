@@ -70,6 +70,30 @@ Workspace's live working copy (`@`). Full shape defined in
 [jj-integration.md](jj-integration.md); referenced here because it is also
 the primary signal the Android explorer's changed-files section polls.
 
+### `project.list`
+
+Returns every Project the requesting Identity can reach, across every
+devhost: `{ project_id, name, primary_workspace_id, active }`, where
+`active` mirrors the definition in
+[android-navigation.md](android-navigation.md)'s Host sort mode (at least
+one Workspace with a connected agent/service Item or a recent event) —
+`hostd` computes it, the client does not. This is the fleet drawer's
+Project-mode data source; it does not replace `workspace.list`, which
+remains how a specific Project's Workspaces are enumerated once expanded.
+
+### `project.set_primary_workspace`
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `project_id` | yes | |
+| `workspace_id` | yes | MUST already belong to `project_id`. |
+
+Changes which Workspace `project.list` reports as `primary_workspace_id`
+and which one the Android fleet drawer opens when a Project row is tapped.
+Set automatically to the first Workspace registered for a Project
+(`workspace.create` when `project_source` names a not-yet-known Project);
+this RPC is only needed to change it afterward.
+
 ## Item RPCs
 
 Items are typed things living inside a Workspace's Zellij session. The

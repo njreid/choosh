@@ -1,8 +1,28 @@
-//! Bounded, framework-agnostic primitives for Choosh's future loopback web surfaces.
+//! Bounded, framework-agnostic primitives for Choosh's loopback web surfaces.
 //!
-//! The M0 crate intentionally exposes no listener or browser bridge. Network ownership
-//! and authenticated gateway behavior arrive with M3; keeping this boundary empty makes
-//! an accidental public listener impossible in the foundation milestone.
+//! This crate intentionally exposes no listener or browser bridge yet: the
+//! loopback HTTP server, Datastar SSE wiring, and root-confined ranged
+//! asset serving all depend on the `workspace.file.read` RPC
+//! (`docs/specs/jj-integration.md`), which is part of
+//! [M1](../../../docs/milestones/M1-workspace-and-jj.md) and not yet
+//! landed. What's here — [`markdown`]'s sanitizing Markdown→HTML renderer
+//! and the [`is_safe_relative_asset`] gate — is the decoupled rendering
+//! core that increment will wire up to a real file source; see
+//! [M5](../../../docs/milestones/M5-web-and-markdown.md) ("Web preview and
+//! Markdown") for the full scope this crate grows into.
+
+pub mod markdown;
+
+/// Escapes arbitrary text for safe embedding in HTML, via `maud`'s
+/// auto-escaping `html!` macro. `markdown::render_markdown` handles its own
+/// content escaping internally (through `pulldown-cmark`'s HTML generator,
+/// after neutralizing raw-HTML events — see `markdown` for why); this is
+/// for embedding standalone dynamic text elsewhere, e.g. a workspace-
+/// relative file name in a future page-shell `<title>`.
+#[must_use]
+pub fn escape_html(text: &str) -> String {
+    maud::html! { (text) }.into_string()
+}
 
 /// Returns the stable boundary name used by diagnostics and future protocol wiring.
 #[must_use]
@@ -28,11 +48,17 @@ pub fn is_safe_relative_asset(reference: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{boundary_name, is_safe_relative_asset};
+    use super::{boundary_name, escape_html, is_safe_relative_asset};
 
     #[test]
     fn foundation_boundary_has_a_stable_name() {
         assert_eq!(boundary_name(), "choosh-web");
+    }
+
+    #[test]
+    fn escape_html_neutralizes_markup() {
+        assert_eq!(escape_html("<script>alert(1)</script>"), "&lt;script&gt;alert(1)&lt;/script&gt;");
+        assert_eq!(escape_html("plain text"), "plain text");
     }
 
     #[test]
