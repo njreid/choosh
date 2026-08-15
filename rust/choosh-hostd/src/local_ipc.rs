@@ -145,6 +145,26 @@ pub async fn send_event(path: &std::path::Path, event: &WireAgentEvent) -> Resul
     Ok(())
 }
 
+/// A minimal liveness probe against the local IPC socket: succeeds iff
+/// something is actively accepting connections at `path` within `timeout`.
+/// Used by [`crate::update`]'s post-restart rollback monitor as the
+/// concrete "local RPC socket health-check" `docs/specs/host-deployment.md`'s
+/// Rollback subsection calls for.
+///
+/// Deliberately just a connect-and-drop, not a real `WireAgentEvent`
+/// round trip: this module's protocol carries exactly one message type
+/// end to end (an `emit` invocation's normalized event), and a probe
+/// message would either be misdelivered to whatever's really waiting on
+/// `agent_event_rx` or rejected by [`handle_connection`]'s single-frame
+/// contract — neither of which a liveness probe needs. A successful
+/// connect already proves `serve` reached the point (very early in
+/// [`crate::serve::run`], before the SSH bridge, host-tool currency
+/// checks, or the relayd connect loop) where it bound this socket, which
+/// is exactly the signal "did the restarted binary come up at all" needs.
+pub async fn probe(path: &std::path::Path, timeout: std::time::Duration) -> bool {
+    tokio::time::timeout(timeout, UnixStream::connect(path)).await.is_ok_and(|result| result.is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +201,22 @@ mod tests {
 
         let listener = bind(&path).unwrap();
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn probe_succeeds_against_a_live_listener_and_fails_against_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sock");
+
+        assert!(!probe(&path, std::time::Duration::from_millis(200)).await, "no listener bound yet");
+
+        let listener = bind(&path).unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let server = tokio::spawn(serve_forever(listener, tx));
+
+        assert!(probe(&path, std::time::Duration::from_secs(2)).await);
+
+        server.abort();
     }
 
     #[tokio::test]

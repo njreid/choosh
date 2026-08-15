@@ -6,6 +6,7 @@ pub mod envelope;
 pub mod framing;
 pub mod handshake;
 pub mod host_rpc;
+pub mod offload;
 pub mod relay;
 pub mod session;
 pub mod wire;

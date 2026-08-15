@@ -571,6 +571,7 @@ dependencies = [
  "jj-lib",
  "nix",
  "rand 0.10.2",
+ "reqwest",
  "russh",
  "serde",
  "serde_json",

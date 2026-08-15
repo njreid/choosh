@@ -139,16 +139,99 @@ pub async fn rename_workspace(path: &Path, new_name: &str) -> Result<(), JjError
     Ok(())
 }
 
-/// `jj workspace add <dest> --name <name> -R <existing_repo_root>`, for the
-/// "one `jj workspace` per agent" mechanism (`jj-integration.md`) when
-/// `workspace.create`'s `parent_workspace_id` is set.
+/// `jj workspace add <dest> --name <name> [-r <revision>] -R
+/// <existing_repo_root>`, for the "one `jj workspace` per agent" mechanism
+/// (`jj-integration.md`) when `workspace.create`'s `parent_workspace_id` is
+/// set (`revision: None`, matching that path's existing behavior of
+/// sharing the parent's current `@`'s parent(s)), and for M7's `dev-exec`
+/// ephemeral offload workspace (`revision: Some(<commit_id>)`, anchoring
+/// the new workspace's working copy as a child of that specific revision
+/// instead — verified against a real `jj 0.44.0` binary: `-r`/`--revision`
+/// accepts any revset, including a bare commit hash, and creates the new
+/// workspace's working-copy commit "as if you had run `jj new r1 r2 r3
+/// ...`", per `jj workspace add --help`). If `revision` names a commit this
+/// store has never seen, `jj` itself fails with a non-zero exit — this
+/// surfaces as [`JjError::CommandFailed`], not a silent no-op.
 ///
 /// # Errors
 ///
 /// See [`JjError`].
-pub async fn workspace_add(existing_repo_root: &Path, dest: &Path, name: &str) -> Result<(), JjError> {
-    run(&["workspace", "add", path_arg(dest)?, "--name", name, "-R", path_arg(existing_repo_root)?], None).await?;
+pub async fn workspace_add(existing_repo_root: &Path, dest: &Path, name: &str, revision: Option<&str>) -> Result<(), JjError> {
+    let mut args = vec!["workspace", "add", path_arg(dest)?, "--name", name];
+    if let Some(revision) = revision {
+        args.push("-r");
+        args.push(revision);
+    }
+    args.push("-R");
+    args.push(path_arg(existing_repo_root)?);
+    run(&args, None).await?;
     Ok(())
+}
+
+/// `jj workspace forget <name> -R <existing_repo_root>`: stops tracking a
+/// workspace's working-copy commit in the shared repo's operation log,
+/// without touching anything on disk (per `jj workspace forget --help`,
+/// verified against the real binary) — the bookkeeping half of tearing down
+/// an ephemeral `dev-exec` offload workspace ([`workspace_add`] above);
+/// callers that also want the directory itself reclaimed do that
+/// separately (a plain `remove_dir_all`, since `jj` deliberately leaves the
+/// files alone).
+///
+/// # Errors
+///
+/// See [`JjError`].
+pub async fn forget_workspace(existing_repo_root: &Path, name: &str) -> Result<(), JjError> {
+    run(&["workspace", "forget", name, "-R", path_arg(existing_repo_root)?], None).await?;
+    Ok(())
+}
+
+/// `jj log --no-graph -T commit_id -r @`: the current working copy's Git
+/// commit id — the portable "matching jj revision" identifier `dev-exec`
+/// carries across two independent `jj` stores of the same underlying Git
+/// history (see `choosh_protocol::offload`'s module doc comment for why the
+/// commit id, not the `jj` change id, is what's portable here).
+///
+/// # Errors
+///
+/// Returns [`JjError::UnparseableOutput`] if `jj log` produced no output at
+/// all for `@` (should be unreachable for any real repo, which always has a
+/// working-copy commit) — see [`JjError`] otherwise.
+///
+/// **A sharp edge worth recording** (found while building this module's own
+/// two-independent-clones integration test, `serve.rs`'s
+/// `dev_exec_offload_runs_against_the_targets_real_workspace_and_streams_output_back`):
+/// `@` itself is frequently NOT the portable thing to send, even though its
+/// *commit id* is nominally a Git content hash. `jj git clone`/`jj new`
+/// create a fresh, locally-generated commit object for the new working copy
+/// (with this store's own author/committer timestamp), so two independent
+/// clones' respective `@`s are two genuinely different Git commits even
+/// when their tree content is byte-identical — there is no reason to expect
+/// a bare `jj clone`'s `@` to exist on any other store. What IS portable is
+/// a commit that was imported unchanged from the shared Git remote (e.g.
+/// `@-` immediately after a fresh clone, or anything reachable that was
+/// `jj git push`ed and then `jj git fetch`ed elsewhere) — callers of
+/// [`commit_id_at`]/this function for a cross-host purpose (M7's
+/// `dev-exec`) need a revision that is actually shared, not merely "the
+/// current working copy," which `dev_exec.rs`'s own module doc comment
+/// notes as a real, stated limitation of this pass.
+pub async fn current_commit_id(workspace_root: &Path) -> Result<String, JjError> {
+    commit_id_at(workspace_root, "@").await
+}
+
+/// Like [`current_commit_id`], but for an arbitrary revset expression
+/// rather than always `@` — the general form both `current_commit_id` and
+/// this module's own tests build on.
+///
+/// # Errors
+///
+/// See [`current_commit_id`].
+pub async fn commit_id_at(workspace_root: &Path, revision: &str) -> Result<String, JjError> {
+    let output = run(&["log", "--no-graph", "-T", "commit_id", "-r", revision], Some(workspace_root)).await?;
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Err(JjError::UnparseableOutput(format!("jj log -r {revision} -T commit_id returned no output")));
+    }
+    Ok(trimmed.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -775,7 +858,7 @@ mod tests {
         ensure_colocated(parent_dir.path()).await.unwrap();
 
         let agent_dest = parent_dir.path().parent().unwrap().join(format!("agent-{}", uuid::Uuid::new_v4()));
-        workspace_add(parent_dir.path(), &agent_dest, "agent-b").await.unwrap();
+        workspace_add(parent_dir.path(), &agent_dest, "agent-b", None).await.unwrap();
         assert!(agent_dest.join("a.txt").exists(), "new workspace should check out the shared repo's content");
 
         std::fs::remove_dir_all(&agent_dest).ok();
@@ -973,8 +1056,8 @@ mod tests {
 
         let a_dest = parent_dir.path().parent().unwrap().join(format!("wsa-{}", uuid::Uuid::new_v4()));
         let b_dest = parent_dir.path().parent().unwrap().join(format!("wsb-{}", uuid::Uuid::new_v4()));
-        workspace_add(parent_dir.path(), &a_dest, "workspace-a").await.unwrap();
-        workspace_add(parent_dir.path(), &b_dest, "workspace-b").await.unwrap();
+        workspace_add(parent_dir.path(), &a_dest, "workspace-a", None).await.unwrap();
+        workspace_add(parent_dir.path(), &b_dest, "workspace-b", None).await.unwrap();
 
         std::fs::write(a_dest.join("a.txt"), "hello\nfrom A\n").unwrap();
         run(&["describe", "-m", "edit from A"], Some(&a_dest)).await.unwrap();

@@ -8,8 +8,10 @@
 //! `docs/milestones/M0-enrollment.md`.
 
 mod agent_launch;
+pub mod auth_detect;
 mod backoff;
 pub mod credential;
+pub mod dev_exec;
 mod frame_channel;
 pub mod fs_ops;
 pub mod hooks;
@@ -24,6 +26,7 @@ pub mod rpc;
 pub mod serve;
 mod ssh_keys;
 pub mod ssh_server;
+pub mod update;
 mod zellij_ops;
 
 use clap::{Parser, Subcommand};
@@ -68,6 +71,44 @@ pub enum Command {
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
+    },
+    /// M7's cross-host task offload (`docs/milestones/M7-fleet-and-provisioning.md`):
+    /// runs `<command>` on the devhost named by `--host` (its raw
+    /// `device_id`, not an alias — see `dev_exec`'s module doc comment for
+    /// why), against a matching `jj` revision in a fresh ephemeral
+    /// workspace derived from `--workspace`'s registered root on *this*
+    /// devhost. Streams the remote command's stdout/stderr to this
+    /// process's own stdout/stderr and exits with its exact exit code.
+    DevExec {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        workspace: String,
+        /// Fixed argv after `--`, never a shell string — same
+        /// `host-rpc.md` "Command construction" discipline every other
+        /// subprocess-launching command in this CLI follows.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Internal use only — spawned by `choosh-hostd`'s own self-update
+    /// path (`crate::update::spawn_rollback_monitor`), never by a human or
+    /// any other CLI form. See `crate::update`'s module doc comment for
+    /// the full design: polls `--socket`'s local IPC socket for
+    /// `--current`'s health within a bounded window, and rolls back to
+    /// `--previous` (restarting the service once more) if it never comes
+    /// up healthy.
+    #[command(hide = true)]
+    UpdateMonitor {
+        #[arg(long)]
+        previous: std::path::PathBuf,
+        #[arg(long)]
+        current: std::path::PathBuf,
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        #[arg(long)]
+        state_file: std::path::PathBuf,
+        #[arg(long)]
+        version: String,
     },
 }
 
@@ -134,6 +175,29 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync
         Command::Service { command: ServiceCommand::Run { workspace, name, port, protocol, command } } => {
             run_service_run(&workspace, &name, port, &protocol, command).await
         }
+        Command::DevExec { host, workspace, command } => run_dev_exec(&host, &workspace, command).await,
+        Command::UpdateMonitor { previous, current, socket, state_file, version } => {
+            update::run_monitor(previous, current, socket, state_file, version).await;
+            Ok(())
+        }
+    }
+}
+
+/// # Errors
+///
+/// Returns an error (exit code 1, per this crate's other subcommands) for
+/// every *transport/protocol*-level failure — see [`dev_exec::DevExecError`].
+/// A non-zero exit from the *offloaded command itself* is NOT one of these:
+/// per M7's exit criterion ("streams output back... " with an implied
+/// faithful result), that exit code is propagated verbatim via
+/// `std::process::exit`, which this function calls directly rather than
+/// returning through the normal `Result` plumbing (whose `Err` path this
+/// crate's `main` always turns into a flat exit code 1, per `main.rs`'s
+/// `Result`-returning `main` — too coarse for "propagate the exact code").
+async fn run_dev_exec(host: &str, workspace: &str, command: Vec<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match dev_exec::run(host, workspace, command).await {
+        Ok(exit_code) => std::process::exit(exit_code),
+        Err(error) => Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
     }
 }
 
@@ -333,5 +397,42 @@ mod tests {
             panic!("expected Command::Service(Run), got {cli:?}");
         };
         assert_eq!(protocol, "http");
+    }
+
+    #[test]
+    fn cli_parses_update_monitor() {
+        let cli = Cli::parse_from([
+            "choosh-hostd",
+            "update-monitor",
+            "--previous",
+            "/opt/choosh-hostd.previous",
+            "--current",
+            "/opt/choosh-hostd",
+            "--socket",
+            "/run/choosh-hostd/emit.sock",
+            "--state-file",
+            "/opt/state/update_state.json",
+            "--version",
+            "0.5.0",
+        ]);
+        let Command::UpdateMonitor { previous, current, socket, state_file, version } = cli.command else {
+            panic!("expected Command::UpdateMonitor, got {cli:?}");
+        };
+        assert_eq!(previous, std::path::PathBuf::from("/opt/choosh-hostd.previous"));
+        assert_eq!(current, std::path::PathBuf::from("/opt/choosh-hostd"));
+        assert_eq!(socket, std::path::PathBuf::from("/run/choosh-hostd/emit.sock"));
+        assert_eq!(state_file, std::path::PathBuf::from("/opt/state/update_state.json"));
+        assert_eq!(version, "0.5.0");
+    }
+
+    #[test]
+    fn cli_parses_dev_exec_matching_m7s_milestone_doc_shape() {
+        let cli = Cli::parse_from(["choosh-hostd", "dev-exec", "--host", "dev-heavy", "--workspace", "app", "--", "cargo", "test"]);
+        let Command::DevExec { host, workspace, command } = cli.command else {
+            panic!("expected Command::DevExec, got {cli:?}");
+        };
+        assert_eq!(host, "dev-heavy");
+        assert_eq!(workspace, "app");
+        assert_eq!(command, vec!["cargo".to_string(), "test".to_string()]);
     }
 }

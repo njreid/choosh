@@ -34,13 +34,36 @@ done
 stage="$(mktemp -d -t choosh-android-rust.XXXXXX)"
 trap 'rm -rf -- "$stage"' EXIT INT TERM
 
+# Reproducible-build fix, confirmed by a real two-checkout diff (building the
+# same source from /home/njr/code/choosh and a second checkout at a different
+# absolute path): two problems compounded to make `lib/*/libchoosh_android_bridge.so`
+# byte-different (but behaviorally identical) between checkouts.
+#   1. Cargo's build metadata hash for path dependencies (choosh-android-bridge
+#      -> choosh-protocol etc., all in-workspace path deps) embeds their
+#      absolute filesystem location, which leaked into panic/debug-info
+#      strings. `--remap-path-prefix` on both the workspace root and the
+#      Cargo registry/home neutralizes that.
+#   2. Independently, the default release profile's parallel codegen
+#      (multiple codegen units compiled concurrently) lays out generated
+#      per-type string tables (e.g. serde's known-variant-name arrays) in an
+#      order that depends on which codegen unit's compilation happens to
+#      finish first -- deterministic for repeated builds of one checkout,
+#      but not guaranteed to match a different checkout/environment where
+#      unit contents hash differently. `-C codegen-units=1` removes the
+#      multi-unit link-order question entirely for this small crate graph;
+#      the cost (slower codegen, no cross-unit parallelism) is fine here
+#      since this script already builds serially per ABI.
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+build_rustflags="--remap-path-prefix=$root=/build/choosh --remap-path-prefix=$cargo_home=/build/cargo-home -C codegen-units=1"
+
 build_one() {
   local target="$1" abi="$2" linker="$3"
   local linker_key="CARGO_TARGET_${target^^}_LINKER"
   local cc_key="CC_${target//-/_}"
   local ar_key="AR_${target//-/_}"
   linker_key="${linker_key//-/_}"
-  env "$linker_key=$toolchain/$linker" "$cc_key=$toolchain/$linker" "$ar_key=$toolchain/llvm-ar" cargo build \
+  env "$linker_key=$toolchain/$linker" "$cc_key=$toolchain/$linker" "$ar_key=$toolchain/llvm-ar" \
+    RUSTFLAGS="$build_rustflags" cargo build \
     --manifest-path "$root/Cargo.toml" \
     --locked --release --target "$target" -p choosh-android-bridge
   local library="$root/target/$target/release/libchoosh_android_bridge.so"

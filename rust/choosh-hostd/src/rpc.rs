@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 use crate::agent_launch::agent_launch_argv;
 use crate::fs_ops::{self, FsError};
 use crate::jj_ops::{self, JjError};
+use crate::mise_ops::{self, MiseError};
 use crate::readiness;
 use crate::registry::{Registry, RegistryError};
 use crate::zellij_ops::{self, ZellijError};
@@ -35,6 +36,19 @@ pub struct RpcContext {
     /// `host-rpc.md`'s "root-confined under the devhost's configured
     /// workspaces directory".
     pub workspaces_dir: PathBuf,
+    /// The `mise` binary this context's project-pinned toolchain resolution
+    /// (`mise_ops::ensure_project_toolchain`/`project_env`) invokes — plumbed
+    /// through rather than read from the environment at each call site so
+    /// tests can point it at a fixture, the same reason `SshBridgeConfig`
+    /// carries its own `mise_bin` (see `serve.rs`'s `mise_ops::mise_bin_from_env`
+    /// call site).
+    pub mise_bin: String,
+    /// `choosh-hostd`-owned directory for Project-pinned `mise` installed-
+    /// tool payloads (`mise_ops`'s doc comment) — shared across every
+    /// workspace on this host, but never the same tree
+    /// `SshBridgeConfig::mise_host_tools_dir` (host-managed tools) uses, per
+    /// toolchain-provisioning.md's tier-isolation requirement.
+    pub mise_project_tools_dir: PathBuf,
 }
 
 /// # Panics
@@ -117,6 +131,28 @@ async fn handle_create(
         Ok(value) => value,
         Err(response) => return response,
     };
+
+    // Project-pinned toolchains (toolchain-provisioning.md's first tier):
+    // if this workspace's root declares a `mise.toml`, `mise install` MUST
+    // succeed before the workspace is reported ready. Run before the
+    // Zellij session is created and before anything is registered, so a
+    // failure here (a real, plausible one — a typo'd tool name, a network
+    // hiccup, an unresolvable version) leaves nothing partially created:
+    // no Zellij session, no registry entry — this whole `workspace.create`
+    // fails cleanly rather than reporting a workspace that's up but
+    // missing its pinned toolchain. `internal` rather than
+    // `invalid_argument`: the failing input is the *Project's* own
+    // `mise.toml` content, not anything the RPC caller supplied in this
+    // request, so `invalid_argument` (about this request's own arguments)
+    // would misattribute the failure; `internal` reflects "the host
+    // couldn't complete this operation" without implying the caller did
+    // anything wrong.
+    if mise_ops::has_mise_toml(&root_path)
+        && let Err(mise_error) = mise_ops::ensure_project_toolchain(&ctx.mise_bin, &root_path, &ctx.mise_project_tools_dir).await
+    {
+        tracing::warn!(%mise_error, workspace_name, "mise install failed for a workspace's mise.toml; failing workspace.create");
+        return mise_error_response(request_id, &mise_error);
+    }
 
     if let Err(zellij_error) = zellij_ops::create_session(&workspace_name, &root_path).await {
         return zellij_error_response(request_id, &zellij_error);
@@ -202,7 +238,7 @@ async fn create_agent_workspace(
     if dest.exists() {
         return Err(error(String::new(), "conflict", "agent workspace destination already exists"));
     }
-    jj_ops::workspace_add(&parent_root, &dest, workspace_name).await.map_err(|e| jj_error_response(String::new(), &e))?;
+    jj_ops::workspace_add(&parent_root, &dest, workspace_name, None).await.map_err(|e| jj_error_response(String::new(), &e))?;
     let canonical = jj_ops::canonicalize_prospective(&dest).map_err(|e| jj_error_response(String::new(), &e))?;
     Ok((canonical, project_id, project_name))
 }
@@ -383,6 +419,29 @@ async fn handle_item_create(
         (workspace.workspace_name.clone(), workspace.root_path.clone())
     };
 
+    // Project-pinned toolchains, second half (see `handle_create`'s own
+    // mise-related comment for the first half): resolve this workspace's
+    // `mise env` fresh for *this* spawn, per toolchain-provisioning.md
+    // ("Every agent, service, and shell process... MUST have `mise env`...
+    // injected"). Empty for a workspace with no `mise.toml` — every
+    // `initial_command` builder below treats an empty `mise_env` as "add
+    // nothing", so this item type's argv is byte-for-byte what it was
+    // before project-pinned toolchains existed. `mise install` already ran
+    // at `workspace.create` time, so this is just a (fast, no-network)
+    // resolve — a failure here is rare enough (e.g. an installed tool
+    // payload disappeared out from under `choosh-hostd` between workspace
+    // creation and now) that failing this specific `item.create` is the
+    // right, narrow blast radius rather than silently spawning a process
+    // missing its pinned toolchain's environment.
+    let mise_env = if mise_ops::has_mise_toml(&root_path) {
+        match mise_ops::project_env(&ctx.mise_bin, &root_path, &ctx.mise_project_tools_dir).await {
+            Ok(env) => env,
+            Err(mise_error) => return mise_error_response(request_id, &mise_error),
+        }
+    } else {
+        Vec::new()
+    };
+
     let initial_command: Vec<String> = match item_type {
         ItemType::AgentTerminal => {
             let Some(agent) = agent else {
@@ -391,9 +450,9 @@ async fn handle_item_create(
             let Some(root_str) = root_path.to_str() else {
                 return error(request_id, "internal", "workspace root is not valid UTF-8");
             };
-            agent_launch_argv(agent, workspace_id, "pending", root_str)
+            agent_launch_argv(agent, workspace_id, "pending", root_str, &mise_env)
         }
-        ItemType::Shell => Vec::new(),
+        ItemType::Shell => shell_launch_argv(&mise_env),
         ItemType::WebService => {
             let Some(command) = command else {
                 return error(request_id, "invalid_argument", "item_type WebService requires command");
@@ -401,7 +460,7 @@ async fn handle_item_create(
             if command.is_empty() {
                 return error(request_id, "invalid_argument", "command must not be empty");
             }
-            command
+            wrap_command_with_mise_env(&mise_env, command)
         }
     };
     if item_type == ItemType::WebService && port.is_none() {
@@ -422,7 +481,7 @@ async fn handle_item_create(
         let Some(root_str) = root_path.to_str() else {
             return error(request_id, "internal", "workspace root is not valid UTF-8");
         };
-        agent_launch_argv(agent.expect("checked above"), workspace_id, &item_id, root_str)
+        agent_launch_argv(agent.expect("checked above"), workspace_id, &item_id, root_str, &mise_env)
     } else {
         initial_command
     };
@@ -685,6 +744,50 @@ fn zellij_error_response(request_id: String, cause: &ZellijError) -> RpcResponse
     error(request_id, "internal", format!("zellij session creation failed: {cause}"))
 }
 
+/// See `handle_create`'s call site for why this is always `internal`, not
+/// `invalid_argument`.
+fn mise_error_response(request_id: String, cause: &MiseError) -> RpcResponse {
+    error(request_id, "internal", format!("mise provisioning failed: {cause}"))
+}
+
+/// `Shell` items' `initial_command` is empty by default (an ordinary
+/// `zellij` default-shell tab, per `zellij_ops::new_tab`'s doc comment) —
+/// but env vars can't ride along with an empty `initial_command` either
+/// (`new_tab` only ever prepends `env KEY=VALUE ...` in front of an
+/// explicit command, per `agent_launch.rs`'s pattern), so a non-empty
+/// `mise_env` needs an explicit command to attach itself to. Resolves the
+/// shell the same way an interactive login would (`$SHELL`, falling back
+/// to `/bin/sh`) rather than hardcoding one. Returns an empty `Vec`
+/// (unchanged `Shell` behavior) when `mise_env` is empty, so a workspace
+/// with no `mise.toml` gets exactly the same `Shell` argv as before
+/// project-pinned toolchains existed.
+fn shell_launch_argv(mise_env: &[(String, String)]) -> Vec<String> {
+    if mise_env.is_empty() {
+        return Vec::new();
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut argv = vec!["env".to_string()];
+    argv.extend(mise_env.iter().map(|(key, value)| format!("{key}={value}")));
+    argv.push(shell);
+    argv
+}
+
+/// `WebService` items' `command` is already a fixed, caller-supplied argv
+/// (`host-rpc.md`'s "Command construction") — this prepends `env
+/// KEY=VALUE ...` the same way `agent_launch.rs::agent_launch_argv` does,
+/// so `mise env` reaches the spawned dev-server process too. Returns
+/// `command` unchanged when `mise_env` is empty (no `mise.toml`), matching
+/// this item type's pre-project-pinned-toolchains behavior exactly.
+fn wrap_command_with_mise_env(mise_env: &[(String, String)], command: Vec<String>) -> Vec<String> {
+    if mise_env.is_empty() {
+        return command;
+    }
+    let mut argv = vec!["env".to_string()];
+    argv.extend(mise_env.iter().map(|(key, value)| format!("{key}={value}")));
+    argv.extend(command);
+    argv
+}
+
 fn jj_error_response(request_id: String, cause: &JjError) -> RpcResponse {
     error(request_id, "internal", format!("jj operation failed: {cause}"))
 }
@@ -742,6 +845,7 @@ mod tests {
     use super::*;
     use base64::Engine;
     use choosh_protocol::host_rpc::ByteRange;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     fn ctx_with_tempdir() -> (tempfile::TempDir, RpcContext) {
@@ -753,6 +857,16 @@ mod tests {
             registry: Arc::new(Mutex::new(Registry::load(&registry_path).unwrap())),
             devhost_id: "dev-1".to_string(),
             workspaces_dir,
+            // Deliberately a path nothing can execute: none of this
+            // module's tests register a workspace with a `mise.toml`
+            // unless they explicitly override this field (see the
+            // `mise`-tagged tests below) — if `has_mise_toml`'s gate ever
+            // regressed to firing unconditionally, every other test in
+            // this module would start failing loudly (a `MiseError::Spawn`
+            // surfaced as an `internal` RPC error) instead of silently
+            // passing on cargo-culted mocked behavior.
+            mise_bin: "/nonexistent/choosh-hostd-tests-must-not-invoke-mise".to_string(),
+            mise_project_tools_dir: dir.path().join("mise-project-tools"),
         };
         (dir, ctx)
     }
@@ -1449,5 +1563,275 @@ mod tests {
 
         zellij_ops::kill_session(&name).await.ok();
         assert_eq!(observed, Some(ItemStatus::Failed), "expected the item to fail within the readiness bound when its port never comes up");
+    }
+
+    // -------------------------------------------------------------
+    // M7 two-tier `mise` provisioning: Project-pinned toolchains
+    // (toolchain-provisioning.md's first tier), end to end through
+    // `dispatch` itself — a real `WorkspaceCreate` then a real
+    // `ItemCreate`, exactly as `serve.rs` drives this module in
+    // production. `ctx.mise_bin` is pointed at a fixture script (same
+    // approach `mise_ops::tests` uses for `ensure_zed_remote_server`),
+    // not the real `mise` binary — deterministic and network-free, while
+    // still exercising the real `Command`/`tokio::process` plumbing and
+    // the real `zellij` binary for tab creation.
+    // -------------------------------------------------------------
+
+    /// A fake `mise` standing in for the real binary in these `rpc.rs`
+    /// integration tests: `install` succeeds unless a `FAIL_INSTALL`
+    /// marker file exists in the directory it's invoked against (the
+    /// workspace root, since `mise_ops::run_mise_project` sets that as
+    /// `current_dir`), and `env --json` echoes back that same directory's
+    /// `env.json` file — a caller-controlled stand-in for "whatever this
+    /// workspace's real `mise.toml` would resolve to", exactly mirroring
+    /// `mise_ops::tests::write_fake_project_mise`'s shape.
+    fn write_fake_project_mise(dir: &Path) -> PathBuf {
+        let script_path = dir.join("mise");
+        let body = "#!/bin/sh\nset -e\ncase \"$1\" in\n  install)\n    if [ -f \"$(pwd)/FAIL_INSTALL\" ]; then echo 'boom: cannot resolve tool' >&2; exit 1; fi\n    exit 0\n    ;;\n  env)\n    cat \"$(pwd)/env.json\"\n    ;;\n  *)\n    echo \"unknown subcommand: $1\" >&2\n    exit 1\n    ;;\nesac\n";
+        std::fs::write(&script_path, body).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script_path
+    }
+
+    /// Creates a real git repo at `ctx.workspaces_dir/<name>` with both a
+    /// (fixture-only-meaningful) `mise.toml` and an `env.json` describing
+    /// what the fake `mise` from [`write_fake_project_mise`] should
+    /// resolve for it.
+    fn init_git_repo_with_mise_toml(ctx: &RpcContext, name: &str, marker_value: &str) -> PathBuf {
+        let existing = ctx.workspaces_dir.join(name);
+        std::fs::create_dir_all(&existing).unwrap();
+        init_git_repo(&existing);
+        std::fs::write(existing.join("mise.toml"), b"[tools]\nnode = \"20\"\n").unwrap();
+        std::fs::write(existing.join("env.json"), format!(r#"{{"CHOOSH_MISE_TEST_MARKER": "{marker_value}"}}"#)).unwrap();
+        existing
+    }
+
+    #[tokio::test]
+    async fn mise_toml_pinned_tool_is_installed_and_its_env_reaches_a_spawned_item_process() {
+        let name = format!("mise-e2e-{}", uuid::Uuid::new_v4());
+        let (dir, mut ctx) = ctx_with_tempdir();
+        let mise_bin = write_fake_project_mise(dir.path());
+        ctx.mise_bin = mise_bin.to_str().unwrap().to_string();
+        init_git_repo_with_mise_toml(&ctx, &name, "workspace-a-value");
+
+        let create_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "r1".to_string(),
+                devhost_id: "dev-1".to_string(),
+                workspace_name: name.clone(),
+                project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
+                parent_workspace_id: None,
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceCreateOk { workspace_id, .. } = create_response else {
+            panic!("expected WorkspaceCreateOk (mise install against a real mise.toml should succeed), got {create_response:?}");
+        };
+
+        let output_file = dir.path().join("web-service-env-dump.txt");
+        let item_response = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r2".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::WebService,
+                name: "dumpenv".to_string(),
+                agent: None,
+                command: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("echo \"marker=$CHOOSH_MISE_TEST_MARKER\" > {}", output_file.display()),
+                ]),
+                port: Some(reserve_ephemeral_port()),
+            },
+        )
+        .await;
+        let RpcResponse::ItemCreateOk { .. } = item_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected ItemCreateOk, got {item_response:?}");
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut content = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&output_file) {
+                content = text;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        zellij_ops::kill_session(&name).await.ok();
+        assert_eq!(content.trim(), "marker=workspace-a-value", "the mise-resolved CHOOSH_MISE_TEST_MARKER env var must be visible inside the spawned item process");
+    }
+
+    #[tokio::test]
+    async fn workspace_with_no_mise_toml_registers_normally_with_no_mise_install_attempted() {
+        // `ctx_with_tempdir`'s default `mise_bin` points at a nonexistent
+        // path: if `handle_create`/`handle_item_create` ever called
+        // `mise` despite this workspace having no `mise.toml`, the very
+        // first such call would fail to spawn and this whole test would
+        // fail — this is exactly the assertion this test needs, made
+        // automatically true by never overriding `mise_bin`.
+        let name = format!("no-mise-{}", uuid::Uuid::new_v4());
+        let (_dir, ctx) = ctx_with_tempdir();
+        let existing = ctx.workspaces_dir.join(&name);
+        std::fs::create_dir_all(&existing).unwrap();
+        init_git_repo(&existing);
+        assert!(!mise_ops::has_mise_toml(&existing), "test setup bug: this workspace must not have a mise.toml");
+
+        let create_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "r1".to_string(),
+                devhost_id: "dev-1".to_string(),
+                workspace_name: name.clone(),
+                project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
+                parent_workspace_id: None,
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceCreateOk { workspace_id, .. } = create_response else {
+            panic!("expected WorkspaceCreateOk for a workspace with no mise.toml, got {create_response:?}");
+        };
+
+        // A `Shell` item must also work normally — no injected env, no
+        // attempted mise invocation.
+        let item_response = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r2".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::Shell,
+                name: "sh".to_string(),
+                agent: None,
+                command: None,
+                port: None,
+            },
+        )
+        .await;
+        zellij_ops::kill_session(&name).await.ok();
+        assert!(matches!(item_response, RpcResponse::ItemCreateOk { .. }), "expected ItemCreateOk for a Shell item in a workspace with no mise.toml, got {item_response:?}");
+    }
+
+    #[tokio::test]
+    async fn mise_toml_with_an_unresolvable_tool_fails_workspace_create_and_leaves_nothing_registered() {
+        let name = format!("mise-bad-{}", uuid::Uuid::new_v4());
+        let (dir, mut ctx) = ctx_with_tempdir();
+        let mise_bin = write_fake_project_mise(dir.path());
+        ctx.mise_bin = mise_bin.to_str().unwrap().to_string();
+        let existing = init_git_repo_with_mise_toml(&ctx, &name, "unused");
+        // Triggers the fake mise's `install` failure path (this module's
+        // own equivalent of "a typo'd tool name" / "a version mise/ubi
+        // can't resolve" from toolchain-provisioning.md's Failure
+        // handling section).
+        std::fs::write(existing.join("FAIL_INSTALL"), b"").unwrap();
+
+        let create_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "r1".to_string(),
+                devhost_id: "dev-1".to_string(),
+                workspace_name: name.clone(),
+                project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
+                parent_workspace_id: None,
+            },
+        )
+        .await;
+        match &create_response {
+            RpcResponse::Error { code, message, .. } => {
+                assert_eq!(code, "internal");
+                assert!(message.contains("boom"), "expected the fake mise's stderr to surface in the error message, got: {message}");
+            }
+            other => panic!("expected an Error response for an unresolvable mise.toml, got {other:?}"),
+        }
+
+        // No partial/broken workspace left registered, and no Zellij
+        // session created for it either — `handle_create` must fail
+        // before either side effect, not after.
+        {
+            let registry = ctx.registry.lock().await;
+            assert!(registry.find_workspace_by_name(&name).is_none(), "a failed mise install must not leave a registered workspace behind");
+        }
+        assert!(!zellij_ops::list_sessions().await.unwrap().contains(&name), "a failed mise install must not leave a Zellij session behind");
+    }
+
+    #[tokio::test]
+    async fn concurrent_workspaces_injected_mise_envs_do_not_leak_into_each_other() {
+        let name_a = format!("mise-leak-a-{}", uuid::Uuid::new_v4());
+        let name_b = format!("mise-leak-b-{}", uuid::Uuid::new_v4());
+        let (dir, mut ctx) = ctx_with_tempdir();
+        let mise_bin = write_fake_project_mise(dir.path());
+        ctx.mise_bin = mise_bin.to_str().unwrap().to_string();
+        init_git_repo_with_mise_toml(&ctx, &name_a, "value-a");
+        init_git_repo_with_mise_toml(&ctx, &name_b, "value-b");
+
+        let create_a = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "ra".to_string(),
+                devhost_id: "dev-1".to_string(),
+                workspace_name: name_a.clone(),
+                project_source: ProjectSource::ExistingPath { existing_path: name_a.clone() },
+                parent_workspace_id: None,
+            },
+        )
+        .await;
+        let create_b = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "rb".to_string(),
+                devhost_id: "dev-1".to_string(),
+                workspace_name: name_b.clone(),
+                project_source: ProjectSource::ExistingPath { existing_path: name_b.clone() },
+                parent_workspace_id: None,
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceCreateOk { workspace_id: workspace_id_a, .. } = create_a else {
+            panic!("expected WorkspaceCreateOk for workspace A, got {create_a:?}");
+        };
+        let RpcResponse::WorkspaceCreateOk { workspace_id: workspace_id_b, .. } = create_b else {
+            panic!("expected WorkspaceCreateOk for workspace B, got {create_b:?}");
+        };
+
+        let output_a = dir.path().join("dump-a.txt");
+        let output_b = dir.path().join("dump-b.txt");
+        for (workspace_id, output_file) in [(&workspace_id_a, &output_a), (&workspace_id_b, &output_b)] {
+            let response = dispatch(
+                &ctx,
+                RpcRequest::ItemCreate {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    workspace_id: workspace_id.clone(),
+                    item_type: ItemType::WebService,
+                    name: "dumpenv".to_string(),
+                    agent: None,
+                    command: Some(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("echo \"marker=$CHOOSH_MISE_TEST_MARKER\" > {}", output_file.display()),
+                    ]),
+                    port: Some(reserve_ephemeral_port()),
+                },
+            )
+            .await;
+            assert!(matches!(response, RpcResponse::ItemCreateOk { .. }), "expected ItemCreateOk, got {response:?}");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (mut content_a, mut content_b) = (String::new(), String::new());
+        while std::time::Instant::now() < deadline && (content_a.is_empty() || content_b.is_empty()) {
+            content_a = std::fs::read_to_string(&output_a).unwrap_or_default();
+            content_b = std::fs::read_to_string(&output_b).unwrap_or_default();
+            if content_a.is_empty() || content_b.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        zellij_ops::kill_session(&name_a).await.ok();
+        zellij_ops::kill_session(&name_b).await.ok();
+        assert_eq!(content_a.trim(), "marker=value-a", "workspace A's spawned process must see only workspace A's mise env");
+        assert_eq!(content_b.trim(), "marker=value-b", "workspace B's spawned process must see only workspace B's mise env");
     }
 }

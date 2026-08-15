@@ -30,7 +30,7 @@
 //! workspace is a real scenario this pass did not test.
 
 use nix::pty::{OpenptyResult, openpty};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 #[derive(Debug)]
@@ -82,8 +82,22 @@ impl PtySession {
         // `stdout`/`stderr` each need their own `Stdio`.
         let slave_stdin = slave.try_clone().map_err(PtyError::Spawn)?;
         let slave_stdout = slave.try_clone().map_err(PtyError::Spawn)?;
+        // Deliberately does NOT set `ZELLIJ_SESSION_NAME` on this child —
+        // confirmed by direct experiment (both a bare shell invocation and
+        // a real-pty Python harness, 6/6 reproductions) that doing so is
+        // actively harmful: `zellij attach <name>` reads that env var (real
+        // zellij source, `commands.rs`'s `start_client`) as "the session
+        // I'm already a client of" and, if it equals the attach target,
+        // deterministically panics with "You are trying to attach to the
+        // current session... This is not supported." — a real, 100%-
+        // reproducible self-nesting false positive, not a rare race, since
+        // this attach is always *from outside* `session_name`, never a
+        // client of it already. The session to attach to is already fully
+        // specified via the positional `.arg(session_name)` below; this env
+        // var is `focus_tab`'s mechanism (its `zellij action` invocation
+        // has no explicit session argument of its own and needs it), not
+        // this command's.
         let child = Command::new("zellij")
-            .env("ZELLIJ_SESSION_NAME", session_name)
             .arg("attach")
             .arg(session_name)
             .stdin(std::process::Stdio::from(slave_stdin))
@@ -119,7 +133,7 @@ impl PtySession {
     /// An I/O error reading the pty master (e.g. the attached client
     /// exited and closed its end).
     pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.master.read(buf).await
+        read_retrying_would_block(&mut self.master, buf).await
     }
 
     /// # Errors
@@ -154,7 +168,31 @@ impl PtyReadHalf {
     ///
     /// An I/O error reading the pty master.
     pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf).await
+        read_retrying_would_block(&mut self.0, buf).await
+    }
+}
+
+/// The master fd is deliberately non-blocking (see [`PtySession::attach`]'s
+/// `O_NONBLOCK` setup) so tokio's async I/O can multiplex it — but
+/// `tokio::fs::File`'s `AsyncRead` impl runs the underlying `read(2)` on a
+/// blocking-pool thread and forwards *whatever* that syscall returns,
+/// `EAGAIN`/`WouldBlock` included, rather than treating "genuinely nothing
+/// to read yet" as a reason to wait and retry. A `read()` racing ahead of
+/// the attached client actually producing output (a completely normal,
+/// expected timing outcome, not a real error) would otherwise surface as a
+/// hard I/O error to every caller — exactly the same race
+/// `ssh_server.rs`'s `spawn_pty_output_forwarder` already documents and
+/// retries around for its own, differently-obtained pty master. This
+/// shares that fix across both of `PtySession`'s read paths ([`PtySession::read`]
+/// and [`PtyReadHalf::read`]) rather than duplicating it.
+async fn read_retrying_would_block(file: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match file.read(buf).await {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            result => return result,
+        }
     }
 }
 

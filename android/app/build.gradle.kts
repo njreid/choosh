@@ -1,6 +1,10 @@
 import java.util.Properties
 import java.util.zip.ZipFile
 import org.gradle.api.tasks.testing.Test
+import org.gradle.api.artifacts.result.ResolvedArtifactResult
+import org.gradle.maven.MavenModule
+import org.gradle.maven.MavenPomArtifact
+import javax.xml.parsers.DocumentBuilderFactory
 
 // AGP 9's built-in Kotlin support means the separate org.jetbrains.kotlin.android
 // plugin must not be applied (AGP rejects it outright) — only compiler plugins
@@ -257,17 +261,163 @@ val cyclonedxBom = tasks.register("cyclonedxBom") {
     }
 }
 
+// A real, LGPL-relevant NOTICE.txt: not just a coordinate list. Resolves each
+// releaseRuntimeClasspath dependency's *actual published Maven POM licence
+// declaration* (an ArtifactResolutionQuery for MavenPomArtifact — the same
+// technique dedicated license-report Gradle plugins use), buckets
+// dependencies by their declared licence, and embeds the complete licence
+// text for the two licences that cover the overwhelming majority of the
+// graph (Apache-2.0: nearly all of AndroidX/Kotlin/Firebase/Gson; LGPL-2.1:
+// Sora Editor, the one dependency this matters legally for — see
+// docs/licenses/sora-packaging.md). Anything the resolved POM doesn't
+// declare a machine-readable <licenses> entry for (this is normal for
+// Google Play Services artifacts, which ship under the Android SDK terms
+// rather than an OSI licence) is called out explicitly rather than silently
+// mislabeled as Apache-2.0 or dropped.
 val generateReleaseLicenseReport = tasks.register("generateReleaseLicenseReport") {
     group = "reporting"
     val output = layout.buildDirectory.file("reports/licenses/NOTICE.txt")
+    val apache2File = file("licenses/Apache-2.0.txt")
+    val lgpl21File = file("licenses/LGPL-2.1.txt")
     outputs.file(output)
+    inputs.file(apache2File)
+    inputs.file(lgpl21File)
     doLast {
-        val modules = configurations.getByName("releaseRuntimeClasspath").resolvedConfiguration
-            .resolvedArtifacts.map { "${it.moduleVersion.id.group}:${it.name}:${it.moduleVersion.id.version}" }
-            .distinct().sorted()
+        data class Coord(val group: String, val name: String, val version: String) : Comparable<Coord> {
+            override fun compareTo(other: Coord) =
+                compareValuesBy(this, other, { it.group }, { it.name }, { it.version })
+            override fun toString() = "$group:$name:$version"
+        }
+        data class LicenseInfo(val name: String?, val url: String?)
+
+        val resolvedArtifacts = configurations.getByName("releaseRuntimeClasspath").resolvedConfiguration.resolvedArtifacts
+        val coordsById = resolvedArtifacts.mapNotNull { artifact ->
+            val id = artifact.id.componentIdentifier as? org.gradle.api.artifacts.component.ModuleComponentIdentifier
+                ?: return@mapNotNull null
+            id to Coord(id.group, id.module, id.version)
+        }.toMap()
+
+        val pomQuery = dependencies.createArtifactResolutionQuery()
+            .forComponents(coordsById.keys)
+            .withArtifacts(MavenModule::class.java, MavenPomArtifact::class.java)
+            .execute()
+
+        val builderFactory = DocumentBuilderFactory.newInstance()
+        fun parsePomLicense(pomFile: java.io.File): LicenseInfo = try {
+            val doc = builderFactory.newDocumentBuilder().parse(pomFile)
+            val licenseNodes = doc.getElementsByTagName("license")
+            if (licenseNodes.length == 0) {
+                LicenseInfo(null, null)
+            } else {
+                val el = licenseNodes.item(0) as org.w3c.dom.Element
+                val name = (el.getElementsByTagName("name").item(0) as? org.w3c.dom.Element)?.textContent?.trim()
+                val url = (el.getElementsByTagName("url").item(0) as? org.w3c.dom.Element)?.textContent?.trim()
+                LicenseInfo(name, url)
+            }
+        } catch (e: Exception) {
+            LicenseInfo(null, null)
+        }
+
+        val licenseByCoord = sortedMapOf<Coord, LicenseInfo>()
+        for (component in pomQuery.resolvedComponents) {
+            val coord = coordsById[component.id] ?: continue
+            var info = LicenseInfo(null, null)
+            for (artifact in component.getArtifacts(MavenPomArtifact::class.java)) {
+                if (artifact is ResolvedArtifactResult) {
+                    info = parsePomLicense(artifact.file)
+                    if (info.name != null) break
+                }
+            }
+            licenseByCoord[coord] = info
+        }
+        // A component the query couldn't resolve at all still gets listed, as undeclared
+        // rather than silently omitted.
+        for (coord in coordsById.values) licenseByCoord.putIfAbsent(coord, LicenseInfo(null, null))
+
+        fun bucketOf(info: LicenseInfo): String {
+            val n = info.name?.lowercase() ?: return "UNDECLARED"
+            return when {
+                "lgpl" in n || "lesser general public" in n -> "LGPL-2.1-or-later"
+                "apache" in n && "2" in n -> "Apache-2.0"
+                else -> info.name
+            }
+        }
+
+        val buckets = sortedMapOf<String, MutableList<Coord>>()
+        for ((coord, info) in licenseByCoord) buckets.getOrPut(bucketOf(info)) { mutableListOf() }.add(coord)
+        buckets.values.forEach { it.sortWith(compareBy({ c -> c.group }, { c -> c.name }, { c -> c.version })) }
+
+        val text = buildString {
+            appendLine("Choosh dependency licence notices")
+            appendLine("Generated by :app:generateReleaseLicenseReport from the resolved releaseRuntimeClasspath's")
+            appendLine("published Maven POM licence declarations.")
+            appendLine("${licenseByCoord.size} distinct runtime dependencies across ${buckets.size} licence bucket(s).")
+            appendLine()
+            appendLine("=".repeat(78))
+            appendLine("SORA EDITOR -- LGPL-2.1-or-later (see docs/licenses/sora-packaging.md)")
+            appendLine("=".repeat(78))
+            appendLine()
+            appendLine("Choosh depends on io.github.rosemoe:editor (Sora Editor) as an unmodified,")
+            appendLine("ordinary Maven AAR dependency. Choosh has made NO source or bytecode")
+            appendLine("modifications to this library.")
+            appendLine()
+            appendLine("  Coordinate:         io.github.rosemoe:editor:0.24.6")
+            appendLine("  Upstream source:    https://github.com/Rosemoe/sora-editor")
+            appendLine("  Source tag/commit:  0.24.6 / 87055c459e346cac6c619b3350f0bfba076228cc")
+            appendLine("  Copyright:          Copyright (C) 2020-2024 Rosemoe")
+            appendLine("  Declared licence:   \"LGPL v2.1\" (this artifact's published Maven POM <licenses> block)")
+            appendLine()
+            appendLine("Full licence text follows:")
+            appendLine()
+            append(lgpl21File.readText())
+            appendLine()
+            appendLine("=".repeat(78))
+            appendLine("APACHE LICENSE, VERSION 2.0 -- applies to the dependencies listed below")
+            appendLine("=".repeat(78))
+            appendLine()
+            append(apache2File.readText())
+            appendLine()
+            for (bucketName in listOf("LGPL-2.1-or-later", "Apache-2.0")) {
+                val coords = buckets[bucketName].orEmpty()
+                appendLine("-".repeat(78))
+                appendLine("$bucketName -- ${coords.size} dependencies:")
+                coords.forEach { appendLine("  $it") }
+                appendLine()
+            }
+            val other = buckets.filterKeys { it != "LGPL-2.1-or-later" && it != "Apache-2.0" && it != "UNDECLARED" }
+            if (other.isNotEmpty()) {
+                appendLine("=".repeat(78))
+                appendLine("OTHER DECLARED LICENCES")
+                appendLine("=".repeat(78))
+                for ((bucketName, coords) in other) {
+                    appendLine()
+                    appendLine("$bucketName -- ${coords.size} dependencies:")
+                    coords.forEach { c ->
+                        val url = licenseByCoord[c]?.url
+                        appendLine("  $c" + if (url != null) " ($url)" else "")
+                    }
+                }
+                appendLine()
+            }
+            val undeclared = buckets["UNDECLARED"].orEmpty()
+            if (undeclared.isNotEmpty()) {
+                appendLine("=".repeat(78))
+                appendLine("UNDECLARED IN RESOLVED POM METADATA -- MANUAL REVIEW REQUIRED")
+                appendLine("=".repeat(78))
+                appendLine("These artifacts' published Maven POM did not declare a machine-readable")
+                appendLine("<licenses> element. Commonly this means a Google Play Services/Firebase")
+                appendLine("artifact distributed under the Android Software Development Kit License")
+                appendLine("Agreement (https://developer.android.com/studio/terms) rather than an OSI")
+                appendLine("licence -- verify the applicable terms for each before treating this list")
+                appendLine("as closed.")
+                appendLine()
+                undeclared.forEach { appendLine("  $it") }
+                appendLine()
+            }
+        }
         output.get().asFile.apply {
             parentFile.mkdirs()
-            writeText("Choosh dependency coordinates\n\n" + modules.joinToString("\n", postfix = "\n"))
+            writeText(text)
         }
     }
 }

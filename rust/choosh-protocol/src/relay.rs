@@ -158,6 +158,35 @@ pub enum WireAgentEvent {
         workspace_id: String,
         editor: WireEditor,
     },
+    /// `choosh-hostd` detected a headless device-code SSO/cloud-CLI auth
+    /// flow (`agent-events.md`'s `auth_required`: `aws sso login`, `gcloud
+    /// auth login`, `az login`, `gh auth login`) with no local browser to
+    /// hand off to. Deliberately carries no `workspace_id`/`item_id` — per
+    /// the spec, this payload is exactly these three fields, nothing else;
+    /// it is not attributable to a single workspace item the way every
+    /// other variant above is. **No token, credential, or session
+    /// identifier MUST ever appear here** — `choosh-hostd`'s detector
+    /// (`choosh-hostd::auth_detect`) is responsible for extracting only
+    /// these three fields from a provider's real output before this type
+    /// is ever constructed, never forwarding a captured line/buffer
+    /// wholesale.
+    AuthRequired {
+        provider: WireAuthProvider,
+        user_code: String,
+        verification_uri: String,
+    },
+}
+
+/// The four named cloud/SSO providers `agent-events.md`'s `auth_required`
+/// event covers. Serializes exactly as the spec's payload shape shows
+/// (`"aws"`/`"gcp"`/`"azure"`/`"github"`), not as `PascalCase`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireAuthProvider {
+    Aws,
+    Gcp,
+    Azure,
+    Github,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -343,6 +372,32 @@ pub enum ServerPush {
     AgentEvent {
         from_device_id: String,
         event: WireAgentEvent,
+    },
+    /// `relayd`-pushed self-update instruction, per relay-protocol.md's
+    /// `update_binary` section and host-deployment.md's "Self-update".
+    /// Triggered by an operator action (the Android app or `just
+    /// deploy`-adjacent tooling), not by anything in this Identity
+    /// protocol itself. The devhost does not reply over this channel —
+    /// see host-deployment.md for the download-verify-swap-restart
+    /// procedure and its Rollback subsection. `push_id` is what makes a
+    /// redelivery after reconnect idempotently handleable (relay-protocol.md's
+    /// "Control frames" section: every server-pushed frame carries one,
+    /// in place of the `request_id` an ordinary client-initiated frame
+    /// carries).
+    ///
+    /// Named `update_binary` on the wire (`snake_case`) rather than
+    /// `update-binary` — the one exception to this enum's otherwise
+    /// uniform kebab-case tag convention, because both relay-protocol.md
+    /// and host-deployment.md spell it with an underscore throughout;
+    /// `#[serde(rename = ...)]` overrides the enum-level `rename_all` for
+    /// this variant alone.
+    #[serde(rename = "update_binary")]
+    UpdateBinary {
+        push_id: String,
+        download_url: String,
+        /// Lowercase hex-encoded SHA-256 of the binary at `download_url`.
+        sha256: String,
+        version: String,
     },
 }
 
@@ -596,6 +651,42 @@ mod tests {
     }
 
     #[test]
+    fn auth_required_event_round_trips_and_uses_the_spec_exact_payload_shape() {
+        for provider in [WireAuthProvider::Aws, WireAuthProvider::Gcp, WireAuthProvider::Azure, WireAuthProvider::Github] {
+            let event = WireAgentEvent::AuthRequired {
+                provider,
+                user_code: "WDJB-MJHT".to_string(),
+                verification_uri: "https://example.com/device".to_string(),
+            };
+            let json = serde_json::to_string(&event).expect("serialize");
+            let decoded: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, event);
+        }
+        let json = serde_json::to_string(&WireAgentEvent::AuthRequired {
+            provider: WireAuthProvider::Aws,
+            user_code: "WDJB-MJHT".to_string(),
+            verification_uri: "https://example.com/device".to_string(),
+        })
+        .unwrap();
+        assert!(json.contains("\"kind\":\"auth_required\""));
+        assert!(json.contains("\"provider\":\"aws\""));
+        assert!(json.contains("\"user_code\":\"WDJB-MJHT\""));
+        assert!(json.contains("\"verification_uri\":\"https://example.com/device\""));
+        // Per agent-events.md: "No token, credential, or session identifier
+        // MUST ever appear in this event" — this is the type-level half of
+        // that guarantee: the struct has exactly three fields, so there is
+        // no field a future edit could accidentally start populating with
+        // captured output. Parsed back as a generic Value to assert the
+        // object literally has no other keys, not just that the ones we
+        // expect are present.
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let object = value.as_object().unwrap();
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["kind", "provider", "user_code", "verification_uri"]);
+    }
+
+    #[test]
     fn list_devhost_ssh_endpoints_request_round_trips_through_json() {
         let request = ControlRequest::ListDevhostSshEndpoints { request_id: "id".to_string() };
         let json = serde_json::to_string(&request).expect("serialize");
@@ -618,6 +709,25 @@ mod tests {
         let json = serde_json::to_string(&response).expect("serialize");
         let decoded: ControlResponse = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn update_binary_push_round_trips_and_uses_the_spec_exact_snake_case_wire_tag() {
+        let push = ServerPush::UpdateBinary {
+            push_id: "push-1".to_string(),
+            download_url: "https://relay.example/releases/choosh-hostd-linux-x86_64".to_string(),
+            sha256: "0011223344556677889900112233445566778899001122334455667788990a".to_string(),
+            version: "0.5.0".to_string(),
+        };
+        let json = serde_json::to_string(&push).expect("serialize");
+        // Per relay-protocol.md, this is the one push type spelled with an
+        // underscore rather than this enum's usual kebab-case tag.
+        assert!(json.contains("\"type\":\"update_binary\""));
+        assert!(!json.contains("update-binary"));
+        // Disjoint from ControlResponse, same as every other ServerPush variant.
+        assert!(serde_json::from_str::<ControlResponse>(&json).is_err());
+        let decoded: ServerPush = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, push);
     }
 
     #[test]

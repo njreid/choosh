@@ -9,6 +9,13 @@
 //! this module works around that by prefixing the real `env` utility with
 //! explicit `KEY=VALUE` arguments, itself a fixed-argv construction, not
 //! shell interpolation.
+//!
+//! The same `env KEY=VALUE ...` prefix also carries a workspace's
+//! Project-pinned `mise env` (`docs/specs/toolchain-provisioning.md`'s
+//! first tier, resolved by `mise_ops::project_env` and passed in here by
+//! `rpc::handle_item_create`) alongside the fixed `CHOOSH_*` vars — both
+//! land in the same `env` invocation, so an agent process sees both without
+//! needing two separate wrapping layers.
 
 use choosh_protocol::host_rpc::AgentKind;
 
@@ -32,18 +39,24 @@ fn agent_env_value(agent: AgentKind) -> &'static str {
     }
 }
 
-/// Builds `["env", "CHOOSH_WORKSPACE_ID=...", ..., "<executable>"]` — ready
-/// to pass as `zellij_ops::new_tab`'s `initial_command`.
+/// Builds `["env", "CHOOSH_WORKSPACE_ID=...", ..., "K=V", ..., "<executable>"]`
+/// — one `"K=V"` entry per `mise_env` pair — ready to pass as
+/// `zellij_ops::new_tab`'s `initial_command`. `mise_env` is the workspace's
+/// resolved Project-pinned `mise env` (empty for a workspace with no
+/// `mise.toml`, per toolchain-provisioning.md — an empty slice adds
+/// nothing beyond the fixed `CHOOSH_*` vars this already set).
 #[must_use]
-pub fn agent_launch_argv(agent: AgentKind, workspace_id: &str, item_id: &str, root: &str) -> Vec<String> {
-    vec![
+pub fn agent_launch_argv(agent: AgentKind, workspace_id: &str, item_id: &str, root: &str, mise_env: &[(String, String)]) -> Vec<String> {
+    let mut argv = vec![
         "env".to_string(),
         format!("CHOOSH_WORKSPACE_ID={workspace_id}"),
         format!("CHOOSH_ITEM_ID={item_id}"),
         format!("CHOOSH_ROOT={root}"),
         format!("CHOOSH_AGENT={}", agent_env_value(agent)),
-        executable(agent).to_string(),
-    ]
+    ];
+    argv.extend(mise_env.iter().map(|(key, value)| format!("{key}={value}")));
+    argv.push(executable(agent).to_string());
+    argv
 }
 
 #[cfg(test)]
@@ -52,7 +65,7 @@ mod tests {
 
     #[test]
     fn claude_launch_argv_sets_every_required_env_var_and_ends_with_the_executable() {
-        let argv = agent_launch_argv(AgentKind::Claude, "ws-1", "item-1", "/workspaces/app");
+        let argv = agent_launch_argv(AgentKind::Claude, "ws-1", "item-1", "/workspaces/app", &[]);
         assert_eq!(
             argv,
             vec![
@@ -61,6 +74,25 @@ mod tests {
                 "CHOOSH_ITEM_ID=item-1",
                 "CHOOSH_ROOT=/workspaces/app",
                 "CHOOSH_AGENT=claude",
+                "claude",
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_launch_argv_injects_project_pinned_mise_env_between_the_choosh_vars_and_the_executable() {
+        let mise_env = vec![("NODE_VERSION".to_string(), "20.20.2".to_string()), ("PATH".to_string(), "/mise/node/20/bin:/usr/bin".to_string())];
+        let argv = agent_launch_argv(AgentKind::Claude, "ws-1", "item-1", "/workspaces/app", &mise_env);
+        assert_eq!(
+            argv,
+            vec![
+                "env",
+                "CHOOSH_WORKSPACE_ID=ws-1",
+                "CHOOSH_ITEM_ID=item-1",
+                "CHOOSH_ROOT=/workspaces/app",
+                "CHOOSH_AGENT=claude",
+                "NODE_VERSION=20.20.2",
+                "PATH=/mise/node/20/bin:/usr/bin",
                 "claude",
             ]
         );

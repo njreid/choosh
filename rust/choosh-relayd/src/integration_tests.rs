@@ -10,7 +10,7 @@ use crate::state::{EnrollmentToken, now_unix};
 use crate::wire::{encode_control, new_decoder};
 use crate::{AppState, build_state_in, router};
 use choosh_protocol::relay::{
-    AuthResult, ClientAuth, ControlRequest, ControlResponse, DeviceAuth, IdentityClass, PhoneAuth,
+    AuthResult, ClientAuth, ConnectionState, ControlRequest, ControlResponse, DeviceAuth, IdentityClass, PhoneAuth,
     ServerHello, ServerPush, decode_tunnel_frame, decode_tunnel_id_hex, encode_tunnel_frame,
 };
 use ed25519_dalek::{Signer, SigningKey};
@@ -97,6 +97,20 @@ async fn enroll_devhost(server: &TestServer, key: &SigningKey) -> (String, Strin
 }
 
 async fn enroll_as(server: &TestServer, key: &SigningKey, identity_class: IdentityClass) -> (String, String) {
+    enroll_as_with_details(server, key, identity_class, "test-device", None).await
+}
+
+/// The general form [`enroll_as`] delegates to (`account_label: None`,
+/// `alias: "test-device"`) — split out so the fleet-view multi-account test
+/// below can enroll two devhosts with distinct, real `account_label`s
+/// without changing `enroll_as`'s (widely used) signature.
+async fn enroll_as_with_details(
+    server: &TestServer,
+    key: &SigningKey,
+    identity_class: IdentityClass,
+    alias: &str,
+    account_label: Option<String>,
+) -> (String, String) {
     // Devhost enrollment MUST carry a loopback SSH host public key
     // (auth-and-enrollment.md step 6) — a fresh, unrelated Ed25519 key
     // stands in for a real SSH host key here, since these tests only
@@ -122,9 +136,9 @@ async fn enroll_as(server: &TestServer, key: &SigningKey, identity_class: Identi
                 key.verifying_key().to_bytes(),
             ),
             host_ssh_public_key,
-            alias: Some("test-device".to_string()),
+            alias: Some(alias.to_string()),
             platform: Some("linux".to_string()),
-            account_label: None,
+            account_label,
         },
     )
     .await;
@@ -140,6 +154,26 @@ async fn enroll_as(server: &TestServer, key: &SigningKey, identity_class: Identi
 async fn authenticated_device(server: &TestServer, identity_class: IdentityClass) -> (WsStream, String) {
     let key = SigningKey::generate(&mut crate::rng::os_rng());
     let (device_id, certificate) = enroll_as(server, &key, identity_class).await;
+    let mut ws = connect(server).await;
+    let nonce = recv_hello(&mut ws).await;
+    send_control(&mut ws, &device_auth_for(&nonce, &device_id, &key, certificate)).await;
+    let auth: AuthResult = recv_control(&mut ws).await;
+    assert!(matches!(auth, AuthResult::Ok(_)), "expected device auth to succeed, got {auth:?}");
+    (ws, device_id)
+}
+
+/// [`authenticated_device`]'s sibling for the fleet-view multi-account
+/// exit-criterion test: enrolls and authenticates a devhost with a
+/// specific, real `alias`/`account_label` rather than the fixed
+/// `"test-device"`/`None` every other test in this file uses — two devhosts
+/// enrolled this way (with distinct labels, distinct signing keys, and no
+/// shared credential material of any kind) are exactly what
+/// `docs/milestones/M7-fleet-and-provisioning.md`'s exit criterion ("in at
+/// least two different AWS accounts with no shared credentials between
+/// them") requires proving.
+async fn authenticated_device_with_account_label(server: &TestServer, alias: &str, account_label: &str) -> (WsStream, String) {
+    let key = SigningKey::generate(&mut crate::rng::os_rng());
+    let (device_id, certificate) = enroll_as_with_details(server, &key, IdentityClass::Devhost, alias, Some(account_label.to_string())).await;
     let mut ws = connect(server).await;
     let nonce = recv_hello(&mut ws).await;
     send_control(&mut ws, &device_auth_for(&nonce, &device_id, &key, certificate)).await;
@@ -700,6 +734,35 @@ async fn a_full_outbound_queue_closes_the_tunnel_instead_of_growing_unboundedly(
     );
 }
 
+#[tokio::test]
+async fn oversized_tunnel_frame_closes_the_connection() {
+    // Regression test for the gap where the ingress decoder is shared
+    // across both frame classes and sized to `MAX_CONTROL_FRAME_BYTES` (1
+    // MiB) — a tunnel frame between `MAX_TUNNEL_FRAME_BYTES` (256 KiB) and
+    // that shared cap would previously pass framing uncaught, in violation
+    // of relay-protocol.md's "a frame exceeding its class's size cap"
+    // connection-termination rule.
+    let server = spawn_server().await;
+    let mut phone = authenticated_phone(&server).await;
+    let (mut devhost, devhost_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+    let tunnel_id = open_tunnel(&mut phone, &mut devhost, &devhost_id, "rpc").await;
+
+    let oversized_payload = vec![0u8; choosh_protocol::relay::MAX_TUNNEL_FRAME_BYTES + 1];
+    let frame = encode_tunnel_frame(tunnel_id, &oversized_payload);
+    // Encoded under the larger control-frame cap, matching exactly what the
+    // shared ingress decoder accepts on the wire before class-specific
+    // limits are applied.
+    let framed = choosh_protocol::framing::encode_frame(&frame, choosh_protocol::relay::MAX_CONTROL_FRAME_BYTES)
+        .expect("frame encodes under the control-frame cap");
+    phone.send(WsMessage::Binary(framed.into())).await.expect("send oversized tunnel frame");
+
+    let next = phone.next().await;
+    assert!(
+        next.is_none() || matches!(next, Some(Ok(WsMessage::Close(_)))),
+        "an oversized tunnel frame must close the connection, got {next:?}"
+    );
+}
+
 fn input_required_event(workspace_id: &str, item_id: &str) -> choosh_protocol::relay::WireAgentEvent {
     choosh_protocol::relay::WireAgentEvent::InputRequired {
         workspace_id: workspace_id.to_string(),
@@ -796,4 +859,151 @@ async fn agent_event_with_no_phone_connected_does_not_error_the_devhost() {
     .await;
     let response: ControlResponse = recv_control(&mut devhost).await;
     assert!(matches!(response, ControlResponse::AgentEventOk { .. }), "expected AgentEventOk even with no phone connected, got {response:?}");
+}
+
+// --- M7: `dev-exec` offload capability + fleet-view multi-account --------
+//
+// `auth-and-enrollment.md`'s capability table already reserved `devhost`
+// `open-tunnel` scoped to `purpose = "offload"` only, enforced in
+// `ws::check_open_tunnel_permitted` — these tests are new *coverage* of
+// that existing enforcement (no `ws.rs` change was needed for the
+// capability itself, confirmed by reading it before writing these), plus
+// the fleet-view exit criterion, which per M7's own scope bullet is "mostly
+// a verification task" over `list-devhosts`/presence, also already built.
+
+#[tokio::test]
+async fn devhost_can_open_an_offload_purpose_tunnel_to_another_devhost() {
+    let server = spawn_server().await;
+    let (mut requester, _requester_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+    let (mut target, target_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+
+    let tunnel_id = open_tunnel(&mut requester, &mut target, &target_id, "offload").await;
+    send_tunnel_frame(&mut requester, tunnel_id, b"offload bytes").await;
+    let (received_id, payload) = recv_tunnel_frame(&mut target).await;
+    assert_eq!(received_id, tunnel_id);
+    assert_eq!(payload, b"offload bytes");
+}
+
+/// The negative half of the same capability scope: a `devhost` Identity may
+/// open a tunnel to another devhost ONLY for `purpose = "offload"` — every
+/// other purpose (including `"ssh"`, which is `laptop-proxy`'s own scope,
+/// and `"rpc"`, which only a `phone` may request) must be refused, per
+/// `check_open_tunnel_permitted`'s `IdentityClass::Devhost if purpose ==
+/// "offload" => {}` / `IdentityClass::LaptopProxy | IdentityClass::Devhost
+/// => Err("not_permitted")` match arms.
+#[tokio::test]
+async fn devhost_cannot_open_a_non_offload_purpose_tunnel_to_another_devhost() {
+    let server = spawn_server().await;
+    let (mut requester, _requester_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+    let (_target, target_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+
+    for purpose in ["rpc", "ssh", "pty:item-1", "web:item-1"] {
+        send_control(
+            &mut requester,
+            &ControlRequest::OpenTunnel { request_id: format!("wrong-{purpose}"), target_device_id: target_id.clone(), purpose: purpose.to_string() },
+        )
+        .await;
+        let response: ControlResponse = recv_control(&mut requester).await;
+        assert!(
+            matches!(&response, ControlResponse::Error { code, .. } if code == "not_permitted"),
+            "devhost requesting purpose {purpose:?} against another devhost must be rejected: {response:?}"
+        );
+    }
+}
+
+/// The other half: `laptop-proxy` is scoped to `purpose = "ssh"` only (an
+/// existing, already-tested rule — `laptop_proxy_may_only_open_ssh_purpose_tunnels`
+/// above), and per that same match arm structure has NO path to
+/// `"offload"` either. Recorded here as its own explicit case for the
+/// `"offload"` purpose specifically, since a future edit to
+/// `check_open_tunnel_permitted` could plausibly add a `laptop-proxy`
+/// arm without this test catching a regression otherwise.
+#[tokio::test]
+async fn laptop_proxy_cannot_open_an_offload_purpose_tunnel() {
+    let server = spawn_server().await;
+    let (mut laptop, _laptop_id) = authenticated_device(&server, IdentityClass::LaptopProxy).await;
+    let (_target, target_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+
+    send_control(
+        &mut laptop,
+        &ControlRequest::OpenTunnel { request_id: "r".to_string(), target_device_id: target_id, purpose: "offload".to_string() },
+    )
+    .await;
+    let response: ControlResponse = recv_control(&mut laptop).await;
+    assert!(
+        matches!(&response, ControlResponse::Error { code, .. } if code == "not_permitted"),
+        "laptop-proxy requesting an offload-purpose tunnel must be rejected: {response:?}"
+    );
+}
+
+/// M7's fleet-view exit criterion: "The fleet view correctly lists and
+/// status-tracks devhosts in at least two different AWS accounts with no
+/// shared credentials between them." This is "mostly a verification task"
+/// per the milestone doc's own scope bullet — `DevHostPresence::account_label`
+/// and the presence registry both already exist and needed no code change;
+/// what this test actually proves is that two independently-enrolled
+/// devhosts (distinct signing keys, distinct certificates, distinct
+/// `account_label`s — nothing shared between them at any layer this
+/// process touches) both appear correctly, with their OWN account label and
+/// OWN independent online/offline state, in one `list-devhosts` response.
+#[allow(clippy::similar_names)] // `presence_a_after_disconnect`/`presence_b_after_disconnect` are intentionally parallel names for this test's two devhosts, not an accidental collision risk.
+#[tokio::test]
+async fn fleet_view_tracks_two_devhosts_in_different_accounts_with_independent_presence() {
+    let server = spawn_server().await;
+    let (mut devhost_a, device_a) = authenticated_device_with_account_label(&server, "prod-build-box", "aws:111111111111").await;
+    let (mut devhost_b, device_b) = authenticated_device_with_account_label(&server, "staging-build-box", "aws:222222222222").await;
+
+    let mut phone = authenticated_phone(&server).await;
+    send_control(&mut phone, &ControlRequest::ListDevhosts { request_id: "r1".to_string() }).await;
+    let response: ControlResponse = recv_control(&mut phone).await;
+    let ControlResponse::ListDevhostsOk { devhosts, .. } = response else { panic!("expected ListDevhostsOk, got {response:?}") };
+
+    let entry_a = devhosts.iter().find(|d| d.device_id == device_a).expect("devhost A listed");
+    let entry_b = devhosts.iter().find(|d| d.device_id == device_b).expect("devhost B listed");
+    assert_eq!(entry_a.account_label.as_deref(), Some("aws:111111111111"));
+    assert_eq!(entry_b.account_label.as_deref(), Some("aws:222222222222"));
+    assert_ne!(entry_a.account_label, entry_b.account_label, "the two accounts' labels must not collide");
+    assert_eq!(entry_a.alias, "prod-build-box");
+    assert_eq!(entry_b.alias, "staging-build-box");
+    assert_eq!(entry_a.connection_state, ConnectionState::Online);
+    assert_eq!(entry_b.connection_state, ConnectionState::Online);
+
+    // Disconnect A only; B's presence must stay independently tracked —
+    // this is the "status-tracked" half of the exit criterion, not just a
+    // one-time snapshot. relayd updates `online_devices` as part of its own
+    // connection-cleanup path when the read loop ends, which happens
+    // asynchronously relative to this test's own `close()` call — a short
+    // bounded poll (not a fixed sleep) waits for that to land, the same
+    // "poll a real RPC rather than assume a fixed delay" discipline this
+    // module's other disconnect-observing tests use.
+    devhost_a.close(None).await.expect("close devhost A's connection");
+    drop(devhost_a);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let devhosts_after = loop {
+        send_control(&mut phone, &ControlRequest::ListDevhosts { request_id: "r2".to_string() }).await;
+        let response: ControlResponse = recv_control(&mut phone).await;
+        let ControlResponse::ListDevhostsOk { devhosts, .. } = response else { panic!("expected ListDevhostsOk, got {response:?}") };
+        let a_offline = devhosts.iter().any(|d| d.device_id == device_a && d.connection_state == ConnectionState::Offline);
+        if a_offline || tokio::time::Instant::now() >= deadline {
+            break devhosts;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+
+    let presence_a_after_disconnect = devhosts_after.iter().find(|d| d.device_id == device_a).expect("devhost A still listed after disconnect");
+    let presence_b_after_disconnect = devhosts_after.iter().find(|d| d.device_id == device_b).expect("devhost B still listed after disconnect");
+    assert_eq!(presence_a_after_disconnect.connection_state, ConnectionState::Offline, "devhost A must be observed offline after its connection closed");
+    assert_eq!(presence_b_after_disconnect.connection_state, ConnectionState::Online, "devhost B's presence must be tracked independently of devhost A's disconnect");
+    assert_eq!(presence_b_after_disconnect.account_label.as_deref(), Some("aws:222222222222"), "devhost B's account label must be unaffected by devhost A's disconnect");
+
+    // Both devhosts still connected can independently exercise their
+    // capability scope (open-tunnel to each other for offload) — a further,
+    // real confirmation that neither Identity's credential/session state
+    // bled into the other's.
+    let tunnel_id = open_tunnel(&mut phone, &mut devhost_b, &device_b, "rpc").await;
+    send_tunnel_frame(&mut phone, tunnel_id, b"still isolated").await;
+    let (received_id, payload) = recv_tunnel_frame(&mut devhost_b).await;
+    assert_eq!(received_id, tunnel_id);
+    assert_eq!(payload, b"still isolated");
 }

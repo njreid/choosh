@@ -21,7 +21,7 @@ scope — a connection's class is set once at enrollment and never escalates:
 | Class | Authenticates via | May do |
 | --- | --- | --- |
 | `phone` (human) | WebAuthn passkey | `list-devhosts`, `open-tunnel` to any devhost, `request-enrollment-token`, `register-fcm-token`, receive `agent-event` forwards |
-| `laptop-proxy` (machine) | Device credential from enrollment | `open-tunnel` to devhost SSH endpoints only (`purpose = "ssh"`); nothing else |
+| `laptop-proxy` (machine) | Device credential from enrollment | `open-tunnel` to devhost SSH endpoints only (`purpose = "ssh"`); `list-devhost-ssh-endpoints` (a restricted read of alias + SSH host key per devhost, for `proxy sync`, per [ssh-bridge-and-zed.md](ssh-bridge-and-zed.md)); nothing else |
 | `devhost` (machine) | Device credential from enrollment | `agent-event`, accept inbound tunnels, `open-tunnel` to another devhost only for cross-host offload (`purpose = "offload"`) |
 
 A `laptop-proxy` connection MUST NOT be able to call `list-devhosts` or open

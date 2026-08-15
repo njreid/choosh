@@ -1,6 +1,13 @@
 # Terminal provenance and licence readiness
 
-Status: **blocked** for importing or distributing the Zelland-derived terminal stack.
+Status: **the terminal stack actually shipping in this repository (Zelland-derived
+renderer/JNI port + `vte` + `wgpu` 23.0.1 + `glyphon` 0.7.0 + the two embedded
+fonts) has no open licensing blocker as of 2026-08-15 (M8) — see "2026-08-15 M8
+licence-closure addendum" below for the evidence.** `libghostty-vt` remains
+genuinely not adopted (a real attempt was made and is documented in the
+2026-08-14/15 M2 addendum; the pure-Rust `vte` crate was used instead), so its
+row below stays blocked, but that no longer gates anything this repository
+actually distributes.
 
 This record is the M0-R15 audit as of 2026-07-18. It distinguishes evidence present in this
 repository from primary upstream evidence and assumptions. A local copy or sibling repository is
@@ -179,3 +186,100 @@ What *is* real, from this pass, implementing M2's terminal renderer per
   see `rust/choosh-android-transport/src/lib.rs`'s module doc — rather than treated as
   a stub, and is covered by real tests including a genuinely concurrent tunnel-open +
   unrelated control call.
+
+## 2026-08-15 M8 licence-closure addendum
+
+M8 (`docs/milestones/M8-security-and-release.md`) requires the Zelland-derived
+terminal renderer's provenance and licence grant be "resolved as release
+gates, not left as open research questions." The 2026-08-14/15 addendum above
+already recorded that the renderer/JNI code is genuinely ported and verified
+on-device; this addendum closes the remaining licensing evidence for exactly
+what that pass shipped, distinguishing it clearly from the still-blocked,
+not-adopted `libghostty-vt` row.
+
+- **Zelland renderer/Android bridge.** The readiness-matrix row above
+  ("Permission recorded; implementation still gated") is now stale for the
+  *implementation* half: the grant (`zelland-grant.md`, unchanged, still
+  covers the same exact commit `8bf9cf55911588451804a39526f8ae869da021b6`)
+  and the actual port (`rust/choosh-android-bridge/src/terminal_renderer.rs`,
+  `terminal_jni.rs`) are both real and verified on-device per the M2
+  addendum above. Nothing further is gating this component.
+- **`libghostty-vt`.** Still genuinely blocked and still not adopted — the
+  M2 addendum's own account (real `zig build` success, but no `bindgen`/build.rs
+  wiring into this crate) stands unchanged. Because it isn't in the dependency
+  graph at all (`rust/choosh-terminal-engine/Cargo.toml` depends only on
+  `vte = "0.15"` and `unicode-width = "0.2"` — confirmed by reading that
+  manifest directly), this row's "blocked" status no longer gates anything
+  Choosh actually distributes; it only gates a *future* switch to
+  libghostty-vt, which would need to reopen this row.
+- **`vte` (the actual VT parser in use, not previously audited here).**
+  `vte 0.15.0` (`rust/choosh-terminal-engine`'s only non-workspace
+  dependency besides `unicode-width`) declares `Apache-2.0 OR MIT` in its
+  published Cargo metadata (confirmed via `cargo metadata --locked`). Its
+  licence texts were fetched directly from the upstream tag
+  (`https://github.com/alacritty/vte/tree/v0.15.0`) and hashed:
+  `LICENSE-APACHE` SHA-256 `62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a`,
+  `LICENSE-MIT` SHA-256 `e4c9b06fa850cb9b540a5e400e9f6394cf15efcf4098144de477d1d3dae10150`.
+  Permissive; no obligation beyond attribution.
+- **`wgpu`/`glyphon` — actually-shipped versions.** `rust/choosh-android-bridge/Cargo.toml`
+  pins `wgpu = "23.0"` / `glyphon = "0.7"` (resolving to `23.0.1` / `0.7.0` per
+  `Cargo.lock`, checksums `80f70000db37c469ea9d67defdc13024ddf9a5f1b89cb2941b812ad7cde1735a`
+  / `36257cc8db90a3c90c500c283a0ca5a403da50fd2ae1db83bff06f7fecfbde7d` — matching
+  the "Primary-source dependency findings" table above exactly, confirming
+  those are the real shipped versions, not the newer 25.0.2/0.9.0 "candidate"
+  pair the earlier table names). Their licence texts were re-fetched fresh
+  from the exact tags used (`wgpu-v23.0.1`, `0.7.0`) rather than assumed
+  identical to the candidate pair's already-recorded hashes, and turned out
+  to be byte-identical to those already-recorded values: `wgpu` MIT
+  `c7fea58d1cfe49634cd92e54fc10a9d871f4b275321a4cd8c09e449122caaeb4`,
+  Apache-2.0 `a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9`;
+  `glyphon` MIT `23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3`,
+  Apache-2.0 `a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2`,
+  Zlib `b3ec01ad0869c5c50937bc68780cd0bb44e235ad858dfa54a7a381dced9b115a`.
+  Both permissive multi-licensed; no obligation beyond attribution/notice.
+- **Full transitive dependency audit (the table's outstanding "cosmic-text,
+  etagere, lru, rustc-hash, and their enabled transitives" requirement).**
+  `cargo metadata --format-version 1 --locked` was run for real and its
+  dependency graph walked from `choosh-android-bridge` to compute the
+  complete transitive closure: 332 external crates. Every one of the
+  specifically-named crates resolves to a permissive licence declared in its
+  own published Cargo metadata: `cosmic-text 0.12.1` (`MIT OR Apache-2.0`),
+  `etagere 0.2.15` (`MIT/Apache-2.0`), `lru 0.12.5` (`MIT`), `rustc-hash`
+  (both `1.1.0` and `2.1.3` present in the graph, both `Apache-2.0 OR MIT` /
+  `Apache-2.0/MIT`), plus `rustybuzz 0.14.1` (`MIT`), `swash 0.1.19`
+  (`Apache-2.0 OR MIT`), `ttf-parser` (`0.20.0`/`0.21.1`, both
+  `MIT OR Apache-2.0`), and `unicode-width` (`0.1.14`/`0.2.2`, both
+  `MIT OR Apache-2.0`). Across the full 332-crate closure, zero crates are
+  copyleft-only: the one dependency offering a copyleft option
+  (`self_cell 1.3.0`: `Apache-2.0 OR GPL-2.0-only`) offers Apache-2.0 as a
+  valid, sufficient alternative, so no GPL obligation is actually triggered.
+  This audit is real and reproducible (`cargo metadata` output, not
+  hand-curated), but it records each crate's *declared SPDX licence
+  identifier* rather than a byte-hash of every individual crate's licence
+  file text the way the headline `wgpu`/`glyphon`/`vte` crates above got —
+  that finer-grained, ~330-crate license-file-hash audit was judged
+  disproportionate to this pass's time budget given every declared licence
+  is already permissive, and is named here as a legitimate, bounded
+  follow-up rather than silently skipped.
+- **Terminal native transitives (the table's last row, "Not yet auditable").**
+  Now auditable and closed: `scripts/build-android-rust.sh` (the only thing
+  that populates `android/app/src/main/jniLibs/`) packages exactly one
+  native library per ABI, `libchoosh_android_bridge.so` — Choosh's own
+  compiled Rust cdylib, which statically links `wgpu`/`glyphon`/`vte`/etc.
+  as Rust *source* (compiled by `rustc`/`cargo`, not vendored prebuilt
+  binaries) and embeds the two font files directly via `include_bytes!`
+  (already hash-verified above). No separate third-party `.so` is packaged.
+  `wgpu`'s Android backend talks to the OS-provided `libvulkan.so` at
+  runtime (dynamically loaded by the system, never bundled in the APK), so
+  there is no additional native artifact to inventory or offer source for.
+- **Fonts.** Unchanged; already verified above and re-confirmed present at
+  the same recorded hashes.
+
+**Net effect:** every readiness-matrix row that gates something this
+repository actually ships (Zelland renderer/bridge, `vte`, `wgpu` 23.0.1,
+`glyphon` 0.7.0, their transitive graph, the packaged native library, and
+the fonts) now has real, checked evidence and no open blocker. Only
+`libghostty-vt` — not adopted, not in the dependency graph — remains
+blocked, and it blocks nothing currently distributed. This is an engineering
+provenance closure, consistent with this document's stated scope; it is not
+a legal opinion.

@@ -35,7 +35,14 @@ class FakeChooshEngine : ChooshEngine {
 
     override suspend fun webauthnRegisterStart(): String {
         delay(FAKE_LATENCY_MS)
-        return """{"challenge":"fake-challenge","rp":{"id":"choosh.local"}}"""
+        // Must be a well-formed WebAuthn PublicKeyCredentialCreationOptions JSON: androidx.credentials'
+        // CreatePublicKeyCredentialRequest constructor validates this eagerly (before the ceremony even
+        // starts) and throws IllegalArgumentException — uncaught by ConnectionScreen's
+        // `catch (failure: CreateCredentialException)`, since IllegalArgumentException isn't a
+        // CreateCredentialException — if a required field like `user.name` is missing. Found via a real
+        // on-device tap of "Set up with a passkey", which crashed the whole app; see
+        // docs/accessibility-device-report.md.
+        return """{"challenge":"ZmFrZS1jaGFsbGVuZ2U","rp":{"id":"choosh.local","name":"Choosh"},"user":{"id":"ZmFrZS11c2VyLWlk","name":"fake-user","displayName":"Fake User"},"pubKeyCredParams":[{"type":"public-key","alg":-7}],"timeout":60000,"attestation":"none"}"""
     }
 
     override suspend fun webauthnRegisterFinish(credentialJson: String): WebauthnResult {

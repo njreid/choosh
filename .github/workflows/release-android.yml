@@ -104,20 +104,7 @@ jobs:
       - name: Collect and verify release evidence
         env:
           VERSION: ${{ steps.version.outputs.name }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RELEASE_DIR"
-          mapfile -t apks < <(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print)
-          if (( ${#apks[@]} != 1 )); then
-            echo "expected exactly one universal release APK, found ${#apks[@]}" >&2
-            exit 1
-          fi
-          apk="$RELEASE_DIR/choosh-${VERSION}.apk"
-          cp "${apks[0]}" "$apk"
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk"
-          cp android/app/build/reports/bom.json "$RELEASE_DIR/choosh-${VERSION}.cdx.json"
-          cp android/app/build/reports/licenses/NOTICE.txt "$RELEASE_DIR/choosh-${VERSION}-NOTICE.txt"
-          sha256sum "$RELEASE_DIR"/* > "$RELEASE_DIR/choosh-${VERSION}.sha256"
+        run: ./scripts/collect-release-evidence.sh "$VERSION"
 
       - name: Attest APK provenance
         uses: actions/attest-build-provenance@v2

@@ -175,6 +175,23 @@ write_systemd_unit() {
 	unit_dir="$HOME/.config/systemd/user"
 	unit_path="$unit_dir/choosh-hostd.service"
 	run mkdir -p "$unit_dir"
+	# KillMode=process (not the systemd default of control-group) is
+	# load-bearing, not cosmetic: confirmed by direct experiment (real
+	# systemd --user unit, real `zellij attach --create-background`
+	# session, real long-running process inside it) that with the
+	# default control-group KillMode, `systemctl --user restart
+	# choosh-hostd.service` SIGKILLs every process in the unit's cgroup
+	# — including the Zellij *server* and everything attached to it —
+	# even though Zellij's server is not a session leader or process-group
+	# member of the choosh-hostd process by the time of the kill. Only the
+	# main tracked PID (choosh-hostd itself) is signaled under
+	# KillMode=process, which is exactly host-deployment.md's Self-update
+	# requirement ("Zellij sessions... MUST survive this restart
+	# unaffected") and DESIGN.md principle 6 ("Zellij owns process
+	# persistence independently of choosh-hostd's own liveness"). This is
+	# also what makes choosh-hostd::update's own rollback watchdog (a
+	# plain child process, no systemd-run/scope trickery needed) survive
+	# the same restart it triggers.
 	unit_content="[Unit]
 Description=Choosh host daemon
 After=network-online.target
@@ -184,6 +201,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=$HOSTD_BIN serve
 Restart=on-failure
+KillMode=process
 Environment=CHOOSH_ENROLLMENT_TOKEN=$TOKEN
 Environment=CHOOSH_RELAYD_URL=$CHOOSH_RELAYD_URL
 
@@ -198,6 +216,12 @@ WantedBy=default.target
 	echo "$unit_path"
 }
 
+# AbandonProcessGroup (default false): without it, launchd tracks and
+# signals this job's entire BSD process group on `launchctl kickstart -k`,
+# not just the tracked PID — the macOS analogue of the Linux unit's
+# KillMode=process fix above, for the exact same reason (Zellij's server
+# and choosh-hostd::update's rollback watchdog must survive a self-update
+# restart).
 write_launchd_plist() {
 	plist_dir="$HOME/Library/LaunchAgents"
 	plist_path="$plist_dir/ai.choosh.hostd.plist"
@@ -223,6 +247,8 @@ write_launchd_plist() {
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
+	<true/>
+	<key>AbandonProcessGroup</key>
 	<true/>
 </dict>
 </plist>

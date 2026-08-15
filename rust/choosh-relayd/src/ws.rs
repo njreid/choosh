@@ -197,7 +197,13 @@ async fn authenticate_device(
         .map_err(|_| "signature does not verify".to_string())?;
 
     Ok(Authenticated {
-        device_id: device_auth.device_id.clone(),
+        // Sourced from `cert_device_id` (the CA-verified certificate body),
+        // not `device_auth.device_id` (the caller's presented claim) —
+        // they're provably equal by the check above, but binding the
+        // authenticated Identity to the verified value directly means a
+        // future edit that weakens or removes that check can't silently
+        // reintroduce a claim-not-derived-from-the-certificate identity bug.
+        device_id: cert_device_id,
         identity_class: entry.identity_class,
     })
 }
@@ -285,6 +291,25 @@ async fn serve_authenticated_loop(
                             }
                         }
                         Some(FRAME_CLASS_TUNNEL) => {
+                            // The shared ingress decoder is sized to the
+                            // larger control-frame cap (`new_decoder`'s
+                            // `control_frame_limits`), since one decoder
+                            // serves both frame classes for the connection's
+                            // whole lifetime. That means a tunnel frame
+                            // between `MAX_TUNNEL_FRAME_BYTES` and
+                            // `MAX_CONTROL_FRAME_BYTES` would otherwise pass
+                            // decoding uncaught. relay-protocol.md requires
+                            // `relayd` to terminate the connection on "a
+                            // frame exceeding its class's size cap" — this
+                            // check enforces that cap explicitly for the
+                            // tunnel class, which the shared decoder alone
+                            // cannot.
+                            if frame.len()
+                                > 1 + TUNNEL_ID_BYTES + choosh_protocol::relay::MAX_TUNNEL_FRAME_BYTES
+                            {
+                                let _ = socket.close().await;
+                                return;
+                            }
                             handle_tunnel_frame(state, &authenticated.device_id, &frame).await;
                         }
                         // Any other class byte (or an empty frame, which
@@ -718,6 +743,14 @@ fn dispatch_fcm_push_stub(token: &str, from_device_id: &str, event: &WireAgentEv
         // silence here.
         WireAgentEvent::EditorAttached { workspace_id, editor } => (workspace_id.as_str(), "", format!("editor_attached:{editor:?}")),
         WireAgentEvent::EditorDetached { workspace_id, editor } => (workspace_id.as_str(), "", format!("editor_detached:{editor:?}")),
+        // No `workspace_id`/`item_id` per `WireAgentEvent::AuthRequired`'s
+        // own doc comment — this event isn't attributable to a single
+        // workspace item. Only the `provider` tag is logged here, the same
+        // way every other arm above logs a typed tag rather than free-form
+        // content: `user_code`/`verification_uri` are what the phone needs
+        // to display to complete the flow, not what belongs in a relay log
+        // line.
+        WireAgentEvent::AuthRequired { provider, .. } => ("", "", format!("auth_required:{provider:?}")),
     };
     tracing::info!(
         fcm_token_prefix = %token.get(..8).unwrap_or(token),

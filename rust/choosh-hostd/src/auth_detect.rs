@@ -1,0 +1,763 @@
+//! Detects a headless device-code SSO/cloud-CLI auth flow in a stream of
+//! terminal bytes, per `docs/specs/agent-events.md`'s `auth_required` and
+//! `docs/milestones/M7-fleet-and-provisioning.md`'s "SSO/cloud-CLI
+//! device-code bridge".
+//!
+//! **What this observes, and what it doesn't.** The four named tools (`aws
+//! sso login`, `gcloud auth login`, `az login`, `gh auth login`) share a
+//! real signal when they can't hand off to a local browser: they print a
+//! short-lived user code and a verification URL, then block. This module
+//! never runs or knows about any of those binaries — it is a pure text
+//! scanner over whatever bytes a real pty happened to produce, wired in by
+//! `serve.rs`'s `open_pty_tunnel` (the same pty master `pty.rs`'s
+//! `PtySession` reads for the `pty:<item_id>` tunnel path an `AgentTerminal`/
+//! `Shell` item's Zellij tab is attached through). See `serve.rs`'s own doc
+//! comments for exactly which spawn paths feed this and which don't.
+//!
+//! **Verification status per provider — read before trusting a pattern
+//! here against a real device.** `aws` and `github` are matched against
+//! byte-for-byte real captured output (see each `detect_*` function's doc
+//! comment for how it was captured); `azure` is matched against the
+//! device-code message's well-documented, years-stable phrasing
+//! (cross-checked via public documentation, not captured from a live `az`
+//! binary — none was installed in the environment this was built in);
+//! `gcp` is the weakest of the four — see [`detect_gcp`]'s doc comment for
+//! why the real, currently-shipping `gcloud auth login --no-launch-browser`
+//! flow does not actually emit anything this module can match, and what
+//! this implementation does instead.
+//!
+//! **Extraction, not capture.** Every `detect_*` function returns only the
+//! three named fields, each independently bounds- and shape-checked before
+//! being accepted — never "the rest of the line" or "the whole matched
+//! region". This is deliberate: agent-events.md's hard requirement ("No
+//! token, credential, or session identifier MUST ever appear in this
+//! event") means a naive "grab everything after the marker up to the next
+//! newline" implementation would be a real defect the moment some
+//! provider's real output puts anything else on that line. See this
+//! module's `no_leakage` test for a concrete adversarial case.
+
+use choosh_protocol::relay::{WireAgentEvent, WireAuthProvider};
+
+/// Upper bound on how much recently-seen terminal text this detector keeps
+/// around across [`AuthCodeDetector::feed`] calls. Bounds memory for a
+/// long-lived interactive session (a `Shell` item can stay attached for
+/// hours) while comfortably exceeding the longest real prompt text any of
+/// the four providers print (the AWS `PrintOnlyHandler` message, the
+/// longest of the four verified/researched here, is well under 1KiB).
+const MAX_BUFFER_CHARS: usize = 8192;
+
+/// Incremental scanner over one pty's output stream. Bytes arrive in
+/// arbitrary chunks (`pty.rs`'s reader loop uses an 8KiB buffer, but a
+/// provider's own stdout buffering can split a marker or a code across
+/// reads in either direction) — this type exists specifically so a match
+/// spanning a chunk boundary is still found, without ever re-scanning from
+/// scratch on every byte.
+pub struct AuthCodeDetector {
+    /// Accumulated, ANSI-stripped, CR-normalized text seen so far, capped
+    /// at [`MAX_BUFFER_CHARS`] (oldest content evicted first).
+    buffer: String,
+    /// The last `(provider, user_code)` this detector already emitted an
+    /// event for. A completed device-code prompt typically stays visible
+    /// in the pty's scrollback (and therefore in `buffer`) for as long as
+    /// the CLI keeps blocking on it, which would otherwise re-match and
+    /// re-emit on every subsequent read — this suppresses that re-emission
+    /// for the *same* code. A genuinely new login attempt (a different
+    /// code) is still reported.
+    already_fired: Option<(WireAuthProvider, String)>,
+}
+
+impl Default for AuthCodeDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AuthCodeDetector {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { buffer: String::new(), already_fired: None }
+    }
+
+    /// Feeds newly-read pty bytes. Returns `Some` the first time a
+    /// complete, validated device-code prompt is recognized for a given
+    /// `(provider, user_code)` pair; `None` otherwise — including while a
+    /// real prompt is only partially buffered (see this module's tests for
+    /// the partial-output cases this is required not to fire on).
+    pub fn feed(&mut self, bytes: &[u8]) -> Option<WireAgentEvent> {
+        // Lossy is correct here: a chunk boundary can legitimately split a
+        // multi-byte UTF-8 codepoint, which `from_utf8_lossy` turns into a
+        // replacement character for *this* feed call rather than an error —
+        // acceptable because none of the four providers' device-code
+        // markers or codes are anything but ASCII, so a stray replacement
+        // character elsewhere in the stream can never hide a real match.
+        let decoded = String::from_utf8_lossy(bytes);
+        let cleaned = strip_ansi_and_normalize(&decoded);
+        self.buffer.push_str(&cleaned);
+        if self.buffer.chars().count() > MAX_BUFFER_CHARS {
+            let overflow = self.buffer.chars().count() - MAX_BUFFER_CHARS;
+            self.buffer = self.buffer.chars().skip(overflow).collect();
+        }
+
+        let (provider, user_code, verification_uri) = detect_github(&self.buffer)
+            .or_else(|| detect_aws(&self.buffer))
+            .or_else(|| detect_azure(&self.buffer))
+            .or_else(|| detect_gcp(&self.buffer))?;
+
+        if self.already_fired.as_ref() == Some(&(provider, user_code.clone())) {
+            return None;
+        }
+        self.already_fired = Some((provider, user_code.clone()));
+        Some(WireAgentEvent::AuthRequired { provider, user_code, verification_uri })
+    }
+}
+
+/// Strips ANSI escape sequences (CSI — `ESC [ ... <final byte 0x40-0x7E>`,
+/// e.g. SGR color codes and the cursor/terminal-capability queries real
+/// CLIs emit like `ESC[6n`; OSC — `ESC ] ... (BEL | ESC \\)`, e.g. the
+/// background-color query `gh` was directly observed emitting) and
+/// normalizes line endings (bare `\r` dropped, `\r\n` collapsed to `\n`) so
+/// the `detect_*` matchers below can work against plain text the way a
+/// real terminal emulator would render it, rather than against raw
+/// escape-sequence-laden bytes. Deliberately conservative on anything that
+/// isn't a recognized CSI/OSC shape (a bare `ESC` followed by one other
+/// character is dropped as a simple two-byte escape) rather than
+/// attempting to be a complete terminal emulator.
+fn strip_ansi_and_normalize(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    loop {
+                        match chars.next() {
+                            None | Some('\u{7}') => break,
+                            Some('\u{1b}') if chars.peek() == Some(&'\\') => {
+                                chars.next();
+                                break;
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if ch == '\r' {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A conservative shape check for the short alphanumeric(-dash) code every
+/// one of these providers prints: long enough not to match stray words,
+/// short enough to bound what a malformed/adversarial stream could get
+/// accepted as a "code" (see this module's `no_leakage` test), and
+/// alphanumeric-plus-dash only — real device codes never contain spaces or
+/// punctuation, so if the token we found doesn't look like this, treat the
+/// "match" as spurious rather than forwarding something wrong.
+fn looks_like_device_code(token: &str) -> bool {
+    let len = token.len();
+    (4..=24).contains(&len) && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') && token.bytes().any(|b| b.is_ascii_alphanumeric())
+}
+
+/// Returns the whitespace-delimited token starting at `text[start..]`, with
+/// common trailing sentence punctuation trimmed — but only if that token is
+/// already terminated by whitespace somewhere in `text`. Returning `None`
+/// when the token runs all the way to the end of the buffer (no confirmed
+/// terminator yet) is the load-bearing part: it's what makes a code or URL
+/// that's been cut off mid-stream by a chunk boundary correctly *not*
+/// match yet, rather than being extracted truncated.
+fn take_token(text: &str, start: usize) -> Option<&str> {
+    let rest = text.get(start..)?;
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let end = rest.find(char::is_whitespace)?;
+    let token = rest[..end].trim_end_matches(['.', ',', ':', ';', '!', '?']);
+    if token.is_empty() { None } else { Some(token) }
+}
+
+/// The first whitespace-delimited word on the first non-blank line at or
+/// after byte offset `from` — used for the AWS matcher, whose code sits
+/// alone on its own line after a blank line. Like [`take_token`], requires
+/// a confirmed trailing newline for both any blank lines skipped and the
+/// token's own line, so a still-arriving line never matches early.
+fn first_nonblank_line_token(text: &str, from: usize) -> Option<&str> {
+    let mut pos = from;
+    loop {
+        let remaining = text.get(pos..)?;
+        let newline_offset = remaining.find('\n')?;
+        let line = remaining[..newline_offset].trim();
+        if line.is_empty() {
+            pos += newline_offset + 1;
+            continue;
+        }
+        let end = line.find(char::is_whitespace).unwrap_or(line.len());
+        let token = line[..end].trim_end_matches(['.', ',', ':', ';', '!', '?']);
+        return if token.is_empty() { None } else { Some(token) };
+    }
+}
+
+/// The first `https://` URL in `text`, terminated by whitespace (i.e. not
+/// yet-incomplete), bounded to a sane length so a pathological stream
+/// can't make this scan (or a downstream consumer) do unbounded work.
+fn first_https_url(text: &str) -> Option<&str> {
+    let start = text.find("https://")?;
+    https_url_at(text, start)
+}
+
+/// The *last* `https://` URL in `text` — used where a provider prints the
+/// verification URL before the code (AWS, and the constructed `gcp`
+/// scaffolding): with [`detect_aws`]/[`detect_gcp`] anchoring on the
+/// *last* (most recent) occurrence of their code marker via `str::rfind`
+/// (so a buffer holding more than one completed login attempt still
+/// reports the current one, not a stale earlier one), the URL that
+/// belongs to that same, most-recent attempt is symmetrically the nearest
+/// one preceding it, i.e. the last one in the prefix searched.
+fn last_https_url(text: &str) -> Option<&str> {
+    let start = text.rfind("https://")?;
+    https_url_at(text, start)
+}
+
+fn https_url_at(text: &str, start: usize) -> Option<&str> {
+    let rest = &text[start..];
+    let end = rest.find(char::is_whitespace)?;
+    let url = &rest[..end];
+    if url.len() > 512 { None } else { Some(url) }
+}
+
+/// **Verified against real, captured output of the installed `gh` binary
+/// in this environment** (`gh version 2.96.0`), both without a controlling
+/// terminal (`gh auth login --hostname github.com --git-protocol https
+/// --web` piped, browser suppressed via `BROWSER=/bin/false`) and — the
+/// case that actually matters here, since a `pty:<item_id>` tunnel always
+/// gives the attached client a real controlling terminal — through a real
+/// pty (`python3`'s `pty.fork()`), byte-for-byte, including the ANSI SGR
+/// color codes and the `ESC]11;?ESC\`/`ESC[6n` terminal-capability queries
+/// `gh` emits first. The two captured forms:
+///
+/// ```text
+/// ! First copy your one-time code: F1FE-DF1C
+/// Open this URL to continue in your web browser: https://github.com/login/device
+/// ```
+///
+/// and, over a real pty (color codes shown stripped, as
+/// [`strip_ansi_and_normalize`] leaves them):
+///
+/// ```text
+/// ! First copy your one-time code: 21F9-D986
+/// Press Enter to open https://github.com/login/device in your browser...
+/// ```
+///
+/// Both share the same stable anchor phrase and both put the verification
+/// URL somewhere after the code — this single matcher covers both real
+/// captured shapes (and a GitHub Enterprise `--hostname`, which changes the
+/// URL's host but not this structure) without needing to special-case tty
+/// vs. non-tty.
+fn detect_github(text: &str) -> Option<(WireAuthProvider, String, String)> {
+    const MARKER: &str = "First copy your one-time code:";
+    // The *last* occurrence: a long-lived buffer can accumulate more than
+    // one completed prompt (a retried login), and the current one is
+    // always the most recent — see `last_https_url`'s doc comment for the
+    // matching reasoning on the AWS/gcp side.
+    let marker_pos = text.rfind(MARKER)?;
+    let code = take_token(text, marker_pos + MARKER.len())?;
+    if !looks_like_device_code(code) {
+        return None;
+    }
+    let code_end = marker_pos + MARKER.len() + text[marker_pos + MARKER.len()..].find(code)? + code.len();
+    let uri = first_https_url(&text[code_end..])?;
+    if !uri.contains("/login/device") {
+        return None;
+    }
+    Some((WireAuthProvider::Github, code.to_string(), uri.to_string()))
+}
+
+/// **Verified against the real, installed `aws` CLI's source** (`aws-cli
+/// 2.35.17`, `awscli/customizations/sso/{login,utils}.py` read directly
+/// from this environment's site-packages — not documentation, the literal
+/// f-strings the running binary formats and prints) for both handlers
+/// `aws sso login` can use:
+///
+/// `PrintOnlyHandler` (selected by `--no-browser`, the flag a genuinely
+/// headless devhost's launcher would reach for):
+///
+/// ```text
+/// Browser will not be automatically opened.
+/// Please visit the following URL:
+///
+/// {verificationUri}
+///
+/// Then enter the code:
+///
+/// {userCode}
+///
+/// Alternatively, you may visit the following URL which will autofill the
+/// code upon loading:
+/// {verificationUriComplete}
+/// ```
+///
+/// `OpenBrowserHandler` (the default — reached on a devhost with no
+/// `DISPLAY`/`WAYLAND_DISPLAY` where `webbrowser.open_new_tab` silently
+/// fails, since that failure is only logged at `DEBUG`, per
+/// `login.py`/`utils.py`'s `except Exception: LOG.debug(...)`):
+///
+/// ```text
+/// Attempting to open your default browser.
+/// If the browser does not open or you wish to use a different device to
+/// authorize this request, open the following URL:
+///
+/// {verificationUri}
+///
+/// Then enter the code:
+///
+/// {userCode}
+/// ```
+///
+/// A real device authorization against a live AWS SSO instance was not
+/// available to capture end to end (confirmed instead, live, that a bogus
+/// `sso_start_url` reaches the real AWS SSO OIDC endpoint and returns a
+/// real `InvalidRequestException` — see this module's
+/// `real_aws_error_output_is_not_a_false_positive` test for that exact
+/// captured negative fixture), so the `{verificationUri}`/`{userCode}`
+/// values in this module's positive AWS tests are realistic placeholders
+/// substituted into the verified real template, not a captured live
+/// transcript.
+///
+/// Both handlers share "Then enter the code:" as a stable anchor, with the
+/// code alone on the next non-blank line, and the verification URL — not
+/// `verificationUriComplete`, which appears later and is not what this
+/// extracts — as the first `https://` URL appearing anywhere before that
+/// anchor.
+fn detect_aws(text: &str) -> Option<(WireAuthProvider, String, String)> {
+    const MARKER: &str = "Then enter the code:";
+    let marker_pos = text.rfind(MARKER)?;
+    let code = first_nonblank_line_token(text, marker_pos + MARKER.len())?;
+    if !looks_like_device_code(code) {
+        return None;
+    }
+    let uri = last_https_url(&text[..marker_pos])?;
+    Some((WireAuthProvider::Aws, code.to_string(), uri.to_string()))
+}
+
+/// **Not verified against a real `az` binary** — the Azure CLI is not
+/// installed in the environment this was built in (`az --version` ->
+/// command not found). Matched instead against `az login`'s device-code
+/// message, which is extremely widely and consistently documented and has
+/// been stable in this exact phrasing across the CLI's history (cross-
+/// checked via public documentation/search rather than a live capture):
+///
+/// ```text
+/// To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code <CODE> to authenticate.
+/// ```
+///
+/// Unlike the other three providers, both fields sit on one line — the URL
+/// is the token right after "use a web browser to open the page ", the
+/// code is the token right after the subsequent "enter the code ".
+fn detect_azure(text: &str) -> Option<(WireAuthProvider, String, String)> {
+    const URL_MARKER: &str = "use a web browser to open the page ";
+    const CODE_MARKER: &str = "enter the code ";
+    let url_marker_pos = text.rfind(URL_MARKER)?;
+    let after_url_marker = url_marker_pos + URL_MARKER.len();
+    let uri = take_token(text, after_url_marker)?;
+    if !uri.starts_with("https://") {
+        return None;
+    }
+    let code_marker_pos = after_url_marker + text[after_url_marker..].find(CODE_MARKER)?;
+    let code = take_token(text, code_marker_pos + CODE_MARKER.len())?;
+    if !looks_like_device_code(code) {
+        return None;
+    }
+    Some((WireAuthProvider::Azure, code.to_string(), uri.to_string()))
+}
+
+/// **Not verified against a real `gcloud` binary, and — unlike the other
+/// three providers — not expected to match one either, honestly.** Google
+/// Cloud SDK is not installed in the environment this was built in, but
+/// more importantly: research into `gcloud auth login --no-launch-browser`'s
+/// actual, currently-shipping behavior (Google's own documentation, cross-
+/// checked across multiple pages) shows it does **not** use the "device
+/// prints a short code, user types it into a browser" flow the other three
+/// providers use and this module's payload shape assumes. It uses the
+/// *reverse*, out-of-band flow: `gcloud` prints a long
+/// `https://accounts.google.com/o/oauth2/auth?...` authorization URL, the
+/// user completes sign-in in a browser on a *different* device, that
+/// browser page displays a verification code, and the user pastes *that*
+/// code back into `gcloud`'s own "Enter authorization code:" terminal
+/// prompt. There is no short `user_code` ever printed to `gcloud`'s own
+/// stdout for this detector to see — so a real headless `gcloud auth
+/// login` session will not fire this matcher today, no matter how it's
+/// tuned, because the field this module needs to extract is never in the
+/// stream at all.
+///
+/// This function is still implemented — matching a hypothetical RFC 8628
+/// ("OAuth 2.0 Device Authorization Grant")-shaped message, which is what
+/// `agent-events.md`'s own example payload (`user_code: "WDJB-MJHT"` is
+/// literally RFC 8628 §3.3's example value) appears to assume `gcp` would
+/// look like — so the `gcp` arm of the provider enum and this module's
+/// dispatch are complete and ready the moment either (a) `gcloud` ships a
+/// real device-code mode, or (b) this is pointed at a different
+/// Google-ecosystem tool that already speaks true RFC 8628 (e.g. some
+/// `gcloud`-adjacent or embedded-device Google auth tooling does). Treat
+/// this one function, uniquely among the four, as unverified scaffolding
+/// rather than a working detector for `gcloud auth login` as it exists
+/// today — flagged here and in the top-level report, not silently assumed
+/// to work.
+fn detect_gcp(text: &str) -> Option<(WireAuthProvider, String, String)> {
+    const MARKER: &str = "enter the code:";
+    let marker_pos = text.rfind(MARKER)?;
+    let code = take_token(text, marker_pos + MARKER.len())?;
+    if !looks_like_device_code(code) {
+        return None;
+    }
+    let uri = last_https_url(&text[..marker_pos])?;
+    Some((WireAuthProvider::Gcp, code.to_string(), uri.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte-for-byte what `gh auth login --hostname github.com
+    /// --git-protocol https --web` printed with stdout piped (no
+    /// controlling terminal), `BROWSER=/bin/false` so it can't actually
+    /// launch anything — captured directly against the real `gh 2.96.0`
+    /// binary installed in this environment.
+    const GH_PIPED_REAL: &str = "\n! First copy your one-time code: F1FE-DF1C\nOpen this URL to continue in your web browser: https://github.com/login/device\n";
+
+    /// The same real `gh` invocation, this time through a real pty
+    /// (`python3 pty.fork()`), with ANSI SGR color codes and the leading
+    /// `ESC]11;?ESC\`/`ESC[6n` capability-query escapes `gh` emits first —
+    /// exactly the shape `pty.rs`'s real pty master would deliver to this
+    /// detector. Given here already run through [`strip_ansi_and_normalize`]
+    /// is *not* what's tested below (the raw bytes are, via
+    /// `feed_in_chunks_of`) — this constant documents the cleaned form for
+    /// readability.
+    const GH_PTY_REAL_RAW: &[u8] = b"\x1b]11;?\x1b\\\x1b[6n\r\n\x1b[0;33m!\x1b[0m First copy your one-time code: \x1b[0;1;39m21F9-D986\x1b[0m\r\n\x1b[0;1;39mPress Enter\x1b[0m to open https://github.com/login/device in your browser... ";
+
+    /// The real `awscli 2.35.17` `PrintOnlyHandler` template
+    /// (`awscli/customizations/sso/utils.py`), with a placeholder
+    /// `verificationUri`/`userCode` substituted in — see [`detect_aws`]'s
+    /// doc comment for why the values themselves aren't a live capture.
+    fn aws_print_only_handler_output(verification_uri: &str, user_code: &str, verification_uri_complete: &str) -> String {
+        format!(
+            "Browser will not be automatically opened.\nPlease visit the following URL:\n\n{verification_uri}\n\nThen enter the code:\n\n{user_code}\n\nAlternatively, you may visit the following URL which will autofill the code upon loading:\n{verification_uri_complete}\n"
+        )
+    }
+
+    /// The real `awscli 2.35.17` `OpenBrowserHandler` template, same
+    /// source file.
+    fn aws_open_browser_handler_output(verification_uri: &str, user_code: &str) -> String {
+        format!(
+            "Attempting to open your default browser.\nIf the browser does not open or you wish to use a different device to authorize this request, open the following URL:\n\n{verification_uri}\n\nThen enter the code:\n\n{user_code}\n"
+        )
+    }
+
+    /// Byte-for-byte what `aws sso login --profile testsso --no-browser`
+    /// printed against a deliberately-bogus `sso_start_url`, captured live
+    /// against the real, installed `aws-cli 2.35.17` — proof this really
+    /// reaches AWS's SSO OIDC endpoint and gets a real error back, and a
+    /// genuine negative fixture: a *different* kind of SSO-adjacent
+    /// failure that must not be mistaken for a device-code prompt.
+    const AWS_REAL_INVALID_START_URL_ERROR: &str = "aws: [ERROR]: An error occurred (InvalidRequestException) when calling the StartDeviceAuthorization operation:\n\nAdditional error details:\nerror: invalid_request\nerror_description: Invalid start url provided\n";
+
+    /// The well-documented, stable `az login` device-code message — see
+    /// [`detect_azure`]'s doc comment for its verification status.
+    fn az_device_code_output(code: &str) -> String {
+        format!("To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code {code} to authenticate.\n")
+    }
+
+    /// Feeds `bytes` through a fresh detector split into `chunk_size`-byte
+    /// pieces, returning the first `Some` result (if any) — used to prove
+    /// detection survives an arbitrary chunk boundary, including one that
+    /// lands mid-marker or mid-code.
+    fn feed_in_chunks_of(bytes: &[u8], chunk_size: usize) -> Option<WireAgentEvent> {
+        let mut detector = AuthCodeDetector::new();
+        for chunk in bytes.chunks(chunk_size.max(1)) {
+            if let Some(event) = detector.feed(chunk) {
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn github_piped_real_capture_is_detected() {
+        let mut detector = AuthCodeDetector::new();
+        let event = detector.feed(GH_PIPED_REAL.as_bytes()).expect("must detect the real gh device-code prompt");
+        assert_eq!(
+            event,
+            WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Github,
+                user_code: "F1FE-DF1C".to_string(),
+                verification_uri: "https://github.com/login/device".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn github_real_pty_capture_with_ansi_color_codes_is_detected() {
+        let mut detector = AuthCodeDetector::new();
+        let event = detector.feed(GH_PTY_REAL_RAW).expect("must detect through real ANSI escape sequences");
+        assert_eq!(
+            event,
+            WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Github,
+                user_code: "21F9-D986".to_string(),
+                verification_uri: "https://github.com/login/device".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn github_detection_survives_the_marker_and_code_split_across_reads() {
+        for chunk_size in [1, 3, 7, 16, 64] {
+            let event = feed_in_chunks_of(GH_PIPED_REAL.as_bytes(), chunk_size);
+            assert_eq!(
+                event,
+                Some(WireAgentEvent::AuthRequired {
+                    provider: WireAuthProvider::Github,
+                    user_code: "F1FE-DF1C".to_string(),
+                    verification_uri: "https://github.com/login/device".to_string(),
+                }),
+                "failed to detect with chunk_size={chunk_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_print_only_handler_output_is_detected() {
+        let text = aws_print_only_handler_output(
+            "https://device.sso.us-east-1.amazonaws.com/",
+            "ABCD-WXYZ",
+            "https://device.sso.us-east-1.amazonaws.com/?user_code=ABCD-WXYZ",
+        );
+        let mut detector = AuthCodeDetector::new();
+        let event = detector.feed(text.as_bytes()).expect("must detect the aws PrintOnlyHandler prompt");
+        assert_eq!(
+            event,
+            WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Aws,
+                user_code: "ABCD-WXYZ".to_string(),
+                verification_uri: "https://device.sso.us-east-1.amazonaws.com/".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn aws_open_browser_handler_output_is_detected_and_does_not_capture_the_complete_uri() {
+        let text = aws_open_browser_handler_output("https://device.sso.us-east-1.amazonaws.com/", "QRST-1234");
+        let mut detector = AuthCodeDetector::new();
+        let event = detector.feed(text.as_bytes()).unwrap();
+        assert_eq!(
+            event,
+            WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Aws,
+                user_code: "QRST-1234".to_string(),
+                verification_uri: "https://device.sso.us-east-1.amazonaws.com/".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn real_aws_error_output_is_not_a_false_positive() {
+        let mut detector = AuthCodeDetector::new();
+        assert_eq!(detector.feed(AWS_REAL_INVALID_START_URL_ERROR.as_bytes()), None);
+    }
+
+    #[test]
+    fn azure_device_code_message_is_detected() {
+        let text = az_device_code_output("BQFQAAT9V");
+        let mut detector = AuthCodeDetector::new();
+        let event = detector.feed(text.as_bytes()).unwrap();
+        assert_eq!(
+            event,
+            WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Azure,
+                user_code: "BQFQAAT9V".to_string(),
+                verification_uri: "https://microsoft.com/devicelogin".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn gcp_constructed_fixture_is_detected_by_the_scaffolding_matcher() {
+        // See detect_gcp's doc comment: this fixture does not represent
+        // real gcloud output — it exists to exercise the RFC 8628-shaped
+        // scaffolding this module ships for the `gcp` provider slot.
+        let text = "To continue, open https://accounts.google.com/o/oauth2/device/verify in a browser and enter the code: WDJB-MJHT\n";
+        let mut detector = AuthCodeDetector::new();
+        let event = detector.feed(text.as_bytes()).unwrap();
+        assert_eq!(
+            event,
+            WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Gcp,
+                user_code: "WDJB-MJHT".to_string(),
+                verification_uri: "https://accounts.google.com/o/oauth2/device/verify".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn ordinary_shell_output_never_matches_any_provider() {
+        let samples = [
+            "total 12\ndrwxr-xr-x  3 user user 4096 Aug 14 00:00 .\n-rw-r--r--  1 user user   42 Aug 14 00:00 README.md\n",
+            "$ git status\nOn branch main\nnothing to commit, working tree clean\n",
+            "npm WARN deprecated something@1.0.0: use something-else instead\n",
+            "Then enter the wrong thing entirely, not a code\n",
+            "",
+        ];
+        for sample in samples {
+            let mut detector = AuthCodeDetector::new();
+            assert_eq!(detector.feed(sample.as_bytes()), None, "unexpected match on: {sample:?}");
+        }
+    }
+
+    #[test]
+    fn a_different_kind_of_auth_failure_does_not_false_positive() {
+        // gh's own "not logged in" status output — a real auth-adjacent
+        // message that must not be confused with a device-code prompt.
+        let gh_status = "gh auth status\nX Not logged in to github.com\n";
+        // A generic OAuth error unrelated to any of the four providers'
+        // real device-code phrasing.
+        let generic_oauth_error = "Error: invalid_grant: Token has been expired or revoked.\n";
+        for sample in [gh_status, generic_oauth_error, AWS_REAL_INVALID_START_URL_ERROR] {
+            let mut detector = AuthCodeDetector::new();
+            assert_eq!(detector.feed(sample.as_bytes()), None, "unexpected match on: {sample:?}");
+        }
+    }
+
+    #[test]
+    fn partial_output_missing_the_verification_uri_does_not_fire() {
+        let mut detector = AuthCodeDetector::new();
+        // Only the code line has arrived so far; the CLI hasn't printed
+        // the URL line yet (a real, reachable interleaving — the process
+        // could be scheduled out between the two `print`/`uni_print`
+        // calls, or the pty reader could simply have read up to here).
+        assert_eq!(detector.feed(b"! First copy your one-time code: F1FE-DF1C\n"), None);
+        // The rest arrives in a later read; only *now* must it fire.
+        let event = detector.feed(b"Open this URL to continue in your web browser: https://github.com/login/device\n").unwrap();
+        assert_eq!(
+            event,
+            WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Github,
+                user_code: "F1FE-DF1C".to_string(),
+                verification_uri: "https://github.com/login/device".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_code_cut_off_mid_token_by_a_chunk_boundary_does_not_fire_early() {
+        let mut detector = AuthCodeDetector::new();
+        // "F1FE-DF1C" truncated to "F1FE-DF" with no trailing whitespace
+        // yet — take_token must refuse to guess this is the complete code.
+        assert_eq!(detector.feed(b"! First copy your one-time code: F1FE-DF"), None);
+        let event = detector
+            .feed(b"1C\nOpen this URL to continue in your web browser: https://github.com/login/device\n")
+            .unwrap();
+        assert_eq!(
+            event,
+            WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Github,
+                user_code: "F1FE-DF1C".to_string(),
+                verification_uri: "https://github.com/login/device".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn detecting_twice_for_the_same_code_only_fires_once() {
+        let mut detector = AuthCodeDetector::new();
+        assert!(detector.feed(GH_PIPED_REAL.as_bytes()).is_some());
+        // The same prompt text is still sitting in the pty's scrollback
+        // and gets read again (e.g. the user's terminal redraws, or a
+        // second small read happens to re-cover the same bytes) — must
+        // not re-fire for an identical (provider, user_code).
+        assert_eq!(detector.feed(GH_PIPED_REAL.as_bytes()), None);
+        assert_eq!(detector.feed(GH_PIPED_REAL.as_bytes()), None);
+    }
+
+    #[test]
+    fn a_genuinely_new_code_after_an_already_fired_one_still_fires() {
+        let mut detector = AuthCodeDetector::new();
+        assert!(detector.feed(GH_PIPED_REAL.as_bytes()).is_some());
+        let second_login = "! First copy your one-time code: 9999-ZZZZ\nOpen this URL to continue in your web browser: https://github.com/login/device\n";
+        let event = detector.feed(second_login.as_bytes()).unwrap();
+        assert_eq!(
+            event,
+            WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Github,
+                user_code: "9999-ZZZZ".to_string(),
+                verification_uri: "https://github.com/login/device".to_string(),
+            }
+        );
+    }
+
+    /// The no-leakage requirement, proven directly: a realistic-looking
+    /// secret sitting elsewhere in the very same output stream — before
+    /// and after the real device-code prompt, on the same lines a naive
+    /// "capture the whole match region" implementation might have grabbed
+    /// — must never end up in the emitted event's fields.
+    #[test]
+    fn embedded_fake_secrets_elsewhere_in_the_stream_never_reach_the_event() {
+        let poisoned = format!(
+            "noise AWS_SECRET_ACCESS_KEY=wJalrFAKESECRETKEYEXAMPLEbPxRfiCYEXAMPLEKEY more noise\n{GH_PIPED_REAL}trailing GH_TOKEN=ghp_FAKEfakeFAKEfakeFAKEfakeFAKEfake1234\n"
+        );
+        let mut detector = AuthCodeDetector::new();
+        let event = detector.feed(poisoned.as_bytes()).expect("the real prompt embedded in the poisoned stream must still be found");
+        let WireAgentEvent::AuthRequired { provider, user_code, verification_uri } = &event else {
+            panic!("expected AuthRequired, got {event:?}");
+        };
+        assert_eq!(*provider, WireAuthProvider::Github);
+        assert_eq!(user_code, "F1FE-DF1C");
+        assert_eq!(verification_uri, "https://github.com/login/device");
+
+        // Belt and braces: serialize the event exactly as it would go over
+        // the wire and confirm the fake secrets are nowhere in it at all —
+        // not truncated into a field, not appended, nothing.
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("AWS_SECRET_ACCESS_KEY"));
+        assert!(!json.contains("wJalrFAKESECRETKEYEXAMPLEbPxRfiCYEXAMPLEKEY"));
+        assert!(!json.contains("GH_TOKEN"));
+        assert!(!json.contains("ghp_FAKEfakeFAKEfakeFAKEfakeFAKEfake1234"));
+        assert!(!json.contains("noise"));
+        // And the Debug representation too, in case a future change logs
+        // the event directly rather than its serialized form.
+        let debug = format!("{event:?}");
+        assert!(!debug.contains("AWS_SECRET_ACCESS_KEY"));
+        assert!(!debug.contains("GH_TOKEN"));
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_and_osc_sequences_and_normalizes_line_endings() {
+        assert_eq!(strip_ansi_and_normalize("\x1b[0;33mhello\x1b[0m\r\nworld"), "hello\nworld");
+        assert_eq!(strip_ansi_and_normalize("\x1b]11;?\x1b\\ok"), "ok");
+        assert_eq!(strip_ansi_and_normalize("\x1b[6nplain"), "plain");
+        assert_eq!(strip_ansi_and_normalize("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn looks_like_device_code_rejects_obviously_wrong_shapes() {
+        assert!(looks_like_device_code("F1FE-DF1C"));
+        assert!(looks_like_device_code("BQFQAAT9V"));
+        assert!(!looks_like_device_code("abc")); // too short
+        assert!(!looks_like_device_code("this is not a code")); // contains spaces (never a single token anyway)
+        assert!(!looks_like_device_code("----")); // no alphanumeric content at all
+        assert!(!looks_like_device_code(&"A".repeat(64))); // absurdly long
+    }
+}

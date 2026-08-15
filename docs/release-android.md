@@ -49,7 +49,9 @@ the release workflow's `apksigner verify` responsibility.
 Before treating a release as complete, verify the GitHub Release contains exactly:
 
 - `choosh-VERSION.apk`;
-- `choosh-VERSION.sha256`;
+- `choosh-VERSION.sha256` (the APK's digest only, in `sha256sum` format — not a
+  combined hash of every release asset);
+- `choosh-VERSION.apk.signer.json` (the signer evidence named above);
 - `choosh-VERSION.cdx.json`;
 - `choosh-VERSION-NOTICE.txt`;
 - the GitHub provenance attestation associated with the APK.
