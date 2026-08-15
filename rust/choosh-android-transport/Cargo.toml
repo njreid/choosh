@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 choosh-protocol = { path = "../choosh-protocol" }
-tokio = { version = "=1.53.0", features = ["rt", "macros", "time"] }
+tokio = { version = "=1.53.0", features = ["rt", "macros", "time", "sync"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3.34"
 serde = { version = "1", features = ["derive"] }

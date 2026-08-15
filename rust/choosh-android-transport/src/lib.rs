@@ -6,6 +6,21 @@
 //! its own — a phone's credential comes from `WebAuthn`, which is
 //! `choosh-android-bridge`'s job, not this crate's.
 //!
+//! Since M1/M2, `choosh-hostd` speaks a multiplexed-tunnel-over-one-socket
+//! protocol (`docs/specs/host-rpc.md`'s "Transport" section: RPC and PTY
+//! traffic may interleave on the same relay connection). [`PhoneConnection`]
+//! mirrors that on the phone side: [`PhoneConnection::connect`] spawns a
+//! single background task that owns the underlying `WebSocket` for the
+//! connection's lifetime — the same "one task reads every frame and
+//! dispatches by tunnel ID" shape as `choosh-hostd::serve::serve_dispatch`
+//! — and every public method here (including the pre-M1 control-only ones)
+//! is a thin request/response wrapper that talks to that task over a
+//! command channel. This is what lets [`PhoneConnection::call_rpc`] and
+//! [`PhoneConnection::open_pty_tunnel`] be genuinely concurrent: a slow RPC
+//! round trip never blocks PTY bytes arriving on a different tunnel, or
+//! vice versa, because both are just waiters parked on their own channel
+//! while the background task keeps servicing whichever is ready first.
+//!
 //! This crate has no `main`/CLI: `choosh-android-bridge` is its only
 //! consumer, driving it from JNI call sites.
 
@@ -14,13 +29,25 @@
 pub mod backoff;
 mod frame_channel;
 
+use std::collections::HashMap;
+
+use choosh_protocol::host_rpc::{RpcRequest, RpcResponse};
 use choosh_protocol::relay::{
     AuthResult, ClientAuth, ControlRequest, ControlResponse, DevHostPresence, FRAME_CLASS_CONTROL,
-    PhoneAuth, ServerHello,
+    FRAME_CLASS_TUNNEL, PhoneAuth, ServerHello, ServerPush, TUNNEL_ID_BYTES, decode_tunnel_id_hex,
 };
 use frame_channel::{ChannelError, FrameChannel};
+use tokio::sync::{mpsc, oneshot};
 
 type WsChannel = FrameChannel<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>;
+
+/// The 8 raw bytes identifying one tunnel on the wire, per relay-protocol.md.
+type TunnelId = [u8; TUNNEL_ID_BYTES];
+
+/// What an `open-tunnel` call resolves to: the new tunnel's ID plus the
+/// receiver half of the inbound-payload channel the I/O task created for
+/// it (see [`PendingReply::OpenTunnel`]).
+type OpenTunnelResult = Result<(TunnelId, mpsc::Receiver<Vec<u8>>), CallError>;
 
 #[derive(Debug)]
 pub enum ConnectError {
@@ -77,19 +104,80 @@ impl From<ChannelError> for CallError {
     }
 }
 
-/// A live, phone-authenticated connection to `relayd`. Holds the socket
-/// open; the caller decides when to drop it (and, per relay-protocol.md,
-/// MUST reconnect+re-authenticate rather than expect any in-flight state to
-/// survive a drop — see [`PhoneConnection::run_with_reconnect`] for that
-/// loop already built).
+/// Bound of an `"rpc"`-purpose tunnel's inbound channel — `call_rpc` opens a
+/// fresh tunnel per call and reads exactly one response off it, so this
+/// only ever needs to hold that single message.
+const RPC_TUNNEL_CHANNEL_CAPACITY: usize = 4;
+
+/// Bound of a `"pty:<item_id>"`-purpose tunnel's inbound channel — generous
+/// enough that a burst of terminal output doesn't trip it under normal
+/// interactive use, small enough that a caller who stops reading doesn't
+/// let this task buffer output unboundedly (see [`handle_tunnel_frame`]'s
+/// backpressure handling below).
+const PTY_TUNNEL_CHANNEL_CAPACITY: usize = 64;
+
+/// One ask sent to the background I/O task via [`PhoneConnection`]'s
+/// command channel. The task owns the socket exclusively — mirroring
+/// `choosh-hostd`'s `serve_dispatch`'s single-task-owns-the-channel shape —
+/// so every write (a plain control request, an `open-tunnel`, a
+/// tunnel-frame send, or a tunnel close) is funneled through here rather
+/// than contended over a lock.
+enum IoCommand {
+    SendControl {
+        request_id: String,
+        request: ControlRequest,
+        respond_to: oneshot::Sender<ControlResponse>,
+    },
+    OpenTunnel {
+        target_device_id: String,
+        purpose: String,
+        channel_capacity: usize,
+        respond_to: oneshot::Sender<OpenTunnelResult>,
+    },
+    SendTunnelBytes {
+        tunnel_id: TunnelId,
+        payload: Vec<u8>,
+    },
+    CloseTunnel {
+        tunnel_id: TunnelId,
+    },
+}
+
+/// What the I/O task does once a `ControlResponse` for a given
+/// `request_id` arrives — either just hand it back verbatim (every
+/// pre-M1 control request), or, for `open-tunnel`, first register the new
+/// tunnel's inbound channel (so no tunnel frame for it can possibly be lost
+/// between the response arriving and the caller registering interest —
+/// there is no caller-side registration step at all, it all happens here,
+/// synchronously, before this task loops back to read the next frame).
+enum PendingReply {
+    Control(oneshot::Sender<ControlResponse>),
+    OpenTunnel {
+        channel_capacity: usize,
+        respond_to: oneshot::Sender<OpenTunnelResult>,
+    },
+}
+
+/// A live, phone-authenticated connection to `relayd`. Connecting spawns a
+/// background task (see the module docs) that owns the socket for the
+/// connection's lifetime; this handle only holds a channel into it, so
+/// dropping every clone of that channel (this handle plus any
+/// [`PtyTunnelHandle`]s derived from it) is what ends the background task,
+/// not any explicit close call.
 pub struct PhoneConnection {
-    channel: WsChannel,
+    command_tx: mpsc::UnboundedSender<IoCommand>,
+    /// `None` after [`Self::hold_until_closed`] has already consumed it —
+    /// guards against a caller calling it twice rather than panicking (it's
+    /// only ever called once, by [`run_with_reconnect`], but this stays
+    /// robust to being called from anywhere else in the future).
+    io_task: Option<tokio::task::JoinHandle<ChannelError>>,
 }
 
 impl PhoneConnection {
     /// Dials `relayd`, completes the `ServerHello`/`ClientAuth::Phone`
-    /// handshake with the given session credential, and returns a live
-    /// connection on `AuthResult::Ok`.
+    /// handshake with the given session credential, and — on
+    /// `AuthResult::Ok` — spawns the background I/O task and returns a live
+    /// connection handle.
     ///
     /// # Errors
     ///
@@ -119,9 +207,25 @@ impl PhoneConnection {
 
         let result: AuthResult = channel.recv().await?;
         match result {
-            AuthResult::Ok(_) => Ok(Self { channel }),
+            AuthResult::Ok(_) => {
+                let (command_tx, command_rx) = mpsc::unbounded_channel();
+                let io_task = tokio::spawn(run_io_task(channel, command_rx));
+                Ok(Self { command_tx, io_task: Some(io_task) })
+            }
             AuthResult::Failed(failed) => Err(ConnectError::Rejected(failed.reason)),
         }
+    }
+
+    /// Sends one `ControlRequest` and awaits its `ControlResponse`, routed
+    /// through the background I/O task rather than touching the socket
+    /// directly — every control-only method below (`list_devhosts` etc.) is
+    /// a thin wrapper around this.
+    async fn send_control(&self, request_id: String, request: ControlRequest) -> Result<ControlResponse, CallError> {
+        let (respond_to, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(IoCommand::SendControl { request_id, request, respond_to })
+            .map_err(|_| CallError::Transport(ChannelError::Closed))?;
+        response_rx.await.map_err(|_| CallError::Transport(ChannelError::Closed))
     }
 
     /// Requests the current fleet presence list.
@@ -131,10 +235,7 @@ impl PhoneConnection {
     /// See [`CallError`].
     pub async fn list_devhosts(&mut self) -> Result<Vec<DevHostPresence>, CallError> {
         let request_id = new_request_id();
-        self.channel
-            .send(FRAME_CLASS_CONTROL, &ControlRequest::ListDevhosts { request_id: request_id.clone() })
-            .await?;
-        match self.channel.recv::<ControlResponse>().await? {
+        match self.send_control(request_id.clone(), ControlRequest::ListDevhosts { request_id }).await? {
             ControlResponse::ListDevhostsOk { devhosts, .. } => Ok(devhosts),
             ControlResponse::Error { code, message, .. } => Err(CallError::Server { code, message }),
             _ => Err(CallError::UnexpectedResponse),
@@ -152,13 +253,10 @@ impl PhoneConnection {
         identity_class: choosh_protocol::relay::IdentityClass,
     ) -> Result<(String, String), CallError> {
         let request_id = new_request_id();
-        self.channel
-            .send(
-                FRAME_CLASS_CONTROL,
-                &ControlRequest::RequestEnrollmentToken { request_id: request_id.clone(), identity_class },
-            )
-            .await?;
-        match self.channel.recv::<ControlResponse>().await? {
+        match self
+            .send_control(request_id.clone(), ControlRequest::RequestEnrollmentToken { request_id, identity_class })
+            .await?
+        {
             ControlResponse::RequestEnrollmentTokenOk { token, expires_at, .. } => Ok((token, expires_at)),
             ControlResponse::Error { code, message, .. } => Err(CallError::Server { code, message }),
             _ => Err(CallError::UnexpectedResponse),
@@ -174,36 +272,357 @@ impl PhoneConnection {
     /// See [`CallError`].
     pub async fn register_fcm_token(&mut self, fcm_token: &str) -> Result<(), CallError> {
         let request_id = new_request_id();
-        self.channel
-            .send(
-                FRAME_CLASS_CONTROL,
-                &ControlRequest::RegisterFcmToken { request_id: request_id.clone(), fcm_token: fcm_token.to_string() },
+        match self
+            .send_control(
+                request_id.clone(),
+                ControlRequest::RegisterFcmToken { request_id, fcm_token: fcm_token.to_string() },
             )
-            .await?;
-        match self.channel.recv::<ControlResponse>().await? {
+            .await?
+        {
             ControlResponse::RegisterFcmTokenOk { .. } => Ok(()),
             ControlResponse::Error { code, message, .. } => Err(CallError::Server { code, message }),
             _ => Err(CallError::UnexpectedResponse),
         }
     }
 
-    /// Blocks until the connection drops (or a malformed frame terminates
-    /// it, per relay-protocol.md). M0 has no server-pushed frame to react
-    /// to on this connection yet (no tunnels, no agent events), so this is
-    /// just liveness — the caller's reconnect loop decides what happens
-    /// next. Never returns `Ok`.
+    /// Opens a tunnel of the given `purpose` and, on success, returns its
+    /// ID plus the inbound-payload receiver the background task created for
+    /// it (see [`PendingReply::OpenTunnel`] — that registration happens
+    /// inside the I/O task itself, before it reads anything else off the
+    /// socket, so there is no window in which an incoming tunnel frame for
+    /// this ID could arrive and be dropped as "unknown").
+    async fn open_tunnel(
+        &self,
+        target_device_id: &str,
+        purpose: String,
+        channel_capacity: usize,
+    ) -> OpenTunnelResult {
+        let (respond_to, open_rx) = oneshot::channel();
+        self.command_tx
+            .send(IoCommand::OpenTunnel {
+                target_device_id: target_device_id.to_string(),
+                purpose,
+                channel_capacity,
+                respond_to,
+            })
+            .map_err(|_| CallError::Transport(ChannelError::Closed))?;
+        open_rx.await.map_err(|_| CallError::Transport(ChannelError::Closed))?
+    }
+
+    /// Opens a fresh `"rpc"`-purpose tunnel, sends exactly one
+    /// [`RpcRequest`], awaits its [`RpcResponse`], then proactively closes
+    /// the tunnel.
+    ///
+    /// **Design choice: fresh tunnel per call, not one reused tunnel per
+    /// devhost.** A reused tunnel would save the `open-tunnel` round trip on
+    /// every call after the first, at the cost of tracking per-devhost
+    /// tunnel state that has to be invalidated on devhost
+    /// disconnect/reconnect (relay-protocol.md's reconnect-discontinuity
+    /// rule: tunnels never survive either side reconnecting) and
+    /// interleaving multiple concurrent RPCs' responses on one tunnel ID
+    /// (fine, since `host-rpc.md` requests are ordered per-tunnel and
+    /// request-ID-tagged — but still more bookkeeping). Fresh-per-call is
+    /// simpler, has no invalidation problem, and matches this crate's
+    /// existing one-shot-request style for every other method here; its
+    /// cost — one extra `open-tunnel` round trip per call — is a reasonable
+    /// trade at M1's call volume (RPCs triggered by explicit user action,
+    /// not a hot loop). A terminal/diff UI that turns out to hammer
+    /// `call_rpc` in a loop is the point at which reusing a tunnel would be
+    /// worth revisiting.
+    ///
+    /// # Errors
+    ///
+    /// See [`CallError`]. An [`RpcResponse::Error`] from `hostd` is NOT a
+    /// `CallError` — it comes back as `Ok(RpcResponse::Error { .. })` for
+    /// the caller to inspect, since it's an application-level outcome
+    /// (`host-rpc.md`'s fixed error codes), not a transport failure.
+    pub async fn call_rpc(&mut self, target_device_id: &str, request: RpcRequest) -> Result<RpcResponse, CallError> {
+        let (tunnel_id, mut response_rx) =
+            self.open_tunnel(target_device_id, "rpc".to_string(), RPC_TUNNEL_CHANNEL_CAPACITY).await?;
+
+        // The rpc-tunnel wire shape per host-rpc.md/relay-protocol.md: the
+        // tunnel payload carries its own inner class byte, which MUST be
+        // FRAME_CLASS_CONTROL, followed directly by the RpcRequest's JSON —
+        // no further length-prefixing inside.
+        let mut payload = Vec::with_capacity(1 + 128);
+        payload.push(FRAME_CLASS_CONTROL);
+        serde_json::to_writer(&mut payload, &request).map_err(|error| CallError::Transport(ChannelError::from(error)))?;
+        self.command_tx
+            .send(IoCommand::SendTunnelBytes { tunnel_id, payload })
+            .map_err(|_| CallError::Transport(ChannelError::Closed))?;
+
+        let response_payload = response_rx.recv().await.ok_or(CallError::Transport(ChannelError::Closed))?;
+        // Fresh-tunnel-per-call: this tunnel is done with after exactly one
+        // response, success or not — close it now rather than leaking it
+        // for its full 300s idle timeout.
+        let _ = self.command_tx.send(IoCommand::CloseTunnel { tunnel_id });
+
+        let (inner_class, inner_body) = response_payload.split_first().ok_or(CallError::UnexpectedResponse)?;
+        if *inner_class != FRAME_CLASS_CONTROL {
+            return Err(CallError::UnexpectedResponse);
+        }
+        let response: RpcResponse =
+            serde_json::from_slice(inner_body).map_err(|error| CallError::Transport(ChannelError::from(error)))?;
+        if response.request_id() != request.request_id() {
+            return Err(CallError::UnexpectedResponse);
+        }
+        Ok(response)
+    }
+
+    /// Opens a `"pty:<item_id>"`-purpose tunnel and returns a duplex handle
+    /// for streaming phone keystrokes in and devhost PTY output out over
+    /// this same multiplexed connection.
+    ///
+    /// Unlike `call_rpc`, this tunnel is NOT one-shot: it stays open for as
+    /// long as the returned [`PtyTunnelHandle`] is alive, or until
+    /// [`PtyTunnelHandle::close`] is called — a terminal attachment is
+    /// inherently long-lived, not a single request/response.
+    ///
+    /// # Errors
+    ///
+    /// See [`CallError`].
+    pub async fn open_pty_tunnel(&mut self, target_device_id: &str, item_id: &str) -> Result<PtyTunnelHandle, CallError> {
+        let (tunnel_id, output_rx) =
+            self.open_tunnel(target_device_id, format!("pty:{item_id}"), PTY_TUNNEL_CHANNEL_CAPACITY).await?;
+        Ok(PtyTunnelHandle { tunnel_id, command_tx: self.command_tx.clone(), output_rx })
+    }
+
+    /// Blocks until the background I/O task ends (connection drop, a
+    /// malformed frame, or the command channel losing every sender), per
+    /// relay-protocol.md. The caller's reconnect loop decides what happens
+    /// next. Never returns after being called twice — see the `io_task`
+    /// field doc.
     async fn hold_until_closed(&mut self) -> ChannelError {
-        loop {
-            if let Err(error) = self.channel.recv_raw().await {
-                return error;
+        let Some(io_task) = self.io_task.take() else {
+            return ChannelError::Closed;
+        };
+        io_task.await.unwrap_or(ChannelError::Closed)
+    }
+}
+
+/// A duplex byte stream over a `"pty:<item_id>"` tunnel, for a JNI caller
+/// (`choosh-android-bridge`) to drive a terminal UI from: [`Self::write`]
+/// sends phone keystrokes to the devhost's PTY, [`Self::read`] yields
+/// devhost PTY output as it arrives.
+///
+/// **Design choice: plain mpsc-backed handle, not `AsyncRead`/`AsyncWrite`.**
+/// `write` is synchronous (an unbounded-channel send never blocks) and
+/// `read` is a single async method returning `Option<Vec<u8>>` — this is
+/// the minimal shape a Kotlin-facing `Engine` needs to drive from JNI (push
+/// bytes in, pull chunks out), without pulling in `tokio::io`'s
+/// `AsyncRead`/`AsyncWrite` machinery for a boundary that's going to get
+/// copied into a `ByteArray` on the Kotlin side regardless.
+///
+/// Both directions share the parent [`PhoneConnection`]'s single I/O task:
+/// `write` never blocks on `read`'s progress or vice versa, since sends go
+/// through that task's unbounded command channel and receives come off this
+/// handle's own bounded channel, populated independently by that task's
+/// read loop as frames for this tunnel ID arrive.
+pub struct PtyTunnelHandle {
+    tunnel_id: TunnelId,
+    command_tx: mpsc::UnboundedSender<IoCommand>,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+}
+
+impl PtyTunnelHandle {
+    /// Sends raw bytes (phone keystrokes) to the devhost's PTY. Per the
+    /// wire contract, a `"pty:"`-purpose tunnel carries bytes verbatim — no
+    /// inner class tag, unlike an `"rpc"`-purpose tunnel.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Transport`] if the underlying connection has already
+    /// ended.
+    pub fn write(&self, bytes: &[u8]) -> Result<(), CallError> {
+        self.command_tx
+            .send(IoCommand::SendTunnelBytes { tunnel_id: self.tunnel_id, payload: bytes.to_vec() })
+            .map_err(|_| CallError::Transport(ChannelError::Closed))
+    }
+
+    /// Waits for the next chunk of devhost PTY output. Returns `None` once
+    /// the tunnel has closed — either end sent the zero-length close
+    /// signal, or the underlying connection ended — a clean end-of-stream,
+    /// not an error.
+    pub async fn read(&mut self) -> Option<Vec<u8>> {
+        self.output_rx.recv().await
+    }
+
+    /// Proactively sends the tunnel-close signal. Not required before
+    /// dropping the handle (relayd's 300s idle timeout, and the devhost's
+    /// own PTY-attachment teardown on a close signal it never gets, both
+    /// eventually cover an ungracefully-dropped handle), but this avoids
+    /// waiting on that timeout when the caller already knows it's done.
+    pub fn close(self) {
+        let _ = self.command_tx.send(IoCommand::CloseTunnel { tunnel_id: self.tunnel_id });
+    }
+}
+
+/// Owns the socket for the lifetime of one connection attempt: the single
+/// task that reads every incoming frame and issues every outgoing one,
+/// mirroring `choosh-hostd::serve::serve_dispatch`. Callers never touch the
+/// `WsChannel` directly — they submit an [`IoCommand`] and await a
+/// `oneshot`/`mpsc` reply, so a slow RPC round trip never blocks unrelated
+/// tunnel traffic (or vice versa): both wait on their own channel while
+/// this loop keeps servicing whichever is ready first. Returns the terminal
+/// [`ChannelError`] that ended the connection (or [`ChannelError::Closed`]
+/// if every command-channel sender was simply dropped).
+async fn run_io_task(mut channel: WsChannel, mut command_rx: mpsc::UnboundedReceiver<IoCommand>) -> ChannelError {
+    let mut pending_control: HashMap<String, PendingReply> = HashMap::new();
+    let mut tunnels: HashMap<TunnelId, mpsc::Sender<Vec<u8>>> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            command = command_rx.recv() => {
+                let Some(command) = command else {
+                    // Every PhoneConnection/PtyTunnelHandle clone of
+                    // command_tx has been dropped — nothing left to serve.
+                    return ChannelError::Closed;
+                };
+                if let Err(error) = handle_command(command, &mut channel, &mut pending_control, &mut tunnels).await {
+                    return error;
+                }
             }
-            // An unexpected-but-well-framed control frame arriving here
-            // (there are none in M0) would be logged and ignored rather
-            // than treated as fatal — matching choosh-hostd's posture that
-            // an unrecognized frame isn't itself a connection-ending event,
-            // only a malformed one (already handled by recv_raw's Err path).
+
+            frame = channel.recv_raw() => {
+                match frame {
+                    Ok((FRAME_CLASS_CONTROL, body)) => {
+                        handle_control_frame(&body, &mut pending_control, &mut tunnels);
+                    }
+                    Ok((FRAME_CLASS_TUNNEL, body)) => {
+                        if let Err(error) = handle_tunnel_frame(&body, &mut tunnels) {
+                            return error;
+                        }
+                    }
+                    Ok((class, _body)) => tracing::debug!(class, "received frame with no handler for this class"),
+                    Err(error) => return error,
+                }
+            }
         }
     }
+}
+
+/// Handles one [`IoCommand`]: registers whatever bookkeeping the eventual
+/// response needs (in `pending_control`/`tunnels`) and writes the
+/// corresponding frame. Returns `Err` only when the write itself fails —
+/// per relay-protocol.md a failed send means the connection is
+/// unrecoverable, so [`run_io_task`] ends rather than trying to keep going.
+async fn handle_command(
+    command: IoCommand,
+    channel: &mut WsChannel,
+    pending_control: &mut HashMap<String, PendingReply>,
+    tunnels: &mut HashMap<TunnelId, mpsc::Sender<Vec<u8>>>,
+) -> Result<(), ChannelError> {
+    match command {
+        IoCommand::SendControl { request_id, request, respond_to } => {
+            pending_control.insert(request_id, PendingReply::Control(respond_to));
+            channel.send(FRAME_CLASS_CONTROL, &request).await
+        }
+        IoCommand::OpenTunnel { target_device_id, purpose, channel_capacity, respond_to } => {
+            let request_id = new_request_id();
+            pending_control.insert(request_id.clone(), PendingReply::OpenTunnel { channel_capacity, respond_to });
+            let request = ControlRequest::OpenTunnel { request_id, target_device_id, purpose };
+            channel.send(FRAME_CLASS_CONTROL, &request).await
+        }
+        IoCommand::SendTunnelBytes { tunnel_id, payload } => channel.send_tunnel(tunnel_id, &payload).await,
+        IoCommand::CloseTunnel { tunnel_id } => {
+            tunnels.remove(&tunnel_id);
+            // Best-effort: the connection may already be on its way down,
+            // in which case there is no one left to observe this signal
+            // anyway, and that's not itself a reason to end the task.
+            let _ = channel.send_tunnel(tunnel_id, &[]).await;
+            Ok(())
+        }
+    }
+}
+
+/// Handles one `FRAME_CLASS_CONTROL` frame: a `ControlResponse` matching a
+/// pending request (delivered to its waiter, with `open-tunnel`'s success
+/// case also registering the new tunnel's inbound channel here — see
+/// [`PendingReply::OpenTunnel`]), or anything else, logged and ignored.
+fn handle_control_frame(
+    body: &[u8],
+    pending_control: &mut HashMap<String, PendingReply>,
+    tunnels: &mut HashMap<TunnelId, mpsc::Sender<Vec<u8>>>,
+) {
+    match serde_json::from_slice::<ControlResponse>(body) {
+        Ok(response) => {
+            let Some(pending) = pending_control.remove(response.request_id()) else {
+                tracing::debug!("control response for an unknown/already-resolved request_id, ignoring");
+                return;
+            };
+            match pending {
+                PendingReply::Control(respond_to) => {
+                    let _ = respond_to.send(response);
+                }
+                PendingReply::OpenTunnel { channel_capacity, respond_to } => {
+                    let result = match response {
+                        ControlResponse::OpenTunnelOk { tunnel_id, .. } => match decode_tunnel_id_hex(&tunnel_id) {
+                            Some(id) => {
+                                let (tx, rx) = mpsc::channel(channel_capacity);
+                                tunnels.insert(id, tx);
+                                Ok((id, rx))
+                            }
+                            None => Err(CallError::UnexpectedResponse),
+                        },
+                        ControlResponse::Error { code, message, .. } => Err(CallError::Server { code, message }),
+                        _ => Err(CallError::UnexpectedResponse),
+                    };
+                    let _ = respond_to.send(result);
+                }
+            }
+        }
+        // Not a ControlResponse — try ServerPush before giving up, the same
+        // fallback dispatch relay-protocol.md's own participants use. A
+        // phone that opens a tunnel is never itself its target (see this
+        // crate's module docs), so it never legitimately receives
+        // `TunnelOffered`; `AgentEvent` pushes have no handler yet in this
+        // pass (the terminal/notifications follow-on work). Both are logged
+        // and dropped rather than treated as fatal, matching
+        // choosh-hostd's posture that an unrecognized-but-well-formed frame
+        // doesn't end the connection.
+        Err(_) => match serde_json::from_slice::<ServerPush>(body) {
+            Ok(push) => tracing::debug!(?push, "ignoring server push with no handler in this pass"),
+            Err(error) => tracing::debug!(%error, "unrecognized control frame, ignoring"),
+        },
+    }
+}
+
+/// Handles one `FRAME_CLASS_TUNNEL` frame: routes its payload to the
+/// matching tunnel's inbound channel, or removes that tunnel on a
+/// zero-length (close-signal) payload. Returns `Err` only for a frame
+/// shorter than a tunnel ID — per relay-protocol.md that's malformed and
+/// the connection is unrecoverable, matching every other malformed-frame
+/// case in this crate and in `choosh-hostd::serve::handle_tunnel_frame`.
+fn handle_tunnel_frame(body: &[u8], tunnels: &mut HashMap<TunnelId, mpsc::Sender<Vec<u8>>>) -> Result<(), ChannelError> {
+    if body.len() < TUNNEL_ID_BYTES {
+        return Err(ChannelError::MalformedTunnelFrame);
+    }
+    let (id_bytes, payload) = body.split_at(TUNNEL_ID_BYTES);
+    let mut tunnel_id = [0u8; TUNNEL_ID_BYTES];
+    tunnel_id.copy_from_slice(id_bytes);
+
+    if payload.is_empty() {
+        // Zero-length payload is the tunnel-close signal; dropping the
+        // sender here is what turns a pending PtyTunnelHandle::read (or
+        // call_rpc's single-shot receive) into a clean end-of-stream rather
+        // than a silent hang.
+        tunnels.remove(&tunnel_id);
+        return Ok(());
+    }
+    if let Some(sender) = tunnels.get(&tunnel_id) {
+        if sender.try_send(payload.to_vec()).is_err() {
+            // Either the receiver was dropped without a close signal, or
+            // it's backlogged past its channel capacity. Either way, per
+            // relay-protocol.md's own backpressure posture ("closes the
+            // tunnel rather than growing memory without limit"), drop the
+            // tunnel here too rather than buffer unboundedly or block this
+            // shared task on a slow consumer.
+            tunnels.remove(&tunnel_id);
+        }
+    } else {
+        tracing::debug!("tunnel frame for an unknown tunnel id, ignoring");
+    }
+    Ok(())
 }
 
 fn new_request_id() -> String {
@@ -226,6 +645,14 @@ fn new_request_id() -> String {
 /// a connection currently held open by [`PhoneConnection::hold_until_closed`]
 /// reacts to a `nativeClose` call immediately instead of only between
 /// attempts.
+///
+/// Unchanged in shape from before tunnel support landed:
+/// [`PhoneConnection`] stayed a single, non-`Clone` owner (a
+/// [`PtyTunnelHandle`] only needs its own clone of the command channel, not
+/// a clone of the connection itself), so handing exclusive ownership to
+/// `on_connected` for the connection's lifetime and getting it back still
+/// works exactly as it did — the multiplexing lives entirely inside
+/// [`PhoneConnection`]/the background I/O task, not in this loop.
 pub async fn run_with_reconnect<F, D>(
     relay_ws_url: String,
     session_credential: String,
@@ -288,24 +715,25 @@ fn getrandom_fill(buf: &mut [u8]) {
 mod tests {
     use super::*;
     use choosh_protocol::framing::encode_frame;
-    use choosh_protocol::relay::{AuthOk, ConnectionState, IdentityClass, MAX_CONTROL_FRAME_BYTES};
+    use choosh_protocol::host_rpc::WorkspaceSummary;
+    use choosh_protocol::relay::{
+        AuthOk, ConnectionState, IdentityClass, MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES, decode_tunnel_frame,
+        encode_tunnel_frame, encode_tunnel_id_hex,
+    };
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
 
-    async fn send_control<T: serde::Serialize>(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-        value: &T,
-    ) {
+    type TestWs = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    async fn send_control<T: serde::Serialize>(ws: &mut TestWs, value: &T) {
         let mut payload = vec![FRAME_CLASS_CONTROL];
         payload.extend(serde_json::to_vec(value).unwrap());
         let wire = encode_frame(&payload, MAX_CONTROL_FRAME_BYTES).unwrap();
         ws.send(Message::Binary(wire.into())).await.unwrap();
     }
 
-    async fn recv_control<T: serde::de::DeserializeOwned>(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) -> T {
+    async fn recv_control<T: serde::de::DeserializeOwned>(ws: &mut TestWs) -> T {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Binary(bytes))) => {
@@ -322,10 +750,50 @@ mod tests {
         }
     }
 
+    /// Sends a tunnel frame the way `relayd` would forward one from the
+    /// other tunnel endpoint — used by the fake server in the tunnel tests
+    /// below to simulate genuine pass-through, not a control-frame
+    /// shortcut.
+    async fn send_tunnel_frame(ws: &mut TestWs, tunnel_id: TunnelId, payload: &[u8]) {
+        let wire = encode_frame(&encode_tunnel_frame(tunnel_id, payload), MAX_TUNNEL_FRAME_BYTES).unwrap();
+        ws.send(Message::Binary(wire.into())).await.unwrap();
+    }
+
+    async fn recv_tunnel_frame(ws: &mut TestWs) -> (TunnelId, Vec<u8>) {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Binary(bytes))) => {
+                    let mut decoder = choosh_protocol::framing::FrameDecoder::new(
+                        choosh_protocol::framing::FrameLimits::new(MAX_CONTROL_FRAME_BYTES, 4).unwrap(),
+                    );
+                    let frames = decoder.feed(&bytes).unwrap();
+                    let (id, payload) = decode_tunnel_frame(&frames[0]).expect("expected a tunnel frame");
+                    return (id, payload.to_vec());
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected a binary frame, got {other:?}"),
+            }
+        }
+    }
+
     async fn bind_fake_relayd() -> (TcpListener, String) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         (listener, format!("ws://{addr}/connect"))
+    }
+
+    /// Drives a fake relayd's connection through hello/auth-ok, the shared
+    /// prefix every test below needs before it can do anything tunnel- or
+    /// RPC-specific.
+    async fn authenticate_fake_relayd(ws: &mut TestWs) {
+        send_control(ws, &ServerHello { nonce: "n".to_string() }).await;
+        let auth: ClientAuth = recv_control(ws).await;
+        assert!(matches!(auth, ClientAuth::Phone(PhoneAuth { session_credential }) if session_credential == "good-cred"));
+        send_control(
+            ws,
+            &AuthResult::Ok(AuthOk { identity_class: IdentityClass::Phone, device_id: "phone-1".to_string() }),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -334,21 +802,14 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            send_control(&mut ws, &ServerHello { nonce: "n".to_string() }).await;
+            authenticate_fake_relayd(&mut ws).await;
 
-            let auth: ClientAuth = recv_control(&mut ws).await;
-            assert!(matches!(auth, ClientAuth::Phone(PhoneAuth { session_credential }) if session_credential == "good-cred"));
-            send_control(
-                &mut ws,
-                &AuthResult::Ok(AuthOk { identity_class: IdentityClass::Phone, device_id: "phone-1".to_string() }),
-            )
-            .await;
-
-            let _request: ControlRequest = recv_control(&mut ws).await;
+            let request: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::ListDevhosts { request_id } = request else { panic!("expected list-devhosts") };
             send_control(
                 &mut ws,
                 &ControlResponse::ListDevhostsOk {
-                    request_id: "ignored-by-client-side-of-this-test".to_string(),
+                    request_id,
                     devhosts: vec![DevHostPresence {
                         device_id: "dev-1".to_string(),
                         alias: "build-box".to_string(),
@@ -395,18 +856,15 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            send_control(&mut ws, &ServerHello { nonce: "n".to_string() }).await;
-            let _auth: ClientAuth = recv_control(&mut ws).await;
-            send_control(
-                &mut ws,
-                &AuthResult::Ok(AuthOk { identity_class: IdentityClass::Phone, device_id: "phone-1".to_string() }),
-            )
-            .await;
-            let _request: ControlRequest = recv_control(&mut ws).await;
+            authenticate_fake_relayd(&mut ws).await;
+            let request: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::RequestEnrollmentToken { request_id, .. } = request else {
+                panic!("expected request-enrollment-token")
+            };
             send_control(
                 &mut ws,
                 &ControlResponse::RequestEnrollmentTokenOk {
-                    request_id: "ignored".to_string(),
+                    request_id,
                     token: "tok-123".to_string(),
                     expires_at: "2026-08-14T00:15:00Z".to_string(),
                 },
@@ -421,6 +879,198 @@ mod tests {
             .expect("request_enrollment_token should succeed");
         assert_eq!(token, "tok-123");
         assert_eq!(expires_at, "2026-08-14T00:15:00Z");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn call_rpc_round_trips_through_a_relayed_rpc_tunnel() {
+        let (listener, url) = bind_fake_relayd().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, target_device_id, purpose } = open else {
+                panic!("expected open-tunnel");
+            };
+            assert_eq!(target_device_id, "dev-1");
+            assert_eq!(purpose, "rpc");
+            let tunnel_id: TunnelId = [1, 2, 3, 4, 5, 6, 7, 8];
+            send_control(
+                &mut ws,
+                &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) },
+            )
+            .await;
+
+            // The RPC request arrives as an opaque tunnel frame, the same
+            // shape relayd would forward from phone to devhost — this
+            // simulates relayd's pass-through behavior, not a
+            // control-frame shortcut.
+            let (id, payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(id, tunnel_id);
+            let (inner_class, inner_body) = payload.split_first().unwrap();
+            assert_eq!(*inner_class, FRAME_CLASS_CONTROL);
+            let request: RpcRequest = serde_json::from_slice(inner_body).unwrap();
+            let RpcRequest::WorkspaceList { request_id: rpc_request_id } = request else {
+                panic!("expected workspace-list");
+            };
+
+            let response = RpcResponse::WorkspaceListOk {
+                request_id: rpc_request_id,
+                workspaces: vec![WorkspaceSummary {
+                    workspace_id: "ws-1".to_string(),
+                    workspace_name: "app".to_string(),
+                    devhost_id: "dev-1".to_string(),
+                    project_id: "proj-1".to_string(),
+                    created_at: "2026-08-14T00:00:00Z".to_string(),
+                }],
+            };
+            let mut response_payload = vec![FRAME_CLASS_CONTROL];
+            response_payload.extend(serde_json::to_vec(&response).unwrap());
+            send_tunnel_frame(&mut ws, tunnel_id, &response_payload).await;
+
+            // call_rpc closes its fresh, one-shot tunnel proactively.
+            let (closed_id, closed_payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(closed_id, tunnel_id);
+            assert!(closed_payload.is_empty());
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let response = connection
+            .call_rpc("dev-1", RpcRequest::WorkspaceList { request_id: "req-1".to_string() })
+            .await
+            .expect("call_rpc should succeed");
+        match response {
+            RpcResponse::WorkspaceListOk { workspaces, .. } => {
+                assert_eq!(workspaces.len(), 1);
+                assert_eq!(workspaces[0].workspace_name, "app");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_pty_tunnel_streams_bytes_in_both_directions_and_closes_cleanly() {
+        let (listener, url) = bind_fake_relayd().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, purpose, .. } = open else {
+                panic!("expected open-tunnel");
+            };
+            assert_eq!(purpose, "pty:item-1");
+            let tunnel_id: TunnelId = [9; 8];
+            send_control(
+                &mut ws,
+                &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) },
+            )
+            .await;
+
+            // Devhost -> phone PTY output: raw bytes, no inner class tag.
+            send_tunnel_frame(&mut ws, tunnel_id, b"hello from pty").await;
+
+            // Phone -> devhost keystrokes.
+            let (id, payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(id, tunnel_id);
+            assert_eq!(payload, b"ls\n");
+
+            send_tunnel_frame(&mut ws, tunnel_id, &[]).await; // server-initiated close
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let mut handle =
+            connection.open_pty_tunnel("dev-1", "item-1").await.expect("open_pty_tunnel should succeed");
+
+        let output = handle.read().await.expect("should receive pty output");
+        assert_eq!(output, b"hello from pty");
+
+        handle.write(b"ls\n").expect("write should succeed");
+
+        assert!(handle.read().await.is_none(), "a closed tunnel should read as a clean EOF");
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_rpc_and_pty_tunnels_do_not_block_or_corrupt_each_other() {
+        let (listener, url) = bind_fake_relayd().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open_pty: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id: pty_request_id, purpose, .. } = open_pty else {
+                panic!("expected open-tunnel");
+            };
+            assert_eq!(purpose, "pty:item-1");
+            let pty_tunnel_id: TunnelId = [7; 8];
+            send_control(
+                &mut ws,
+                &ControlResponse::OpenTunnelOk { request_id: pty_request_id, tunnel_id: encode_tunnel_id_hex(pty_tunnel_id) },
+            )
+            .await;
+
+            let open_rpc: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id: rpc_request_id, purpose, .. } = open_rpc else {
+                panic!("expected open-tunnel");
+            };
+            assert_eq!(purpose, "rpc");
+            let rpc_tunnel_id: TunnelId = [8; 8];
+            send_control(
+                &mut ws,
+                &ControlResponse::OpenTunnelOk { request_id: rpc_request_id, tunnel_id: encode_tunnel_id_hex(rpc_tunnel_id) },
+            )
+            .await;
+
+            let (id, payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(id, rpc_tunnel_id);
+            let (_inner_class, inner_body) = payload.split_first().unwrap();
+            let request: RpcRequest = serde_json::from_slice(inner_body).unwrap();
+            let RpcRequest::WorkspaceList { request_id: rpc_call_id } = request else {
+                panic!("expected workspace-list");
+            };
+
+            // Interleave: two pty output chunks land on the wire BEFORE the
+            // rpc response — proving the client's pty read isn't starved
+            // behind the in-flight rpc call, and that the rpc call isn't
+            // corrupted by intervening traffic on a different tunnel id.
+            send_tunnel_frame(&mut ws, pty_tunnel_id, b"chunk-1").await;
+            send_tunnel_frame(&mut ws, pty_tunnel_id, b"chunk-2").await;
+
+            let response = RpcResponse::WorkspaceListOk { request_id: rpc_call_id, workspaces: vec![] };
+            let mut response_payload = vec![FRAME_CLASS_CONTROL];
+            response_payload.extend(serde_json::to_vec(&response).unwrap());
+            send_tunnel_frame(&mut ws, rpc_tunnel_id, &response_payload).await;
+
+            let (closed_id, closed_payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(closed_id, rpc_tunnel_id);
+            assert!(closed_payload.is_empty());
+
+            // A third pty chunk after the rpc call has already completed.
+            send_tunnel_frame(&mut ws, pty_tunnel_id, b"chunk-3").await;
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let mut pty = connection.open_pty_tunnel("dev-1", "item-1").await.expect("open_pty_tunnel should succeed");
+
+        let response = connection
+            .call_rpc("dev-1", RpcRequest::WorkspaceList { request_id: "req-1".to_string() })
+            .await
+            .expect("call_rpc should succeed while a pty tunnel is concurrently open");
+        assert!(matches!(response, RpcResponse::WorkspaceListOk { .. }));
+
+        // All three pty chunks arrive in order, undisturbed by the
+        // interleaved rpc traffic on a different tunnel id.
+        assert_eq!(pty.read().await.unwrap(), b"chunk-1");
+        assert_eq!(pty.read().await.unwrap(), b"chunk-2");
+        assert_eq!(pty.read().await.unwrap(), b"chunk-3");
+
         server.await.unwrap();
     }
 

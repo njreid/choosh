@@ -92,3 +92,90 @@ be `go` only when all prerequisite gates and device conformance pass; the checke
 inconsistent optimistic decision.
 
 This is an engineering provenance gate, not a legal opinion.
+
+## 2026-08-14/15 addendum: the M2 renderer implementation pass
+
+The rows above (and `docs/evidence/terminal-go-no-go.json`/
+`zelland-source-audit.json`, which this file's checker script references) are
+pre-`94b3553` ("Reset architecture to a relay-brokered, jj-backed,
+passkey-authenticated fleet design") scaffolding: the referenced
+`docs/evidence/` directory does not exist at the current `HEAD`, and
+`scripts/check-specs.sh` (the only caller of `scripts/check-terminal-provenance.sh`)
+itself references other files that no longer exist post-reset
+(`CHOOSH_DESIGN_PLAN.md`, `docs/threat-model.md`, `protocol/v1/envelope.schema.json`).
+Both scripts fail on a clean, untouched checkout of current `HEAD`, independent of
+this pass — this addendum does not attempt to resurrect that JSON evidence-gate
+apparatus (four device classes x nine scenarios) as part of this increment; that
+remains a separate, real follow-up if that governance model is still wanted.
+
+What *is* real, from this pass, implementing M2's terminal renderer per
+`docs/specs/terminal-experience.md`:
+
+- **Zelland source**: `njreid/zelland` at `8bf9cf55911588451804a39526f8ae869da021b6`
+  (the same commit `zelland-grant.md` covers), cloned read-only outside this repo.
+  Ported (adapted, not copied verbatim): `src-tauri/src/renderer/mod.rs`'s wgpu/glyphon
+  pipeline (surface-format detection and atlas rebuild, per-row damage cache, cursor
+  shader, deferred resize via a session-level pending-size — the same fix
+  `WGPU_FIXES.md` records, independently rediscovered on-device during this pass'
+  own verification) into `rust/choosh-android-bridge/src/terminal_renderer.rs`, and
+  `src-tauri/src/renderer/android.rs`'s `Surface` -> `ANativeWindow` JNI conversion
+  into `rust/choosh-android-bridge/src/terminal_jni.rs`. Not ported: Tauri, Svelte,
+  the JS bridge, Zelland's package/class names, and `src-tauri/src/ghostty.rs`/
+  `terminal.rs` (see next point).
+- **`libghostty-vt`**: a real, reportable attempt, not skipped. `zig@0.16.0` was
+  provisioned via `mise` and `ghostty-org/ghostty` (upstream, current `main`, not
+  Zelland's vendored copy) was built with
+  `zig build -Demit-lib-vt=true -Dapp-runtime=none -Dtarget=aarch64-linux-android`
+  (and separately for `x86_64-linux-android`) — **both succeeded**, producing a real
+  `libghostty-vt.a` linked against the Android NDK sysroot, with a C header layout
+  (`ghostty/vt/render.h`, `terminal.h`, etc.) substantially compatible with the FFI
+  surface Zelland's pinned commit used. The toolchain is proven viable. What was
+  *not* done: wiring that static library into this crate's actual build (`bindgen`
+  against the current, self-described "incomplete, work-in-progress" API; a
+  `build.rs` invoking `zig build`; porting the render-state row/cell iteration and
+  mouse/key encoders onto the current header shape). Given this task's explicit
+  priority order (real GPU rendering verified on-device, and real PTY tunnel
+  wiring, both rank above the choice of VT backend within item 1), the pure-Rust
+  `vte` crate was used instead, behind the same engine interface libghostty-vt
+  would have filled — see `rust/choosh-terminal-engine/src/terminal.rs`'s module
+  doc for the full reasoning.
+- **`wgpu`/`glyphon`**: `wgpu = "23.0"` (resolved `23.0.1`) / `glyphon = "0.7"`
+  (resolved `0.7.0`) — the versions this task's own instructions specified (matching
+  Zelland's pinned pair), not the newer `wgpu 25`/`glyphon 0.9` pair the table above
+  names as a "candidate" — that newer pair was not evaluated in this pass.
+- **Fonts**: Iosevka Charon Mono regular/bold (already-packaged resources, hashes
+  above) embedded directly into the `.so` at compile time via `include_bytes!` and
+  loaded into `glyphon`'s `FontSystem`, so cell metrics come from the real,
+  measured face (confirmed on-device: `14.25x38px` at the loaded size) rather than
+  a hard-coded constant.
+- **On-device verification**: built and installed on the real Genymotion `cloud_arm`
+  device already provisioned in this environment. A synthetic byte-injection JNI
+  path (`native_terminal_test_inject`, bypassing the PTY tunnel) fed real ANSI
+  sequences (a colored `ls -la` prompt/listing, a 24-row 256-colour full-screen
+  redraw) into the parser and renderer. Screenshots (`adb exec-out screencap`)
+  confirmed real glyphs, real SGR colors, and a real cursor rectangle rendering via
+  wgpu/Vulkan (SwiftShader on this device) — not a stub. The app also survived a
+  rotation cycle and a home/background/foreground cycle without a crash (confirmed
+  via `adb logcat`, no `FATAL EXCEPTION`/`SIGSEGV`/`panicked at` across the whole
+  session). Two real bugs were found and fixed *during* this on-device pass, not
+  just in review: (1) `android/app/build.gradle.kts` didn't order
+  `mergeDebugJniLibFolders`/`mergeDebugNativeLibs` after `buildRustAndroid`, so an
+  incremental Rust-only rebuild could package a stale `.so`; (2) a race where
+  Android's `surfaceChanged` (real pixel dimensions) could arrive before the async
+  `Renderer::init()` GPU-device creation finished, silently dropping the resize and
+  leaving the surface permanently configured at its `1x1` placeholder (frames
+  rendered "successfully" into a single pixel, stretched over the whole view) — fixed
+  with a session-level `pending_size`, the same shape as Zelland's own `PENDING_SIZE`
+  static per `WGPU_FIXES.md`, independently re-encountered here.
+- **PTY tunnel transport**: at the time this task began, `rust/choosh-android-transport`
+  did not yet have the tunnel-multiplexing client (`open_pty_tunnel`/`PtyTunnelHandle`)
+  the task's own instructions described as "already built and tested" — the file
+  present at the actual working `HEAD` (confirmed via `git log`/`git reflog`) was an
+  earlier, single-request-response-only `PhoneConnection` with no tunnel support at
+  all. The wire-format primitives (`ControlRequest::OpenTunnel`, `FRAME_CLASS_TUNNEL`,
+  `encode_tunnel_frame`, etc.) already existed in `choosh-protocol`, so the client-side
+  multiplexing (a background I/O task demultiplexing control responses by
+  `request_id` and tunnel bytes by tunnel ID) was implemented for real in this pass —
+  see `rust/choosh-android-transport/src/lib.rs`'s module doc — rather than treated as
+  a stub, and is covered by real tests including a genuinely concurrent tunnel-open +
+  unrelated control call.

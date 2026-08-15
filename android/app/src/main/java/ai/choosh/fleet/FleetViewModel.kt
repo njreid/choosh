@@ -16,9 +16,17 @@ data class FleetUiState(
     val error: String? = null,
 )
 
-/** Fired once per Project tap; the composition root turns this into "open the primary workspace." */
+/**
+ * Fired once per Project/Workspace tap; the composition root turns
+ * [OpenWorkspace] into a navigation to that Workspace's explorer/`JjDiff`/
+ * `JjChangeGraph` surfaces. `deviceId` travels alongside `workspaceId` here
+ * because every M3 RPC (`workspace.diff`/`log`/`op.*`) is addressed by
+ * `(target_device_id, workspace_id)` together — the workspace list/tap
+ * chain is the only place that pairing is available, so it's carried
+ * through from here rather than re-derived downstream.
+ */
 sealed interface FleetNavigationEvent {
-    data class OpenWorkspace(val workspaceId: String) : FleetNavigationEvent
+    data class OpenWorkspace(val workspaceId: String, val deviceId: String) : FleetNavigationEvent
     data class OpenDevHost(val deviceId: String) : FleetNavigationEvent
 }
 
@@ -66,14 +74,16 @@ class FleetViewModel(private val engine: ChooshEngine) : ViewModel() {
     }
 
     /** Per android-navigation.md: tapping a Project opens its primary Workspace directly. */
-    fun onProjectTapped(project: Project): FleetNavigationEvent =
-        FleetNavigationEvent.OpenWorkspace(project.primaryWorkspaceId)
+    fun onProjectTapped(project: Project): FleetNavigationEvent {
+        val primary = project.workspaces.firstOrNull { it.workspaceId == project.primaryWorkspaceId }
+        return FleetNavigationEvent.OpenWorkspace(project.primaryWorkspaceId, primary?.devHostId.orEmpty())
+    }
 
     fun onDevHostTapped(devHost: DevHostPresence): FleetNavigationEvent =
         FleetNavigationEvent.OpenDevHost(devHost.deviceId)
 
     fun onWorkspaceTapped(workspace: Workspace): FleetNavigationEvent =
-        FleetNavigationEvent.OpenWorkspace(workspace.workspaceId)
+        FleetNavigationEvent.OpenWorkspace(workspace.workspaceId, workspace.devHostId)
 
     private fun recompute() {
         val rows = rowsFor(_state.value.sortMode, devHosts, projects)

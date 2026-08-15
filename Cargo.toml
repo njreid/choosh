@@ -8,6 +8,7 @@ members = [
     "rust/choosh-protocol",
     "rust/choosh-relayd",
     "rust/choosh-ssh",
+    "rust/choosh-terminal-engine",
     "rust/choosh-testkit",
     "rust/choosh-web",
     "rust/chooshd",

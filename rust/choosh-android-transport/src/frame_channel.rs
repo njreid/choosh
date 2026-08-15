@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 
 use choosh_protocol::framing::{FrameDecoder, FrameError, FrameLimits, encode_frame};
-use choosh_protocol::relay::MAX_CONTROL_FRAME_BYTES;
+use choosh_protocol::relay::{MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES, TUNNEL_ID_BYTES, encode_tunnel_frame};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -26,6 +26,10 @@ pub enum ChannelError {
     Ws(tokio_tungstenite::tungstenite::Error),
     Closed,
     EmptyFrame,
+    /// A `FRAME_CLASS_TUNNEL` frame whose payload was shorter than
+    /// `TUNNEL_ID_BYTES` — per relay-protocol.md this is malformed and
+    /// unrecoverable, the tunnel-frame counterpart of [`Self::EmptyFrame`].
+    MalformedTunnelFrame,
 }
 
 impl std::fmt::Display for ChannelError {
@@ -36,6 +40,7 @@ impl std::fmt::Display for ChannelError {
             Self::Ws(error) => write!(f, "WebSocket error: {error}"),
             Self::Closed => write!(f, "connection closed"),
             Self::EmptyFrame => write!(f, "frame carried no class byte"),
+            Self::MalformedTunnelFrame => write!(f, "tunnel frame shorter than a tunnel ID"),
         }
     }
 }
@@ -92,6 +97,26 @@ where
         payload.push(class);
         serde_json::to_writer(&mut payload, value)?;
         let framed = encode_frame(&payload, MAX_CONTROL_FRAME_BYTES).map_err(ChannelError::Frame)?;
+        self.ws.send(Message::Binary(framed.into())).await?;
+        Ok(())
+    }
+
+    /// Sends one `FRAME_CLASS_TUNNEL` frame: `tunnel_id` plus opaque
+    /// `payload` bytes, per relay-protocol.md's tunnel-frame shape
+    /// (`choosh_protocol::relay::encode_tunnel_frame`). Bounded by
+    /// [`MAX_TUNNEL_FRAME_BYTES`] rather than the control-frame bound —
+    /// tunnel traffic (RPC and PTY bytes alike) is capped tighter than
+    /// control frames per relay-protocol.md's stated bounds. A zero-length
+    /// `payload` is the valid, meaningful tunnel-close signal; this method
+    /// does not special-case it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelError::Frame`] if the encoded payload exceeds the
+    /// tunnel-frame bound, or [`ChannelError::Ws`] if the send fails.
+    pub async fn send_tunnel(&mut self, tunnel_id: [u8; TUNNEL_ID_BYTES], payload: &[u8]) -> Result<(), ChannelError> {
+        let body = encode_tunnel_frame(tunnel_id, payload);
+        let framed = encode_frame(&body, MAX_TUNNEL_FRAME_BYTES).map_err(ChannelError::Frame)?;
         self.ws.send(Message::Binary(framed.into())).await?;
         Ok(())
     }
@@ -233,6 +258,41 @@ mod tests {
         let fake = FakeWs { inbound: VecDeque::new(), outbound: Vec::new() };
         let mut channel = FrameChannel::new(fake);
         assert!(matches!(channel.recv_raw().await, Err(ChannelError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn send_tunnel_produces_a_correctly_framed_tunnel_frame() {
+        let fake = FakeWs { inbound: VecDeque::new(), outbound: Vec::new() };
+        let mut channel = FrameChannel::new(fake);
+        let tunnel_id = [1, 2, 3, 4, 5, 6, 7, 8];
+        channel.send_tunnel(tunnel_id, b"hello").await.unwrap();
+
+        let Message::Binary(bytes) = &channel.ws.outbound[0] else {
+            panic!("expected a binary message");
+        };
+        let mut decoder = FrameDecoder::new(FrameLimits::new(MAX_TUNNEL_FRAME_BYTES, 1).unwrap());
+        let frames = decoder.feed(bytes).unwrap();
+        assert_eq!(frames.len(), 1);
+        let (decoded_id, payload) = choosh_protocol::relay::decode_tunnel_frame(&frames[0]).unwrap();
+        assert_eq!(decoded_id, tunnel_id);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[tokio::test]
+    async fn send_tunnel_allows_a_zero_length_close_signal() {
+        let fake = FakeWs { inbound: VecDeque::new(), outbound: Vec::new() };
+        let mut channel = FrameChannel::new(fake);
+        let tunnel_id = [9, 9, 9, 9, 9, 9, 9, 9];
+        channel.send_tunnel(tunnel_id, b"").await.unwrap();
+
+        let Message::Binary(bytes) = &channel.ws.outbound[0] else {
+            panic!("expected a binary message");
+        };
+        let mut decoder = FrameDecoder::new(FrameLimits::new(MAX_TUNNEL_FRAME_BYTES, 1).unwrap());
+        let frames = decoder.feed(bytes).unwrap();
+        let (decoded_id, payload) = choosh_protocol::relay::decode_tunnel_frame(&frames[0]).unwrap();
+        assert_eq!(decoded_id, tunnel_id);
+        assert!(payload.is_empty());
     }
 
     #[tokio::test]

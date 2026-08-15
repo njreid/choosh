@@ -11,12 +11,30 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 choosh-android-transport = { path = "../choosh-android-transport" }
 choosh-protocol = { path = "../choosh-protocol" }
+choosh-terminal-engine = { path = "../choosh-terminal-engine" }
 jni = { version = "=0.22.4", default-features = false }
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "=1.0.150"
 tokio = { version = "=1.53.0", features = ["rt-multi-thread", "sync"] }
 tracing = "0.1.44"
+
+# Terminal renderer (docs/specs/terminal-experience.md), ported from
+# njreid/zelland@8bf9cf5's src-tauri/src/renderer/mod.rs — see
+# docs/licenses/terminal-provenance.md. Versions match Zelland's own
+# Cargo.toml (known-compatible pair) rather than the newest release.
+wgpu = "23.0"
+glyphon = "0.7"
+bytemuck = { version = "1", features = ["derive"] }
+raw-window-handle = "0.6"
+
+# Android-only: converts a JNI `Surface` into the `ANativeWindow` wgpu needs,
+# ported from renderer/android.rs. Target-gated because `nativewindow`
+# linkage only exists on a real Android sysroot (matches Zelland's own
+# Cargo.toml gating of these same two crates).
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", features = ["nativewindow"] }
+ndk-sys = "0.6"
 
 [dev-dependencies]
 tokio-tungstenite = "0.30.0"

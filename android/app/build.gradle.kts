@@ -193,6 +193,22 @@ tasks.matching { it.name == "assembleDebug" || it.name == "assembleRelease" }.co
     dependsOn(buildRustAndroid)
 }
 
+// `assembleDebug dependsOn buildRustAndroid` alone is not sufficient
+// ordering: it only guarantees `buildRustAndroid` finishes before
+// `assembleDebug` itself runs, not before the packaging tasks that read
+// `jniLibs/` along the way (`mergeDebugJniLibFolders`, `mergeDebugNativeLibs`,
+// and their Release equivalents) — those are siblings of `buildRustAndroid`
+// in the task graph, not descendants of it, so Gradle was free to schedule
+// them first and package a stale `.so` (confirmed on a real device: an
+// incremental Rust-only change rebuilt the library correctly, but the
+// installed APK's behavior didn't change because these merge tasks had
+// already read the previous `jniLibs/` contents and reported themselves
+// up-to-date before `buildRustAndroid` overwrote them). Every task that
+// reads `jniLibs/` must depend on `buildRustAndroid` directly.
+tasks.matching { it.name.contains("JniLibFolders") || it.name.contains("NativeLibs") }.configureEach {
+    dependsOn(buildRustAndroid)
+}
+
 val validateReleaseEvidence = tasks.register("validateReleaseEvidence") {
     group = "verification"
     doLast {

@@ -3,7 +3,8 @@
 //! anywhere in this module. `lib.rs`'s `extern "system"` functions are thin
 //! marshaling wrappers around this.
 
-use choosh_android_transport::PhoneConnection;
+use choosh_android_transport::{CallError, PhoneConnection, PtyTunnelHandle};
+use choosh_protocol::host_rpc::{RpcRequest, RpcResponse};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -127,8 +128,305 @@ impl Engine {
         }
     }
 
+    /// Sends one M3 jj RPC ([`RpcRequest::WorkspaceDiff`],
+    /// `WorkspaceLog`, `WorkspaceOpLog`, `WorkspaceOpUndo`,
+    /// `WorkspaceOpRestore`, `WorkspaceStatus`) over `target_device_id`'s
+    /// tunnel and returns the raw [`RpcResponse`], or `Err` with a
+    /// human-readable message covering both "not connected" and a
+    /// [`CallError`] — the caller (each typed `workspace_*` method below)
+    /// turns either into this module's shared `{"error": ...}` JSON shape,
+    /// and an `Ok(RpcResponse::Error {...})` application-level failure into
+    /// the same shape by matching on it itself, since only the caller knows
+    /// which response variant it expected to see on success.
+    async fn call_jj_rpc(&self, target_device_id: &str, request: RpcRequest) -> Result<RpcResponse, String> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err("not connected: call nativeConnect first".to_string());
+        };
+        match connection.call_rpc(target_device_id, request).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                // As with list_devhosts: drop a connection that just failed
+                // a call rather than let the next attempt reuse it.
+                *guard = None;
+                Err(format!("rpc call failed: {error}"))
+            }
+        }
+    }
+
+    /// Returns `workspace.diff`'s `files` array (`Vec<DiffFileEntry>`) as a
+    /// bare JSON array — `from`/`to` empty means the RPC's own default
+    /// (`from = "@-"`, `to = "@"`), matching this module's other
+    /// caller-friendly wrapper style over the raw wire types.
+    pub async fn workspace_diff(&self, target_device_id: &str, workspace_id: &str, from: &str, to: &str) -> String {
+        let request = RpcRequest::WorkspaceDiff {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            from: none_if_empty(from),
+            to: none_if_empty(to),
+        };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceDiffOk { files, .. }) => to_json(&files),
+            Ok(other) => unexpected_or_error_json("workspace.diff", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// Returns `workspace.log`'s `changes` array (`Vec<ChangeGraphNode>`) —
+    /// the `JjChangeGraph` item's node/edge data (edges are each node's own
+    /// `parent_change_ids`) — as a bare JSON array. Empty `revset` means
+    /// `jj log`'s own default.
+    pub async fn workspace_log(&self, target_device_id: &str, workspace_id: &str, revset: &str, limit: i64) -> String {
+        let request = RpcRequest::WorkspaceLog {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            revset: none_if_empty(revset),
+            limit: clamp_limit(limit),
+        };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceLogOk { changes, .. }) => to_json(&changes),
+            Ok(other) => unexpected_or_error_json("workspace.log", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// Returns `workspace.op.log`'s `operations` array
+    /// (`Vec<OperationLogEntry>`) as a bare JSON array, most recent first.
+    pub async fn workspace_op_log(&self, target_device_id: &str, workspace_id: &str, limit: i64) -> String {
+        let request = RpcRequest::WorkspaceOpLog {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            limit: clamp_limit(limit),
+        };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceOpLogOk { operations, .. }) => to_json(&operations),
+            Ok(other) => unexpected_or_error_json("workspace.op.log", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// `workspace.op.undo` — reverses `op_id`'s effect. Returns
+    /// `{"new_op_id": "..."}`: per `jj-integration.md`, this is the id of
+    /// the *new* operation-log entry the undo itself created, never `op_id`.
+    /// The caller (Kotlin) is expected to re-fetch `workspace.log`/
+    /// `workspace.op.log` afterward to observe the reversal — this call
+    /// does not do that itself.
+    pub async fn workspace_op_undo(&self, target_device_id: &str, workspace_id: &str, op_id: &str) -> String {
+        let request = RpcRequest::WorkspaceOpUndo {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            op_id: op_id.to_string(),
+        };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceOpUndoOk { new_op_id, .. }) => json!({ "new_op_id": new_op_id }).to_string(),
+            Ok(other) => unexpected_or_error_json("workspace.op.undo", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// `workspace.op.restore` — resets the repo to `op_id`'s state. Returns
+    /// `{"new_op_id": "..."}`, same "id of the new entry, not the one
+    /// restored to" contract as [`Self::workspace_op_undo`].
+    pub async fn workspace_op_restore(&self, target_device_id: &str, workspace_id: &str, op_id: &str) -> String {
+        let request = RpcRequest::WorkspaceOpRestore {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            op_id: op_id.to_string(),
+        };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceOpRestoreOk { new_op_id, .. }) => json!({ "new_op_id": new_op_id }).to_string(),
+            Ok(other) => unexpected_or_error_json("workspace.op.restore", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// Returns `workspace.status`'s `{changed, conflicted}` shape verbatim,
+    /// backing the explorer's changed-files section.
+    pub async fn workspace_status(&self, target_device_id: &str, workspace_id: &str) -> String {
+        let request = RpcRequest::WorkspaceStatus { request_id: new_request_id(), workspace_id: workspace_id.to_string() };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceStatusOk { changed, conflicted, .. }) => {
+                to_json(&json!({ "changed": changed, "conflicted": conflicted }))
+            }
+            Ok(other) => unexpected_or_error_json("workspace.status", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// Opens a document per editor-protocol.md's "Opening a document":
+    /// `workspace.file.read { workspace_id, path }` (no `revision`/`range`
+    /// — defaults to the live working copy `@`, whole file). The returned
+    /// JSON is one of:
+    ///
+    /// - `{"type":"ok","content_base64":...,"revision":...,"total_size":...}`
+    /// - `{"type":"error","code":...,"message":...}` — a `hostd`-side
+    ///   rejection (e.g. binary/oversized, per editor-protocol.md's "Limits").
+    /// - `{"type":"offline","message":...}` — a transport-level failure
+    ///   (not connected, or `call_rpc` itself failed) — editor-protocol.md's
+    ///   `offline` save state, not an application error.
+    pub async fn open_document(&self, target_device_id: &str, workspace_id: &str, path: &str) -> String {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return offline_json("not connected: call nativeConnect first");
+        };
+        let request = RpcRequest::WorkspaceFileRead {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            path: path.to_string(),
+            revision: None,
+            range: None,
+        };
+        match connection.call_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceFileReadOk { content_base64, total_size, revision, .. }) => {
+                json!({ "type": "ok", "content_base64": content_base64, "revision": revision, "total_size": total_size }).to_string()
+            }
+            Ok(RpcResponse::Error { code, message, .. }) => error_json_with_code(&code, &message),
+            Ok(other) => error_json_with_code("internal", &format!("unexpected response to workspace.file.read: {other:?}")),
+            Err(error) => {
+                // Per relay-protocol.md's reconnect-discontinuity rule and
+                // this module's existing `list_devhosts` precedent: a failed
+                // call on a stale/dropped connection drops it so the next
+                // attempt doesn't reuse a known-broken channel.
+                if matches!(error, CallError::Transport(_)) {
+                    *guard = None;
+                }
+                offline_json(&format!("workspace.file.read failed: {error}"))
+            }
+        }
+    }
+
+    /// Saves a document per editor-protocol.md's "Persistence":
+    /// `workspace.file.write { workspace_id, path, base_revision,
+    /// content_base64 }`. `content_base64` is always the document's full
+    /// current content (this crate's V1 scope, per
+    /// `choosh_protocol::host_rpc::RpcRequest::WorkspaceFileWrite`'s doc
+    /// comment) — callers debounce Sora's edit stream themselves before
+    /// calling this. The returned JSON:
+    ///
+    /// - `{"type":"ok","revision":...}` — becomes the next `base_revision`.
+    /// - `{"type":"stale","current_revision":...,"current_content_base64":...}`
+    ///   — a real conflict (editor-protocol.md's `conflicted` state): the
+    ///   caller MUST NOT silently overwrite in either direction, it must
+    ///   surface this to the user for an explicit "keep mine"/"take theirs"
+    ///   resolution.
+    /// - `{"type":"error","code":...,"message":...}` — a `hostd`-side
+    ///   rejection.
+    /// - `{"type":"offline","message":...}` — a transport-level failure;
+    ///   the caller keeps its local edits and gets a chance to retry once
+    ///   connectivity returns, per editor-protocol.md's `offline` state.
+    pub async fn save_document(
+        &self,
+        target_device_id: &str,
+        workspace_id: &str,
+        path: &str,
+        base_revision: &str,
+        content_base64: &str,
+    ) -> String {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return offline_json("not connected: call nativeConnect first");
+        };
+        let request = RpcRequest::WorkspaceFileWrite {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            path: path.to_string(),
+            base_revision: base_revision.to_string(),
+            content_base64: content_base64.to_string(),
+        };
+        match connection.call_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceFileWriteOk { revision, .. }) => json!({ "type": "ok", "revision": revision }).to_string(),
+            Ok(RpcResponse::WorkspaceFileWriteStale { current_revision, current_content_base64, .. }) => json!({
+                "type": "stale",
+                "current_revision": current_revision,
+                "current_content_base64": current_content_base64,
+            })
+            .to_string(),
+            Ok(RpcResponse::Error { code, message, .. }) => error_json_with_code(&code, &message),
+            Ok(other) => error_json_with_code("internal", &format!("unexpected response to workspace.file.write: {other:?}")),
+            Err(error) => {
+                if matches!(error, CallError::Transport(_)) {
+                    *guard = None;
+                }
+                offline_json(&format!("workspace.file.write failed: {error}"))
+            }
+        }
+    }
+
+    /// Opens a `"pty:<item_id>"`-purpose tunnel for the terminal renderer.
+    ///
+    /// # Errors
+    ///
+    /// A message describing why: not connected yet, or the tunnel-open
+    /// call itself failed (see [`CallError`]).
+    ///
+    /// Only called from `terminal_jni.rs`, which is
+    /// `#[cfg(target_os = "android")]`-gated — see `crate::with_connection_engine`
+    /// and `terminal_renderer.rs`'s module doc for why a host build
+    /// legitimately never calls this despite it being real, tested (via
+    /// this crate's Android-target build) production code.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub async fn open_pty_tunnel(&self, target_device_id: &str, item_id: &str) -> Result<PtyTunnelHandle, String> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err("not connected: call nativeConnect first".to_string());
+        };
+        connection.open_pty_tunnel(target_device_id, item_id).await.map_err(|error| {
+            tracing::warn!(%error, "open_pty_tunnel failed");
+            format!("open_pty_tunnel failed: {error}")
+        })
+    }
+
     pub async fn close(&self) {
         *self.connection.lock().await = None;
+    }
+}
+
+/// A request id unique per in-flight RPC, generated by this crate rather
+/// than `choosh-android-transport` (its pre-M1 control methods generate
+/// their own internally, but `PhoneConnection::call_rpc` takes a
+/// fully-formed [`RpcRequest`] — including its `request_id` — from the
+/// caller). Same shape as that crate's own private `new_request_id`
+/// (process id plus a monotonic counter — unique per in-flight request, not
+/// globally unique or ordered, and no UUID dependency this crate has no
+/// other need for).
+fn new_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("req-{}-{count}", std::process::id())
+}
+
+fn offline_json(message: &str) -> String {
+    json!({ "type": "offline", "message": message }).to_string()
+}
+
+fn error_json_with_code(code: &str, message: &str) -> String {
+    json!({ "type": "error", "code": code, "message": message }).to_string()
+}
+
+fn to_json<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|error| error_json(&format!("failed to encode response: {error}")))
+}
+
+fn none_if_empty(value: &str) -> Option<String> {
+    if value.is_empty() { None } else { Some(value.to_string()) }
+}
+
+/// Clamps a Kotlin-supplied `Long` limit to a sane, positive `usize` —
+/// negative/zero/absurdly large inputs from the JNI boundary get a safe
+/// default rather than panicking on the `i64`->`usize` conversion.
+fn clamp_limit(limit: i64) -> usize {
+    usize::try_from(limit).unwrap_or(50).clamp(1, 500)
+}
+
+/// An `Ok(RpcResponse::Error {...})` or any other unexpected response
+/// variant, turned into this module's shared error JSON shape — every
+/// `workspace_*` method's fallback arm for "the RPC succeeded at the
+/// transport level but wasn't the response we expected."
+fn unexpected_or_error_json(rpc_name: &str, response: &RpcResponse) -> String {
+    match response {
+        RpcResponse::Error { code, message, .. } => json!({ "error": format!("{code}: {message}") }).to_string(),
+        other => error_json(&format!("unexpected response to {rpc_name}: {other:?}")),
     }
 }
 
@@ -238,11 +536,12 @@ mod tests {
             send(&mut ws, &ServerHello { nonce: "n".to_string() }).await;
             let _auth: ClientAuth = recv(&mut ws).await;
             send(&mut ws, &AuthResult::Ok(AuthOk { identity_class: choosh_protocol::relay::IdentityClass::Phone, device_id: "phone-1".to_string() })).await;
-            let _request: ControlRequest = recv(&mut ws).await;
+            let request: ControlRequest = recv(&mut ws).await;
+            let ControlRequest::ListDevhosts { request_id } = request else { panic!("expected list-devhosts") };
             send(
                 &mut ws,
                 &ControlResponse::ListDevhostsOk {
-                    request_id: "ignored".to_string(),
+                    request_id,
                     devhosts: vec![DevHostPresence {
                         device_id: "dev-1".to_string(),
                         alias: "build-box".to_string(),

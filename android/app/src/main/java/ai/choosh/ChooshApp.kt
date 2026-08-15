@@ -8,6 +8,10 @@ import ai.choosh.engine.FakeChooshEngine
 import ai.choosh.fleet.FleetDrawer
 import ai.choosh.fleet.FleetNavigationEvent
 import ai.choosh.fleet.FleetViewModel
+import ai.choosh.sourceeditor.SourceEditorScreen
+import ai.choosh.sourceeditor.SourceEditorViewModel
+import ai.choosh.terminal.TerminalScreen
+import ai.choosh.workspace.WorkspaceScreen
 import android.content.Context
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -55,8 +59,27 @@ private suspend fun fetchFcmToken(): String? = runCatching { FirebaseMessaging.g
 private sealed interface Screen {
     data object Connection : Screen
     data object Fleet : Screen
-    data class WorkspacePlaceholder(val workspaceId: String) : Screen
+    data class Workspace(val workspaceId: String, val deviceId: String) : Screen
     data class DevHostPlaceholder(val deviceId: String) : Screen
+
+    /**
+     * The `SourceEditor` pinned item (docs/specs/android-navigation.md's
+     * pinned-kinds table / docs/specs/editor-protocol.md). `deviceId` is
+     * needed alongside `workspaceId` because
+     * `PhoneConnection::call_rpc`/`Engine.openDocument`/`saveDocument` are
+     * always devhost-targeted — there is no workspace-scoped connection to
+     * resolve it from implicitly.
+     */
+    data class SourceEditor(val deviceId: String, val workspaceId: String, val path: String) : Screen
+
+    /**
+     * The `AgentTerminal` pinned-item page, per
+     * `docs/specs/android-navigation.md`'s pinned-kinds table. Reachable
+     * today only from [Workspace]'s demo affordance — a real entry point
+     * (tapping an actual `AgentTerminal` item in the explorer) lands with
+     * `item.list` wiring into the explorer itself, a later increment.
+     */
+    data class Terminal(val deviceId: String, val itemId: String) : Screen
 }
 
 @Composable
@@ -90,25 +113,58 @@ fun ChooshApp(context: Context) {
                         onSortModeSelected = viewModel::setSortMode,
                         onProjectClick = { project ->
                             screen = when (val event = viewModel.onProjectTapped(project)) {
-                                is FleetNavigationEvent.OpenWorkspace -> Screen.WorkspacePlaceholder(event.workspaceId)
+                                is FleetNavigationEvent.OpenWorkspace -> Screen.Workspace(event.workspaceId, event.deviceId)
                                 is FleetNavigationEvent.OpenDevHost -> Screen.DevHostPlaceholder(event.deviceId)
                             }
                         },
                         onDevHostClick = { devHost -> screen = Screen.DevHostPlaceholder(devHost.deviceId) },
-                        onWorkspaceClick = { workspace -> screen = Screen.WorkspacePlaceholder(workspace.workspaceId) },
+                        onWorkspaceClick = { workspace -> screen = Screen.Workspace(workspace.workspaceId, workspace.devHostId) },
                     )
                 }
 
-                is Screen.WorkspacePlaceholder -> PlaceholderScreen(
-                    title = "Workspace ${current.workspaceId}",
-                    subtitle = "Workspace browsing/terminal/diff surfaces land in M1+.",
+                is Screen.Workspace -> WorkspaceScreen(
+                    engine = engine,
+                    workspaceId = current.workspaceId,
+                    deviceId = current.deviceId,
                     onBack = { screen = Screen.Fleet },
+                    // Demo entry points — the explorer doesn't yet surface real
+                    // AgentTerminal/SourceEditor pinned items to tap directly
+                    // (item.list wiring is a later increment), so these open a
+                    // fixed item/path against the current workspace instead.
+                    onOpenTerminal = { screen = Screen.Terminal(deviceId = current.deviceId, itemId = current.workspaceId) },
+                    onOpenEditor = { path -> screen = Screen.SourceEditor(current.deviceId, current.workspaceId, path) },
                 )
 
                 is Screen.DevHostPlaceholder -> PlaceholderScreen(
                     title = "DevHost ${current.deviceId}",
                     subtitle = "Per-devhost workspace list lands with real workspace RPCs (M1).",
                     onBack = { screen = Screen.Fleet },
+                )
+
+                is Screen.SourceEditor -> {
+                    val viewModel: SourceEditorViewModel = viewModel(
+                        key = "source-editor:${current.deviceId}:${current.workspaceId}:${current.path}",
+                        factory = singleInstanceFactory {
+                            SourceEditorViewModel(engine, current.deviceId, current.workspaceId, current.path)
+                        },
+                    )
+                    SourceEditorScreen(
+                        viewModel = viewModel,
+                        path = current.path,
+                        onBack = { screen = Screen.Workspace(current.workspaceId, current.deviceId) },
+                    )
+                }
+
+                is Screen.Terminal -> TerminalScreen(
+                    deviceId = current.deviceId,
+                    itemId = current.itemId,
+                    // No live relayd deployment exists yet (see NativeChooshEngine.kt's
+                    // doc comment) — FakeChooshEngine has no connection handle to hand
+                    // TerminalScreen, so real PTY attach isn't reachable from this
+                    // composition root today; the demo-output buttons still exercise
+                    // the real VT parser + renderer end to end.
+                    connectionHandle = null,
+                    onBack = { screen = Screen.Workspace(current.itemId, current.deviceId) },
                 )
             }
         }

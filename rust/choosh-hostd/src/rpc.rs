@@ -8,8 +8,8 @@
 use std::path::PathBuf;
 
 use choosh_protocol::host_rpc::{
-    ChangedPath, ItemStatus, ItemSummary, ItemType, MAX_FILE_READ_RANGE_BYTES, MAX_TREE_LIST_PAGE, ProjectSource,
-    RpcRequest, RpcResponse, WorkspaceSummary,
+    ChangeGraphNode, ChangedPath, DiffFileEntry, DiffHunk, DiffSegment, DiffSegmentKind, ItemStatus, ItemSummary, ItemType,
+    MAX_FILE_READ_RANGE_BYTES, MAX_TREE_LIST_PAGE, OperationLogEntry, ProjectSource, RpcRequest, RpcResponse, WorkspaceSummary,
 };
 use tokio::sync::Mutex;
 
@@ -54,6 +54,20 @@ pub async fn dispatch(ctx: &RpcContext, request: RpcRequest) -> RpcResponse {
         }
         RpcRequest::ItemList { workspace_id, .. } => handle_item_list(ctx, request_id, &workspace_id).await,
         RpcRequest::ItemStop { item_id, .. } => handle_item_stop(ctx, request_id, &item_id).await,
+        RpcRequest::WorkspaceDiff { workspace_id, from, to, .. } => {
+            handle_diff(ctx, request_id, &workspace_id, from.as_deref(), to.as_deref()).await
+        }
+        RpcRequest::WorkspaceLog { workspace_id, revset, limit, .. } => {
+            handle_log(ctx, request_id, &workspace_id, revset.as_deref(), limit).await
+        }
+        RpcRequest::WorkspaceOpLog { workspace_id, limit, .. } => handle_op_log(ctx, request_id, &workspace_id, limit).await,
+        RpcRequest::WorkspaceOpUndo { workspace_id, op_id, .. } => handle_op_undo(ctx, request_id, &workspace_id, &op_id).await,
+        RpcRequest::WorkspaceOpRestore { workspace_id, op_id, .. } => {
+            handle_op_restore(ctx, request_id, &workspace_id, &op_id).await
+        }
+        RpcRequest::WorkspaceFileWrite { workspace_id, path, base_revision, content_base64, .. } => {
+            handle_file_write(ctx, request_id, &workspace_id, &path, &base_revision, &content_base64).await
+        }
     }
 }
 
@@ -273,14 +287,58 @@ async fn handle_file_read(
     };
     let range_tuple = range.map(|r| (r.offset, r.length));
     match fs_ops::read_file_range(&root_path, path, range_tuple, MAX_FILE_READ_RANGE_BYTES) {
-        Ok((bytes, total_size)) => {
+        Ok((bytes, total_size, revision)) => {
             use base64::Engine;
             RpcResponse::WorkspaceFileReadOk {
                 request_id,
                 content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
                 total_size,
+                revision,
             }
         }
+        Err(fs_error) => fs_error_response(request_id, &fs_error),
+    }
+}
+
+/// `workspace.file.write` (`docs/milestones/M4-editing.md`,
+/// `jj-integration.md`'s `workspace.file.write` section). No `jj`
+/// invocation happens here — per `jj-integration.md`, "jj snapshots the new
+/// working-copy state automatically" the next time anything invokes `jj`
+/// against this workspace, so writing the bytes to `@`'s checkout is the
+/// entire effect this RPC needs to produce (verified against the real `jj`
+/// binary in this module's tests below, not just trusted from the spec's
+/// prose).
+///
+/// V1 scope note (mirrors `RpcRequest::WorkspaceFileWrite`'s doc comment):
+/// a write always targets a path that already exists — it always follows a
+/// prior `workspace.file.read` of that same path, per `jj-integration.md`
+/// ("`base_revision` MUST be the revision the client last read `path`
+/// at"). A `path` that doesn't yet exist maps to `not_found` via
+/// [`fs_ops::FsError::NotFound`], the same as every other path-bearing RPC;
+/// creating a brand-new file is not a case this RPC is asked to support.
+async fn handle_file_write(
+    ctx: &RpcContext,
+    request_id: String,
+    workspace_id: &str,
+    path: &str,
+    base_revision: &str,
+    content_base64: &str,
+) -> RpcResponse {
+    use base64::Engine;
+    let root_path = match lookup_root(ctx, workspace_id).await {
+        Ok(path) => path,
+        Err(response) => return with_request_id(response, request_id),
+    };
+    let Ok(content) = base64::engine::general_purpose::STANDARD.decode(content_base64) else {
+        return error(request_id, "invalid_argument", "content_base64 is not valid base64");
+    };
+    match fs_ops::write_file(&root_path, path, base_revision, &content, MAX_FILE_READ_RANGE_BYTES) {
+        Ok(fs_ops::WriteOutcome::Written { new_revision }) => RpcResponse::WorkspaceFileWriteOk { request_id, revision: new_revision },
+        Ok(fs_ops::WriteOutcome::Stale { current_revision, current_content }) => RpcResponse::WorkspaceFileWriteStale {
+            request_id,
+            current_revision,
+            current_content_base64: base64::engine::general_purpose::STANDARD.encode(current_content),
+        },
         Err(fs_error) => fs_error_response(request_id, &fs_error),
     }
 }
@@ -429,6 +487,144 @@ async fn handle_item_stop(ctx: &RpcContext, request_id: String, item_id: &str) -
     }
 }
 
+fn to_wire_diff_segment_kind(kind: jj_ops::DiffSegmentKind) -> DiffSegmentKind {
+    match kind {
+        jj_ops::DiffSegmentKind::Context => DiffSegmentKind::Context,
+        jj_ops::DiffSegmentKind::Added => DiffSegmentKind::Added,
+        jj_ops::DiffSegmentKind::Removed => DiffSegmentKind::Removed,
+    }
+}
+
+fn to_wire_diff_hunk(hunk: jj_ops::DiffHunk) -> DiffHunk {
+    DiffHunk {
+        old_start: hunk.old_start,
+        old_lines: hunk.old_lines,
+        new_start: hunk.new_start,
+        new_lines: hunk.new_lines,
+        segments: hunk
+            .segments
+            .into_iter()
+            .map(|s| DiffSegment { kind: to_wire_diff_segment_kind(s.kind), text: s.text })
+            .collect(),
+    }
+}
+
+fn to_wire_diff_file_entry(entry: jj_ops::DiffFileEntry) -> DiffFileEntry {
+    match entry {
+        jj_ops::DiffFileEntry::Hunks { old_path, new_path, hunks } => {
+            DiffFileEntry::Hunks { old_path, new_path, hunks: hunks.into_iter().map(to_wire_diff_hunk).collect() }
+        }
+        jj_ops::DiffFileEntry::Binary { path, status, byte_size } => {
+            DiffFileEntry::Binary { path, status: fs_ops::to_wire_change_kind(status), byte_size }
+        }
+    }
+}
+
+fn to_wire_change_graph_node(node: jj_ops::ChangeGraphNode) -> ChangeGraphNode {
+    ChangeGraphNode {
+        change_id: node.change_id,
+        commit_id: node.commit_id,
+        description: node.description,
+        author: node.author,
+        parent_change_ids: node.parent_change_ids,
+        is_working_copy: node.is_working_copy,
+        bookmarks: node.bookmarks,
+    }
+}
+
+fn to_wire_operation_log_entry(entry: jj_ops::OperationLogEntry) -> OperationLogEntry {
+    OperationLogEntry {
+        op_id: entry.op_id,
+        description: entry.description,
+        start_time: entry.start_time,
+        end_time: entry.end_time,
+        tags: entry.tags,
+    }
+}
+
+async fn handle_diff(
+    ctx: &RpcContext,
+    request_id: String,
+    workspace_id: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> RpcResponse {
+    let root_path = match lookup_root(ctx, workspace_id).await {
+        Ok(path) => path,
+        Err(response) => return with_request_id(response, request_id),
+    };
+    match jj_ops::diff(&root_path, from, to).await {
+        Ok(entries) => RpcResponse::WorkspaceDiffOk { request_id, files: entries.into_iter().map(to_wire_diff_file_entry).collect() },
+        // `from`/`to` are the only caller-supplied strings `jj diff` can
+        // fail on once the workspace itself is known good — a bad/unparseable
+        // revision, never an internal fault of this host.
+        Err(jj_error) => jj_revision_error_response(request_id, &jj_error),
+    }
+}
+
+async fn handle_log(
+    ctx: &RpcContext,
+    request_id: String,
+    workspace_id: &str,
+    revset: Option<&str>,
+    limit: usize,
+) -> RpcResponse {
+    let root_path = match lookup_root(ctx, workspace_id).await {
+        Ok(path) => path,
+        Err(response) => return with_request_id(response, request_id),
+    };
+    match jj_ops::log(&root_path, revset, limit).await {
+        Ok(changes) => RpcResponse::WorkspaceLogOk { request_id, changes: changes.into_iter().map(to_wire_change_graph_node).collect() },
+        // As with `handle_diff`: the only way this fails against a known-good
+        // workspace is a bad `revset`.
+        Err(jj_error) => jj_revision_error_response(request_id, &jj_error),
+    }
+}
+
+async fn handle_op_log(ctx: &RpcContext, request_id: String, workspace_id: &str, limit: usize) -> RpcResponse {
+    let root_path = match lookup_root(ctx, workspace_id).await {
+        Ok(path) => path,
+        Err(response) => return with_request_id(response, request_id),
+    };
+    match jj_ops::op_log(&root_path, limit).await {
+        Ok(operations) => {
+            RpcResponse::WorkspaceOpLogOk { request_id, operations: operations.into_iter().map(to_wire_operation_log_entry).collect() }
+        }
+        Err(jj_error) => jj_error_response(request_id, &jj_error),
+    }
+}
+
+async fn handle_op_undo(ctx: &RpcContext, request_id: String, workspace_id: &str, op_id: &str) -> RpcResponse {
+    if op_id.is_empty() {
+        return error(request_id, "invalid_argument", "op_id must not be empty");
+    }
+    let root_path = match lookup_root(ctx, workspace_id).await {
+        Ok(path) => path,
+        Err(response) => return with_request_id(response, request_id),
+    };
+    match jj_ops::op_undo(&root_path, op_id).await {
+        Ok(new_op_id) => RpcResponse::WorkspaceOpUndoOk { request_id, new_op_id },
+        // The only caller-supplied input to `jj operation revert` is
+        // `op_id` — a failure here almost always means it doesn't name a
+        // real operation, which is `not_found`, not `internal`.
+        Err(jj_error) => jj_op_id_error_response(request_id, &jj_error),
+    }
+}
+
+async fn handle_op_restore(ctx: &RpcContext, request_id: String, workspace_id: &str, op_id: &str) -> RpcResponse {
+    if op_id.is_empty() {
+        return error(request_id, "invalid_argument", "op_id must not be empty");
+    }
+    let root_path = match lookup_root(ctx, workspace_id).await {
+        Ok(path) => path,
+        Err(response) => return with_request_id(response, request_id),
+    };
+    match jj_ops::op_restore(&root_path, op_id).await {
+        Ok(new_op_id) => RpcResponse::WorkspaceOpRestoreOk { request_id, new_op_id },
+        Err(jj_error) => jj_op_id_error_response(request_id, &jj_error),
+    }
+}
+
 /// M1 only reads the live working copy — a non-`@`/`None` `revision`
 /// would need `jj-lib`'s content-addressed store, which is out of scope
 /// here (see `jj_ops.rs`'s module docs), so it's rejected cleanly rather
@@ -467,11 +663,43 @@ fn jj_error_response(request_id: String, cause: &JjError) -> RpcResponse {
     error(request_id, "internal", format!("jj operation failed: {cause}"))
 }
 
+/// For `workspace.diff`/`workspace.log`: once a workspace's root is known
+/// good, the only caller-supplied input left that a `jj diff`/`jj log`
+/// invocation can fail on is `from`/`to`/`revset` — a revision or revset
+/// string that doesn't parse or doesn't resolve. `JjError::CommandFailed`
+/// here is that case, so it maps to `invalid_argument` rather than the
+/// generic `internal` `jj_error_response` above uses for every other
+/// caller (where a `CommandFailed` more plausibly reflects something wrong
+/// on the host side, not a bad caller argument).
+fn jj_revision_error_response(request_id: String, cause: &JjError) -> RpcResponse {
+    match cause {
+        JjError::CommandFailed { .. } => error(request_id, "invalid_argument", format!("jj operation failed: {cause}")),
+        JjError::Spawn(_) | JjError::UnparseableOutput(_) => error(request_id, "internal", format!("jj operation failed: {cause}")),
+    }
+}
+
+/// For `workspace.op.undo`/`workspace.op.restore`: the only caller-supplied
+/// input is `op_id`, an entry from `workspace.op.log`'s own listing — a
+/// `CommandFailed` here means `op_id` no longer names a real operation
+/// (verified against real `jj 0.44.0` output: `Error: No operation ID
+/// matching "..."`), which is `not_found`, not `internal`.
+fn jj_op_id_error_response(request_id: String, cause: &JjError) -> RpcResponse {
+    match cause {
+        JjError::CommandFailed { .. } => error(request_id, "not_found", format!("jj operation failed: {cause}")),
+        JjError::Spawn(_) | JjError::UnparseableOutput(_) => error(request_id, "internal", format!("jj operation failed: {cause}")),
+    }
+}
+
 fn fs_error_response(request_id: String, cause: &FsError) -> RpcResponse {
     let code = match cause {
         FsError::OutOfRoot => "out_of_root",
         FsError::NotFound | FsError::NotADirectory | FsError::NotAFile => "not_found",
         FsError::BoundExceeded(_) => "bound_exceeded",
+        // A binary write body isn't a size problem, so it doesn't share
+        // BoundExceeded's `bound_exceeded` code — it fails a content-shape
+        // check, the same category `invalid_argument` covers elsewhere in
+        // this module (e.g. a malformed `content_base64`).
+        FsError::BinaryContent => "invalid_argument",
         FsError::Io(_) => "internal",
     };
     error(request_id, code, cause.to_string())
@@ -692,5 +920,393 @@ mod tests {
 
         zellij_ops::kill_session(&name).await.ok();
         assert!(bound_exceeded);
+    }
+
+    /// Sets up a fresh registered workspace with one uncommitted change on
+    /// disk, for the `workspace.diff`/`workspace.log`/`workspace.op.*`
+    /// dispatch tests below.
+    async fn setup_m3_workspace(prefix: &str) -> (tempfile::TempDir, RpcContext, String, String) {
+        let name = format!("{prefix}-{}", uuid::Uuid::new_v4());
+        let (dir, ctx) = ctx_with_tempdir();
+        let existing = ctx.workspaces_dir.join(&name);
+        std::fs::create_dir_all(&existing).unwrap();
+        init_git_repo(&existing);
+
+        let create_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "r1".to_string(),
+                devhost_id: "dev-1".to_string(),
+                workspace_name: name.clone(),
+                project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
+                parent_workspace_id: None,
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceCreateOk { workspace_id, .. } = create_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceCreateOk, got {create_response:?}");
+        };
+        std::fs::write(existing.join("new.txt"), "hello from the diff RPC\n").unwrap();
+        (dir, ctx, name, workspace_id)
+    }
+
+    #[tokio::test]
+    async fn diff_and_log_round_trip_through_dispatch() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m3diff").await;
+
+        // workspace.diff, default from=@- to=@.
+        let diff_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceDiff { request_id: "r2".to_string(), workspace_id: workspace_id.clone(), from: None, to: None },
+        )
+        .await;
+        let RpcResponse::WorkspaceDiffOk { files, .. } = diff_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceDiffOk, got {diff_response:?}");
+        };
+        assert!(
+            files.iter().any(|f| matches!(f, DiffFileEntry::Hunks { new_path: Some(p), .. } if p == "new.txt")),
+            "expected new.txt in the diff, got {files:?}"
+        );
+
+        // workspace.log, default revset.
+        let log_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceLog { request_id: "r3".to_string(), workspace_id: workspace_id.clone(), revset: None, limit: 20 },
+        )
+        .await;
+        let RpcResponse::WorkspaceLogOk { changes, .. } = log_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceLogOk, got {log_response:?}");
+        };
+        assert!(changes.iter().any(|c| c.is_working_copy));
+
+        // workspace.log with an invalid revset maps to invalid_argument, not internal.
+        let bad_revset_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceLog {
+                request_id: "r4".to_string(),
+                workspace_id: workspace_id.clone(),
+                revset: Some("not a valid revset (((".to_string()),
+                limit: 20,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&bad_revset_response, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument, got {bad_revset_response:?}"
+        );
+
+        // An unregistered workspace_id is not_found.
+        let unknown_ws_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceDiff { request_id: "r9".to_string(), workspace_id: "ws-does-not-exist".to_string(), from: None, to: None },
+        )
+        .await;
+        assert!(matches!(unknown_ws_response, RpcResponse::Error { code, .. } if code == "not_found"));
+
+        zellij_ops::kill_session(&name).await.ok();
+    }
+
+    #[tokio::test]
+    async fn op_log_and_op_undo_restore_round_trip_through_dispatch() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m3op").await;
+
+        // workspace.op.log.
+        let op_log_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceOpLog { request_id: "r5".to_string(), workspace_id: workspace_id.clone(), limit: 50 },
+        )
+        .await;
+        let RpcResponse::WorkspaceOpLogOk { operations, .. } = op_log_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceOpLogOk, got {op_log_response:?}");
+        };
+        assert!(!operations.is_empty());
+        let latest_op_id = operations[0].op_id.clone();
+
+        // workspace.op.undo returns the NEW operation's id, never the id it undid.
+        let undo_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceOpUndo { request_id: "r6".to_string(), workspace_id: workspace_id.clone(), op_id: latest_op_id.clone() },
+        )
+        .await;
+        let RpcResponse::WorkspaceOpUndoOk { new_op_id, .. } = undo_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceOpUndoOk, got {undo_response:?}");
+        };
+        assert_ne!(new_op_id, latest_op_id);
+
+        // workspace.op.restore likewise returns a fresh id.
+        let restore_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceOpRestore {
+                request_id: "r7".to_string(),
+                workspace_id: workspace_id.clone(),
+                op_id: latest_op_id.clone(),
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceOpRestoreOk { new_op_id: restore_new_op_id, .. } = restore_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceOpRestoreOk, got {restore_response:?}");
+        };
+        assert_ne!(restore_new_op_id, latest_op_id);
+        assert_ne!(restore_new_op_id, new_op_id);
+
+        // workspace.op.undo of an op_id that doesn't exist maps to not_found.
+        let bad_op_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceOpUndo { request_id: "r8".to_string(), workspace_id: workspace_id.clone(), op_id: "deadbeef1234".to_string() },
+        )
+        .await;
+        assert!(
+            matches!(&bad_op_response, RpcResponse::Error { code, .. } if code == "not_found"),
+            "expected not_found, got {bad_op_response:?}"
+        );
+
+        zellij_ops::kill_session(&name).await.ok();
+    }
+
+    #[tokio::test]
+    async fn file_write_updates_content_and_is_visible_to_jj_without_a_commit_step() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m4write").await;
+        let existing = ctx.workspaces_dir.join(&name);
+
+        let read_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileRead {
+                request_id: "r1".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                revision: None,
+                range: None,
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceFileReadOk { revision, .. } = read_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceFileReadOk, got {read_response:?}");
+        };
+
+        let write_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileWrite {
+                request_id: "r2".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                base_revision: revision.clone(),
+                content_base64: base64::engine::general_purpose::STANDARD.encode(b"hello, edited\n"),
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceFileWriteOk { revision: new_revision, .. } = write_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceFileWriteOk, got {write_response:?}");
+        };
+        assert_ne!(new_revision, revision, "a successful write must return a revision that differs from the pre-write one");
+        assert_eq!(std::fs::read(existing.join("a.txt")).unwrap(), b"hello, edited\n");
+
+        // Confirm real jj visibility with NO explicit "commit" step from
+        // this code: `handle_file_write` above only wrote raw bytes to
+        // disk. Invoking `jj diff --summary` directly here (bypassing this
+        // crate's dispatch/jj_ops entirely) must already see the write as
+        // part of `@`'s snapshot, per jj-integration.md: "jj snapshots the
+        // new working-copy state automatically."
+        let diff_output = std::process::Command::new("jj")
+            .args(["diff", "--summary", "-r", "@", "--no-pager", "--color=never"])
+            .current_dir(&existing)
+            .output()
+            .unwrap();
+        assert!(diff_output.status.success(), "jj diff --summary failed: {}", String::from_utf8_lossy(&diff_output.stderr));
+        let diff_text = String::from_utf8_lossy(&diff_output.stdout);
+        assert!(diff_text.contains("a.txt"), "expected a.txt to show as changed in `jj diff --summary`, got: {diff_text:?}");
+
+        zellij_ops::kill_session(&name).await.ok();
+    }
+
+    #[tokio::test]
+    async fn file_write_rejects_a_stale_base_revision_and_leaves_content_unchanged() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m4stale").await;
+        let existing = ctx.workspaces_dir.join(&name);
+
+        let read_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileRead {
+                request_id: "r1".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                revision: None,
+                range: None,
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceFileReadOk { revision: original_revision, .. } = read_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceFileReadOk, got {read_response:?}");
+        };
+
+        // First write succeeds and moves the file's revision forward.
+        let first_write = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileWrite {
+                request_id: "r2".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                base_revision: original_revision.clone(),
+                content_base64: base64::engine::general_purpose::STANDARD.encode(b"first edit\n"),
+            },
+        )
+        .await;
+        assert!(matches!(first_write, RpcResponse::WorkspaceFileWriteOk { .. }), "expected WorkspaceFileWriteOk, got {first_write:?}");
+
+        // Second write reuses the now-stale ORIGINAL revision — must be
+        // rejected, not silently applied on top of the first edit.
+        let second_write = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileWrite {
+                request_id: "r3".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                base_revision: original_revision,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(b"conflicting edit\n"),
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceFileWriteStale { current_revision, current_content_base64, .. } = second_write else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceFileWriteStale, got {second_write:?}");
+        };
+        let current_content = base64::engine::general_purpose::STANDARD.decode(current_content_base64).unwrap();
+        assert_eq!(current_content, b"first edit\n", "the stale response must carry the file's ACTUAL current content");
+        assert_eq!(current_revision, fs_ops::content_revision(b"first edit\n"));
+        // The rejected write must not have touched the file on disk.
+        assert_eq!(std::fs::read(existing.join("a.txt")).unwrap(), b"first edit\n");
+
+        zellij_ops::kill_session(&name).await.ok();
+    }
+
+    #[tokio::test]
+    async fn file_write_rejects_binary_and_oversized_content_without_touching_the_file() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m4bounds").await;
+        let existing = ctx.workspaces_dir.join(&name);
+
+        let read_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileRead {
+                request_id: "r1".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                revision: None,
+                range: None,
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceFileReadOk { revision, .. } = read_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceFileReadOk, got {read_response:?}");
+        };
+
+        // Binary content (contains a null byte) is rejected as invalid_argument.
+        let binary_write = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileWrite {
+                request_id: "r2".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                base_revision: revision.clone(),
+                content_base64: base64::engine::general_purpose::STANDARD.encode(b"bin\0ary"),
+            },
+        )
+        .await;
+        assert!(
+            matches!(&binary_write, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument, got {binary_write:?}"
+        );
+
+        // Oversized content is rejected as bound_exceeded.
+        let oversized = vec![b'x'; usize::try_from(MAX_FILE_READ_RANGE_BYTES + 1).unwrap()];
+        let oversized_write = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileWrite {
+                request_id: "r3".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                base_revision: revision,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(oversized),
+            },
+        )
+        .await;
+        assert!(
+            matches!(&oversized_write, RpcResponse::Error { code, .. } if code == "bound_exceeded"),
+            "expected bound_exceeded, got {oversized_write:?}"
+        );
+
+        // Neither rejected write may have touched the file on disk.
+        assert_eq!(std::fs::read(existing.join("a.txt")).unwrap(), b"hello\n");
+
+        zellij_ops::kill_session(&name).await.ok();
+    }
+
+    #[tokio::test]
+    async fn file_write_round_trips_mixed_line_endings_through_read_write_read() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m4eol").await;
+        let existing = ctx.workspaces_dir.join(&name);
+        let mixed: &[u8] = b"line1\r\nline2\nline3\r\nline4\n";
+        std::fs::write(existing.join("a.txt"), mixed).unwrap();
+
+        let read_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileRead {
+                request_id: "r1".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                revision: None,
+                range: None,
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceFileReadOk { content_base64, revision, .. } = read_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceFileReadOk, got {read_response:?}");
+        };
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(&content_base64).unwrap(), mixed);
+
+        let write_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileWrite {
+                request_id: "r2".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                base_revision: revision,
+                content_base64,
+            },
+        )
+        .await;
+        assert!(matches!(write_response, RpcResponse::WorkspaceFileWriteOk { .. }), "expected WorkspaceFileWriteOk, got {write_response:?}");
+
+        let reread_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceFileRead {
+                request_id: "r3".to_string(),
+                workspace_id: workspace_id.clone(),
+                path: "a.txt".to_string(),
+                revision: None,
+                range: None,
+            },
+        )
+        .await;
+        let RpcResponse::WorkspaceFileReadOk { content_base64: reread_base64, .. } = reread_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected WorkspaceFileReadOk, got {reread_response:?}");
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(&reread_base64).unwrap(),
+            mixed,
+            "mixed line endings must round-trip byte-identical through read -> write -> read"
+        );
+
+        zellij_ops::kill_session(&name).await.ok();
     }
 }

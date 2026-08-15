@@ -28,6 +28,7 @@
 //! with real `jj-lib` calls behind the same function signatures is a
 //! reasonable, scoped follow-up that wouldn't need to touch any caller.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -58,7 +59,11 @@ impl std::fmt::Display for JjError {
 
 impl std::error::Error for JjError {}
 
-async fn run(args: &[&str], cwd: Option<&Path>) -> Result<String, JjError> {
+/// Shared spawn/wait for every `jj` invocation in this module — `run` (below)
+/// decodes the successful case as UTF-8 text, but [`run_byte_len`] needs the
+/// raw stdout byte count without a UTF-8 validation pass, since a binary
+/// file's content (per `jj file show`) is not text at all. Both wrap this.
+async fn spawn(args: &[&str], cwd: Option<&Path>) -> Result<std::process::Output, JjError> {
     let mut command = Command::new("jj");
     command.args(args).arg("--no-pager").arg("--color=never").stdin(Stdio::null());
     if let Some(cwd) = cwd {
@@ -71,7 +76,22 @@ async fn run(args: &[&str], cwd: Option<&Path>) -> Result<String, JjError> {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
+    Ok(output)
+}
+
+async fn run(args: &[&str], cwd: Option<&Path>) -> Result<String, JjError> {
+    let output = spawn(args, cwd).await?;
     String::from_utf8(output.stdout).map_err(|error| JjError::UnparseableOutput(error.to_string()))
+}
+
+/// Like `run`, but returns only the byte length of stdout without decoding
+/// it as UTF-8 — used to size a binary file's content (`jj file show`'s
+/// stdout is the file's raw bytes) for `workspace.diff`'s `Binary` metadata,
+/// per `jj-integration.md`'s "Binary and oversized files return `{ path,
+/// status, byte_size }` metadata instead of hunks."
+async fn run_byte_len(args: &[&str], cwd: Option<&Path>) -> Result<u64, JjError> {
+    let output = spawn(args, cwd).await?;
+    Ok(u64::try_from(output.stdout.len()).unwrap_or(u64::MAX))
 }
 
 fn path_arg(path: &Path) -> Result<&str, JjError> {
@@ -229,6 +249,471 @@ pub fn canonicalize_prospective(dest: &Path) -> Result<PathBuf, JjError> {
     }
 }
 
+// --- M3: workspace.diff / workspace.log / workspace.op.* -------------------
+//
+// `jj 0.44.0` (the real binary installed in this environment, per `jj
+// --version`) has a `-T`/`--template`, `json(value: Serialize) -> String`
+// template function (`jj help -k templates`) that is a genuine, real JSON
+// serializer for the specific fields it's given — not a free-form text
+// format like `diff --summary`'s. Every template below was built and run
+// against a real `git init` + `jj git init` repo (including a real two
+// `jj workspace add` conflicted-merge scenario — see this module's tests)
+// before being hardcoded here, per this module's own "verify against the
+// real binary, don't guess" precedent.
+//
+// One correction worth recording: `jj-integration.md`'s RPC names
+// (`workspace.op.undo`, `workspace.op.restore`) mirror `jj`'s CLI naming,
+// but this installed `jj 0.44.0` has no `jj op undo` subcommand at all
+// (`jj operation --help` lists only `abandon, diff, integrate, log,
+// restore, revert, show`). The operation that reverses a *named* operation
+// (not just "the most recent one", which is all top-level `jj undo` does)
+// is `jj operation revert <op_id>` — `op_undo` below shells out to that,
+// not to `jj undo`. `jj operation restore <op_id>` matches `op_restore`
+// directly.
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiffSegmentKind {
+    Context,
+    Added,
+    Removed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffSegment {
+    pub kind: DiffSegmentKind,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiffHunk {
+    pub old_start: u64,
+    pub old_lines: u64,
+    pub new_start: u64,
+    pub new_lines: u64,
+    pub segments: Vec<DiffSegment>,
+}
+
+/// Mirrors `choosh_protocol::host_rpc::DiffFileEntry` field-for-field — kept
+/// as this module's own type rather than a direct dependency on
+/// `choosh-protocol` (see `status`/`StatusEntry` above for the same
+/// precedent: parsing stays protocol-agnostic, `rpc.rs` adapts to the wire
+/// shape).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiffFileEntry {
+    Hunks { old_path: Option<String>, new_path: Option<String>, hunks: Vec<DiffHunk> },
+    Binary { path: String, status: ChangeKind, byte_size: u64 },
+}
+
+/// Mirrors `choosh_protocol::host_rpc::ChangeGraphNode`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangeGraphNode {
+    pub change_id: String,
+    pub commit_id: String,
+    pub description: String,
+    pub author: String,
+    pub parent_change_ids: Vec<String>,
+    pub is_working_copy: bool,
+    pub bookmarks: Vec<String>,
+}
+
+/// Mirrors `choosh_protocol::host_rpc::OperationLogEntry`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationLogEntry {
+    pub op_id: String,
+    pub description: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// A `diff --git`-format file section, parsed but not yet resolved to a
+/// wire-shaped [`DiffFileEntry`] — a `Binary` entry's `byte_size` requires
+/// an extra `jj file show` round trip (async I/O), which `parse_git_diff`
+/// (a pure function) cannot itself perform.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RawDiffEntry {
+    Hunks { old_path: Option<String>, new_path: Option<String>, hunks: Vec<DiffHunk> },
+    Binary { path: String, status: ChangeKind },
+}
+
+/// `jj diff --git`'s JSON-template-free fallback: verified against real
+/// `jj 0.44.0` output for a modify, a pure rename (identical content, no
+/// hunks), a rename+content-change (jj only pairs a rename when the content
+/// hash is unchanged — otherwise it prints as a plain delete+add, which this
+/// parser handles the same as any other delete+add), an add, a delete, and
+/// binary variants of add/modify/delete (`Binary files <left> and <right>
+/// differ`, where each side is `/dev/null` or an `a/`-/`b/`-prefixed path).
+/// A conflicted revision's materialized conflict-marker text (per
+/// `jj-integration.md`'s "Conflicts" section) comes through as ordinary
+/// `+`/`-`/` ` diff content lines — jj already renders it as well-formed
+/// unified diff, so no special-casing is needed here to avoid "garbled
+/// output"; verified against a real two-`jj workspace`-add conflicted merge
+/// in this module's tests.
+///
+/// # Errors
+///
+/// Returns [`JjError::UnparseableOutput`] if a hunk header or binary-file
+/// marker line doesn't match the shape verified above — a real upstream
+/// format change, not something to silently paper over.
+fn parse_git_diff(text: &str) -> Result<Vec<RawDiffEntry>, JjError> {
+    let mut entries = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(header_rest) = line.strip_prefix("diff --git ") else { continue };
+
+        let mut rename_from: Option<String> = None;
+        let mut rename_to: Option<String> = None;
+        let mut binary: Option<(bool, bool, Option<String>)> = None;
+        let mut text_old: Option<String> = None;
+        let mut text_new: Option<String> = None;
+        let mut saw_text_markers = false;
+        let mut hunks: Vec<DiffHunk> = Vec::new();
+        let mut current_hunk: Option<DiffHunk> = None;
+
+        while let Some(&next) = lines.peek() {
+            if next.starts_with("diff --git ") {
+                break;
+            }
+            let l = lines.next().expect("peeked Some above");
+            if let Some(from) = l.strip_prefix("rename from ") {
+                rename_from = Some(from.to_string());
+            } else if let Some(to) = l.strip_prefix("rename to ") {
+                rename_to = Some(to.to_string());
+            } else if let Some(rest) = l.strip_prefix("Binary files ") {
+                binary = Some(parse_binary_marker(rest, l)?);
+            } else if current_hunk.is_none() && hunks.is_empty() && l.starts_with("--- ") {
+                text_old = strip_diff_path(&l[4..], 'a');
+                saw_text_markers = true;
+            } else if current_hunk.is_none() && hunks.is_empty() && l.starts_with("+++ ") {
+                text_new = strip_diff_path(&l[4..], 'b');
+                saw_text_markers = true;
+            } else if l.starts_with("@@ ") {
+                if let Some(h) = current_hunk.take() {
+                    hunks.push(h);
+                }
+                current_hunk = Some(parse_hunk_header(l)?);
+            } else if l.starts_with("\\ No newline at end of file") {
+                // Not diff content — a marker about the preceding line's
+                // trailing newline. Nothing to record.
+            } else if let Some(hunk) = current_hunk.as_mut() {
+                let Some(first) = l.chars().next() else { continue };
+                let kind = match first {
+                    ' ' => DiffSegmentKind::Context,
+                    '+' => DiffSegmentKind::Added,
+                    '-' => DiffSegmentKind::Removed,
+                    _ => continue,
+                };
+                hunk.segments.push(DiffSegment { kind, text: l[1..].to_string() });
+            }
+            // Any other line (`new file mode`, `deleted file mode`, `index
+            // ..`, `old mode`/`new mode`, `similarity index`, `copy
+            // from`/`to`) carries no information this parser needs.
+        }
+        if let Some(h) = current_hunk.take() {
+            hunks.push(h);
+        }
+
+        let entry = if let (Some(from), Some(to)) = (rename_from, rename_to) {
+            RawDiffEntry::Hunks { old_path: Some(from), new_path: Some(to), hunks }
+        } else if let Some((left_present, right_present, path)) = binary {
+            let path = path.ok_or_else(|| {
+                JjError::UnparseableOutput(format!("binary marker line had no usable path: {header_rest:?}"))
+            })?;
+            let status = match (left_present, right_present) {
+                (false, true) => ChangeKind::Added,
+                (true, false) => ChangeKind::Deleted,
+                (true, true) => ChangeKind::Modified,
+                (false, false) => {
+                    return Err(JjError::UnparseableOutput(format!(
+                        "binary marker line had neither side present: {header_rest:?}"
+                    )));
+                }
+            };
+            RawDiffEntry::Binary { path, status }
+        } else if saw_text_markers {
+            RawDiffEntry::Hunks { old_path: text_old, new_path: text_new, hunks }
+        } else {
+            // A mode-only change (`old mode`/`new mode`, no content diff) —
+            // no `---`/`+++` lines were printed at all. Fall back to the
+            // `diff --git a/X b/Y` header's own paths (identical on both
+            // sides for anything that isn't a rename, which was already
+            // handled above).
+            let (old, new) = parse_diff_git_header(header_rest)?;
+            RawDiffEntry::Hunks { old_path: Some(old), new_path: Some(new), hunks }
+        };
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Strips a diff path's `a/`/`b/` prefix, or returns `None` for `/dev/null`
+/// (jj's marker for "this side doesn't exist" — a fresh add or a delete).
+fn strip_diff_path(path: &str, side: char) -> Option<String> {
+    if path == "/dev/null" {
+        return None;
+    }
+    let prefix = if side == 'a' { "a/" } else { "b/" };
+    Some(path.strip_prefix(prefix).unwrap_or(path).to_string())
+}
+
+/// Parses `Binary files <left> and <right> differ` (the text after `Binary
+/// files `), verified against real `jj 0.44.0` output for an added,
+/// modified, and deleted binary file. Returns `(left_present, right_present,
+/// preferred_path)`, preferring the right (new-side) path when present.
+fn parse_binary_marker(rest: &str, full_line: &str) -> Result<(bool, bool, Option<String>), JjError> {
+    let rest = rest.strip_suffix(" differ").unwrap_or(rest);
+    let (left, right) =
+        rest.split_once(" and ").ok_or_else(|| JjError::UnparseableOutput(format!("unrecognized binary marker line {full_line:?}")))?;
+    let left_present = left != "/dev/null";
+    let right_present = right != "/dev/null";
+    let left_path = strip_diff_path(left, 'a');
+    let right_path = strip_diff_path(right, 'b');
+    Ok((left_present, right_present, right_path.or(left_path)))
+}
+
+/// Fallback path extraction from a `diff --git a/X b/Y` header line (the
+/// text after `diff --git `), used only when no `---`/`+++`/`rename
+/// from`/`Binary files` line gave an unambiguous path (a mode-only change).
+/// This is a best-effort split on `" b/"`, which is ambiguous for a path
+/// that itself contains the literal substring `" b/"` — an accepted, narrow
+/// limitation shared with `git`'s own `diff --git` header, which has the
+/// same inherent ambiguity.
+fn parse_diff_git_header(header_rest: &str) -> Result<(String, String), JjError> {
+    let old = header_rest.strip_prefix("a/").unwrap_or(header_rest);
+    let split_at =
+        old.find(" b/").ok_or_else(|| JjError::UnparseableOutput(format!("unrecognized diff --git header {header_rest:?}")))?;
+    let (old_path, new_part) = old.split_at(split_at);
+    let new_path = new_part.strip_prefix(" b/").unwrap_or(new_part);
+    Ok((old_path.to_string(), new_path.to_string()))
+}
+
+fn parse_hunk_header(line: &str) -> Result<DiffHunk, JjError> {
+    let rest = line.strip_prefix("@@ ").ok_or_else(|| JjError::UnparseableOutput(format!("bad hunk header {line:?}")))?;
+    let end = rest.find(" @@").ok_or_else(|| JjError::UnparseableOutput(format!("bad hunk header {line:?}")))?;
+    let mut parts = rest[..end].split(' ');
+    let old_part = parts.next().ok_or_else(|| JjError::UnparseableOutput(format!("bad hunk header {line:?}")))?;
+    let new_part = parts.next().ok_or_else(|| JjError::UnparseableOutput(format!("bad hunk header {line:?}")))?;
+    let (old_start, old_lines) = parse_hunk_range(old_part, '-')?;
+    let (new_start, new_lines) = parse_hunk_range(new_part, '+')?;
+    Ok(DiffHunk { old_start, old_lines, new_start, new_lines, segments: Vec::new() })
+}
+
+/// Parses one `-a,b` or `+c,d` hunk-header side; the `,count` is omitted by
+/// git-format diffs (and jj's) when `count == 1`.
+fn parse_hunk_range(part: &str, sign: char) -> Result<(u64, u64), JjError> {
+    let stripped = part.strip_prefix(sign).ok_or_else(|| JjError::UnparseableOutput(format!("bad hunk range {part:?}")))?;
+    let (start_str, count_str) = stripped.split_once(',').unwrap_or((stripped, "1"));
+    let start = start_str.parse::<u64>().map_err(|e| JjError::UnparseableOutput(format!("bad hunk start {start_str:?}: {e}")))?;
+    let count = count_str.parse::<u64>().map_err(|e| JjError::UnparseableOutput(format!("bad hunk count {count_str:?}: {e}")))?;
+    Ok((start, count))
+}
+
+/// `jj diff --git --from <from> --to <to>`, structured into
+/// [`DiffFileEntry`]s per `jj-integration.md`'s `workspace.diff`. `from`/`to`
+/// default to `"@-"`/`"@"` when `None`, matching the spec's documented
+/// defaults exactly (rather than relying on `jj diff`'s own no-flags default
+/// of `-r @`, which is only equivalent for a non-merge `@`).
+///
+/// # Errors
+///
+/// See [`JjError`]. [`JjError::CommandFailed`] here almost always means
+/// `from`/`to` didn't resolve to a revision — `rpc.rs` maps that to
+/// `invalid_argument`, not `internal`.
+pub async fn diff(workspace_root: &Path, from: Option<&str>, to: Option<&str>) -> Result<Vec<DiffFileEntry>, JjError> {
+    let from_rev = from.unwrap_or("@-");
+    let to_rev = to.unwrap_or("@");
+    let output = run(&["diff", "--git", "--from", from_rev, "--to", to_rev], Some(workspace_root)).await?;
+    let raw_entries = parse_git_diff(&output)?;
+
+    let mut entries = Vec::with_capacity(raw_entries.len());
+    for entry in raw_entries {
+        match entry {
+            RawDiffEntry::Hunks { old_path, new_path, hunks } => entries.push(DiffFileEntry::Hunks { old_path, new_path, hunks }),
+            RawDiffEntry::Binary { path, status } => {
+                // Size the side that actually has content: the "to" side for
+                // an add/modify, the "from" side for a delete (the "to" side
+                // doesn't exist there to `jj file show`).
+                let query_rev = if status == ChangeKind::Deleted { from_rev } else { to_rev };
+                let byte_size = run_byte_len(&["file", "show", "-r", query_rev, &path], Some(workspace_root)).await?;
+                entries.push(DiffFileEntry::Binary { path, status, byte_size });
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Per-commit JSON template for `jj log`, built from `jj help -k
+/// templates`'s documented `Commit`/`ChangeId`/`CommitId`/`Signature`
+/// keywords and verified against a real `jj 0.44.0` repo (including a real
+/// conflicted 2-parent merge commit, in this module's tests) rather than
+/// `json(self)` on the whole commit: the docs explicitly warn `json(self)`'s
+/// field set "isn't guaranteed" stable across `jj` releases, but every
+/// keyword named here individually is part of the documented, stable
+/// template API. JSON scaffolding uses jj's *single*-quoted string literals
+/// (no escape processing, so embedded `"` chars pass through literally) to
+/// avoid a wall of backslash-escaping; the trailing `"}\n"` needs a real
+/// `\n`, which only jj's double-quoted string syntax provides.
+const LOG_TEMPLATE: &str = r#"'{"change_id":' ++ json(change_id) ++ ',"commit_id":' ++ json(commit_id) ++ ',"description":' ++ json(description) ++ ',"author":' ++ json(stringify(author.name() ++ ' <' ++ author.email() ++ '>')) ++ ',"parent_change_ids":' ++ json(parents.map(|c| c.change_id())) ++ ',"is_working_copy":' ++ json(self.current_working_copy()) ++ ',"bookmarks":' ++ json(bookmarks.map(|b| b.name())) ++ "}\n""#;
+
+#[derive(serde::Deserialize)]
+struct LogTemplateRow {
+    change_id: String,
+    commit_id: String,
+    description: String,
+    author: String,
+    parent_change_ids: Vec<String>,
+    is_working_copy: bool,
+    bookmarks: Vec<String>,
+}
+
+/// `jj log -T <LOG_TEMPLATE> --no-graph [-r <revset>] -n <limit>`, per
+/// `jj-integration.md`'s `workspace.log`. `revset: None` omits `-r` entirely
+/// so `jj` applies its own default (`revsets.log`) rather than this module
+/// guessing an equivalent expression.
+///
+/// # Errors
+///
+/// See [`JjError`]. [`JjError::CommandFailed`] here almost always means
+/// `revset` failed to parse or resolve — `rpc.rs` maps that to
+/// `invalid_argument`, not `internal`.
+pub async fn log(workspace_root: &Path, revset: Option<&str>, limit: usize) -> Result<Vec<ChangeGraphNode>, JjError> {
+    let limit_str = limit.to_string();
+    let mut args = vec!["log", "--no-graph", "-T", LOG_TEMPLATE, "-n", &limit_str];
+    if let Some(revset) = revset {
+        args.push("-r");
+        args.push(revset);
+    }
+    let output = run(&args, Some(workspace_root)).await?;
+    parse_jsonl(&output, "jj log")?
+        .into_iter()
+        .map(|row: LogTemplateRow| {
+            Ok(ChangeGraphNode {
+                change_id: row.change_id,
+                commit_id: row.commit_id,
+                description: row.description,
+                author: row.author,
+                parent_change_ids: row.parent_change_ids,
+                is_working_copy: row.is_working_copy,
+                bookmarks: row.bookmarks,
+            })
+        })
+        .collect()
+}
+
+/// Per-operation JSON template for `jj operation log`, built the same way as
+/// [`LOG_TEMPLATE`] from `jj help -k templates`'s documented `Operation`
+/// keywords. `tags` (per `jj-integration.md`: "jj's own operation metadata
+/// (e.g. `user`, `hostname`)") is assembled in [`op_log`] below from
+/// `.user()` (verified to render as `"<username>@<hostname>"`, e.g.
+/// `"njr@devhost"`, including the empty-both-sides root operation rendering
+/// as `"@"`) split back into its two halves, plus `.workspace_name()`
+/// (verified to render as `"<name>@"` for a real workspace name, an
+/// idiomatic jj ref-symbol suffix stripped back off below, and `""` for an
+/// operation not tied to a workspace).
+const OP_LOG_TEMPLATE: &str = r#"'{"id":' ++ json(self.id()) ++ ',"description":' ++ json(self.description()) ++ ',"start":' ++ json(self.time().start()) ++ ',"end":' ++ json(self.time().end()) ++ ',"user":' ++ json(self.user()) ++ ',"workspace_name":' ++ json(self.workspace_name()) ++ "}\n""#;
+
+#[derive(serde::Deserialize)]
+struct OpLogTemplateRow {
+    id: String,
+    description: String,
+    start: String,
+    end: String,
+    user: String,
+    workspace_name: String,
+}
+
+fn op_log_row_to_entry(row: OpLogTemplateRow) -> OperationLogEntry {
+    let mut tags = BTreeMap::new();
+    if !row.user.is_empty() && row.user != "@" {
+        tags.insert("user".to_string(), row.user.clone());
+        if let Some((username, hostname)) = row.user.split_once('@') {
+            if !username.is_empty() {
+                tags.insert("username".to_string(), username.to_string());
+            }
+            if !hostname.is_empty() {
+                tags.insert("hostname".to_string(), hostname.to_string());
+            }
+        }
+    }
+    let workspace_name = row.workspace_name.strip_suffix('@').unwrap_or(&row.workspace_name);
+    if !workspace_name.is_empty() {
+        tags.insert("workspace_name".to_string(), workspace_name.to_string());
+    }
+    OperationLogEntry { op_id: row.id, description: row.description, start_time: row.start, end_time: row.end, tags }
+}
+
+/// `jj operation log -T <OP_LOG_TEMPLATE> --no-graph -n <limit>`, per
+/// `jj-integration.md`'s `workspace.op.log`. Most-recent-first is `jj
+/// operation log`'s own natural order (verified above) — no reordering
+/// needed.
+///
+/// # Errors
+///
+/// See [`JjError`].
+pub async fn op_log(workspace_root: &Path, limit: usize) -> Result<Vec<OperationLogEntry>, JjError> {
+    let limit_str = limit.to_string();
+    let args = ["operation", "log", "--no-graph", "-T", OP_LOG_TEMPLATE, "-n", &limit_str];
+    let output = run(&args, Some(workspace_root)).await?;
+    Ok(parse_jsonl(&output, "jj operation log")?.into_iter().map(op_log_row_to_entry).collect())
+}
+
+/// The current head of the operation log, per [`current_op_id`] — the
+/// building block [`op_undo`]/[`op_restore`] both use to learn the id of the
+/// *new* operation-log entry their respective mutation just created, per
+/// `jj-integration.md`: "Both MUST themselves produce a new operation-log
+/// entry" and the RPC response carries that new entry's id, never the id
+/// that was undone/restored to.
+async fn current_op_id(workspace_root: &Path) -> Result<String, JjError> {
+    let args = ["operation", "log", "--no-graph", "-T", OP_LOG_TEMPLATE, "-n", "1"];
+    let output = run(&args, Some(workspace_root)).await?;
+    let rows = parse_jsonl(&output, "jj operation log")?;
+    rows.into_iter()
+        .next()
+        .map(|row: OpLogTemplateRow| row.id)
+        .ok_or_else(|| JjError::UnparseableOutput("jj operation log returned no entries".to_string()))
+}
+
+/// `jj operation revert <op_id>`, per `jj-integration.md`'s `workspace.op.undo
+/// { workspace_id, op_id }`: "reverses the effect of a single named
+/// operation" — see this section's module-level note on why `revert`, not
+/// the top-level `jj undo` (which only ever targets "the most recent
+/// operation", not an arbitrary named one). Returns the id of the new
+/// operation-log entry the revert itself created.
+///
+/// # Errors
+///
+/// See [`JjError`]. [`JjError::CommandFailed`] here almost always means
+/// `op_id` didn't resolve to a real operation — `rpc.rs` maps that to
+/// `not_found`, not `internal`.
+pub async fn op_undo(workspace_root: &Path, op_id: &str) -> Result<String, JjError> {
+    run(&["operation", "revert", op_id], Some(workspace_root)).await?;
+    current_op_id(workspace_root).await
+}
+
+/// `jj operation restore <op_id>`, per `jj-integration.md`'s
+/// `workspace.op.restore { workspace_id, op_id }`. Returns the id of the new
+/// operation-log entry the restore itself created (never `op_id` itself).
+///
+/// # Errors
+///
+/// See [`JjError`]. [`JjError::CommandFailed`] here almost always means
+/// `op_id` didn't resolve to a real operation — `rpc.rs` maps that to
+/// `not_found`, not `internal`.
+pub async fn op_restore(workspace_root: &Path, op_id: &str) -> Result<String, JjError> {
+    run(&["operation", "restore", op_id], Some(workspace_root)).await?;
+    current_op_id(workspace_root).await
+}
+
+/// Parses one JSON object per line (the shape every template in this
+/// section produces, each line self-contained because `json()` escapes any
+/// embedded newlines) into a `Vec<T>`.
+fn parse_jsonl<T: serde::de::DeserializeOwned>(text: &str, context: &str) -> Result<Vec<T>, JjError> {
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).map_err(|e| JjError::UnparseableOutput(format!("{context}: {e} in {line:?}"))))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +787,270 @@ mod tests {
         let dest = dir.path().join("fresh-clone-dest");
         let resolved = canonicalize_prospective(&dest).unwrap();
         assert_eq!(resolved, dir.path().canonicalize().unwrap().join("fresh-clone-dest"));
+    }
+
+    #[test]
+    fn parses_hunk_headers_with_and_without_an_explicit_count() {
+        let with_count = parse_hunk_header("@@ -1,5 +1,6 @@").unwrap();
+        assert_eq!(with_count, DiffHunk { old_start: 1, old_lines: 5, new_start: 1, new_lines: 6, segments: Vec::new() });
+
+        let without_count = parse_hunk_header("@@ -1 +0,0 @@").unwrap();
+        assert_eq!(without_count, DiffHunk { old_start: 1, old_lines: 1, new_start: 0, new_lines: 0, segments: Vec::new() });
+    }
+
+    #[test]
+    fn parses_a_real_git_format_modify_add_delete_and_pure_rename_shape() {
+        // Verified verbatim (line-for-line) against real `jj 0.44.0 diff
+        // --git` output for exactly this scenario: a modified file, a new
+        // file, a deleted file, and a pure rename (renamed.txt has the same
+        // content jj had for old.txt, so jj pairs them into one rename
+        // entry rather than a delete+add).
+        let text = "diff --git a/mod.txt b/mod.txt\nindex b3c5a95f92..e456bee908 100644\n--- a/mod.txt\n+++ b/mod.txt\n@@ -1,2 +1,2 @@\n line1\n-line2\n+line-two-changed\ndiff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000000..017a0c8e4d\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,1 @@\n+brand new\ndiff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex ce01362503..0000000000\n--- a/old.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-hello\ndiff --git a/src.txt b/renamed.txt\nrename from src.txt\nrename to renamed.txt\n";
+        let entries = parse_git_diff(text).unwrap();
+        assert_eq!(entries.len(), 4);
+
+        assert_eq!(
+            entries[0],
+            RawDiffEntry::Hunks {
+                old_path: Some("mod.txt".to_string()),
+                new_path: Some("mod.txt".to_string()),
+                hunks: vec![DiffHunk {
+                    old_start: 1,
+                    old_lines: 2,
+                    new_start: 1,
+                    new_lines: 2,
+                    segments: vec![
+                        DiffSegment { kind: DiffSegmentKind::Context, text: "line1".to_string() },
+                        DiffSegment { kind: DiffSegmentKind::Removed, text: "line2".to_string() },
+                        DiffSegment { kind: DiffSegmentKind::Added, text: "line-two-changed".to_string() },
+                    ],
+                }],
+            }
+        );
+        assert_eq!(
+            entries[1],
+            RawDiffEntry::Hunks {
+                old_path: None,
+                new_path: Some("new.txt".to_string()),
+                hunks: vec![DiffHunk {
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 1,
+                    new_lines: 1,
+                    segments: vec![DiffSegment { kind: DiffSegmentKind::Added, text: "brand new".to_string() }],
+                }],
+            }
+        );
+        assert_eq!(
+            entries[2],
+            RawDiffEntry::Hunks {
+                old_path: Some("old.txt".to_string()),
+                new_path: None,
+                hunks: vec![DiffHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 0,
+                    new_lines: 0,
+                    segments: vec![DiffSegment { kind: DiffSegmentKind::Removed, text: "hello".to_string() }],
+                }],
+            }
+        );
+        assert_eq!(
+            entries[3],
+            RawDiffEntry::Hunks { old_path: Some("src.txt".to_string()), new_path: Some("renamed.txt".to_string()), hunks: vec![] }
+        );
+    }
+
+    #[test]
+    fn parses_real_binary_add_modify_and_delete_marker_lines() {
+        // Verified verbatim against real `jj 0.44.0 diff --git` output.
+        let added = "diff --git a/bin.bin b/bin.bin\nnew file mode 100644\nindex 0000000000..3007cf9e85\nBinary files /dev/null and b/bin.bin differ\n";
+        assert_eq!(parse_git_diff(added).unwrap(), vec![RawDiffEntry::Binary { path: "bin.bin".to_string(), status: ChangeKind::Added }]);
+
+        let modified = "diff --git a/bin.bin b/bin.bin\nindex b27a3f0330..169ef48eb1 100644\nBinary files a/bin.bin and b/bin.bin differ\n";
+        assert_eq!(
+            parse_git_diff(modified).unwrap(),
+            vec![RawDiffEntry::Binary { path: "bin.bin".to_string(), status: ChangeKind::Modified }]
+        );
+
+        let deleted = "diff --git a/bin.bin b/bin.bin\ndeleted file mode 100644\nindex 3007cf9e85..0000000000\nBinary files a/bin.bin and /dev/null differ\n";
+        assert_eq!(
+            parse_git_diff(deleted).unwrap(),
+            vec![RawDiffEntry::Binary { path: "bin.bin".to_string(), status: ChangeKind::Deleted }]
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_reports_modify_add_delete_rename_and_binary_against_a_real_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        ensure_colocated(dir.path()).await.unwrap();
+
+        // Establish a real `@-` baseline that includes `rename_source.txt`,
+        // so the rename below has a real prior path (with matching content)
+        // to pair against — a rename can only be detected between two
+        // revisions, never within a single working-copy snapshot.
+        std::fs::write(dir.path().join("rename_source.txt"), "unchanged content\n").unwrap();
+        std::fs::write(dir.path().join("mod.txt"), "before\n").unwrap();
+        run(&["new"], Some(dir.path())).await.unwrap();
+
+        std::fs::rename(dir.path().join("rename_source.txt"), dir.path().join("rename_target.txt")).unwrap();
+        std::fs::write(dir.path().join("mod.txt"), "after\n").unwrap();
+        std::fs::write(dir.path().join("added.txt"), "new content\n").unwrap();
+        std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+        // Bytes that cycle through 0x00..0x04 so a null byte is always
+        // present — the same heuristic real `git`/`jj` use to decide a file
+        // is binary, verified above against the real jj binary.
+        std::fs::write(dir.path().join("binary.bin"), [0u8, 1, 2, 3, 4].repeat(40)).unwrap();
+
+        let entries = diff(dir.path(), None, None).await.unwrap();
+
+        assert!(
+            entries.iter().any(
+                |e| matches!(e, DiffFileEntry::Hunks { old_path: Some(o), new_path: Some(n), .. } if o == "mod.txt" && n == "mod.txt")
+            ),
+            "expected a modify entry for mod.txt, got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(e, DiffFileEntry::Hunks { old_path: None, new_path: Some(n), .. } if n == "added.txt")),
+            "expected an add entry for added.txt, got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(e, DiffFileEntry::Hunks { old_path: Some(o), new_path: None, .. } if o == "a.txt")),
+            "expected a delete entry for a.txt, got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(e,
+                DiffFileEntry::Hunks { old_path: Some(o), new_path: Some(n), hunks }
+                    if o == "rename_source.txt" && n == "rename_target.txt" && hunks.is_empty()
+            )),
+            "expected a pure-rename entry with no hunks, got {entries:?}"
+        );
+        let binary_entry = entries
+            .iter()
+            .find(|e| matches!(e, DiffFileEntry::Binary { path, .. } if path == "binary.bin"))
+            .unwrap_or_else(|| panic!("expected a binary entry for binary.bin, got {entries:?}"));
+        assert_eq!(binary_entry, &DiffFileEntry::Binary { path: "binary.bin".to_string(), status: ChangeKind::Added, byte_size: 200 });
+    }
+
+    #[tokio::test]
+    async fn log_reports_the_default_revset_and_an_explicit_revset() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        ensure_colocated(dir.path()).await.unwrap();
+
+        let default_nodes = log(dir.path(), None, 20).await.unwrap();
+        assert!(default_nodes.iter().any(|n| n.is_working_copy), "default revset should include the working copy");
+        assert!(default_nodes.iter().any(|n| n.description.starts_with("init")), "default revset should include the git-imported init commit");
+
+        let working_copy_only = log(dir.path(), Some("@"), 20).await.unwrap();
+        assert_eq!(working_copy_only.len(), 1);
+        assert!(working_copy_only[0].is_working_copy);
+        assert!(working_copy_only[0].parent_change_ids.len() == 1, "the fresh working copy has exactly one parent");
+    }
+
+    #[tokio::test]
+    async fn log_rejects_a_bad_revset_with_a_command_failed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        ensure_colocated(dir.path()).await.unwrap();
+
+        let result = log(dir.path(), Some("this is not a valid revset((("), 20).await;
+        assert!(matches!(result, Err(JjError::CommandFailed { .. })), "expected CommandFailed, got {result:?}");
+    }
+
+    /// Exercises M3's exit criterion directly: "the change graph reflects
+    /// concurrent edits from two `jj workspace`s against the same repo
+    /// correctly, including a conflicted merge" — two real `jj workspace
+    /// add` working copies edit the same file differently, then get merged
+    /// into a genuinely conflicted commit, and both `log` and `diff` are
+    /// asserted not to crash or garble the result.
+    #[tokio::test]
+    async fn log_and_diff_handle_a_real_conflicted_merge_from_two_workspaces() {
+        let parent_dir = tempfile::tempdir().unwrap();
+        init_git_repo(parent_dir.path());
+        ensure_colocated(parent_dir.path()).await.unwrap();
+
+        let a_dest = parent_dir.path().parent().unwrap().join(format!("wsa-{}", uuid::Uuid::new_v4()));
+        let b_dest = parent_dir.path().parent().unwrap().join(format!("wsb-{}", uuid::Uuid::new_v4()));
+        workspace_add(parent_dir.path(), &a_dest, "workspace-a").await.unwrap();
+        workspace_add(parent_dir.path(), &b_dest, "workspace-b").await.unwrap();
+
+        std::fs::write(a_dest.join("a.txt"), "hello\nfrom A\n").unwrap();
+        run(&["describe", "-m", "edit from A"], Some(&a_dest)).await.unwrap();
+        std::fs::write(b_dest.join("a.txt"), "hello\nfrom B\n").unwrap();
+        run(&["describe", "-m", "edit from B"], Some(&b_dest)).await.unwrap();
+
+        let a_change_id = log(&a_dest, Some("@"), 1).await.unwrap()[0].change_id.clone();
+        let b_change_id = log(&b_dest, Some("@"), 1).await.unwrap()[0].change_id.clone();
+
+        run(&["new", &a_change_id, &b_change_id, "-m", "merge A and B"], Some(&a_dest)).await.unwrap();
+
+        // The change graph must show the merge as a real 2-parent node —
+        // this is the "concurrent edits ... reflected correctly" half of
+        // the exit criterion.
+        let nodes = log(&a_dest, None, 20).await.unwrap();
+        let merge_node = nodes.iter().find(|n| n.is_working_copy).expect("merge commit should be the working copy");
+        assert_eq!(merge_node.parent_change_ids.len(), 2, "merge should have both A's and B's edits as parents");
+        assert!(merge_node.parent_change_ids.contains(&a_change_id));
+        assert!(merge_node.parent_change_ids.contains(&b_change_id));
+
+        // The diff from either parent to the conflicted merge must parse
+        // cleanly (jj renders the conflict as valid unified-diff content,
+        // materializing its own conflict markers as ordinary +/- lines —
+        // this must not crash or be treated as garbled/binary).
+        let diff_from_a = diff(&a_dest, Some(&a_change_id), None).await.unwrap();
+        let conflicted_file = diff_from_a
+            .iter()
+            .find(|e| matches!(e, DiffFileEntry::Hunks { new_path: Some(p), .. } if p == "a.txt"))
+            .unwrap_or_else(|| panic!("expected a hunked (not binary/garbled) entry for a.txt, got {diff_from_a:?}"));
+        let DiffFileEntry::Hunks { hunks, .. } = conflicted_file else { unreachable!() };
+        let all_text: String = hunks.iter().flat_map(|h| h.segments.iter()).map(|s| s.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(all_text.contains("from A"));
+        assert!(all_text.contains("from B"));
+        assert!(all_text.contains("conflict"), "jj's own conflict marker text should be present as ordinary diff content");
+
+        std::fs::remove_dir_all(&a_dest).ok();
+        std::fs::remove_dir_all(&b_dest).ok();
+    }
+
+    #[tokio::test]
+    async fn op_log_op_undo_and_op_restore_round_trip_against_a_real_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        ensure_colocated(dir.path()).await.unwrap();
+
+        // `describe` has a lasting effect independent of on-disk file
+        // content, unlike a plain file edit (which the next `jj` invocation
+        // would just re-snapshot) — a clean target to undo/restore against.
+        run(&["describe", "-m", "first message"], Some(dir.path())).await.unwrap();
+        let described_op_id = op_log(dir.path(), 1).await.unwrap()[0].op_id.clone();
+        let described_node = log(dir.path(), Some("@"), 1).await.unwrap().remove(0);
+        assert_eq!(described_node.description, "first message\n");
+
+        let operations_before = op_log(dir.path(), 50).await.unwrap();
+        assert!(!operations_before.is_empty());
+        assert!(operations_before[0].tags.contains_key("hostname") || operations_before[0].tags.contains_key("user"));
+
+        let undo_new_op_id = op_undo(dir.path(), &described_op_id).await.unwrap();
+        assert_ne!(undo_new_op_id, described_op_id, "op.undo must return the id of the NEW operation-log entry it created");
+        let after_undo = log(dir.path(), Some("@"), 1).await.unwrap().remove(0);
+        assert_ne!(after_undo.description, "first message\n", "undo should have reverted the description change");
+
+        let restore_new_op_id = op_restore(dir.path(), &described_op_id).await.unwrap();
+        assert_ne!(restore_new_op_id, described_op_id, "op.restore must return the id of the NEW operation-log entry it created");
+        assert_ne!(restore_new_op_id, undo_new_op_id);
+        let after_restore = log(dir.path(), Some("@"), 1).await.unwrap().remove(0);
+        assert_eq!(after_restore.description, "first message\n", "restore should have brought the description change back");
+    }
+
+    #[tokio::test]
+    async fn op_undo_of_a_nonexistent_op_id_fails_with_command_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        ensure_colocated(dir.path()).await.unwrap();
+
+        let result = op_undo(dir.path(), "deadbeef1234").await;
+        assert!(matches!(result, Err(JjError::CommandFailed { .. })), "expected CommandFailed, got {result:?}");
     }
 }

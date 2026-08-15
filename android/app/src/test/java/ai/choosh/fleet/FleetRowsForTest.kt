@@ -187,7 +187,7 @@ class FleetRowsForTest {
 
         val event = FleetViewModel(FakeChooshEngine()).onProjectTapped(project)
 
-        assertEquals(FleetNavigationEvent.OpenWorkspace("ws-second"), event)
+        assertEquals(FleetNavigationEvent.OpenWorkspace("ws-second", "dev-a"), event)
     }
 
     @Test
@@ -201,6 +201,6 @@ class FleetRowsForTest {
     fun `tapping a workspace opens that workspace`() {
         val ws = workspace("ws-x", "x", "dev-a", lastActiveAt = "2026-08-14T10:00:00Z")
         val event = FleetViewModel(FakeChooshEngine()).onWorkspaceTapped(ws)
-        assertEquals(FleetNavigationEvent.OpenWorkspace("ws-x"), event)
+        assertEquals(FleetNavigationEvent.OpenWorkspace("ws-x", "dev-a"), event)
     }
 }
