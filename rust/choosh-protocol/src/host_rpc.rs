@@ -70,12 +70,10 @@ pub enum RpcRequest {
     },
     /// `host-rpc.md`'s fixed item-type set is `AgentTerminal`, `Shell`,
     /// `JjChangeGraph`, `JjDiff`, `SourceEditor`, `MarkdownPreview`,
-    /// `WebService`, `EditorPresence` — only `AgentTerminal` and `Shell`
-    /// correspond to an actual Zellij tab with a live process and an
-    /// `item.create` call of their own; the rest are client-side
-    /// projections over other RPCs/events, per `host-rpc.md`. `WebService`
-    /// registration is real here but its tunnel-serving is a later
-    /// milestone (`service-tunnels.md`).
+    /// `WebService`, `EditorPresence` — only `AgentTerminal`, `Shell`, and
+    /// `WebService` correspond to an actual Zellij tab with a live process
+    /// and an `item.create` call of their own; the rest are client-side
+    /// projections over other RPCs/events, per `host-rpc.md`.
     ItemCreate {
         request_id: String,
         workspace_id: String,

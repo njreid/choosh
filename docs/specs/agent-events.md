@@ -56,8 +56,10 @@ claim.
 
 ### `files_changed`
 
-Contains root-relative candidate paths and optional operation hints. Paths
-are untrusted hints: `choosh-hostd` canonicalizes them under the workspace
+Contains root-relative candidate paths (`WireAgentEvent::FilesChanged`'s
+only field beyond `workspace_id`/`item_id` is `paths: Vec<String>` — no
+separate operation-hint field exists on the wire). Paths are untrusted
+hints: `choosh-hostd` canonicalizes them under the workspace
 root, and Android reconciles them against `workspace.status`
 ([jj-integration.md](jj-integration.md)) rather than trusting the agent's
 claim directly — jj replaces Git here, but the "hints, not authority"
@@ -102,18 +104,29 @@ else Zed's own protocol exchanges over the tunnel.
 Events are `agent-event` control frames on the Identity's relay connection
 (see [relay-protocol.md](relay-protocol.md) for frame shape) — there is no
 longer a host-side spool drained over an SSH-stdio RPC channel. Each event
-still receives a monotonically increasing sequence number per workspace and
-is retained in a bounded per-workspace spool inside `choosh-hostd`, exactly
-as before; only the transport carrying it to Android changed. Android
-subscribes to the relay's `agent-event` stream for a workspace starting
-after its last acknowledged sequence. If the requested sequence is older
-than the retained window, `choosh-hostd` returns `snapshot_required` and the
-client refreshes full workspace/item state via `host-rpc.md`'s
-`workspace.status`/`workspace.list` instead of replaying stale events.
+MUST receive a monotonically increasing sequence number per workspace and
+MUST be retained in a bounded per-workspace spool inside `choosh-hostd`.
+Android MUST subscribe to the relay's `agent-event` stream for a workspace
+starting after its last acknowledged sequence. If the requested sequence is
+older than the retained window, `choosh-hostd` MUST return
+`snapshot_required` and the client refreshes full workspace/item state via
+`host-rpc.md`'s `workspace.status`/`workspace.list` instead of replaying
+stale events.
 
 A reconnect after any gap — network loss, app backgrounding, or the relay
 connection itself cycling — MUST resume from the last acknowledged sequence
 or fall back to `snapshot_required`; it MUST NOT silently drop events.
+
+**Not yet implemented**: `choosh-hostd` currently forwards agent events
+through a single bounded, in-memory channel
+(`rust/choosh-hostd/src/serve.rs`'s `agent_event_tx`/`agent_event_rx`, a
+plain `tokio::sync::mpsc::channel(256)`) with no per-event sequence number,
+no per-workspace spool, no on-disk persistence across a `serve` restart,
+and no `snapshot_required` response anywhere in the wire types — the code's
+own comment at that channel's construction site calls this out explicitly
+as a real, documented gap versus the replay/sequence machinery described
+above. A reconnect today simply resumes the live event stream from
+whatever arrives next; it does not detect or fill a gap.
 
 ## Android notifications
 

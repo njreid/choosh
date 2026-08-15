@@ -62,13 +62,15 @@
 // non-test call site (`gateway_jni.rs`) is android-only.
 #![cfg_attr(not(any(test, target_os = "android")), allow(dead_code))]
 
-use crate::http_lite::{RequestHead, build_response, try_parse_head};
+use crate::http_lite::{RunningLoopbackGateway, build_response, cookie_token_matches, must_shutdown, random_token, read_head_with_cap};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 
@@ -123,19 +125,17 @@ impl Default for MarkdownGatewayCaps {
     }
 }
 
-pub struct RunningMarkdownGateway {
-    pub port: u16,
-    pub token: String,
-    shutdown_tx: watch::Sender<bool>,
-    accept_task: tokio::task::JoinHandle<()>,
-}
-
-impl RunningMarkdownGateway {
-    pub async fn stop(self) {
-        let _ = self.shutdown_tx.send(true);
-        let _ = self.accept_task.await;
-    }
-}
+/// Unlike [`crate::web_gateway::RunningGateway`], this gateway's
+/// `accept_loop` does not race each already-spawned per-connection
+/// `serve_connection` task against `stop()`'s shutdown signal — only
+/// deliberately so: every connection here is a single bounded
+/// request/response (`render_doc_response`/`serve_asset_response`, never a
+/// long-lived byte pump), so it finishes on its own in the time an RPC
+/// round trip takes, and `stop()`'s "the accept loop itself has ended"
+/// guarantee (inherited from [`RunningLoopbackGateway::stop`]) is enough:
+/// no new connection is accepted after `stop()` returns, and no in-flight
+/// one outlives it by more than one fetch.
+pub type RunningMarkdownGateway = RunningLoopbackGateway;
 
 /// Starts a Markdown gateway bound to one workspace document context: every
 /// `/doc`/`/asset` request this instance serves is implicitly scoped to
@@ -162,7 +162,7 @@ pub async fn start_markdown_gateway(
     let accept_token = token.clone();
     let accept_task = tokio::spawn(accept_loop(listener, doc_path, fetcher, accept_token, caps, semaphore, shutdown_rx));
 
-    Ok(RunningMarkdownGateway { port, token, shutdown_tx, accept_task })
+    Ok(RunningLoopbackGateway::new(port, token, shutdown_tx, accept_task))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -199,17 +199,6 @@ async fn accept_loop(
     }
 }
 
-async fn must_shutdown(rx: &mut watch::Receiver<bool>) {
-    loop {
-        if *rx.borrow() {
-            return;
-        }
-        if rx.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
 async fn serve_connection(
     mut stream: tokio::net::TcpStream,
     doc_path: String,
@@ -218,16 +207,23 @@ async fn serve_connection(
     caps: MarkdownGatewayCaps,
 ) {
     let mut buf = Vec::with_capacity(2048);
-    let Some(head) = read_head_with_cap(&mut stream, &mut buf, caps.max_header_bytes, caps.idle_timeout).await else {
-        let _ = stream.write_all(&build_response(431, "Request Header Fields Too Large", &[], b"")).await;
-        return;
+    let head = match read_head_with_cap(&mut stream, &mut buf, caps.max_header_bytes, caps.idle_timeout).await {
+        Ok(Some(head)) => head,
+        // Oversized: this specific reason genuinely is "your headers were
+        // too large", so (unlike the `Err` arm below) a 431 is accurate
+        // here.
+        Ok(None) => {
+            let _ = stream.write_all(&build_response(431, "Request Header Fields Too Large", &[], b"")).await;
+            return;
+        }
+        // A malformed head, an idle timeout, or the client closing before a
+        // full head arrived are not "headers too large" — matching
+        // `web_gateway::serve_connection`'s identical distinction, this
+        // just closes rather than sending a misleading 431.
+        Err(_) => return,
     };
 
-    let cookie_ok = head
-        .header("cookie")
-        .map(crate::http_lite::parse_cookie_header)
-        .is_some_and(|pairs| pairs.iter().any(|(name, value)| name == TOKEN_COOKIE_NAME && value == &token));
-    if !cookie_ok {
+    if !cookie_token_matches(&head, TOKEN_COOKIE_NAME, &token) {
         let _ = stream.write_all(&build_response(403, "Forbidden", &[], b"")).await;
         return;
     }
@@ -239,32 +235,6 @@ async fn serve_connection(
         _ => build_response(404, "Not Found", &[], b"not found"),
     };
     let _ = stream.write_all(&response).await;
-}
-
-async fn read_head_with_cap(
-    stream: &mut tokio::net::TcpStream,
-    buf: &mut Vec<u8>,
-    max_header_bytes: usize,
-    idle_timeout: Duration,
-) -> Option<RequestHead> {
-    let mut chunk = [0_u8; 2048];
-    loop {
-        // See web_gateway::read_head_with_cap's identical ordering note:
-        // the cap must be checked before parsing, not after, so a head
-        // that arrives oversized-but-complete in a single read is still
-        // rejected.
-        if buf.len() > max_header_bytes {
-            return None;
-        }
-        if let Ok(Some(head)) = try_parse_head(buf) {
-            return Some(head);
-        }
-        let Ok(Ok(read)) = tokio::time::timeout(idle_timeout, stream.read(&mut chunk)).await else { return None };
-        if read == 0 {
-            return None;
-        }
-        buf.extend_from_slice(&chunk[..read]);
-    }
 }
 
 async fn render_doc_response(doc_path: &str, fetcher: &FileFetcher) -> Vec<u8> {
@@ -431,15 +401,6 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn random_token() -> String {
-    use std::io::Read;
-    let mut bytes = [0_u8; 32];
-    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-        let _ = file.read_exact(&mut bytes);
-    }
-    crate::http_lite::hex_encode(&bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,6 +424,33 @@ mod tests {
         })
     }
 
+    /// Like `fixed_fetcher`, but also records every path `fetcher` was
+    /// actually invoked with, so a test can assert a fetch never happened
+    /// at all — not just that the HTTP response was a 403.
+    fn recording_fetcher(
+        files: std::collections::HashMap<String, Vec<u8>>,
+    ) -> (FileFetcher, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fetcher: FileFetcher = Arc::new(move |path: String, range: Option<(u64, u64)>| {
+            let files = files.clone();
+            let tx = tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(path.clone());
+                let Some(content) = files.get(&path) else { return Err(FetchError::NotFound) };
+                let total_size = content.len() as u64;
+                match range {
+                    Some((offset, length)) => {
+                        let start = usize::try_from(offset.min(total_size)).unwrap_or(usize::MAX);
+                        let end = usize::try_from((offset + length).min(total_size)).unwrap_or(usize::MAX);
+                        Ok(FetchedFile { content: content[start..end].to_vec(), total_size })
+                    }
+                    None => Ok(FetchedFile { content: content.clone(), total_size }),
+                }
+            })
+        });
+        (fetcher, rx)
+    }
+
     async fn connect_and_send(port: u16, request: &[u8]) -> Vec<u8> {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         stream.write_all(request).await.unwrap();
@@ -479,6 +467,27 @@ mod tests {
             start_markdown_gateway("README.md".to_string(), fixed_fetcher(files), MarkdownGatewayCaps::default()).await.unwrap();
         let response = connect_and_send(gateway.port, b"GET /doc HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403"));
+        gateway.stop().await;
+    }
+
+    /// Same ordering guarantee `web_gateway`'s
+    /// `request_without_the_cookie_gets_403_and_never_opens_an_upstream`
+    /// proves for its own upstream-open: a missing/wrong cookie must reject
+    /// with 403 *before* this gateway's own equivalent of "reach past the
+    /// loopback boundary" — here, calling `fetcher` at all (an RPC round
+    /// trip to `hostd`, per this module's doc comment) — ever happens.
+    #[tokio::test]
+    async fn doc_request_without_the_cookie_never_calls_the_fetcher() {
+        let files = std::collections::HashMap::from([("README.md".to_string(), b"# hi".to_vec())]);
+        let (fetcher, mut fetch_calls) = recording_fetcher(files);
+        let gateway = start_markdown_gateway("README.md".to_string(), fetcher, MarkdownGatewayCaps::default()).await.unwrap();
+
+        let response = connect_and_send(gateway.port, b"GET /doc HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), fetch_calls.recv()).await.is_err(),
+            "the fetcher was called despite the missing cookie"
+        );
         gateway.stop().await;
     }
 

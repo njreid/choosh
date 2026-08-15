@@ -804,6 +804,61 @@ mod tests {
         );
     }
 
+    /// A distinct failure mode from `run_monitor_gives_up_after_one_rollback_attempt_instead_of_looping_forever`
+    /// above: there, the rollback `rename()` itself *succeeds* but the
+    /// rolled-back binary still never passes its own health check. Here,
+    /// `.previous` is deliberately never written at all, so the rollback
+    /// `rename()` call fails outright (a real `ENOENT`) — this must still
+    /// be recorded as a distinct, reported failure (with its own "rollback
+    /// rename also failed" reason, not conflated with an ordinary
+    /// health-check failure) rather than panicking or hanging, and must
+    /// leave `current` untouched since nothing was ever renamed onto it.
+    #[tokio::test]
+    async fn run_monitor_reports_a_distinct_failure_when_the_rollback_rename_itself_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("choosh-hostd");
+        let previous = dir.path().join("choosh-hostd.previous"); // never written
+        let socket = dir.path().join("emit.sock"); // never bound; health check must fail first
+        let state_path = dir.path().join("update_state.json");
+        std::fs::write(&current, b"broken-new-binary").unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            temp_env::async_with_vars(
+                [
+                    ("CHOOSH_HOSTD_UPDATE_HEALTH_WINDOW_MS", Some("100")),
+                    ("CHOOSH_HOSTD_UPDATE_POLL_MS", Some("20")),
+                    ("CHOOSH_HOSTD_UPDATE_SETTLE_MS", Some("10")),
+                    ("CHOOSH_HOSTD_SERVICE_UNIT", Some("choosh-hostd-unittest-does-not-exist.service")),
+                ],
+                run_monitor(previous.clone(), current.clone(), socket, state_path.clone(), "0.9.0".to_string()),
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok(), "run_monitor must return promptly rather than hang when the rollback rename itself fails");
+        assert!(!previous.exists(), "previous was never created in this test");
+        assert_eq!(std::fs::read(&current).unwrap(), b"broken-new-binary", "a failed rename must leave current completely untouched");
+
+        let state = load_state(&state_path);
+        let report = state.pending_failure.expect("a failure must still be recorded even when the rollback rename itself fails");
+        assert!(
+            report.reason.contains("rollback rename also failed"),
+            "expected the distinct rename-failure reason, got: {}",
+            report.reason
+        );
+
+        let event = take_pending_failure_event(&state_path).expect("the failure must still be reported upstream via the normal channel");
+        assert_eq!(
+            event,
+            WireAgentEvent::AgentStatus {
+                workspace_id: SELF_UPDATE_WORKSPACE_ID.to_string(),
+                item_id: SELF_UPDATE_ITEM_ID.to_string(),
+                status: WireAgentStatus::Failed,
+            }
+        );
+    }
+
     #[test]
     fn state_round_trips_through_disk_and_missing_file_loads_as_default() {
         let dir = tempfile::tempdir().unwrap();

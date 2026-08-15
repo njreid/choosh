@@ -15,7 +15,8 @@ sufficient.
   cross-wiring (Identity A reaching a tunnel meant for Identity B), and
   `relayd` availability/DoS — each with a documented mitigation or an
   explicitly accepted risk. This is additive to, not a replacement for, the
-  existing path/redaction/command-construction threat model.
+  existing path/redaction/command-construction threat model. Result:
+  [`docs/security/relayd-threat-model.md`](../security/relayd-threat-model.md).
 - **`choosh-hostd` self-update.** `relayd`-pushed `UPDATE_BINARY` control
   frame; atomic download-verify-`chmod`-`rename()` swap; re-exec or
   service-manager restart; rollback if the new binary fails its socket
@@ -36,7 +37,8 @@ sufficient.
 - **Device and accessibility testing.** Screen-reader/TalkBack pass over
   the Explorer and pinned-item navigation, hardware-keyboard and DeX/
   external-display behavior, tablet layout, and a low-memory device
-  profile under sustained terminal output.
+  profile under sustained terminal output. Result:
+  [`docs/accessibility-device-report.md`](../accessibility-device-report.md).
 
 ## Exit criteria
 
@@ -44,7 +46,8 @@ sufficient.
   impersonating a devhost, replaying an enrollment token, a compromised
   laptop-proxy credential, cross-tunnel leakage, relay downtime — with a
   documented mitigation or an accepted risk for each; none are left as
-  unstated assumptions.
+  unstated assumptions. Written up in
+  [docs/security/relayd-threat-model.md](../security/relayd-threat-model.md).
 - A `choosh-hostd` self-update on a live devhost with an attached agent
   session completes with no dropped Zellij session and a clean rollback
   when the pushed binary is deliberately broken in a test.
@@ -57,4 +60,5 @@ sufficient.
   reviewed as a release gate — not deferred past the release they gate.
 - The accessibility and device-profile pass has a written result (pass,
   or a named gap with a tracked follow-up) rather than an implied "looks
-  fine."
+  fine." Written up in
+  [docs/accessibility-device-report.md](../accessibility-device-report.md).

@@ -308,19 +308,7 @@ struct TabInfo {
 ///
 /// Returns [`ZellijError::Spawn`] if `zellij` can't be spawned.
 pub async fn focus_tab(session_name: &str, tab_name: &str) -> Result<(), ZellijError> {
-    let _guard = ZELLIJ_CLIENT_LOCK.lock().await;
-    let child = Command::new("zellij")
-        .env("ZELLIJ_SESSION_NAME", session_name)
-        .arg("action")
-        .arg("go-to-tab-name")
-        .arg(tab_name)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(ZellijError::Spawn)?;
-    wait_bounded(child).await;
-    Ok(())
+    run_zellij_client(&["action", "go-to-tab-name", tab_name], Some(session_name)).await
 }
 
 /// Closes the tab named `tab_name` in `session_name`. Looks up the tab's
@@ -352,20 +340,8 @@ pub async fn close_tab(session_name: &str, tab_name: &str) -> Result<(), ZellijE
         return Ok(());
     };
 
-    let _guard = ZELLIJ_CLIENT_LOCK.lock().await;
-    let child = Command::new("zellij")
-        .env("ZELLIJ_SESSION_NAME", session_name)
-        .arg("action")
-        .arg("close-tab")
-        .arg("--tab-id")
-        .arg(tab.tab_id.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(ZellijError::Spawn)?;
-    wait_bounded(child).await;
-    Ok(())
+    let tab_id = tab.tab_id.to_string();
+    run_zellij_client(&["action", "close-tab", "--tab-id", &tab_id], Some(session_name)).await
 }
 
 /// Session names from `zellij list-sessions --no-formatting`, one per
@@ -409,26 +385,38 @@ pub async fn kill_session(session_name: &str) -> Result<(), ZellijError> {
     // Same hang risk `create_session` documents (pipe inheritance, and the
     // client process itself sometimes never exiting) — same bounded-wait
     // fix, plus the same serialization against every other `zellij` client
-    // invocation this process makes (see `ZELLIJ_CLIENT_LOCK`).
+    // invocation this process makes (see `ZELLIJ_CLIENT_LOCK`, both via
+    // `run_zellij_client`).
+    run_zellij_client(&["kill-session", session_name], None).await?;
+    run_zellij_client(&["delete-session", session_name], None).await
+}
+
+/// Spawns `zellij <args>` with stdio silenced, guarded by
+/// [`ZELLIJ_CLIENT_LOCK`], and waits up to 5s for it to exit
+/// ([`wait_bounded`]) — the common "fire off a zellij client invocation and
+/// don't trust its own exit/hang behavior" shape [`focus_tab`],
+/// [`close_tab`], [`kill_session`], [`ensure_web_server_running`], and
+/// [`stop_web_server`] all need (see [`wait_bounded`]'s own doc comment for
+/// why a hung/killed client here is never itself a failure — the real
+/// success signal is always a separate poll). `session_name` sets
+/// `ZELLIJ_SESSION_NAME` when `Some`, the mechanism `zellij action`
+/// commands use to target a session (see [`new_tab`]'s doc comment).
+/// [`create_session`] and [`new_tab`] don't use this: they need
+/// `current_dir`/dynamic trailing argv this helper doesn't support, plus
+/// their own retry-until-confirmed loop around the spawn itself.
+///
+/// # Errors
+///
+/// Returns [`ZellijError::Spawn`] if `zellij` can't be spawned.
+async fn run_zellij_client(args: &[&str], session_name: Option<&str>) -> Result<(), ZellijError> {
     let _guard = ZELLIJ_CLIENT_LOCK.lock().await;
-    let kill = Command::new("zellij")
-        .arg("kill-session")
-        .arg(session_name)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(ZellijError::Spawn)?;
-    wait_bounded(kill).await;
-    let delete = Command::new("zellij")
-        .arg("delete-session")
-        .arg(session_name)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(ZellijError::Spawn)?;
-    wait_bounded(delete).await;
+    let mut command = Command::new("zellij");
+    if let Some(session_name) = session_name {
+        command.env("ZELLIJ_SESSION_NAME", session_name);
+    }
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let child = command.spawn().map_err(ZellijError::Spawn)?;
+    wait_bounded(child).await;
     Ok(())
 }
 
@@ -477,19 +465,7 @@ pub async fn ensure_web_server_running() -> Result<u16, ZellijError> {
         return Ok(ZELLIJ_WEB_DEFAULT_PORT);
     }
 
-    {
-        let _guard = ZELLIJ_CLIENT_LOCK.lock().await;
-        let child = Command::new("zellij")
-            .arg("web")
-            .arg("--start")
-            .arg("-d")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(ZellijError::Spawn)?;
-        wait_bounded(child).await;
-    }
+    run_zellij_client(&["web", "--start", "-d"], None).await?;
 
     for _ in 0..20 {
         if web_server_status_online().await? {
@@ -520,17 +496,7 @@ async fn web_server_status_online() -> Result<bool, ZellijError> {
 /// caller is a reasonable future addition, not part of this change's scope.
 #[allow(dead_code)]
 pub async fn stop_web_server() -> Result<(), ZellijError> {
-    let _guard = ZELLIJ_CLIENT_LOCK.lock().await;
-    let child = Command::new("zellij")
-        .arg("web")
-        .arg("--stop")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(ZellijError::Spawn)?;
-    wait_bounded(child).await;
-    Ok(())
+    run_zellij_client(&["web", "--stop"], None).await
 }
 
 #[cfg(test)]

@@ -1,9 +1,12 @@
-//! Dispatches `host-rpc.md`'s M1 request set against the registry, `jj`,
-//! Zellij, and root-confined filesystem layers. Deliberately a plain
-//! function over already-decoded request/response types — the
-//! tunnel/frame plumbing that gets bytes here lives in `serve.rs`, kept
-//! separate so this dispatch logic is testable without any WebSocket
-//! machinery, the same split `choosh-relayd`'s enroll handling uses.
+//! Dispatches every `RpcRequest` variant — `host-rpc.md`'s original
+//! registry/item RPCs (M1) plus the `workspace.diff`/`workspace.log`/
+//! `workspace.op.*` (M3) and `workspace.file.write` (M4) additions
+//! `jj-integration.md` describes — against the registry, `jj`, Zellij, and
+//! root-confined filesystem layers. Deliberately a plain function over
+//! already-decoded request/response types — the tunnel/frame plumbing that
+//! gets bytes here lives in `serve.rs`, kept separate so this dispatch
+//! logic is testable without any WebSocket machinery, the same split
+//! `choosh-relayd`'s enroll handling uses.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -129,7 +132,14 @@ async fn handle_create(
 
     let (root_path, project_id, project_name) = match outcome {
         Ok(value) => value,
-        Err(response) => return response,
+        // `create_root_workspace`/`create_agent_workspace` (and
+        // `confine_workspaces_dir`, which both call) build every `Err`
+        // response with an empty placeholder `request_id` — they have no
+        // way to know the real one at their own call sites deep inside a
+        // helper — so it MUST be filled in here before this reaches the
+        // caller, the same way every other early-return error path in this
+        // module (`lookup_root`'s callers, etc.) uses `with_request_id`.
+        Err(response) => return with_request_id(response, request_id),
     };
 
     // Project-pinned toolchains (toolchain-provisioning.md's first tier):
@@ -442,15 +452,17 @@ async fn handle_item_create(
         Vec::new()
     };
 
+    // For `AgentTerminal`, only validate `agent` here — the real argv needs
+    // this call's freshly reserved `item_id` (see the comment below), so
+    // building it twice (once with a throwaway placeholder ID, once for
+    // real) would just be wasted work with the exact same validation
+    // already done here.
     let initial_command: Vec<String> = match item_type {
         ItemType::AgentTerminal => {
-            let Some(agent) = agent else {
+            if agent.is_none() {
                 return error(request_id, "invalid_argument", "item_type AgentTerminal requires agent");
-            };
-            let Some(root_str) = root_path.to_str() else {
-                return error(request_id, "internal", "workspace root is not valid UTF-8");
-            };
-            agent_launch_argv(agent, workspace_id, "pending", root_str, &mise_env)
+            }
+            Vec::new()
         }
         ItemType::Shell => shell_launch_argv(&mise_env),
         ItemType::WebService => {
@@ -460,7 +472,7 @@ async fn handle_item_create(
             if command.is_empty() {
                 return error(request_id, "invalid_argument", "command must not be empty");
             }
-            wrap_command_with_mise_env(&mise_env, command)
+            prefix_with_mise_env(&mise_env, command)
         }
     };
     if item_type == ItemType::WebService && port.is_none() {
@@ -474,9 +486,8 @@ async fn handle_item_create(
     // the tab's own launch command needs to know its ID". Resolved by
     // reserving the ID first (it's only ever used as an opaque env var
     // value, never checked against the registry until after this call
-    // returns) and rebuilding the launch argv with the real ID before
-    // spawning — the throwaway "pending" placeholder above never reaches a
-    // real process.
+    // returns) and building the real launch argv with it here, the only
+    // place `AgentTerminal`'s `initial_command` is ever actually built.
     let initial_command = if item_type == ItemType::AgentTerminal {
         let Some(root_str) = root_path.to_str() else {
             return error(request_id, "internal", "workspace root is not valid UTF-8");
@@ -766,26 +777,25 @@ fn shell_launch_argv(mise_env: &[(String, String)]) -> Vec<String> {
         return Vec::new();
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut argv = vec!["env".to_string()];
-    argv.extend(mise_env.iter().map(|(key, value)| format!("{key}={value}")));
-    argv.push(shell);
-    argv
+    prefix_with_mise_env(mise_env, vec![shell])
 }
 
-/// `WebService` items' `command` is already a fixed, caller-supplied argv
-/// (`host-rpc.md`'s "Command construction") — this prepends `env
-/// KEY=VALUE ...` the same way `agent_launch.rs::agent_launch_argv` does,
-/// so `mise env` reaches the spawned dev-server process too. Returns
-/// `command` unchanged when `mise_env` is empty (no `mise.toml`), matching
-/// this item type's pre-project-pinned-toolchains behavior exactly.
-fn wrap_command_with_mise_env(mise_env: &[(String, String)], command: Vec<String>) -> Vec<String> {
+/// Prepends `env KEY=VALUE ...` in front of `argv`, the same convention
+/// `agent_launch.rs::agent_launch_argv` uses to inject `mise env` into a
+/// spawned process — shared by [`shell_launch_argv`] (its own resolved
+/// `$SHELL` argv) and `handle_item_create`'s `WebService` branch (the
+/// caller-supplied `command`, per `host-rpc.md`'s "Command construction").
+/// Returns `argv` unchanged when `mise_env` is empty (no `mise.toml`),
+/// matching both call sites' pre-project-pinned-toolchains behavior
+/// exactly.
+fn prefix_with_mise_env(mise_env: &[(String, String)], argv: Vec<String>) -> Vec<String> {
     if mise_env.is_empty() {
-        return command;
+        return argv;
     }
-    let mut argv = vec!["env".to_string()];
-    argv.extend(mise_env.iter().map(|(key, value)| format!("{key}={value}")));
-    argv.extend(command);
-    argv
+    let mut prefixed = vec!["env".to_string()];
+    prefixed.extend(mise_env.iter().map(|(key, value)| format!("{key}={value}")));
+    prefixed.extend(argv);
+    prefixed
 }
 
 fn jj_error_response(request_id: String, cause: &JjError) -> RpcResponse {
@@ -1448,6 +1458,309 @@ mod tests {
         );
 
         zellij_ops::kill_session(&name).await.ok();
+    }
+
+    /// `workspace.create`'s `existing_path` root-confinement rejection
+    /// (`confine_workspaces_dir`), driven all the way through `dispatch`
+    /// rather than unit-tested against `confine_workspaces_dir` directly —
+    /// this is also the regression test for a real bug found while
+    /// reviewing this function: every error `create_root_workspace`/
+    /// `create_agent_workspace`/`confine_workspaces_dir` returns is built
+    /// with an empty placeholder `request_id` (they have no way to know the
+    /// caller's real one), and `handle_create` used to return that response
+    /// as-is instead of filling the real `request_id` back in via
+    /// `with_request_id` — silently dropping it from every one of these
+    /// error responses. Asserted here alongside the `out_of_root` code
+    /// itself so a regression on either would fail this test.
+    #[tokio::test]
+    async fn workspace_create_rejects_an_existing_path_traversal_and_preserves_the_request_id() {
+        let (_dir, ctx) = ctx_with_tempdir();
+        let response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "the-real-request-id".to_string(),
+                devhost_id: "dev-1".to_string(),
+                workspace_name: "escapetest".to_string(),
+                project_source: ProjectSource::ExistingPath { existing_path: "../../../etc".to_string() },
+                parent_workspace_id: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&response, RpcResponse::Error { code, request_id, .. } if code == "out_of_root" && request_id == "the-real-request-id"),
+            "expected an out_of_root error carrying the caller's real request_id, got {response:?}"
+        );
+    }
+
+    /// `create_agent_workspace`'s own `not_found` path (an unregistered
+    /// `parent_workspace_id`) — a second, independent proof that these
+    /// helper-returned errors' `request_id` is preserved, this time through
+    /// the `parent_workspace_id`-set branch of `handle_create` rather than
+    /// `create_root_workspace`'s.
+    #[tokio::test]
+    async fn workspace_create_with_an_unregistered_parent_workspace_id_is_not_found() {
+        let (_dir, ctx) = ctx_with_tempdir();
+        let response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "r1".to_string(),
+                devhost_id: "dev-1".to_string(),
+                workspace_name: "agentws".to_string(),
+                project_source: ProjectSource::ExistingPath { existing_path: "agentws".to_string() },
+                parent_workspace_id: Some("ws-does-not-exist".to_string()),
+            },
+        )
+        .await;
+        assert!(
+            matches!(&response, RpcResponse::Error { code, request_id, .. } if code == "not_found" && request_id == "r1"),
+            "expected a not_found error carrying the caller's real request_id, got {response:?}"
+        );
+    }
+
+    /// `WorkspaceTreeList`/`WorkspaceFileRead`'s shared `reject_non_live_revision`
+    /// gate: a `revision` other than `None`/`Some("@")` must be
+    /// `invalid_argument`, never silently served against `@` instead.
+    #[tokio::test]
+    async fn tree_list_rejects_a_non_live_revision() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m1revision").await;
+        let response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceTreeList {
+                request_id: "r1".to_string(),
+                workspace_id,
+                path_prefix: String::new(),
+                revision: Some("abc123".to_string()),
+                cursor: None,
+            },
+        )
+        .await;
+        zellij_ops::kill_session(&name).await.ok();
+        assert!(
+            matches!(&response, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument for a non-live revision, got {response:?}"
+        );
+    }
+
+    /// `item.create`'s two workspace/name-shape error paths, neither of
+    /// which had direct dispatch-level coverage before this test: an
+    /// unregistered `workspace_id` is `not_found`, and a malformed `name`
+    /// is `invalid_argument` — both checked before anything about
+    /// `item_type` is even looked at.
+    #[tokio::test]
+    async fn item_create_rejects_an_unregistered_workspace_and_a_malformed_name() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m2itembasics").await;
+
+        let unknown_workspace = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r1".to_string(),
+                workspace_id: "ws-does-not-exist".to_string(),
+                item_type: ItemType::Shell,
+                name: "sh".to_string(),
+                agent: None,
+                command: None,
+                port: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&unknown_workspace, RpcResponse::Error { code, .. } if code == "not_found"),
+            "expected not_found for an unregistered workspace_id, got {unknown_workspace:?}"
+        );
+
+        let bad_name = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r2".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::Shell,
+                name: "not valid!".to_string(),
+                agent: None,
+                command: None,
+                port: None,
+            },
+        )
+        .await;
+
+        zellij_ops::kill_session(&name).await.ok();
+        assert!(
+            matches!(&bad_name, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument for a malformed item name, got {bad_name:?}"
+        );
+    }
+
+    /// `item.create`'s per-`item_type` required-field validations, none of
+    /// which had direct dispatch-level coverage before this test:
+    /// `AgentTerminal` needs `agent`; `WebService` needs a non-empty
+    /// `command` and a `port`. Each is `invalid_argument`, and none
+    /// registers a partial item along the way.
+    #[tokio::test]
+    async fn item_create_type_specific_required_fields_are_validated() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m2itemfields").await;
+
+        let missing_agent = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r1".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::AgentTerminal,
+                name: "agent1".to_string(),
+                agent: None,
+                command: None,
+                port: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&missing_agent, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument for AgentTerminal with no agent, got {missing_agent:?}"
+        );
+
+        let missing_command = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r2".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::WebService,
+                name: "web1".to_string(),
+                agent: None,
+                command: None,
+                port: Some(reserve_ephemeral_port()),
+            },
+        )
+        .await;
+        assert!(
+            matches!(&missing_command, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument for WebService with no command, got {missing_command:?}"
+        );
+
+        let empty_command = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r3".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::WebService,
+                name: "web2".to_string(),
+                agent: None,
+                command: Some(Vec::new()),
+                port: Some(reserve_ephemeral_port()),
+            },
+        )
+        .await;
+        assert!(
+            matches!(&empty_command, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument for WebService with an empty command, got {empty_command:?}"
+        );
+
+        let missing_port = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r4".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::WebService,
+                name: "web3".to_string(),
+                agent: None,
+                command: Some(vec!["cat".to_string()]),
+                port: None,
+            },
+        )
+        .await;
+
+        zellij_ops::kill_session(&name).await.ok();
+        assert!(
+            matches!(&missing_port, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument for WebService with no port, got {missing_port:?}"
+        );
+    }
+
+    /// `item.create`'s `conflict` path: a second `item.create` reusing an
+    /// already-registered `name` within the same workspace is rejected,
+    /// never silently adopted or overwritten.
+    #[tokio::test]
+    async fn item_create_duplicate_name_is_a_conflict() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m2itemdup").await;
+
+        let first = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r1".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::Shell,
+                name: "sh".to_string(),
+                agent: None,
+                command: None,
+                port: None,
+            },
+        )
+        .await;
+        assert!(matches!(first, RpcResponse::ItemCreateOk { .. }), "expected ItemCreateOk, got {first:?}");
+
+        let duplicate = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r2".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::Shell,
+                name: "sh".to_string(),
+                agent: None,
+                command: None,
+                port: None,
+            },
+        )
+        .await;
+
+        zellij_ops::kill_session(&name).await.ok();
+        assert!(
+            matches!(&duplicate, RpcResponse::Error { code, .. } if code == "conflict"),
+            "expected conflict for a duplicate item name, got {duplicate:?}"
+        );
+    }
+
+    /// `workspace.op.undo`/`workspace.op.restore`'s two shared caller-input
+    /// validations that `op_log_and_op_undo_restore_round_trip_through_dispatch`
+    /// doesn't already cover: an empty `op_id` is `invalid_argument` for
+    /// both RPCs (checked before either ever invokes `jj`), and
+    /// `workspace.op.restore` maps an `op_id` that doesn't resolve to
+    /// `not_found`, exactly like `workspace.op.undo` already does.
+    #[tokio::test]
+    async fn op_undo_and_op_restore_reject_empty_and_unresolvable_op_ids() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m3opids").await;
+
+        let empty_undo = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceOpUndo { request_id: "r1".to_string(), workspace_id: workspace_id.clone(), op_id: String::new() },
+        )
+        .await;
+        assert!(
+            matches!(&empty_undo, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument for an empty op_id, got {empty_undo:?}"
+        );
+
+        let empty_restore = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceOpRestore { request_id: "r2".to_string(), workspace_id: workspace_id.clone(), op_id: String::new() },
+        )
+        .await;
+        assert!(
+            matches!(&empty_restore, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument for an empty op_id, got {empty_restore:?}"
+        );
+
+        let unresolvable_restore = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceOpRestore {
+                request_id: "r3".to_string(),
+                workspace_id: workspace_id.clone(),
+                op_id: "deadbeef1234".to_string(),
+            },
+        )
+        .await;
+
+        zellij_ops::kill_session(&name).await.ok();
+        assert!(
+            matches!(&unresolvable_restore, RpcResponse::Error { code, .. } if code == "not_found"),
+            "expected not_found for an unresolvable op_id, got {unresolvable_restore:?}"
+        );
     }
 
     /// A free-but-unused ephemeral port: binds to port 0 to let the OS

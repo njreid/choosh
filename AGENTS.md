@@ -53,6 +53,19 @@ constraints that follow from it.
 - JSON Schemas use draft 2020-12.
 - Markdown links should be relative for repository-owned documents.
 - Protocol examples must conform to their schemas once fixture validation is available.
+- `scripts/build-android-rust.sh` (invoked by `android/app/build.gradle.kts`
+  via `commandLine`) runs `cargo build` without ever setting
+  `CARGO_TARGET_DIR` itself, so it inherits whatever value the shell that
+  launched Gradle happens to have — but it then looks for the built
+  `.so` at the hardcoded path `$root/target/$target/release/...` (Cargo's
+  *default* target dir), not wherever an inherited `CARGO_TARGET_DIR`
+  actually sent the build output. If your shell has `CARGO_TARGET_DIR` set
+  (e.g. for `just test`/`just clippy`/`just deploy`, which do set it), a
+  Gradle-triggered Android build silently builds to the wrong place and
+  then fails to find the library to copy into `jniLibs`. Unset
+  `CARGO_TARGET_DIR` (or otherwise ensure it's unset) in the shell/session
+  that runs `./gradlew`, distinct from the shell used for `just`/`cargo`
+  commands.
 - Running `:app:connectedDebugAndroidTest` against a Genymotion cloud Android
   device: `com.genymotion.tasklocker` (a protected system package that can't
   be `pm disable-user`'d) steals window focus back to the launcher within

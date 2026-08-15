@@ -77,7 +77,11 @@ reconnects, workspace registration, self-update — requires root.
   running registered service/build process, and MUST release it as soon as
   none of those conditions hold. This prevents macOS sleep from severing
   the outbound `relayd` connection mid-task without holding the assertion
-  needlessly while genuinely idle.
+  needlessly while genuinely idle. **Not yet implemented**: no
+  `IOPMAssertion*`/IOKit call, or any other power-assertion mechanism,
+  exists anywhere in `rust/choosh-hostd/src` or `scripts/install.sh` today
+  — this host was developed and verified on Linux; macOS sleep behavior is
+  untested and unmitigated.
 
 ## Self-update
 

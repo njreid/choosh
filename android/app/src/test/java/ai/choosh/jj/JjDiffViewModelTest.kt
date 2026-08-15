@@ -1,5 +1,6 @@
 package ai.choosh.jj
 
+import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.DiffFileEntry
 import ai.choosh.engine.FakeChooshEngine
 import ai.choosh.fleet.MainDispatcherRule
@@ -10,6 +11,12 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
+
+/** [ChooshEngine] wrapper that always fails `workspaceDiff`, delegating everything else to [FakeChooshEngine] — lets a test exercise [JjDiffViewModel.load]'s `onFailure` path without a real transport failure. */
+private class FailingWorkspaceDiffChooshEngine(private val delegate: ChooshEngine = FakeChooshEngine()) : ChooshEngine by delegate {
+    override suspend fun workspaceDiff(deviceId: String, workspaceId: String, from: String?, to: String?): List<DiffFileEntry> =
+        error("simulated workspace.diff failure")
+}
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class JjDiffViewModelTest {
@@ -46,5 +53,16 @@ class JjDiffViewModelTest {
 
         assertTrue(!viewModel.state.value.isLoading)
         assertEquals(null, viewModel.state.value.error)
+    }
+
+    @Test
+    fun `a workspace diff failure surfaces as an error state, not a crash`() = runTest(mainDispatcherRule.dispatcher) {
+        val viewModel = JjDiffViewModel(FailingWorkspaceDiffChooshEngine(), deviceId = "dev-1", workspaceId = "ws-1")
+        advanceUntilIdle()
+
+        val state = viewModel.state.value
+        assertTrue(!state.isLoading)
+        assertTrue(state.error?.contains("simulated workspace.diff failure") == true)
+        assertTrue("no stale diff data should be shown alongside an error", state.files.isEmpty())
     }
 }

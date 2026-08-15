@@ -8,9 +8,10 @@ find "$root/protocol" -type f -name '*.json' -print0 |
 
 for required in \
   "$root/README.md" \
-  "$root/CHOOSH_DESIGN_PLAN.md" \
+  "$root/DESIGN.md" \
+  "$root/PLAN.md" \
   "$root/docs/specs/README.md" \
-  "$root/docs/threat-model.md" \
+  "$root/docs/security/relayd-threat-model.md" \
   "$root/protocol/v1/envelope.schema.json"
 do
   test -s "$required"

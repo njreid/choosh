@@ -233,8 +233,13 @@ private fun PlaceholderScreen(title: String, subtitle: String, onBack: () -> Uni
     }
 }
 
-/** A minimal single-instance [ViewModelProvider.Factory] — no DI framework, per AGENTS.md. */
-private fun <T : ViewModel> singleInstanceFactory(build: () -> T): ViewModelProvider.Factory =
+/**
+ * A minimal single-instance [ViewModelProvider.Factory] — no DI framework, per AGENTS.md.
+ * `internal`, not `private`: [ai.choosh.workspace.WorkspaceScreen] needs this identical
+ * factory for its own per-tab ViewModels, so this is the one shared definition rather than
+ * two independently-forked copies.
+ */
+internal fun <T : ViewModel> singleInstanceFactory(build: () -> T): ViewModelProvider.Factory =
     object : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <VM : ViewModel> create(modelClass: Class<VM>): VM = build() as VM

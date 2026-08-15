@@ -2,9 +2,12 @@
 //!
 //! Mirrors `docs/specs/relay-protocol.md` and `docs/specs/auth-and-enrollment.md`
 //! exactly: frame classing, the connect-time challenge/credential handshake, and
-//! the M0 control-frame catalog (enrollment, presence). Shared by `choosh-relayd`
-//! and `choosh-hostd` so both sides serialize/deserialize identical Rust types
-//! rather than independently-drifting JSON shapes.
+//! the full control-frame/server-push catalog as it has grown milestone by
+//! milestone — enrollment and presence (M0), `open-tunnel` (M1), `agent-event`/
+//! `register-fcm-token` (M2), the laptop-proxy-only `list-devhost-ssh-endpoints`
+//! read (M6), and the `relayd`-pushed self-update instruction (M8). Shared by
+//! `choosh-relayd` and `choosh-hostd` so both sides serialize/deserialize
+//! identical Rust types rather than independently-drifting JSON shapes.
 
 use serde::{Deserialize, Serialize};
 

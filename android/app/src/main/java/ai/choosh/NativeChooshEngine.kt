@@ -132,10 +132,6 @@ class NativeChooshEngine : ChooshEngine {
     val connectionHandle: Long get() = handle
 
     override fun close() = NativeBridge.nativeClose(handle)
-
-    companion object {
-        private val json = Json { ignoreUnknownKeys = true }
-    }
 }
 
 /**
@@ -201,6 +197,7 @@ private object NativeBridge {
 @Serializable
 private data class WireError(val error: String)
 
+/** The single shared [Json] config for this whole file — every decode function below (including [NativeChooshEngine]'s own methods, which see this unqualified) reuses this instance rather than constructing its own. */
 private val json = Json { ignoreUnknownKeys = true }
 
 private fun <T> decodeOrThrow(raw: String, decode: (String) -> T): T {
@@ -242,7 +239,6 @@ private data class WireWebauthnResult(
 )
 
 private fun decodeWebauthnResult(raw: String): WebauthnResult {
-    val json = Json { ignoreUnknownKeys = true }
     val wire = json.decodeFromString<WireWebauthnResult>(raw)
     return if (wire.ok && wire.session_credential != null) {
         WebauthnResult.Success(wire.session_credential)
@@ -385,7 +381,6 @@ private data class WireDocumentResult(
 )
 
 private fun decodeDocumentOpenResult(raw: String): DocumentOpenResult {
-    val json = Json { ignoreUnknownKeys = true }
     val wire = json.decodeFromString<WireDocumentResult>(raw)
     return when (wire.type) {
         "ok" -> DocumentOpenResult.Success(
@@ -441,7 +436,6 @@ private data class WireItemSummary(
 }
 
 private fun decodeDocumentSaveResult(raw: String): DocumentSaveResult {
-    val json = Json { ignoreUnknownKeys = true }
     val wire = json.decodeFromString<WireDocumentResult>(raw)
     return when (wire.type) {
         "ok" -> DocumentSaveResult.Success(revision = wire.revision ?: "")

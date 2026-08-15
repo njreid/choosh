@@ -412,31 +412,22 @@ fn shell_command() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
-/// Allocates a real pty (`nix::pty::openpty`, the same mechanism
-/// `pty.rs`'s `PtySession` uses for the Zellij-attach path — `zellij
-/// attach` needs a genuine controlling terminal, and so does any ordinary
-/// interactive shell) and spawns `program args` wired to it. Returns the
-/// master's write half (for `data()` to forward client input into), the
-/// child (for `channel_close` to kill), and a reader over the master for
-/// the caller to forward as channel output.
+/// Allocates a real pty and spawns `program args` wired to it, via
+/// `pty.rs`'s [`crate::pty::allocate_and_spawn`] — the same allocation
+/// mechanics `pty.rs`'s `PtySession` uses for the Zellij-attach path
+/// (`zellij attach` needs a genuine controlling terminal, and so does any
+/// ordinary interactive shell), shared rather than duplicated. Returns the
+/// master's write half (for `data()` to forward client input into,
+/// `try_clone`d immediately since it needs to live inside a synchronous
+/// callback while the read half below moves into a spawned task right
+/// away — see `allocate_and_spawn`'s own doc comment for why this differs
+/// from `PtySession`'s single-handle-then-`.split()` approach), the child
+/// (for `channel_close` to kill), and a reader over the master for the
+/// caller to forward as channel output.
 fn spawn_pty_backed(program: &str, args: &[String]) -> std::io::Result<(tokio::fs::File, tokio::process::Child, tokio::fs::File)> {
-    let nix::pty::OpenptyResult { master, slave } = nix::pty::openpty(None, None).map_err(std::io::Error::from)?;
-
-    let slave_stdin = slave.try_clone()?;
-    let slave_stdout = slave.try_clone()?;
-    let child = Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::from(slave_stdin))
-        .stdout(std::process::Stdio::from(slave_stdout))
-        .stderr(std::process::Stdio::from(slave))
-        .spawn()?;
-
-    let flags = nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
-    let mut new_flags = nix::fcntl::OFlag::from_bits_truncate(flags);
-    new_flags.insert(nix::fcntl::OFlag::O_NONBLOCK);
-    nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(new_flags)).map_err(std::io::Error::from)?;
-
-    let master_std = std::fs::File::from(master);
+    let mut command = Command::new(program);
+    command.args(args);
+    let (master_std, child) = crate::pty::allocate_and_spawn(command)?;
     let master_write = tokio::fs::File::from_std(master_std.try_clone()?);
     let master_read = tokio::fs::File::from_std(master_std);
     Ok((master_write, child, master_read))
@@ -451,17 +442,14 @@ fn spawn_pty_output_forwarder(handle: Handle, channel: ChannelId, mut master_rea
     tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
-            match master_read.read(&mut buf).await {
-                // The master fd is deliberately non-blocking (see
-                // `spawn_pty_backed`'s doc comment); a `read()` racing
-                // ahead of the child actually producing output returns a
-                // normal, expected `WouldBlock`, not end-of-stream — retry
-                // after a short yield rather than treating it as the
-                // child having exited. Any other error, or a clean `Ok(0)`
-                // (the pty's slave side fully closed), really is the end.
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
+            // The master fd is deliberately non-blocking (see
+            // `spawn_pty_backed`'s doc comment); `read_retrying_would_block`
+            // (shared with `pty.rs`'s own reader, which has the same race
+            // against its own, differently-obtained pty master) retries a
+            // `WouldBlock` rather than treating it as end-of-stream. Any
+            // other error, or a clean `Ok(0)` (the pty's slave side fully
+            // closed), really is the end.
+            match crate::pty::read_retrying_would_block(&mut master_read, &mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if handle.data(channel, buf[..n].to_vec()).await.is_err() {

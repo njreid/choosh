@@ -7,6 +7,7 @@ import ai.choosh.jj.JjChangeGraphScreen
 import ai.choosh.jj.JjChangeGraphViewModel
 import ai.choosh.jj.JjDiffScreen
 import ai.choosh.jj.JjDiffViewModel
+import ai.choosh.singleInstanceFactory
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -29,8 +30,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 
 /**
@@ -157,10 +156,3 @@ fun WorkspaceScreen(
         }
     }
 }
-
-/** A minimal single-instance [ViewModelProvider.Factory] — no DI framework, per AGENTS.md. */
-private fun <T : ViewModel> singleInstanceFactory(build: () -> T): ViewModelProvider.Factory =
-    object : ViewModelProvider.Factory {
-        @Suppress("UNCHECKED_CAST")
-        override fun <VM : ViewModel> create(modelClass: Class<VM>): VM = build() as VM
-    }

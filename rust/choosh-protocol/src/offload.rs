@@ -255,4 +255,18 @@ mod tests {
     fn malformed_exit_frame_length_is_a_decode_error() {
         assert!(matches!(decode_frame(&[OFFLOAD_FRAME_EXIT, 1, 2]), Err(OffloadFrameError::BadExitLength(2))));
     }
+
+    #[test]
+    fn malformed_json_in_a_request_or_error_frame_is_a_decode_error_not_a_panic() {
+        // `Stdout`/`Stderr`/`Exit` carry raw bytes with no JSON to malform;
+        // `Request`/`Error` are the two kinds whose body is parsed as JSON,
+        // so both get their own malformed-body coverage here.
+        let mut request = vec![OFFLOAD_FRAME_REQUEST];
+        request.extend_from_slice(b"not json");
+        assert!(matches!(decode_frame(&request), Err(OffloadFrameError::Json(_))));
+
+        let mut error = vec![OFFLOAD_FRAME_ERROR];
+        error.extend_from_slice(b"{");
+        assert!(matches!(decode_frame(&error), Err(OffloadFrameError::Json(_))));
+    }
 }

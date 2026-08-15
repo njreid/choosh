@@ -85,12 +85,22 @@ where each `DevHostPresence` is
 `{ device_id, alias, platform, account_label, connection_state, last_seen }`.
 `connection_state` is `"online"` or `"offline"`; there is no partial state.
 
+### `list-devhost-ssh-endpoints`
+
+Laptop-proxy only. Request: `{}`. Response:
+`{ endpoints: [DevhostSshEndpoint] }` where each `DevhostSshEndpoint` is
+`{ device_id, alias, ssh_host_public_key }` — a narrower read than
+`list-devhosts` (no platform, account label, or connection state), scoped
+to what `choosh-hostd proxy sync` needs to populate `known_hosts`. See
+auth-and-enrollment.md's capability table and
+[ssh-bridge-and-zed.md](ssh-bridge-and-zed.md).
+
 ### `open-tunnel`
 
 Any authenticated Identity. Request:
 `{ target_device_id, purpose }` where `purpose` is an opaque tag the two
 tunnel endpoints agree on out of band (e.g. `"rpc"`, `"pty:<item_id>"`,
-`"ssh"`, `"web-preview:<item_id>"`) — `relayd` does not validate `purpose`
+`"ssh"`, `"web:<item_id>"`) — `relayd` does not validate `purpose`
 beyond passing it to the target's tunnel-offer notification. Response:
 `{ tunnel_id }` on success, or a typed failure if `target_device_id` is
 offline or the requesting Identity lacks a capability scope permitting a
@@ -164,7 +174,11 @@ frame received from that Identity, control or tunnel.
   `relayd` (not left half-open); the surviving endpoint sees an ordinary
   close.
 - Control-frame requests against an Identity's own connection that arrive
-  faster than `relayd` can process (e.g. `list-devhosts` polling) are rate
-  limited per-Identity; exceeding the limit closes the connection rather
-  than silently dropping requests, so a client can detect and back off
-  rather than getting inconsistent responses.
+  faster than `relayd` can process (e.g. `list-devhosts` polling) MUST be
+  rate limited per-Identity; exceeding the limit MUST close the connection
+  rather than silently dropping requests, so a client can detect and back
+  off rather than getting inconsistent responses. **Not yet implemented**:
+  `choosh-relayd` has no connection-flood or per-Identity request-rate
+  limiting today — an accepted-risk gap tracked in
+  `docs/security/relayd-threat-model.md` (Case 5) and
+  [PLAN.md](../../PLAN.md)'s Known follow-ups.

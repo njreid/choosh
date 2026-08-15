@@ -151,4 +151,42 @@ class WebServiceViewModelTest {
         assertTrue(viewModel.state.value is WebServiceUiState.Failed)
         assertEquals(0, gatewayController.startCalls)
     }
+
+    @Test
+    fun `FakeChooshEngine's own itemList polling cycle transitions from starting to running`() = runTest(mainDispatcherRule.dispatcher) {
+        // Every other test in this class uses ScriptedItemChooshEngine, which bypasses
+        // FakeChooshEngine.itemList() entirely in favor of a test-scripted result — so none
+        // of them actually exercise FakeChooshEngine's own "starting for the first two polls,
+        // running after" fixture cycle (see that class's itemList() doc comment). This test
+        // drives a real FakeChooshEngine end to end specifically to close that gap.
+        val engine = FakeChooshEngine()
+        val gatewayController = FakeWebServiceGatewayController()
+        val viewModel = WebServiceViewModel(
+            engine,
+            FakeChooshEngine.FIXTURE_DEVICE_ID,
+            FakeChooshEngine.FIXTURE_WORKSPACE_ID,
+            itemId = "item-web-1",
+            connectionHandle = 42L,
+            gatewayController = gatewayController,
+        )
+
+        viewModel.poll()
+        assertEquals(WebServiceUiState.Starting, viewModel.state.value)
+        assertEquals(0, gatewayController.startCalls)
+
+        viewModel.poll()
+        assertEquals(
+            "FakeChooshEngine.itemList() returns STARTING for exactly the first two polls",
+            WebServiceUiState.Starting,
+            viewModel.state.value,
+        )
+        assertEquals(0, gatewayController.startCalls)
+
+        viewModel.poll()
+        assertTrue(
+            "the third poll should observe RUNNING and open the gateway",
+            viewModel.state.value is WebServiceUiState.Ready,
+        )
+        assertEquals(1, gatewayController.startCalls)
+    }
 }

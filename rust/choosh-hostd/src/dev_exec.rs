@@ -471,6 +471,66 @@ mod tests {
         assert!(matches!(result, Err(DevExecError::Remote(ref error)) if error.code == "not_found"), "expected a Remote(not_found) error, got {result:?}");
     }
 
+    /// A distinct failure mode from both "the target is offline" (the relay
+    /// itself rejects `open-tunnel`, covered above) and "the target
+    /// rejects the request" (an `OffloadFrame::Error`, also covered
+    /// above): the tunnel opens and the request is accepted, but the
+    /// connection then drops — or the target hangs and its own
+    /// tunnel-holding connection is closed — before any exit-code frame
+    /// ever arrives. Simulated here by the fake target sending the
+    /// tunnel-close signal (an empty `FRAME_CLASS_TUNNEL` payload, the same
+    /// convention `pipe_stdio_over_tunnel`/relay-protocol.md use elsewhere)
+    /// right after accepting the request, with no stdout/stderr/exit frame
+    /// in between — this must be reported as its own
+    /// `UnexpectedResponse`, not silently read as a zero exit code or
+    /// hang.
+    #[tokio::test]
+    async fn run_with_io_fails_cleanly_when_the_tunnel_closes_with_no_exit_frame() {
+        let (listener, relay_url) = bind_fake_relayd().await;
+        let recorded_out = Arc::new(Mutex::new(Vec::new()));
+        let recorded_err = Arc::new(Mutex::new(Vec::new()));
+        let stdout = RecordingWriter(recorded_out.clone());
+        let stderr = RecordingWriter(recorded_err.clone());
+
+        let client_fut = async {
+            let credential = fake_credential();
+            Box::pin(run_with_io("dev-target", &relay_url, &credential, sample_request(), stdout, stderr)).await
+        };
+
+        let server_fut = async {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            fake_relayd_authenticate(&mut ws).await;
+
+            let _open_tunnel: serde_json::Value = recv_control(&mut ws).await;
+            let tunnel_id = [9u8; TUNNEL_ID_BYTES];
+            send_control(&mut ws, &ControlResponse::OpenTunnelOk { request_id: "r".to_string(), tunnel_id: choosh_protocol::relay::encode_tunnel_id_hex(tunnel_id) }).await;
+
+            let mut decoder = FrameDecoder::new(FrameLimits::new(MAX_TUNNEL_FRAME_BYTES, 4).unwrap());
+            loop {
+                let Some(Ok(Message::Binary(bytes))) = ws.next().await else { panic!("expected the offload request frame") };
+                if !decoder.feed(&bytes).unwrap().is_empty() {
+                    break;
+                }
+            }
+
+            // The target "times out mid-stream": no stdout/stderr/exit
+            // frame ever arrives, just the ordinary tunnel-close signal.
+            let mut close_payload = vec![FRAME_CLASS_TUNNEL];
+            close_payload.extend_from_slice(&tunnel_id);
+            let close_framed = encode_frame(&close_payload, MAX_TUNNEL_FRAME_BYTES).unwrap();
+            let _ = ws.send(Message::Binary(close_framed.into())).await;
+        };
+
+        let (result, ()) = tokio::join!(client_fut, server_fut);
+        assert!(
+            matches!(result, Err(DevExecError::UnexpectedResponse(ref reason)) if reason.contains("closed before an exit code arrived")),
+            "expected a distinct 'tunnel closed with no exit code' error, got {result:?}"
+        );
+        assert!(recorded_out.lock().unwrap().is_empty());
+        assert!(recorded_err.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn run_with_io_fails_cleanly_when_the_relay_rejects_the_open_tunnel() {
         let (listener, relay_url) = bind_fake_relayd().await;

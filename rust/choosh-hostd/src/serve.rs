@@ -2,9 +2,16 @@
 //! `docs/specs/auth-and-enrollment.md`'s "Devhost enrollment"), then holds
 //! an authenticated connection to `choosh-relayd` open, reconnecting with
 //! backoff on any drop (per `docs/specs/relay-protocol.md`'s transport
-//! requirement). Since M1, an `rpc`-purpose tunnel offered on that
-//! connection is accepted and its `host-rpc.md` traffic dispatched via
-//! [`crate::rpc`] — see `docs/milestones/M1-workspace-and-jj.md`.
+//! requirement). Once connected, [`serve_dispatch`] serves every tunnel
+//! purpose this devhost accepts, one offered across M1-M7: `rpc` (`host-rpc.md`
+//! traffic dispatched via [`crate::rpc`], M1), `pty:<item_id>` (an
+//! `AgentTerminal`/`Shell` item's terminal, M2), `web:<item_id>` and
+//! `zellij-web` (`docs/specs/service-tunnels.md`'s registered-service and
+//! break-glass TCP bridges, M5/M6), `ssh` (the loopback SSH bridge,
+//! `ssh-bridge-and-zed.md`, M6), and `offload` (`dev-exec` cross-host command
+//! execution, `docs/milestones/M7-fleet-and-provisioning.md`) — plus
+//! forwarding locally-emitted agent events and self-update pushes. See
+//! [`handle_control_push`]'s doc comment for the per-purpose detail.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -731,6 +738,19 @@ enum FrameOutcome {
 /// explicitly the Android gateway's job, a separate, parallel piece of
 /// work — this bridge's own responsibility is limited to the safety bound
 /// documented on [`WEB_TUNNEL_IDLE_TIMEOUT`]/[`WEB_TUNNEL_READ_BUF_SIZE`].
+/// Decodes `tunnel_id` (the hex form `relay-protocol.md` carries in a
+/// `tunnel-offered` push), warning and returning `None` on a malformed
+/// one — every arm of [`handle_control_push`]'s match needs exactly this
+/// "decode or bail out, having already logged why" step, so it's factored
+/// out here rather than repeated once per tunnel purpose.
+fn decode_tunnel_id_or_warn(tunnel_id: &str) -> Option<[u8; TUNNEL_ID_BYTES]> {
+    let decoded = decode_tunnel_id_hex(tunnel_id);
+    if decoded.is_none() {
+        tracing::warn!(tunnel_id, "tunnel-offered carried a malformed tunnel_id");
+    }
+    decoded
+}
+
 #[allow(clippy::too_many_arguments)] // one tracking collection per tunnel purpose this dispatch handles, per this doc comment; a params struct would just move the count, not reduce it, for a single call site.
 async fn handle_control_push(
     body: &[u8],
@@ -745,18 +765,13 @@ async fn handle_control_push(
 ) {
     match serde_json::from_slice::<ServerPush>(body) {
         Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose == "rpc" => {
-            if let Some(id) = decode_tunnel_id_hex(&tunnel_id) {
+            if let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) {
                 rpc_tunnels.insert(id);
-            } else {
-                tracing::warn!(tunnel_id, "tunnel-offered carried a malformed tunnel_id");
             }
         }
         Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose.starts_with("pty:") => {
             let item_id = &purpose["pty:".len()..];
-            let Some(id) = decode_tunnel_id_hex(&tunnel_id) else {
-                tracing::warn!(tunnel_id, "tunnel-offered carried a malformed tunnel_id");
-                return;
-            };
+            let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) else { return };
             match open_pty_tunnel(rpc_context, item_id, id, tunnel_output_tx.clone(), agent_event_tx.clone()).await {
                 Ok(write_half) => {
                     pty_tunnels.insert(id, write_half);
@@ -766,10 +781,7 @@ async fn handle_control_push(
         }
         Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose.starts_with("web:") => {
             let item_id = &purpose["web:".len()..];
-            let Some(id) = decode_tunnel_id_hex(&tunnel_id) else {
-                tracing::warn!(tunnel_id, "tunnel-offered carried a malformed tunnel_id");
-                return;
-            };
+            let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) else { return };
             match open_web_tunnel(rpc_context, item_id, id, tunnel_output_tx.clone()).await {
                 Ok(write_half) => {
                     web_tunnels.insert(id, write_half);
@@ -789,10 +801,7 @@ async fn handle_control_push(
         // that `from_device_id` is actually present — an empty identity
         // claim is treated as malformed, not silently bridged.
         Ok(ServerPush::TunnelOffered { tunnel_id, from_device_id, purpose }) if purpose == "ssh" => {
-            let Some(id) = decode_tunnel_id_hex(&tunnel_id) else {
-                tracing::warn!(tunnel_id, "tunnel-offered carried a malformed tunnel_id");
-                return;
-            };
+            let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) else { return };
             if from_device_id.trim().is_empty() {
                 tracing::warn!("refusing ssh-purpose tunnel-offered with no requester identity");
                 return;
@@ -824,10 +833,7 @@ async fn handle_control_push(
         // handler. Same "reject an empty requester identity as malformed"
         // discipline the `"ssh"` arm above applies.
         Ok(ServerPush::TunnelOffered { tunnel_id, from_device_id, purpose }) if purpose == "offload" => {
-            let Some(id) = decode_tunnel_id_hex(&tunnel_id) else {
-                tracing::warn!(tunnel_id, "tunnel-offered carried a malformed tunnel_id");
-                return;
-            };
+            let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) else { return };
             if from_device_id.trim().is_empty() {
                 tracing::warn!("refusing offload-purpose tunnel-offered with no requester identity");
                 return;
@@ -835,10 +841,7 @@ async fn handle_control_push(
             offload_pending.insert(id);
         }
         Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose == "zellij-web" => {
-            let Some(id) = decode_tunnel_id_hex(&tunnel_id) else {
-                tracing::warn!(tunnel_id, "tunnel-offered carried a malformed tunnel_id");
-                return;
-            };
+            let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) else { return };
             match open_zellij_web_tunnel(id, tunnel_output_tx.clone()).await {
                 Ok(write_half) => {
                     web_tunnels.insert(id, write_half);

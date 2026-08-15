@@ -35,6 +35,8 @@ Instead:
 `relayd` MUST NOT send an FCM message while it holds an open persistent
 connection to that phone Identity — the persistent path is authoritative
 when present, and duplicate delivery over both paths would double-notify.
+(See the end of this document for the current implementation status of
+this path.)
 
 ## Notifying events
 
@@ -95,3 +97,14 @@ the block without the user typing into the agent directly.
 
 `auth_required` notifications are always open-app-only: tapping opens the
 `verification_uri` in a Custom Tab, per DESIGN.md §6.
+
+**Not yet implemented**: the Android app's notification model
+(`ai.choosh.notifications.NotificationIntent` and everything downstream of
+it) only represents the `input_required` shape (mandatory `workspaceId`/
+`itemId`/`agentName`, keyed `(host_id, workspace_id, item_id)`) — there is
+no code path anywhere in the app that constructs, dedups, or renders an
+`auth_required` notification (`(host_id, provider)`-keyed, no workspace/item
+at all). Separately, both ends of the FCM path are stubs today: `relayd`'s
+dispatch is a logged no-op (`rust/choosh-relayd/src/ws.rs`'s
+`dispatch_fcm_push_stub`) and `ChooshFirebaseMessagingService.onMessageReceived`
+only logs receipt — see [PLAN.md](../../PLAN.md)'s Known follow-ups.

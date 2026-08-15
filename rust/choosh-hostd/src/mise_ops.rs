@@ -118,21 +118,45 @@ fn tool_spec(version: &str) -> String {
 /// [`MiseError::BinaryNotFound`] if `mise where` succeeds but no
 /// `zed-remote-server` executable exists at the path it reports.
 pub async fn ensure_zed_remote_server(mise_bin: &str, version: &str, host_tools_dir: &Path) -> Result<PathBuf, MiseError> {
-    tokio::fs::create_dir_all(host_tools_dir).await.map_err(MiseError::Spawn)?;
-    let spec = tool_spec(version);
+    resolve_host_managed_tool(mise_bin, host_tools_dir, &tool_spec(version), "zed-remote-server").await
+}
 
-    let install_output = run_mise(mise_bin, host_tools_dir, &["install", "--yes", &spec]).await?;
+/// Shared by [`ensure_zed_remote_server`] and [`ensure_host_tool`] (in turn
+/// [`ensure_jj`]/[`ensure_zellij`]): `mise install --yes <spec>` then
+/// `mise where <spec>`, resolving the installed binary the same
+/// two-candidate-path way for both — some `mise` backends lay a tool's
+/// binary directly under its install directory, others under a `bin/`
+/// subdirectory (confirmed empirically for `jj`/`zellij`'s aqua backend to
+/// be the former, but checking both keeps this resilient to a backend
+/// change rather than silently breaking). `spec` is the full `mise`
+/// tool-spec string (`ubi:...@<version>` for zed, `<tool>@latest` for a
+/// host-managed tool); `binary_name` is the executable's own file name to
+/// look for under the resolved install directory, which is not always the
+/// same string as `spec` names (zed's `ubi` spec always resolves to a
+/// `zed-remote-server` binary regardless of the declared version).
+///
+/// # Errors
+///
+/// Returns [`MiseError::InstallFailed`]/[`MiseError::WhereFailed`] if the
+/// underlying `mise install`/`mise where` invocation exits non-zero,
+/// [`MiseError::Spawn`] if `mise_bin` cannot even be executed, and
+/// [`MiseError::BinaryNotFound`] if `mise where` succeeds but no
+/// `binary_name` executable exists at the path it reports.
+async fn resolve_host_managed_tool(mise_bin: &str, host_tools_dir: &Path, spec: &str, binary_name: &str) -> Result<PathBuf, MiseError> {
+    tokio::fs::create_dir_all(host_tools_dir).await.map_err(MiseError::Spawn)?;
+
+    let install_output = run_mise(mise_bin, host_tools_dir, &["install", "--yes", spec]).await?;
     if !install_output.status.success() {
         return Err(MiseError::InstallFailed { stderr: bounded_stderr(&install_output.stderr) });
     }
 
-    let where_output = run_mise(mise_bin, host_tools_dir, &["where", &spec]).await?;
+    let where_output = run_mise(mise_bin, host_tools_dir, &["where", spec]).await?;
     if !where_output.status.success() {
         return Err(MiseError::WhereFailed { stderr: bounded_stderr(&where_output.stderr) });
     }
     let install_dir = PathBuf::from(String::from_utf8_lossy(&where_output.stdout).trim());
 
-    for candidate in [install_dir.join("zed-remote-server"), install_dir.join("bin").join("zed-remote-server")] {
+    for candidate in [install_dir.join(binary_name), install_dir.join("bin").join(binary_name)] {
         if tokio::fs::metadata(&candidate).await.is_ok() {
             return Ok(candidate);
         }
@@ -290,14 +314,10 @@ pub async fn ensure_zellij(mise_bin: &str, host_tools_dir: &Path) -> Result<Path
     ensure_host_tool(mise_bin, "zellij", host_tools_dir).await
 }
 
-/// Shared implementation for [`ensure_jj`]/[`ensure_zellij`]: `mise install
-/// --yes <tool>@latest` then `mise where <tool>@latest`, resolving the
-/// installed binary the same two-candidate-path way
-/// [`ensure_zed_remote_server`] does (some `mise` backends lay a tool's
-/// binary directly under its install directory, others under a `bin/`
-/// subdirectory — confirmed empirically for `jj`/`zellij`'s aqua backend
-/// to be the former, but checking both keeps this resilient to a backend
-/// change rather than silently breaking).
+/// Shared implementation for [`ensure_jj`]/[`ensure_zellij`], via
+/// [`resolve_host_managed_tool`] (also shared with [`ensure_zed_remote_server`]
+/// — see that function's doc comment for the parts of the shape all three
+/// have in common).
 ///
 /// Always resolves `@latest` — per toolchain-provisioning.md, `jj`/
 /// `zellij` "are not project state... kept current by `choosh-hostd`", the
@@ -305,26 +325,7 @@ pub async fn ensure_zellij(mise_bin: &str, host_tools_dir: &Path) -> Result<Path
 /// (which this function has no connection to at all: distinct
 /// `host_tools_dir` tree, no `workspace_root`/`current_dir` involved).
 async fn ensure_host_tool(mise_bin: &str, tool_name: &str, host_tools_dir: &Path) -> Result<PathBuf, MiseError> {
-    tokio::fs::create_dir_all(host_tools_dir).await.map_err(MiseError::Spawn)?;
-    let spec = format!("{tool_name}@latest");
-
-    let install_output = run_mise(mise_bin, host_tools_dir, &["install", "--yes", &spec]).await?;
-    if !install_output.status.success() {
-        return Err(MiseError::InstallFailed { stderr: bounded_stderr(&install_output.stderr) });
-    }
-
-    let where_output = run_mise(mise_bin, host_tools_dir, &["where", &spec]).await?;
-    if !where_output.status.success() {
-        return Err(MiseError::WhereFailed { stderr: bounded_stderr(&where_output.stderr) });
-    }
-    let install_dir = PathBuf::from(String::from_utf8_lossy(&where_output.stdout).trim());
-
-    for candidate in [install_dir.join(tool_name), install_dir.join("bin").join(tool_name)] {
-        if tokio::fs::metadata(&candidate).await.is_ok() {
-            return Ok(candidate);
-        }
-    }
-    Err(MiseError::BinaryNotFound(install_dir))
+    resolve_host_managed_tool(mise_bin, host_tools_dir, &format!("{tool_name}@latest"), tool_name).await
 }
 
 #[cfg(test)]

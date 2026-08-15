@@ -28,6 +28,18 @@
 //! beyond the single-client scenario this module's own tests exercise; a
 //! second concurrent phone attached to a different tab in the same
 //! workspace is a real scenario this pass did not test.
+//!
+//! **Shared with `ssh_server.rs`**: both this module's `zellij attach`
+//! client and `ssh_server`'s interactive shell/exec sessions need a real
+//! allocated pty (`zellij attach` for the reason above; an ordinary
+//! interactive shell for the usual reasons any shell wants a controlling
+//! terminal) — genuinely the same allocate-wire-spawn-and-make-nonblocking
+//! mechanics, just fed a different child command. [`allocate_and_spawn`]
+//! and [`read_retrying_would_block`] are `pub(crate)` specifically so
+//! `ssh_server.rs` shares them rather than duplicating; what differs
+//! between the two callers (which command to spawn, whether the caller
+//! needs one handle or two independently-`try_clone`d ones, how
+//! attach-specific errors are reported) stays with each module.
 
 use nix::pty::{OpenptyResult, openpty};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -35,18 +47,19 @@ use tokio::process::{Child, Command};
 
 #[derive(Debug)]
 pub enum PtyError {
-    Allocate(nix::Error),
+    /// Any failure allocating the pty, wiring it to `zellij attach`'s
+    /// stdio, spawning it, or making the master non-blocking — see
+    /// [`allocate_and_spawn`], which this wraps without distinguishing
+    /// those sub-steps further (nothing downstream of this module matches
+    /// on which one failed; the message text still says which).
     Spawn(std::io::Error),
-    NonBlocking(std::io::Error),
     FocusTab(crate::zellij_ops::ZellijError),
 }
 
 impl std::fmt::Display for PtyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Allocate(error) => write!(f, "failed to allocate a pseudo-terminal: {error}"),
-            Self::Spawn(error) => write!(f, "failed to spawn zellij attach: {error}"),
-            Self::NonBlocking(error) => write!(f, "failed to configure the pty master as non-blocking: {error}"),
+            Self::Spawn(error) => write!(f, "failed to set up the pseudo-terminal-backed zellij attach process: {error}"),
             Self::FocusTab(error) => write!(f, "failed to focus the target tab after attaching: {error}"),
         }
     }
@@ -74,14 +87,7 @@ impl PtySession {
     ///
     /// See [`PtyError`]'s variants.
     pub async fn attach(session_name: &str, tab_name: &str) -> Result<Self, PtyError> {
-        let OpenptyResult { master, slave } = openpty(None, None).map_err(PtyError::Allocate)?;
-
-        // The slave fd becomes the child's stdin/stdout/stderr (a real
-        // controlling terminal, not a pipe) — cloned via `try_clone_to_owned`
-        // rather than moving `slave` three times, since `Command::stdin`/
-        // `stdout`/`stderr` each need their own `Stdio`.
-        let slave_stdin = slave.try_clone().map_err(PtyError::Spawn)?;
-        let slave_stdout = slave.try_clone().map_err(PtyError::Spawn)?;
+        let mut command = Command::new("zellij");
         // Deliberately does NOT set `ZELLIJ_SESSION_NAME` on this child —
         // confirmed by direct experiment (both a bare shell invocation and
         // a real-pty Python harness, 6/6 reproductions) that doing so is
@@ -97,26 +103,9 @@ impl PtySession {
         // var is `focus_tab`'s mechanism (its `zellij action` invocation
         // has no explicit session argument of its own and needs it), not
         // this command's.
-        let child = Command::new("zellij")
-            .arg("attach")
-            .arg(session_name)
-            .stdin(std::process::Stdio::from(slave_stdin))
-            .stdout(std::process::Stdio::from(slave_stdout))
-            .stderr(std::process::Stdio::from(slave))
-            .spawn()
-            .map_err(PtyError::Spawn)?;
-
-        // The master fd must be non-blocking for tokio's async file I/O to
-        // multiplex it correctly alongside everything else on the runtime,
-        // per tokio::fs::File::from_std's own requirement for fds that
-        // aren't regular files.
-        let flags = nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_GETFL)
-            .map_err(|e| PtyError::NonBlocking(std::io::Error::from_raw_os_error(e as i32)))?;
-        let mut new_flags = nix::fcntl::OFlag::from_bits_truncate(flags);
-        new_flags.insert(nix::fcntl::OFlag::O_NONBLOCK);
-        nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(new_flags))
-            .map_err(|e| PtyError::NonBlocking(std::io::Error::from_raw_os_error(e as i32)))?;
-        let master = tokio::fs::File::from_std(std::fs::File::from(master));
+        command.arg("attach").arg(session_name);
+        let (master, child) = allocate_and_spawn(command).map_err(PtyError::Spawn)?;
+        let master = tokio::fs::File::from_std(master);
 
         // Give the attach client a moment to actually connect before
         // asking it to change focus — `go-to-tab-name` targets "the
@@ -172,7 +161,7 @@ impl PtyReadHalf {
     }
 }
 
-/// The master fd is deliberately non-blocking (see [`PtySession::attach`]'s
+/// The master fd is deliberately non-blocking (see [`allocate_and_spawn`]'s
 /// `O_NONBLOCK` setup) so tokio's async I/O can multiplex it — but
 /// `tokio::fs::File`'s `AsyncRead` impl runs the underlying `read(2)` on a
 /// blocking-pool thread and forwards *whatever* that syscall returns,
@@ -180,12 +169,12 @@ impl PtyReadHalf {
 /// to read yet" as a reason to wait and retry. A `read()` racing ahead of
 /// the attached client actually producing output (a completely normal,
 /// expected timing outcome, not a real error) would otherwise surface as a
-/// hard I/O error to every caller — exactly the same race
-/// `ssh_server.rs`'s `spawn_pty_output_forwarder` already documents and
-/// retries around for its own, differently-obtained pty master. This
-/// shares that fix across both of `PtySession`'s read paths ([`PtySession::read`]
-/// and [`PtyReadHalf::read`]) rather than duplicating it.
-async fn read_retrying_would_block(file: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> std::io::Result<usize> {
+/// hard I/O error to every caller. `pub(crate)` so `ssh_server.rs`'s own
+/// pty-output forwarder shares this exact retry rather than duplicating it
+/// for its own, differently-obtained pty master — used here for both of
+/// `PtySession`'s own read paths ([`PtySession::read`] and
+/// [`PtyReadHalf::read`]) too.
+pub(crate) async fn read_retrying_would_block(file: &mut (impl AsyncRead + Unpin), buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         match file.read(buf).await {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -194,6 +183,49 @@ async fn read_retrying_would_block(file: &mut (impl AsyncRead + Unpin), buf: &mu
             result => return result,
         }
     }
+}
+
+/// Allocates a pty, wires `command`'s stdin/stdout/stderr to its slave side
+/// (a real controlling terminal — both [`PtySession::attach`]'s `zellij
+/// attach` client and `ssh_server`'s interactive shell/exec need one, for
+/// the reasons each documents), spawns it, and makes the master
+/// non-blocking (required for tokio's async file I/O to multiplex it, per
+/// `tokio::fs::File::from_std`'s own requirement for fds that aren't
+/// regular files). Returns the master side as a plain `std::fs::File` —
+/// not yet wrapped for tokio — since callers differ in what they need it
+/// for: `PtySession::attach` wraps it as a single `tokio::fs::File` and
+/// only splits it later via an explicit `.split()`; `ssh_server`'s
+/// `spawn_pty_backed` instead `try_clone`s it immediately into independent
+/// read/write handles, since its write half lives inside a synchronous
+/// callback while its read half moves into a spawned task right away.
+///
+/// # Errors
+///
+/// Any I/O error from `openpty`, cloning the slave fd, spawning `command`,
+/// or the `fcntl` calls that set `O_NONBLOCK` — folded into a single
+/// `std::io::Error` rather than distinguishing which sub-step failed,
+/// since neither caller needs that distinction (see [`PtyError::Spawn`]'s
+/// doc comment).
+pub(crate) fn allocate_and_spawn(mut command: Command) -> std::io::Result<(std::fs::File, Child)> {
+    let OpenptyResult { master, slave } = openpty(None, None)?;
+
+    // The slave fd becomes the child's stdin/stdout/stderr — cloned rather
+    // than moving `slave` three times, since `Command::stdin`/`stdout`/
+    // `stderr` each need their own `Stdio`.
+    let slave_stdin = slave.try_clone()?;
+    let slave_stdout = slave.try_clone()?;
+    command
+        .stdin(std::process::Stdio::from(slave_stdin))
+        .stdout(std::process::Stdio::from(slave_stdout))
+        .stderr(std::process::Stdio::from(slave));
+    let child = command.spawn()?;
+
+    let flags = nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_GETFL)?;
+    let mut new_flags = nix::fcntl::OFlag::from_bits_truncate(flags);
+    new_flags.insert(nix::fcntl::OFlag::O_NONBLOCK);
+    nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(new_flags))?;
+
+    Ok((std::fs::File::from(master), child))
 }
 
 pub struct PtyWriteHalf {

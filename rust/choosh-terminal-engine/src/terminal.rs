@@ -183,8 +183,17 @@ impl Terminal {
         if width == 0 {
             // Combining mark: append to the previous cell instead of
             // advancing, per terminal-experience.md's combining-character
-            // requirement.
-            let (col, row) = (self.cursor.col.saturating_sub(1), self.cursor.row);
+            // requirement. If that "previous cell" is a wide character's
+            // zero-width continuation placeholder, step back one more
+            // column to the wide glyph's own cell — a combining mark
+            // following e.g. a CJK character must attach to the glyph
+            // itself (real, confirmed bug: it was previously silently
+            // dropped onto the invisible continuation cell instead, per
+            // this fix's own test in `terminal::tests`).
+            let (mut col, row) = (self.cursor.col.saturating_sub(1), self.cursor.row);
+            if self.grid().cell(col, row).is_some_and(|cell| cell.wide_continuation) {
+                col = col.saturating_sub(1);
+            }
             if let Some(cell) = self.grid().cell(col, row) {
                 let mut updated = cell.clone();
                 updated.text.push(ch);
@@ -638,6 +647,47 @@ mod tests {
         let cell = engine.terminal().grid().cell(0, 0).unwrap();
         assert_eq!(cell.text, "e\u{0301}");
         assert_eq!(engine.terminal().cursor().col, 1);
+    }
+
+    /// A combining mark following a wide (double-width) character must
+    /// attach to the wide glyph's own cell at `col`, not to its trailing
+    /// zero-width continuation placeholder at `col + 1` — even though the
+    /// cursor sits at `col + 2` after the wide write, exactly like it would
+    /// after any single-width character. `wide_cjk_character_occupies_two_cells`
+    /// and `combining_mark_attaches_to_previous_cell` each pass on their own
+    /// (a wide char alone; a combining mark after a single-width char
+    /// alone) without exercising this — the interaction is what this test
+    /// covers.
+    #[test]
+    fn combining_mark_after_a_wide_character_attaches_to_the_wide_cell_not_its_continuation() {
+        let mut engine = Engine::new(10, 2);
+        // U+4F60 ('你', wide) + combining acute accent (U+0301).
+        engine.write("\u{4f60}\u{0301}".as_bytes());
+        let leading = engine.terminal().grid().cell(0, 0).unwrap();
+        assert_eq!(leading.text, "\u{4f60}\u{0301}", "the combining mark must land on the wide glyph's own cell");
+        let continuation = engine.terminal().grid().cell(1, 0).unwrap();
+        assert!(continuation.wide_continuation, "the continuation cell must stay a plain placeholder");
+        assert!(continuation.text.is_empty(), "the combining mark must not land on the continuation cell instead");
+    }
+
+    /// The row-damage cache (`Grid::dirty`) must reflect a wide character
+    /// plus its trailing combining mark as ordinary single-row damage: only
+    /// the row they're written to is dirty, and clearing that row's damage
+    /// after a redraw leaves it clean, exactly like any other write — wide/
+    /// combining handling must not leave the damage cache in some special
+    /// state (e.g. still dirty, or the wrong row dirty) after the two
+    /// features interact.
+    #[test]
+    fn wide_character_with_combining_mark_marks_only_its_own_row_dirty_and_clears_normally() {
+        let mut engine = Engine::new(10, 3);
+        for row in 0..3 {
+            engine.clear_row_dirty(row);
+        }
+        engine.write("\u{4f60}\u{0301}".as_bytes());
+        assert_eq!(engine.dirty_rows(), vec![0], "only row 0 should be dirty after writing to it");
+
+        engine.clear_row_dirty(0);
+        assert!(engine.dirty_rows().is_empty(), "damage must clear normally after a wide+combining write");
     }
 
     #[test]

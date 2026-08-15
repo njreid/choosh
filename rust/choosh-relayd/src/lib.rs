@@ -6,8 +6,11 @@
 //! Implements: `WebAuthn` registration/login, devhost enrollment, presence
 //! (`list-devhosts`), enrollment-token issuance, and `open-tunnel` with
 //! `0x02` tunnel-frame routing (M1 — see `docs/milestones/M1-workspace-and-jj.md`,
-//! whose RPC surface rides over an `rpc`-purpose tunnel). `agent-event` and
-//! `register-fcm-token` are out of scope until the milestones that need them.
+//! whose RPC surface rides over an `rpc`-purpose tunnel). Also `agent-event`
+//! and `register-fcm-token` dispatch/routing (M2), the laptop-proxy-only
+//! `list-devhost-ssh-endpoints` read (M6), and the `devhost`-to-`devhost`
+//! `offload`-purpose tunnel capability (M7) — see `crate::ws::dispatch` for
+//! the full control-frame catalog this now serves.
 
 mod ca;
 #[cfg(test)]

@@ -105,7 +105,13 @@ server-side:
    against this `device_id`, signed by the device's own new certificate —
    this is the one moment a devhost's SSH host key is ever established as
    trusted, and it happens over the same authenticated channel as the rest
-   of enrollment, not a separate TOFU prompt anywhere.
+   of enrollment, not a separate TOFU prompt anywhere. **Design decision
+   (M6):** the SSH host key is not a second, independently generated
+   keypair — `choosh-hostd` derives its SSH host key directly from this
+   same Ed25519 enrollment credential (`rust/choosh-hostd/src/ssh_keys.rs`),
+   since a distinct keypair would need the same generation, persistence,
+   and revocation lifecycle as the enrollment key anyway, with no
+   independent rotation benefit.
 7. `alias`, `platform`, and `account_label` (for presence/fleet display)
    are set at this point too, either from install-script flags or
    defaulted from OS/cloud metadata `choosh-hostd` can read locally
@@ -157,6 +163,15 @@ the `device_id` from `relayd`'s active-identity registry immediately.
   connection attempt is rejected" — there is no requirement to actively
   notify a revoked device, since it has no standing capability to exercise
   in the meantime (it isn't connected).
+
+**Not yet implemented**: the operator-initiated revoke operation itself —
+a control frame or HTTP route that actually sets a device or phone
+credential revoked — does not exist in `choosh-relayd` today.
+`EnrolledDevice.revoked` and phone-session validity are checked everywhere
+the bullets above describe, so a device that *is* revoked correctly fails
+closed, but nothing in the codebase ever performs the revoke. See
+`docs/security/relayd-threat-model.md` (Case 3) and
+[PLAN.md](../../PLAN.md)'s Known follow-ups.
 
 ## Explicit non-goal
 

@@ -37,6 +37,12 @@ and is changeable afterward (an update to the Project record via
 Tapping a DevHost row or a Workspace row (in Host or Recent mode) behaves
 as the flow below.
 
+**Not yet implemented**: `host-rpc.md`'s `project.list`/
+`project.set_primary_workspace` RPCs have no wire type, host handler, or
+Android call site today — the Fleet drawer's Project sort mode currently
+renders from static fixture data (`FleetFixtures.projectsFor`), not a live
+RPC. See [PLAN.md](../../PLAN.md)'s Known follow-ups.
+
 ## Workspace entry
 
 Selecting a DevHost or a specific Workspace row is:

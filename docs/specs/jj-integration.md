@@ -4,12 +4,26 @@ Status: Draft
 
 ## Purpose
 
-`choosh-hostd` embeds [`jj-lib`](https://docs.rs/jj-lib) directly rather
-than shelling out to the `jj` CLI, for the same anti-string-parsing reason
-the pre-relay design gave for avoiding parsed `git` CLI output: CLI text
-formats are not a stable wire contract. This document defines the
-resulting file-browsing, diff, and change-graph RPC surface referenced
-from [host-rpc.md](host-rpc.md) and [DESIGN.md §8](../../DESIGN.md#8-deep-dive-browsing-a-jj-workspace-from-the-phone).
+`choosh-hostd`'s design commits to embedding
+[`jj-lib`](https://docs.rs/jj-lib) directly rather than shelling out to the
+`jj` CLI, for the same anti-string-parsing reason the pre-relay design gave
+for avoiding parsed `git` CLI output: CLI text formats are not a stable
+wire contract. This document defines the file-browsing, diff, and
+change-graph RPC surface referenced from [host-rpc.md](host-rpc.md) and
+[DESIGN.md §8](../../DESIGN.md#8-deep-dive-browsing-a-jj-workspace-from-the-phone) —
+that surface is unaffected by which jj integration strategy backs it.
+
+**Current implementation note:** `rust/choosh-hostd/src/jj_ops.rs` does not
+yet call `jj-lib`'s programmatic API. Every jj-touching operation currently
+shells out to the real `jj` CLI (fixed executable, fully-encoded argv,
+never a shell string, per host-rpc.md's "Command construction") instead —
+a deliberate, reported deviation documented in that module's own doc
+comment, on the grounds that `jj-lib`'s public surface for these
+operations (remote clone, working-copy snapshotting, tree-diff traversal)
+is substantially more work to assemble correctly than a single-pass
+increment could responsibly cover. Replacing this module's internals with
+real `jj-lib` calls behind the same RPC surface is a scoped follow-up, not
+yet done.
 
 **Constraint carried over from [DESIGN.md §14](../../DESIGN.md#14-open-questions):**
 `jj-lib` does not carry the same cross-release API-stability guarantee as,
@@ -43,7 +57,7 @@ in an implementation.
 ### `workspace.tree.list { workspace_id, path_prefix, revision? }`
 
 Returns one directory level's entries under `path_prefix` at `revision`
-(default `@`): `{ name, entry_type: file | dir | conflicted, tracked }`.
+(default `@`): `{ name, kind: file | directory, conflicted }`.
 Recursion is client-driven — see the page-size bound in
 [host-rpc.md](host-rpc.md). `conflicted` is a `jj-lib`-native flag (see
 "Conflicts" below), not something the client infers from markers.
@@ -54,7 +68,7 @@ Returns bounded file content at `revision` (default `@`). `range` is a
 byte offset/length pair for large-file streaming, per the bound in
 [host-rpc.md](host-rpc.md).
 
-### `workspace.file.write { workspace_id, path, base_revision, content_or_edits }`
+### `workspace.file.write { workspace_id, path, base_revision, content_base64 }`
 
 The only mutating file RPC, backing Sora's revisioned edit protocol
 (M4). `base_revision` MUST be the revision the client last read `path` at.
@@ -66,28 +80,28 @@ applying the write:
   needs to perform).
 - If `base_revision` is stale — the file changed on disk (another edit,
   an agent, a Zed save) since the client's last read — `hostd` MUST reject
-  the write with a `revision_stale` error (per the error model in
-  [host-rpc.md](host-rpc.md)) carrying the current revision and content,
-  and MUST NOT silently overwrite the intervening change. This is the same
-  posture the pre-relay Sora document protocol took toward stale edits;
-  jj's lack of an index makes the check simpler (one current state to
-  compare against) but the safety requirement is identical.
+  the write with a dedicated `WorkspaceFileWriteStale` response (per the
+  error model in [host-rpc.md](host-rpc.md)) carrying the current revision
+  and content, and MUST NOT silently overwrite the intervening change. This
+  is the same posture the pre-relay Sora document protocol took toward
+  stale edits; jj's lack of an index makes the check simpler (one current
+  state to compare against) but the safety requirement is identical.
 
-`content_or_edits` MAY be either a full replacement body or an incremental
-edit list (UTF-8 range edits), mirroring the old Sora protocol's
-`ContentChangeEvent` translation — the exact wire shape is an
-implementation choice deferred to the editor-protocol spec, not fixed
-here.
+`content_base64` is always a full replacement body (base64-encoded), never
+an incremental edit list — a deliberate V1 scope reduction from the
+originally-considered incremental-edit design (mirroring the old Sora
+protocol's `ContentChangeEvent` translation), reported in the RPC wire
+type's own doc comment.
 
 ### `workspace.diff { workspace_id, from = "@-", to = "@" }`
 
-Returns structured hunks computed by `jj-lib`'s own diff — never by
-Android. Each hunk: `{ old_path, new_path, old_start, old_lines,
-new_start, new_lines, segments: [{ kind: context | added | removed, text
-}] }`, with `old_path`/`new_path` differing only when `jj-lib` has already
-resolved a rename pairing. Binary and oversized files return `{ path,
-status, byte_size }` metadata instead of hunks, matching the pre-relay
-design's policy for binaries.
+Returns one entry per changed file, structured hunks computed by
+`jj-lib`'s own diff — never by Android: `{ old_path, new_path, hunks: [{
+old_start, old_lines, new_start, new_lines, segments: [{ kind: context |
+added | removed, text }] }] }`, with `old_path`/`new_path` differing only
+when `jj-lib` has already resolved a rename pairing. Binary and oversized
+files return `{ path, status, byte_size }` metadata instead of hunks,
+matching the pre-relay design's policy for binaries.
 
 ### `workspace.log { workspace_id, revset?, limit }`
 
@@ -118,8 +132,8 @@ destructive rewrite of history that isn't itself undoable).
 A conflicted tree entry is a structural property `jj-lib` exposes
 directly, not text markers a client has to parse out of file content.
 `workspace.tree.list` and `workspace.status` (defined in
-[host-rpc.md](host-rpc.md)) both surface it as an explicit
-`entry_type: conflicted` / per-path conflict flag. `workspace.file.read`
+[host-rpc.md](host-rpc.md)) both surface it as an explicit `conflicted`
+boolean field, separate from the entry's `kind`. `workspace.file.read`
 on a conflicted path returns the materialized conflict markers as file
 content (so it's still viewable), but callers MUST treat the structural
 flag, not the presence of marker text, as the source of truth for whether

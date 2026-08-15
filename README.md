@@ -55,8 +55,12 @@ Full architecture: **[DESIGN.md](DESIGN.md)**.
   agents and services each in their own managed tab.
 - Editing: Sora in-app for quick/no-desktop edits; a real Zed remote session
   tunneled through `relayd` when a laptop is available.
-- Terminal: Zelland-derived native `wgpu`/`glyphon` renderer with
-  `libghostty-vt` and an Android IME extra-keys bar.
+- Terminal: Zelland-derived native `wgpu`/`glyphon` renderer with an
+  Android IME extra-keys bar. `libghostty-vt` was the original target VT
+  parser but remains blocked on a stable, independently versioned pin (see
+  `docs/licenses/terminal-provenance.md`); the engine ships a pure-Rust
+  `vte`-backed parser behind the same interface instead, a deliberate
+  scope decision, not a dead end.
 - Notifications: FCM-driven, redacted to workspace/agent/coarse reason.
 - Toolchains: per-project `mise.toml`, provisioned by `choosh-hostd` on
   workspace registration.
@@ -64,11 +68,17 @@ Full architecture: **[DESIGN.md](DESIGN.md)**.
 
 ## Status
 
-This repository is being rebuilt against the architecture in
-[DESIGN.md](DESIGN.md). Prior work here (an SSH-only transport, Git-based
-diffing, a two-binary host daemon) predates that architecture and is being
-replaced, not extended — there is no shipped user base and no backwards
-compatibility constraint.
+All nine milestones (M0–M8) in [docs/milestones/](docs/milestones/) have
+real implementation and verification evidence against the architecture in
+[DESIGN.md](DESIGN.md); see [PLAN.md](PLAN.md) for the current status
+ledger and named follow-ups. The legacy pre-reset crates (an SSH-only
+transport, Git-based diffing, a two-binary host daemon) that predated this
+architecture were removed during M6 once confirmed unreferenced. This does
+not mean the product is finished or bug-free — most notably, no live
+`choosh-relayd` deployment exists yet, so the Android app still defaults to
+an in-memory fake engine and no genuine phone-to-relay-to-devhost round
+trip has been exercised end-to-end (see PLAN.md's "Known follow-ups").
+There is no shipped user base and no backwards compatibility constraint.
 
 ## Repository layout
 

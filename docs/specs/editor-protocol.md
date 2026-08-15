@@ -17,23 +17,28 @@ Opening a file issues `workspace.file.read { workspace_id, path }` (no
 [jj-integration.md](jj-integration.md)) and returns:
 
 ```text
-{ document_id, revision, content, encoding, line_ending, read_only }
+{ content_base64, total_size, revision }
 ```
 
-`revision` here is the content identity captured at open time (the file's
-current on-disk state), not a `jj` change/commit id — it exists purely to
-detect a conflicting concurrent write, the same role `base_revision` plays
-below.
+(`WorkspaceFileReadOk` in [host-rpc.md](host-rpc.md)'s wire types.) There
+is no separate `document_id`, `encoding`, `line_ending`, or `read_only`
+field on this response — `read_only` is instead a client-side UI state
+Sora derives from the file's oversized/binary status (see "Limits" below),
+and encoding is fixed UTF-8 (see "Persistence"). `revision` here is the
+content identity captured at open time (a hex-encoded SHA-256 of the
+file's whole current content, not a `jj` change/commit id) — it exists
+purely to detect a conflicting concurrent write, the same role
+`base_revision` plays below.
 
 ## Editing
 
-Sora emits incremental `ContentChangeEvent`s. The Rust engine translates
-each into a UTF-8 range edit carrying the `base_revision` it was composed
-against, validates and applies it, and returns the new `revision`. An edit
-whose `base_revision` no longer matches the document's current revision
-(the file changed on disk since the last edit was applied or since open —
-from an agent write, a `jj workspace` sync, or a Zed save) produces a
-resync/conflict event rather than a silent overwrite.
+Sora emits incremental `ContentChangeEvent`s locally as the user types, but
+what actually reaches `hostd` on save is always a full-content replacement
+body (base64-encoded), not an incremental edit list — see "Persistence"
+below. An edit whose `base_revision` no longer matches the document's
+current revision (the file changed on disk since the last save or since
+open — from an agent write, a `jj workspace` sync, or a Zed save) produces
+a resync/conflict event rather than a silent overwrite.
 
 ## Save state
 
@@ -45,12 +50,15 @@ snapshot.
 ## Persistence
 
 A save issues `workspace.file.write { workspace_id, path, base_revision,
-content_or_edits }` (defined in [jj-integration.md](jj-integration.md)).
-`hostd` MUST reject a write whose `base_revision` doesn't match the file's
-current on-disk revision rather than silently overwriting it — this is the
-entire conflict model; there is no separate merge/rebase step to get
-wrong, because there is nothing but the working copy to write to. Encoding
-and line endings MUST round-trip byte-identical.
+content_base64 }` (defined in [jj-integration.md](jj-integration.md)) —
+always the document's full current content, base64-encoded, never an
+incremental edit list; this is a deliberate V1 scope reduction from the
+incremental-edit design this section originally sketched, reported in the
+RPC wire type's own doc comment. `hostd` MUST reject a write whose
+`base_revision` doesn't match the file's current on-disk revision rather
+than silently overwriting it — this is the entire conflict model; there is
+no separate merge/rebase step to get wrong, because there is nothing but
+the working copy to write to. Content MUST round-trip byte-identical.
 
 ## Limits
 

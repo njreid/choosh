@@ -1,7 +1,10 @@
 //! The `/connect` `WebSocket` endpoint: the `ServerHello`/`ClientAuth`
-//! handshake, unauthenticated `enroll`, and the authenticated M0
-//! control-frame catalog (`request-enrollment-token`, `list-devhosts`).
-//! See `docs/specs/relay-protocol.md` and `docs/specs/auth-and-enrollment.md`.
+//! handshake, unauthenticated `enroll`, and the full authenticated
+//! control-frame catalog `dispatch` below serves — `request-enrollment-token`/
+//! `list-devhosts` (M0), `open-tunnel` and its `0x02` tunnel-frame routing
+//! (M1), `agent-event`/`register-fcm-token` (M2), `list-devhost-ssh-endpoints`
+//! (M6), and the `offload`-purpose tunnel capability (M7). See
+//! `docs/specs/relay-protocol.md` and `docs/specs/auth-and-enrollment.md`.
 
 use crate::AppState;
 use crate::ca;
@@ -345,11 +348,10 @@ async fn handle_control_frame(
     let response = match decode_control::<ControlRequest>(frame) {
         Ok(request) => dispatch(state, authenticated, request).await,
         Err(err) => {
-            // Covers unrecognized `type` values too — `agent-event` and
-            // `register-fcm-token` aren't in the `ControlRequest` enum yet,
-            // so a request for one of them lands here and is correctly
-            // treated as a malformed frame per relay-protocol.md: terminate
-            // the connection, no partial recovery.
+            // Covers unrecognized `type` values (and anything else that
+            // fails to decode as `ControlRequest`) — correctly treated as a
+            // malformed frame per relay-protocol.md: terminate the
+            // connection, no partial recovery.
             tracing::debug!(?err, device_id = %authenticated.device_id, "closing connection on malformed control frame");
             let _ = socket.close().await;
             return false;
@@ -476,6 +478,22 @@ async fn close_tunnels_for_device(state: &AppState, device_id: &str) {
     }
 }
 
+/// The ids of every tunnel whose `last_activity_unix` is at least
+/// `TUNNEL_IDLE_TIMEOUT_SECONDS` behind `now` — the pure boundary decision
+/// [`reap_idle_tunnels`] acts on, split out so it's unit-testable without
+/// waiting on either the real system clock or that function's own 30-second
+/// tick interval.
+fn expired_tunnel_ids(
+    tunnels: &std::collections::HashMap<[u8; TUNNEL_ID_BYTES], Tunnel>,
+    now: u64,
+) -> Vec<[u8; TUNNEL_ID_BYTES]> {
+    tunnels
+        .iter()
+        .filter(|(_, tunnel)| now.saturating_sub(tunnel.last_activity_unix) >= TUNNEL_IDLE_TIMEOUT_SECONDS)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// Runs for the lifetime of the process: periodically closes tunnels with
 /// no data frames in either direction for `TUNNEL_IDLE_TIMEOUT_SECONDS`,
 /// per relay-protocol.md's tunnel lifecycle, notifying both parties.
@@ -485,14 +503,7 @@ pub async fn reap_idle_tunnels(state: Arc<AppState>) {
         interval.tick().await;
         let expired: Vec<([u8; TUNNEL_ID_BYTES], Tunnel)> = {
             let mut tunnels = state.registry.tunnels.write().await;
-            let now = now_unix();
-            let ids: Vec<[u8; TUNNEL_ID_BYTES]> = tunnels
-                .iter()
-                .filter(|(_, tunnel)| {
-                    now.saturating_sub(tunnel.last_activity_unix) >= TUNNEL_IDLE_TIMEOUT_SECONDS
-                })
-                .map(|(id, _)| *id)
-                .collect();
+            let ids = expired_tunnel_ids(&tunnels, now_unix());
             ids.into_iter().filter_map(|id| tunnels.remove(&id).map(|tunnel| (id, tunnel))).collect()
         };
         for (tunnel_id, tunnel) in expired {
@@ -922,4 +933,52 @@ pub async fn dev_mint_enrollment_token(State(state): State<Arc<AppState>>) -> im
         EnrollmentToken { identity_class: IdentityClass::Devhost, expires_at_unix, consumed: false },
     );
     axum::Json(serde_json::json!({ "token": token, "expires_at": format_unix(expires_at_unix) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Tunnel, expired_tunnel_ids};
+    use crate::state::TUNNEL_IDLE_TIMEOUT_SECONDS;
+    use std::collections::HashMap;
+
+    fn tunnel(last_activity_unix: u64) -> Tunnel {
+        Tunnel {
+            requester_device_id: "requester".to_string(),
+            target_device_id: "target".to_string(),
+            purpose: "rpc".to_string(),
+            last_activity_unix,
+        }
+    }
+
+    // `reap_idle_tunnels` itself relies on a real 30-second tick and the
+    // real system clock, so it isn't practically unit-testable end to end —
+    // this exercises the pure boundary decision it delegates to instead:
+    // the exact instant a tunnel crosses from "idle" to "reap it now" per
+    // relay-protocol.md's tunnel lifecycle, including the inclusive `>=`
+    // boundary at exactly `TUNNEL_IDLE_TIMEOUT_SECONDS`, not just comfortably
+    // on either side of it.
+    #[test]
+    fn tunnels_expire_at_the_idle_timeout_boundary_inclusive() {
+        let now = 1_000_000u64;
+        let mut tunnels = HashMap::new();
+        let fresh = [1u8; 8];
+        let boundary = [2u8; 8];
+        let just_under = [3u8; 8];
+        let long_idle = [4u8; 8];
+        tunnels.insert(fresh, tunnel(now));
+        tunnels.insert(boundary, tunnel(now - TUNNEL_IDLE_TIMEOUT_SECONDS));
+        tunnels.insert(just_under, tunnel(now - TUNNEL_IDLE_TIMEOUT_SECONDS + 1));
+        tunnels.insert(long_idle, tunnel(0));
+
+        let mut expired = expired_tunnel_ids(&tunnels, now);
+        expired.sort_unstable();
+        let mut want = [boundary, long_idle];
+        want.sort_unstable();
+        assert_eq!(expired, want);
+    }
+
+    #[test]
+    fn an_empty_registry_expires_nothing() {
+        assert!(expired_tunnel_ids(&HashMap::new(), 1_000_000).is_empty());
+    }
 }

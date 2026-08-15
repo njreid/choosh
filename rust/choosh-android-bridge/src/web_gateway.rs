@@ -49,7 +49,9 @@
 // non-test call site (`gateway_jni.rs`) is android-only.
 #![cfg_attr(not(any(test, target_os = "android")), allow(dead_code))]
 
-use crate::http_lite::{build_response, rebuild_head_stripping_cookie, try_parse_head};
+use crate::http_lite::{
+    RunningLoopbackGateway, build_response, cookie_token_matches, must_shutdown, random_token, read_head_with_cap, rebuild_head_stripping_cookie,
+};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -153,27 +155,14 @@ impl Default for GatewayCaps {
     }
 }
 
-/// A live gateway: bound to an OS-assigned loopback port, gating on
-/// `token`. Dropping this (or calling [`Self::stop`]) ends the accept loop
-/// and every in-flight connection promptly.
-pub struct RunningGateway {
-    pub port: u16,
-    pub token: String,
-    shutdown_tx: watch::Sender<bool>,
-    accept_task: tokio::task::JoinHandle<()>,
-}
-
-impl RunningGateway {
-    /// Signals every in-flight connection and the accept loop to end, then
-    /// waits for the accept loop itself to actually stop — per
-    /// service-tunnels.md's "closes immediately", callers can rely on the
-    /// port being free and every connection torn down once this returns,
-    /// not just "eventually".
-    pub async fn stop(self) {
-        let _ = self.shutdown_tx.send(true);
-        let _ = self.accept_task.await;
-    }
-}
+/// This gateway races every in-flight connection against its own shutdown
+/// signal (see `accept_loop`'s per-connection `tokio::select!`), so
+/// [`RunningLoopbackGateway::stop`]'s "ends the accept loop" guarantee
+/// extends here to "and every in-flight connection promptly" — per
+/// service-tunnels.md's "closes immediately", callers can rely on the port
+/// being free and every connection torn down once `stop()` returns, not
+/// just "eventually".
+pub type RunningGateway = RunningLoopbackGateway;
 
 /// Starts a gateway for `item_id`, binding an ephemeral port on Android
 /// loopback only. `opener` is called once per accepted connection (never
@@ -196,7 +185,7 @@ pub async fn start_gateway(item_id: String, opener: UpstreamOpener, caps: Gatewa
         accept_loop(listener, opener, item_id, accept_token, caps, semaphore, accept_shutdown).await;
     });
 
-    Ok(RunningGateway { port, token, shutdown_tx, accept_task })
+    Ok(RunningLoopbackGateway::new(port, token, shutdown_tx, accept_task))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -249,17 +238,6 @@ async fn accept_loop(
     }
 }
 
-async fn must_shutdown(rx: &mut watch::Receiver<bool>) {
-    loop {
-        if *rx.borrow() {
-            return;
-        }
-        if rx.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
 /// Serves exactly one accepted client connection end to end: header-gate,
 /// open one upstream, then raw bidirectional byte-pump — see this module's
 /// doc comment for the full reasoning.
@@ -281,11 +259,7 @@ async fn serve_connection(
         Err(_) => return,
     };
 
-    let cookie_ok = head
-        .header("cookie")
-        .map(crate::http_lite::parse_cookie_header)
-        .is_some_and(|pairs| pairs.iter().any(|(name, value)| name == TOKEN_COOKIE_NAME && value == &token));
-    if !cookie_ok {
+    if !cookie_token_matches(&head, TOKEN_COOKIE_NAME, &token) {
         // Per service-tunnels.md: 403 here, and — critically — `opener` is
         // never called on this path, so no tunnel-open request reaches
         // relayd for an unauthenticated request.
@@ -311,38 +285,6 @@ async fn serve_connection(
     }
 
     pump_bidirectional(client, upstream, caps, shutdown_rx).await;
-}
-
-/// Reads from `client` into `buf` until a full HTTP head is present (per
-/// `http_lite::try_parse_head`), the header cap is exceeded (`Ok(None)`),
-/// the connection ends, or it idles past `idle_timeout` (both `Err`).
-async fn read_head_with_cap(
-    client: &mut TcpStream,
-    buf: &mut Vec<u8>,
-    max_header_bytes: usize,
-    idle_timeout: Duration,
-) -> io::Result<Option<crate::http_lite::RequestHead>> {
-    let mut chunk = [0_u8; 4096];
-    loop {
-        // Checked before parsing, not after: a single read can pull in
-        // more bytes than the cap in one shot (a small/fast client), and a
-        // head that happens to already be complete at that point must
-        // still be rejected as oversized rather than accepted just because
-        // it arrived in one piece.
-        if buf.len() > max_header_bytes {
-            return Ok(None);
-        }
-        if let Some(head) = try_parse_head(buf).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed head"))? {
-            return Ok(Some(head));
-        }
-        let read = tokio::time::timeout(idle_timeout, client.read(&mut chunk))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
-        if read == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client closed before a full head arrived"));
-        }
-        buf.extend_from_slice(&chunk[..read]);
-    }
 }
 
 /// Bidirectional raw byte pump between `client` and `upstream`, applying
@@ -413,20 +355,6 @@ async fn pump_bidirectional(client: TcpStream, mut upstream: Box<dyn Upstream>, 
         }
     }
     upstream.close();
-}
-
-fn random_token() -> String {
-    // Same minimal inline OS-RNG approach as
-    // choosh-android-transport::getrandom_fill (no other need for a `rand`
-    // dependency at this crate's small, occasional-use call sites). 32
-    // bytes -> 256 bits of entropy, hex-encoded so it's a safe, unambiguous
-    // cookie value with no escaping concerns.
-    use std::io::Read;
-    let mut bytes = [0_u8; 32];
-    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-        let _ = file.read_exact(&mut bytes);
-    }
-    crate::http_lite::hex_encode(&bytes)
 }
 
 #[cfg(test)]

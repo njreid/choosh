@@ -128,10 +128,13 @@ impl Engine {
         }
     }
 
-    /// Sends one M3 jj RPC ([`RpcRequest::WorkspaceDiff`],
+    /// Sends one `jj`-backed workspace RPC ([`RpcRequest::WorkspaceDiff`],
     /// `WorkspaceLog`, `WorkspaceOpLog`, `WorkspaceOpUndo`,
-    /// `WorkspaceOpRestore`, `WorkspaceStatus`) over `target_device_id`'s
-    /// tunnel and returns the raw [`RpcResponse`], or `Err` with a
+    /// `WorkspaceOpRestore`, `WorkspaceStatus` — the diff/log/op-log/undo/
+    /// restore group landed in M3, `WorkspaceStatus` earlier in M1; all are
+    /// done, this is just which wire types this helper carries) over
+    /// `target_device_id`'s tunnel and returns the raw [`RpcResponse`], or
+    /// `Err` with a
     /// human-readable message covering both "not connected" and a
     /// [`CallError`] — the caller (each typed `workspace_*` method below)
     /// turns either into this module's shared `{"error": ...}` JSON shape,
@@ -584,48 +587,187 @@ mod tests {
         assert!(parsed["error"].as_str().unwrap().contains("not connected"));
     }
 
+    // --- not-connected error paths for every remaining method -------------
+    //
+    // Every `workspace_*`/`item_list` method funnels "not connected" through
+    // the shared `call_jj_rpc` helper (already proven once by
+    // `list_devhosts_before_connect_is_a_typed_error` for its own,
+    // structurally identical not-connected path) into this module's shared
+    // `{"error": ...}` shape; `open_document`/`save_document` instead go
+    // through the distinct `{"type":"offline", ...}` shape;
+    // `open_pty_tunnel`/`open_web_tunnel`/`read_workspace_file_range` return
+    // a bare `Result<_, String>`; `register_fcm_token` returns `false`. Each
+    // is worth its own test rather than assuming the pattern holds, since
+    // that's exactly the kind of "every method wired the same way" claim a
+    // one-off copy-paste mistake in a single method would otherwise slip
+    // past unnoticed.
+    fn unconnected_engine() -> Engine {
+        Engine::new("http://unused".to_string(), "ws://unused".to_string())
+    }
+
+    fn assert_error_json_mentions_not_connected(body: &str) {
+        let parsed: Value = serde_json::from_str(body).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("not connected"), "{body}");
+    }
+
+    fn assert_offline_json_mentions_not_connected(body: &str) {
+        let parsed: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["type"], "offline", "{body}");
+        assert!(parsed["message"].as_str().unwrap().contains("not connected"), "{body}");
+    }
+
     #[tokio::test]
-    async fn connect_then_list_devhosts_round_trips_over_a_real_websocket() {
-        use choosh_protocol::framing::encode_frame;
-        use choosh_protocol::relay::{
-            AuthOk, AuthResult, ClientAuth, ConnectionState, ControlRequest, ControlResponse,
-            DevHostPresence, FRAME_CLASS_CONTROL, MAX_CONTROL_FRAME_BYTES, PhoneAuth, ServerHello,
-        };
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message;
+    async fn register_fcm_token_before_connect_returns_false() {
+        assert!(!unconnected_engine().register_fcm_token("tok").await);
+    }
 
-        async fn send<T: Serialize>(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, value: &T) {
-            let mut payload = vec![FRAME_CLASS_CONTROL];
-            payload.extend(serde_json::to_vec(value).unwrap());
-            let wire = encode_frame(&payload, MAX_CONTROL_FRAME_BYTES).unwrap();
-            ws.send(Message::Binary(wire.into())).await.unwrap();
-        }
-        async fn recv<T: serde::de::DeserializeOwned>(
-            ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-        ) -> T {
-            let Some(Ok(Message::Binary(bytes))) = ws.next().await else { panic!("expected binary frame") };
-            let mut decoder = choosh_protocol::framing::FrameDecoder::new(
-                choosh_protocol::framing::FrameLimits::new(MAX_CONTROL_FRAME_BYTES, 4).unwrap(),
-            );
-            let frames = decoder.feed(&bytes).unwrap();
-            let (_class, body) = frames[0].split_first().unwrap();
-            serde_json::from_slice(body).unwrap()
-        }
+    #[tokio::test]
+    async fn workspace_diff_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().workspace_diff("dev-1", "ws-1", "", "").await);
+    }
 
+    #[tokio::test]
+    async fn workspace_log_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().workspace_log("dev-1", "ws-1", "", 50).await);
+    }
+
+    #[tokio::test]
+    async fn workspace_op_log_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().workspace_op_log("dev-1", "ws-1", 50).await);
+    }
+
+    #[tokio::test]
+    async fn workspace_op_undo_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().workspace_op_undo("dev-1", "ws-1", "op-1").await);
+    }
+
+    #[tokio::test]
+    async fn workspace_op_restore_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().workspace_op_restore("dev-1", "ws-1", "op-1").await);
+    }
+
+    #[tokio::test]
+    async fn workspace_status_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().workspace_status("dev-1", "ws-1").await);
+    }
+
+    #[tokio::test]
+    async fn item_list_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().item_list("dev-1", "ws-1").await);
+    }
+
+    #[tokio::test]
+    async fn open_document_before_connect_is_offline_not_error() {
+        assert_offline_json_mentions_not_connected(&unconnected_engine().open_document("dev-1", "ws-1", "a.txt").await);
+    }
+
+    #[tokio::test]
+    async fn save_document_before_connect_is_offline_not_error() {
+        assert_offline_json_mentions_not_connected(&unconnected_engine().save_document("dev-1", "ws-1", "a.txt", "rev-1", "").await);
+    }
+
+    #[tokio::test]
+    async fn open_pty_tunnel_before_connect_is_a_typed_error() {
+        // `PtyTunnelHandle` (the `Ok` payload) carries no `Debug` impl, so
+        // `unwrap_err()` isn't available here — match instead.
+        let Err(error) = unconnected_engine().open_pty_tunnel("dev-1", "item-1").await else { panic!("expected an error") };
+        assert!(error.contains("not connected"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn open_web_tunnel_before_connect_is_a_typed_error() {
+        let Err(error) = unconnected_engine().open_web_tunnel("dev-1", "item-1").await else { panic!("expected an error") };
+        assert!(error.contains("not connected"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn read_workspace_file_range_before_connect_is_a_typed_error() {
+        let error = unconnected_engine().read_workspace_file_range("dev-1", "ws-1", "a.txt", None).await.unwrap_err();
+        assert!(error.contains("not connected"), "{error}");
+    }
+
+    // --- shared fake-relayd test harness -----------------------------------
+    //
+    // Everything below drives a real `PhoneConnection` against a real,
+    // in-process fake `relayd` over a real WebSocket — the same shape
+    // `choosh-android-transport`'s own test suite uses for its
+    // `call_rpc_round_trips_through_a_relayed_rpc_tunnel` test, hoisted here
+    // as shared helpers (rather than each test hand-rolling its own
+    // send/recv closures, which `connect_then_list_devhosts_round_trips_...`
+    // used to do before this pass) since every RPC-shaped test below needs
+    // the identical hello/auth/open-tunnel prefix.
+    type TestWs = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    async fn bind_fake_relayd_ws() -> (tokio::net::TcpListener, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let ws_url = format!("ws://{addr}/connect");
+        (listener, format!("ws://{addr}/connect"))
+    }
 
+    async fn send_control<T: Serialize>(ws: &mut TestWs, value: &T) {
+        use futures_util::SinkExt;
+        let mut payload = vec![choosh_protocol::relay::FRAME_CLASS_CONTROL];
+        payload.extend(serde_json::to_vec(value).unwrap());
+        let wire = choosh_protocol::framing::encode_frame(&payload, choosh_protocol::relay::MAX_CONTROL_FRAME_BYTES).unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(wire.into())).await.unwrap();
+    }
+
+    async fn recv_control<T: serde::de::DeserializeOwned>(ws: &mut TestWs) -> T {
+        use futures_util::StreamExt;
+        let Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) = ws.next().await else {
+            panic!("expected a binary frame")
+        };
+        let mut decoder = choosh_protocol::framing::FrameDecoder::new(
+            choosh_protocol::framing::FrameLimits::new(choosh_protocol::relay::MAX_CONTROL_FRAME_BYTES, 4).unwrap(),
+        );
+        let frames = decoder.feed(&bytes).unwrap();
+        let (_class, body) = frames[0].split_first().unwrap();
+        serde_json::from_slice(body).unwrap()
+    }
+
+    async fn send_tunnel_frame(ws: &mut TestWs, tunnel_id: [u8; choosh_protocol::relay::TUNNEL_ID_BYTES], payload: &[u8]) {
+        use futures_util::SinkExt;
+        let wire = choosh_protocol::framing::encode_frame(
+            &choosh_protocol::relay::encode_tunnel_frame(tunnel_id, payload),
+            choosh_protocol::relay::MAX_TUNNEL_FRAME_BYTES,
+        )
+        .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(wire.into())).await.unwrap();
+    }
+
+    async fn recv_tunnel_frame(ws: &mut TestWs) -> ([u8; choosh_protocol::relay::TUNNEL_ID_BYTES], Vec<u8>) {
+        use futures_util::StreamExt;
+        let Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) = ws.next().await else {
+            panic!("expected a binary frame")
+        };
+        let mut decoder = choosh_protocol::framing::FrameDecoder::new(
+            choosh_protocol::framing::FrameLimits::new(choosh_protocol::relay::MAX_CONTROL_FRAME_BYTES, 4).unwrap(),
+        );
+        let frames = decoder.feed(&bytes).unwrap();
+        let (id, payload) = choosh_protocol::relay::decode_tunnel_frame(&frames[0]).expect("expected a tunnel frame");
+        (id, payload.to_vec())
+    }
+
+    async fn authenticate_fake_relayd(ws: &mut TestWs) {
+        use choosh_protocol::relay::{AuthOk, AuthResult, ClientAuth, IdentityClass, ServerHello};
+        send_control(ws, &ServerHello { nonce: "n".to_string() }).await;
+        let _auth: ClientAuth = recv_control(ws).await;
+        send_control(ws, &AuthResult::Ok(AuthOk { identity_class: IdentityClass::Phone, device_id: "phone-1".to_string() })).await;
+    }
+
+    #[tokio::test]
+    async fn connect_then_list_devhosts_round_trips_over_a_real_websocket() {
+        use choosh_protocol::relay::{ConnectionState, ControlRequest, ControlResponse, DevHostPresence};
+
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
 
-            send(&mut ws, &ServerHello { nonce: "n".to_string() }).await;
-            let _auth: ClientAuth = recv(&mut ws).await;
-            send(&mut ws, &AuthResult::Ok(AuthOk { identity_class: choosh_protocol::relay::IdentityClass::Phone, device_id: "phone-1".to_string() })).await;
-            let request: ControlRequest = recv(&mut ws).await;
+            let request: ControlRequest = recv_control(&mut ws).await;
             let ControlRequest::ListDevhosts { request_id } = request else { panic!("expected list-devhosts") };
-            send(
+            send_control(
                 &mut ws,
                 &ControlResponse::ListDevhostsOk {
                     request_id,
@@ -640,7 +782,6 @@ mod tests {
                 },
             )
             .await;
-            let _ = PhoneAuth { session_credential: String::new() }; // keep import used across cfg
         });
 
         let engine = Engine::new("http://unused".to_string(), ws_url);
@@ -648,5 +789,114 @@ mod tests {
         let body = engine.list_devhosts().await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed[0]["alias"], "build-box");
+    }
+
+    /// Drives a full RPC round trip (hello/auth, open-tunnel, one tunnel
+    /// frame each way, close-tunnel) exactly like
+    /// `connect_then_list_devhosts_round_trips_over_a_real_websocket` does
+    /// for the control-only `list_devhosts` call — the shared prefix every
+    /// `workspace_*` test below needs. `respond` gets the decoded
+    /// [`RpcRequest`] and returns the exact [`RpcResponse`] the fake relayd
+    /// sends back over the tunnel.
+    async fn connect_and_serve_one_rpc(respond: impl FnOnce(RpcRequest) -> RpcResponse + Send + 'static) -> Engine {
+        use choosh_protocol::relay::{ControlRequest, ControlResponse, FRAME_CLASS_CONTROL as TUNNEL_INNER_CONTROL, encode_tunnel_id_hex};
+
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, purpose, .. } = open else { panic!("expected open-tunnel") };
+            assert_eq!(purpose, "rpc");
+            let tunnel_id: [u8; choosh_protocol::relay::TUNNEL_ID_BYTES] = [1, 2, 3, 4, 5, 6, 7, 8];
+            send_control(&mut ws, &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) }).await;
+
+            let (id, payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(id, tunnel_id);
+            let (inner_class, inner_body) = payload.split_first().unwrap();
+            assert_eq!(*inner_class, TUNNEL_INNER_CONTROL);
+            let request: RpcRequest = serde_json::from_slice(inner_body).unwrap();
+            let response = respond(request);
+
+            let mut response_payload = vec![TUNNEL_INNER_CONTROL];
+            response_payload.extend(serde_json::to_vec(&response).unwrap());
+            send_tunnel_frame(&mut ws, tunnel_id, &response_payload).await;
+
+            // `call_rpc` closes its fresh, one-shot tunnel proactively.
+            let (closed_id, closed_payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(closed_id, tunnel_id);
+            assert!(closed_payload.is_empty());
+        });
+
+        let engine = Engine::new("http://unused".to_string(), ws_url);
+        assert!(engine.connect("good-cred").await, "connect should succeed against a well-behaved fake relayd");
+        engine
+    }
+
+    /// The "wrong response variant" error path: `hostd` (or, here, the fake
+    /// relayd standing in for it) answers a `workspace.diff` request with a
+    /// well-formed but *different* RPC response — a genuine possibility if
+    /// the two ends' request/response pairing ever desyncs — and
+    /// `workspace_diff` must report that as its own `{"error": ...}` shape
+    /// (via `unexpected_or_error_json`) rather than panicking or silently
+    /// misinterpreting the payload as a diff.
+    #[tokio::test]
+    async fn workspace_diff_reports_an_unexpected_response_variant() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::WorkspaceDiff { request_id, .. } = request else { panic!("expected workspace.diff") };
+            // Deliberately the wrong variant: an op-log response answering
+            // a diff request.
+            RpcResponse::WorkspaceOpLogOk { request_id, operations: vec![] }
+        })
+        .await;
+
+        let body = engine.workspace_diff("dev-1", "ws-1", "", "").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("unexpected response to workspace.diff"), "{body}");
+    }
+
+    /// The application-level `hostd` rejection path: a well-formed
+    /// [`RpcResponse::Error`] must surface as this module's shared
+    /// `{"error": "<code>: <message>"}` shape, not the generic "unexpected
+    /// response" fallback — matching `unexpected_or_error_json`'s two
+    /// distinct arms.
+    #[tokio::test]
+    async fn workspace_log_reports_a_hostd_side_rpc_error() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::WorkspaceLog { request_id, .. } = request else { panic!("expected workspace.log") };
+            RpcResponse::Error { request_id, code: "not_found".to_string(), message: "no such workspace".to_string() }
+        })
+        .await;
+
+        let body = engine.workspace_log("dev-1", "ws-1", "", 50).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "not_found: no such workspace", "{body}");
+    }
+
+    /// Transport failure mid-call: the fake relayd disappears (drops the
+    /// socket) right after authenticating, before ever answering the
+    /// `open-tunnel` request `open_document`'s call triggers — the
+    /// `CallError::Transport` path `Engine::open_document` maps to its
+    /// `{"type":"offline", ...}` shape, per that method's own doc comment.
+    #[tokio::test]
+    async fn open_document_reports_offline_on_a_transport_failure() {
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+            // No response to the open-tunnel request that follows — just
+            // drop the connection, simulating relayd vanishing mid-call.
+        });
+
+        let engine = Engine::new("http://unused".to_string(), ws_url);
+        assert!(engine.connect("good-cred").await);
+        server.await.unwrap();
+
+        let body = engine.open_document("dev-1", "ws-1", "a.txt").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["type"], "offline", "{body}");
     }
 }

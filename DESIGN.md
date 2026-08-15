@@ -418,7 +418,8 @@ workspace.status        { workspace_id }  -> changed paths + conflict flags
 
 `jj-lib` does not carry the same API-stability guarantees as, say, `git2` —
 it moves with jj itself. Pin to a specific release tag and expect to bump
-deliberately; do not track a moving branch. (Open question, §12.)
+deliberately; do not track a moving branch. Resolved, formerly an open
+question — see §14.
 
 ## 9. Deep dive: tunneling a Zed remote session through relayd
 
@@ -521,9 +522,9 @@ Two tiers, both `mise`-driven but with different currency policies:
   security-review perspective, even though it's protocol-blind about tunnel
   contents (§2.3). It authenticates every identity and decides who may open
   a tunnel to whom. Its own availability and integrity are now
-  load-bearing for the whole fleet — this is a real posture change from the
-  old "no server at all" boundary and needs its own threat-model pass before
-  release (§12).
+  load-bearing for the whole fleet — this was a real posture change from
+  the old "no server at all" boundary and got its own dedicated M8
+  threat-model pass: `docs/security/relayd-threat-model.md`.
 - **Devhost-side surfaces stay loopback-only.** `hostd`'s RPC socket and SSH
   server bind to loopback; the only way to reach them is a `relayd`-brokered
   tunnel terminating in a local process `hostd` itself spawns, never a
@@ -556,27 +557,37 @@ choosh/
   android/app/                  APK packaging, Compose shell, composition roots
   rust/choosh-relayd/           Relay: presence, tunnel broker, FCM, WebAuthn RP
   rust/choosh-hostd/            Host daemon + laptop proxy mode (merges old chooshd/choosh-host)
-  rust/choosh-core/             Android-side state engine (actor model, revisioned snapshots)
   rust/choosh-android-bridge/   JNI boundary
   rust/choosh-android-transport/  Relay client transport (WebSocket, replaces the old SSH client)
-  rust/choosh-ssh/              SSH server implementation, used by choosh-hostd's Zed bridge
-  rust/choosh-web/              Maud/Datastar Markdown rendering + Zellij web-client fallback proxy
-  rust/choosh-protocol/         Shared envelope/RPC/event schemas
-  rust/choosh-testkit/          Shared test fakes/fixtures
+  rust/choosh-terminal-engine/  Pure-Rust VT100/ANSI terminal engine (grid/cursor/mode, key/mouse encoding)
+  rust/choosh-web/              Markdown rendering + Zellij web-client fallback proxy
+  rust/choosh-protocol/         Shared envelope/RPC/event wire types
   protocol/                     Versioned JSON Schemas and fixtures
   docs/                         Whatever documentation earns its keep going forward
 ```
 
-`rust/choosh-android-transport` and `rust/choosh-ssh` are repurposed, not
-new: the former moves from "SSH client to one host" to "relay client," the
-latter moves from "Android-side SSH client" to "hostd-side SSH server." The
-underlying Russh investment carries over; only the role changes.
+`rust/choosh-android-transport` is repurposed, not new: it moves from "SSH
+client to one host" to "relay client," and the underlying Russh investment
+carries over. `rust/choosh-ssh` did not get the same treatment as planned:
+its client-side code (host-key pinning, public-key client auth) was built
+for the opposite direction (Android dialing out over SSH) and proved
+unreusable for `choosh-hostd`'s SSH *server* role, so the loopback SSH
+server (`choosh-hostd/src/ssh_server.rs`) was built fresh inside
+`choosh-hostd` instead, and `choosh-ssh` was removed as legacy code rather
+than repurposed (see PLAN.md's "Legacy pre-reset crates" note). `choosh-core`
+and `choosh-testkit` were never built either: Android-side state lives in
+Kotlin ViewModels rather than a Rust actor-model engine, and test fakes/
+fixtures live per-crate (`#[cfg(test)]`) rather than in a shared crate.
 
 ## 14. Open questions
 
-- **`jj-lib` pinning strategy.** No stability guarantee across releases;
-  need an explicit pin/bump policy before relying on it for the diff/browse
-  path.
+**Resolved:** `jj-lib` pinning strategy. `choosh-hostd`'s `Cargo.toml`
+pins an exact release (`jj-lib = "0.44.0"`), and
+[jj-integration.md](docs/specs/jj-integration.md) now states the bump
+policy explicitly: pin an exact release and bump it "as a deliberate,
+reviewed increment — never track a moving branch or a loose semver
+range." No longer open.
+
 - **`ubi` asset matching for `zed-remote-server`.** Zed's release assets
   are named per-platform (e.g. `zed-remote-server-linux-x86_64.gz`) and
   gzip-wrapped; confirm `mise`'s `ubi` backend's matching/unpack handles

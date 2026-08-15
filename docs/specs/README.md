@@ -14,7 +14,8 @@ interoperate. RFC 2119 terms are normative here; DESIGN.md's prose is not.
   to this one.
 - [auth-and-enrollment.md](auth-and-enrollment.md) — passkeys for humans,
   device credentials for machines: the WebAuthn RP flow, enrollment-token
-  issuance, the devhost/laptop enrollment chain, and revocation.
+  issuance, the devhost/laptop enrollment chain, and revocation. See also
+  [relayd-threat-model.md](#related-verification-reports) below.
 
 ## Host daemon
 
@@ -58,6 +59,21 @@ interoperate. RFC 2119 terms are normative here; DESIGN.md's prose is not.
   credentials rather than SSH host-key verification.
 - [android-toolchain.md](android-toolchain.md) — the pinned-stable-release
   policy for the Android/Kotlin build.
+
+## Related verification reports
+
+These aren't specs — they're evidence documents written against the specs
+above, reviewing how well the real implementation matches them. See
+[PLAN.md](../../PLAN.md) for the status ledger these feed into.
+
+- [../security/relayd-threat-model.md](../security/relayd-threat-model.md) —
+  the M8 `choosh-relayd` threat-model review: identity, enrollment,
+  credential compromise, tunnel isolation, and availability, each traced to
+  specific code and tested (or named as an accepted risk).
+- [../accessibility-device-report.md](../accessibility-device-report.md) —
+  the M8 hands-on accessibility/device pass against a real Android device:
+  screen reader, hardware keyboard, DeX/tablet layout, and low-memory
+  behavior.
 
 ## Conventions
 

@@ -1,15 +1,22 @@
 //! Bounded, framework-agnostic primitives for Choosh's loopback web surfaces.
 //!
-//! This crate intentionally exposes no listener or browser bridge yet: the
-//! loopback HTTP server, Datastar SSE wiring, and root-confined ranged
-//! asset serving all depend on the `workspace.file.read` RPC
-//! (`docs/specs/jj-integration.md`), which is part of
-//! [M1](../../../docs/milestones/M1-workspace-and-jj.md) and not yet
-//! landed. What's here — [`markdown`]'s sanitizing Markdown→HTML renderer
-//! and the [`is_safe_relative_asset`] gate — is the decoupled rendering
-//! core that increment will wire up to a real file source; see
+//! This crate itself exposes no listener or browser bridge — no socket, no
+//! HTTP framing, no JNI — only [`markdown`]'s sanitizing Markdown→HTML
+//! renderer and the [`is_safe_relative_asset`] gate, both pure functions
+//! over already-fetched bytes. The listener/browser-bridge role this
+//! module doc used to describe as future work is real today, just built
+//! one crate over: `choosh-android-bridge::markdown_gateway` is the
+//! `workspace.file.read`-backed loopback HTTP server
+//! (`docs/specs/service-tunnels.md`'s Markdown/Datastar `WebView` surface)
+//! that fetches a document over the RPC tunnel and calls
+//! [`markdown::render_markdown`] directly as its rendering core — see that
+//! module's doc comment for the full architecture reasoning on why
+//! rendering happens client-side there rather than in this crate. This
+//! crate stays deliberately below that seam: framework-agnostic,
+//! testable without a socket or an RPC connection, and reusable by a
+//! server-side renderer later without change, per
 //! [M5](../../../docs/milestones/M5-web-and-markdown.md) ("Web preview and
-//! Markdown") for the full scope this crate grows into.
+//! Markdown").
 
 pub mod markdown;
 

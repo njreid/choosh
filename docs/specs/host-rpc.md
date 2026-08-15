@@ -66,9 +66,11 @@ entry: `{ workspace_id, workspace_name, devhost_id, project_id, created_at }`.
 ### `workspace.status`
 
 Returns the current changed-files summary and conflict flags for a
-Workspace's live working copy (`@`). Full shape defined in
-[jj-integration.md](jj-integration.md); referenced here because it is also
-the primary signal the Android explorer's changed-files section polls.
+Workspace's live working copy (`@`): `{ changed: [{ path, kind: added |
+modified | deleted }], conflicted: [path] }`. This is the primary signal
+the Android explorer's changed-files section polls; see
+[jj-integration.md](jj-integration.md)'s "Conflicts" section for how the
+`conflicted` list relates to `jj-lib`'s structural conflict flag.
 
 ### `project.list`
 
@@ -175,13 +177,20 @@ allocation.
 
 ## Error model
 
-RPC errors are typed, not free-text: `{ request_id, error: { code,
-message } }` where `code` is a fixed enum (`not_found`,
-`out_of_root`, `invalid_argument`, `conflict`, `revision_stale`,
-`bound_exceeded`, `internal`). `message` MUST NOT contain file contents,
+RPC errors are typed, not free-text: `{ request_id, code, message }` where
+`code` is a fixed enum (`not_found`, `out_of_root`, `invalid_argument`,
+`conflict`, `bound_exceeded`, `internal`). `message` MUST NOT contain file contents,
 command text, or credentials — the same redaction discipline
 [agent-events.md](agent-events.md) applies to notifications applies here
 too, since RPC errors can end up surfaced in the UI. A failed request MUST
 NOT leave partial state: `workspace.create`, `item.create`, and
 `workspace.file.write` are all effectively transactional from the caller's
 perspective — either the full effect happened, or none of it did.
+
+A stale write on `workspace.file.write` is not reported through this
+generic `code`/`message` shape — it needs to carry back the current
+revision and content so the caller can re-render a conflict view, which
+the generic shape can't. It gets its own dedicated response variant,
+`WorkspaceFileWriteStale { request_id, current_revision,
+current_content_base64 }`, instead of `code = "conflict"` or a
+`revision_stale` code.
