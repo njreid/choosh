@@ -25,6 +25,7 @@ pub mod credential;
 pub mod dev_exec;
 mod frame_channel;
 pub mod fs_ops;
+mod host_tool_bin;
 pub mod hooks;
 pub mod jj_ops;
 pub mod local_ipc;

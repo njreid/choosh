@@ -89,6 +89,23 @@ impl std::fmt::Display for ZellijError {
 
 impl std::error::Error for ZellijError {}
 
+/// Builds a `Command::new("zellij")` with `PATH` already set to prefer the
+/// directory `serve.rs`'s `check_host_tool_currency_once` most recently
+/// proved current (via `crate::host_tool_bin::apply_zellij_path` — see that
+/// module's doc comment for why a `PATH` override, not a resolved path
+/// threaded through this module's many call sites) — every `Command::new`
+/// call site in this module, and `pty.rs`'s `PtySession::attach`, builds its
+/// `zellij` invocation through this rather than `Command::new("zellij")`
+/// directly, so all of them stay in sync with exactly one place that knows
+/// how to apply the override. A no-op (ordinary `$PATH` resolution,
+/// unchanged from before this existed) until that check has resolved at
+/// least once.
+pub(crate) fn zellij_command() -> Command {
+    let mut command = Command::new("zellij");
+    crate::host_tool_bin::apply_zellij_path(&mut command);
+    command
+}
+
 /// Creates a Zellij session named `session_name` rooted at `cwd`, per the
 /// headless-creation approach documented above. Idempotent in the sense
 /// that a session already present under this name is treated as success
@@ -136,7 +153,7 @@ pub async fn create_session(session_name: &str, cwd: &Path) -> Result<(), Zellij
         // truth either way, never this process's exit.
         {
             let _guard = ZELLIJ_CLIENT_LOCK.lock().await;
-            let child = Command::new("zellij")
+            let child = zellij_command()
                 .arg("attach")
                 .arg(session_name)
                 .arg("--create-background")
@@ -196,7 +213,7 @@ pub async fn create_session(session_name: &str, cwd: &Path) -> Result<(), Zellij
 pub async fn new_tab(session_name: &str, tab_name: &str, cwd: &Path, initial_command: &[String]) -> Result<(), ZellijError> {
     {
         let _guard = ZELLIJ_CLIENT_LOCK.lock().await;
-        let mut command = Command::new("zellij");
+        let mut command = zellij_command();
         command
             .env("ZELLIJ_SESSION_NAME", session_name)
             .arg("action")
@@ -259,7 +276,7 @@ pub async fn list_tabs(session_name: &str) -> Result<Vec<String>, ZellijError> {
 /// numeric `tab_id` too, to close by ID rather than by currently-focused
 /// tab — see [`close_tab`]'s own doc comment).
 async fn list_tabs_info(session_name: &str) -> Result<Vec<TabInfo>, ZellijError> {
-    let child = Command::new("zellij")
+    let child = zellij_command()
         .env("ZELLIJ_SESSION_NAME", session_name)
         .arg("action")
         .arg("list-tabs")
@@ -354,7 +371,7 @@ pub async fn close_tab(session_name: &str, tab_name: &str) -> Result<(), ZellijE
 /// exit failure with no sessions running is treated as "no sessions", not
 /// an error, since that's Zellij's normal behavior when nothing exists yet.
 pub async fn list_sessions() -> Result<Vec<String>, ZellijError> {
-    let output = Command::new("zellij")
+    let output = zellij_command()
         .arg("list-sessions")
         .arg("--no-formatting")
         .stdin(Stdio::null())
@@ -410,7 +427,7 @@ pub async fn kill_session(session_name: &str) -> Result<(), ZellijError> {
 /// Returns [`ZellijError::Spawn`] if `zellij` can't be spawned.
 async fn run_zellij_client(args: &[&str], session_name: Option<&str>) -> Result<(), ZellijError> {
     let _guard = ZELLIJ_CLIENT_LOCK.lock().await;
-    let mut command = Command::new("zellij");
+    let mut command = zellij_command();
     if let Some(session_name) = session_name {
         command.env("ZELLIJ_SESSION_NAME", session_name);
     }
@@ -477,8 +494,7 @@ pub async fn ensure_web_server_running() -> Result<u16, ZellijError> {
 }
 
 async fn web_server_status_online() -> Result<bool, ZellijError> {
-    let output =
-        Command::new("zellij").arg("web").arg("--status").stdin(Stdio::null()).output().await.map_err(ZellijError::Spawn)?;
+    let output = zellij_command().arg("web").arg("--status").stdin(Stdio::null()).output().await.map_err(ZellijError::Spawn)?;
     Ok(String::from_utf8_lossy(&output.stdout).contains("online"))
 }
 
@@ -577,5 +593,84 @@ mod tests {
             }
             panic!("zellij web server still reported online after stop_web_server");
         }
+    }
+
+    // -------------------------------------------------------------
+    // `host_tool_bin`'s PATH-prepend wiring (see that module's doc comment
+    // for the concurrency-safety reasoning behind this test's design, which
+    // mirrors `jj_ops.rs`'s own `resolved_jj_dir_is_actually_used...` test).
+    // -------------------------------------------------------------
+
+    /// Finds `name`'s real, currently-installed absolute path by walking
+    /// this test process's own `$PATH` directly — used to build a
+    /// fake-`mise`-dir proxy binary that forwards to the real thing. Same
+    /// helper `jj_ops.rs`'s own test module defines for the same purpose
+    /// (not shared — each module's test fixtures are self-contained, per
+    /// this crate's existing per-module fixture convention, e.g.
+    /// `mise_ops.rs`'s `write_fake_mise`).
+    fn find_real_binary(name: &str) -> std::path::PathBuf {
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("could not find a real {name} on this test process's own PATH"))
+    }
+
+    /// The `zellij` sibling of `jj_ops.rs`'s `write_fake_jj_proxy` — same
+    /// transparent-forwarding shape, for the same reason (see that
+    /// function's doc comment): a fake `zellij` that logs its own argv and
+    /// then `exec`s the real binary (found via its absolute path, so it can
+    /// never recursively resolve back to itself even though it inherits the
+    /// overridden `PATH`), so any other, concurrently-running test that
+    /// spawns `zellij` while this fixture's directory is the active
+    /// override still gets fully correct real behavior.
+    fn write_fake_zellij_proxy(fake_dir: &std::path::Path, log_path: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(fake_dir).unwrap();
+        let real_zellij = find_real_binary("zellij");
+        let script_path = fake_dir.join("zellij");
+        let body = format!(
+            "#!/bin/sh\necho \"$@\" >> \"{log}\"\nexec \"{real_zellij}\" \"$@\"\n",
+            log = log_path.display(),
+            real_zellij = real_zellij.display(),
+        );
+        std::fs::write(&script_path, body).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script_path
+    }
+
+    /// Proves the resolved `zellij` directory is genuinely what
+    /// `zellij_command` (in turn every real call site in this module, plus
+    /// `pty.rs`'s `PtySession::attach`) spawns — not just "the code
+    /// compiles and the currency check still passes" — by distinguishing
+    /// the override's absence from its presence against the same operation
+    /// (`list_sessions`), same structure as `jj_ops.rs`'s analogous test.
+    #[tokio::test]
+    async fn resolved_zellij_dir_is_actually_used_over_a_bare_path_zellij() {
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let log_path = fixture_dir.path().join("invocations.log");
+        let fake_zellij_dir = fixture_dir.path().join("resolved-zellij");
+        write_fake_zellij_proxy(&fake_zellij_dir, &log_path);
+
+        // Absence: no override set, so `list_sessions` resolves via
+        // ordinary `$PATH` and never touches the fake proxy.
+        let before = list_sessions().await;
+        assert!(before.is_ok(), "list_sessions should succeed against the real zellij: {before:?}");
+        assert!(!log_path.exists(), "the fake zellij proxy must not be invoked before set_zellij_dir is called");
+
+        // Presence: with the override set, the same operation must route
+        // through the fake proxy — proven by its log entry appearing — and
+        // still succeed correctly, since the proxy transparently forwards
+        // to the real binary.
+        crate::host_tool_bin::set_zellij_dir(Some(fake_zellij_dir));
+        let after = list_sessions().await;
+        crate::host_tool_bin::set_zellij_dir(None);
+
+        assert!(after.is_ok(), "the proxied real zellij must still succeed: {after:?}");
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("list-sessions"),
+            "expected the mise-resolved zellij proxy to have logged the list-sessions invocation, got: {log:?}"
+        );
     }
 }

@@ -110,6 +110,15 @@ impl std::error::Error for JjError {}
 /// file's content (per `jj file show`) is not text at all. Both wrap this.
 async fn spawn(args: &[&str], cwd: Option<&Path>) -> Result<std::process::Output, JjError> {
     let mut command = Command::new("jj");
+    // Prefers the `jj` binary `serve.rs`'s `check_host_tool_currency_once`
+    // most recently proved current under `choosh-hostd`'s own `mise`-managed
+    // `host_tools_dir`, over whatever a bare `$PATH` lookup would otherwise
+    // find first — see `host_tool_bin`'s module doc comment for why this is
+    // a `PATH` override rather than a resolved path threaded through every
+    // one of this module's many call sites. A no-op (ordinary `$PATH`
+    // resolution, unchanged from before this existed) until that check has
+    // resolved at least once.
+    crate::host_tool_bin::apply_jj_path(&mut command);
     command.args(args).arg("--no-pager").arg("--color=never").stdin(Stdio::null());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -1534,5 +1543,91 @@ mod tests {
 
         let result = op_undo(dir.path(), "deadbeef1234").await;
         assert!(matches!(result, Err(JjError::CommandFailed { .. })), "expected CommandFailed, got {result:?}");
+    }
+
+    // -------------------------------------------------------------
+    // `host_tool_bin`'s PATH-prepend wiring (see that module's doc comment
+    // for the concurrency-safety reasoning behind this test's design).
+    // -------------------------------------------------------------
+
+    /// Finds `name`'s real, currently-installed absolute path by walking
+    /// this test process's own `$PATH` directly (not via a `jj`/`zellij`
+    /// shell-out, which is exactly the resolution mechanism this test is
+    /// trying to prove gets overridden) — used to build a fake-`mise`-dir
+    /// proxy binary that forwards to the real thing.
+    fn find_real_binary(name: &str) -> PathBuf {
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path_var)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("could not find a real {name} on this test process's own PATH"))
+    }
+
+    /// Writes a fake `jj` at `fake_dir/jj` that appends its own argv to
+    /// `log_path` and then `exec`s the *real* `jj` (found via
+    /// [`find_real_binary`]) with the same argv — a transparent forwarding
+    /// proxy, not a stub. This specific shape is what makes it safe to set
+    /// process-wide via [`crate::host_tool_bin::set_jj_dir`] even though
+    /// `cargo test` runs many other, unrelated `jj_ops` tests concurrently
+    /// in this same process: any of those tests that happens to spawn `jj`
+    /// while this fake directory is prepended onto `PATH` still gets fully
+    /// correct real `jj` behavior (via `exec`, using the real binary's
+    /// *absolute* path so it can never recursively resolve back to this
+    /// same proxy script even though the child inherits the overridden
+    /// `PATH`), just via one extra logged hop.
+    fn write_fake_jj_proxy(fake_dir: &Path, log_path: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(fake_dir).unwrap();
+        let real_jj = find_real_binary("jj");
+        let script_path = fake_dir.join("jj");
+        let body = format!(
+            "#!/bin/sh\necho \"$@\" >> \"{log}\"\nexec \"{real_jj}\" \"$@\"\n",
+            log = log_path.display(),
+            real_jj = real_jj.display(),
+        );
+        std::fs::write(&script_path, body).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script_path
+    }
+
+    /// Proves `check_host_tool_currency_once`'s resolved `jj` directory is
+    /// genuinely what a real `jj_ops` call spawns — not just "the code
+    /// compiles and the currency check still passes" — by distinguishing
+    /// the override's absence from its presence against the exact same
+    /// operation: with [`crate::host_tool_bin::set_jj_dir`] unset (`None`,
+    /// the default), no proxy invocation is ever logged; once set to a
+    /// directory containing [`write_fake_jj_proxy`]'s fake `jj`, the same
+    /// operation logs a real invocation through it before real `jj` itself
+    /// (reached via the proxy's `exec`) does the actual work.
+    #[tokio::test]
+    async fn resolved_jj_dir_is_actually_used_over_a_bare_path_jj() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let log_path = fixture_dir.path().join("invocations.log");
+        let fake_jj_dir = fixture_dir.path().join("resolved-jj");
+        write_fake_jj_proxy(&fake_jj_dir, &log_path);
+
+        // Absence: no override set, so `ensure_colocated`'s `jj git init`
+        // resolves via ordinary `$PATH` and never touches the fake proxy.
+        ensure_colocated(repo_dir.path()).await.unwrap();
+        assert!(!log_path.exists(), "the fake jj proxy must not be invoked before set_jj_dir is called");
+
+        // Presence: with the override set to the fixture directory, a
+        // second real CLI-shim `jj_ops` call (`op_log`, against the now-
+        // colocated repo — `status`/`log`/`current_commit_id` are the
+        // functions this module migrated to real `jj-lib` calls, so they
+        // have no `Command::new("jj")` left to redirect at all; see this
+        // file's module doc comment) must route through the fake proxy —
+        // proven by its log entry appearing — and still succeed correctly,
+        // since the proxy transparently forwards to the real binary.
+        crate::host_tool_bin::set_jj_dir(Some(fake_jj_dir));
+        let op_log_result = op_log(repo_dir.path(), 5).await;
+        crate::host_tool_bin::set_jj_dir(None);
+
+        assert!(op_log_result.is_ok(), "the proxied real jj must still succeed: {op_log_result:?}");
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(!log.is_empty(), "expected the mise-resolved jj proxy to have logged an invocation");
     }
 }

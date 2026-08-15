@@ -327,10 +327,30 @@ Not blocking, but real and worth tracking rather than leaving implicit:
   including the real two-workspace-conflicted-merge test and the
   rename/binary-diff regression test — pass unchanged against the migrated
   functions.
-- **`jj`/`zellij` currency checks (M7) don't redirect the rest of
-  `choosh-hostd`'s existing `Command::new("jj"/"zellij")` call sites** to
-  the `mise`-resolved binary — currency is checked and logged, but not yet
-  plumbed through every invocation.
+- **`jj`/`zellij` currency checks (M7) now redirect the rest of
+  `choosh-hostd`'s `Command::new("jj"/"zellij")` call sites — fixed
+  (follow-up).** `check_host_tool_currency_once` records the mise-resolved
+  binary directory (`rust/choosh-hostd/src/host_tool_bin.rs`) and every
+  `jj_ops.rs`/`zellij_ops.rs`/`pty.rs` spawn site now prepends it onto the
+  child's own `PATH` before an ordinary `Command::new("jj"/"zellij")`
+  lookup — never touching argv, so the "fixed executable + fully-encoded
+  argv, never a shell string" discipline (`host-rpc.md`'s "Command
+  construction") holds exactly as before. `PATH`-prepend was chosen over
+  threading a resolved path through every call site's signature (the two
+  options `check_host_tool_currency_once`'s own doc comment originally
+  deferred between) because both modules are each called from dozens of
+  places — `rpc.rs`'s test module alone has ~50 `zellij_ops::kill_session`
+  cleanup call sites with no reason to know about a resolved path.
+  Verified with a real distinguishing test per binary: a transparent
+  forwarding proxy binary that logs its own invocation then execs the real
+  one, proving the override (not ambient `$PATH`) is what actually runs,
+  built to stay safe under `cargo test`'s default parallelism (any
+  concurrently-running unrelated test that spawns `jj`/`zellij` while the
+  process-wide override is active still gets fully correct real behavior,
+  just via one extra logged hop). `jj_ops.rs`'s functions already migrated
+  to real `jj-lib` calls (`status`, `current_commit_id`/`commit_id_at`,
+  `log`) have no `Command::new("jj")` left to redirect and were
+  correctly left untouched.
 - **Obtainium discovery was verified against its documented contract**
   (`scripts/check-release-discovery.sh` passes against a real signed APK)
   but never against a real cut GitHub Release — no release has been

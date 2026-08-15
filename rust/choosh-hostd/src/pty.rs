@@ -98,7 +98,11 @@ impl PtySession {
     ///
     /// See [`PtyError`]'s variants.
     pub async fn attach(session_name: &str, tab_name: &str) -> Result<Self, PtyError> {
-        let mut command = Command::new("zellij");
+        // `crate::zellij_ops::zellij_command`, not a bare `Command::new`,
+        // so this attach client prefers the same mise-resolved `zellij`
+        // binary `zellij_ops.rs`'s own call sites do — see that function's
+        // and `host_tool_bin`'s doc comments.
+        let mut command = crate::zellij_ops::zellij_command();
         // Deliberately does NOT set `ZELLIJ_SESSION_NAME` on this child —
         // confirmed by direct experiment (both a bare shell invocation and
         // a real-pty Python harness, 6/6 reproductions) that doing so is

@@ -318,11 +318,17 @@ pub(crate) fn build_rpc_context(device_id: &str) -> Result<RpcContext, ServeErro
 /// even hung `mise` invocation here can never block `serve`'s own startup
 /// or its main relayd connection loop.
 ///
-/// Deliberately does not change which `jj`/`zellij` binary the rest of
-/// this crate invokes (`jj_ops.rs`/`zellij_ops.rs`/`pty.rs` all still
-/// resolve `jj`/`zellij` via `$PATH`, exactly as before this function
-/// existed) — see this function's own further doc comment below for why
-/// that's a deliberate, reported scope boundary rather than an oversight.
+/// Every successful resolution here also updates `crate::host_tool_bin`'s
+/// process-wide record of "the directory containing the `jj`/`zellij`
+/// binary most recently proven current" — which is what actually makes
+/// `jj_ops.rs`/`zellij_ops.rs`/`pty.rs`'s own `Command::new("jj")`/
+/// `Command::new("zellij")` call sites (via `host_tool_bin::apply_jj_path`/
+/// `apply_zellij_path`, in turn `zellij_ops::zellij_command`) prefer that
+/// binary over whatever a bare `$PATH` lookup would otherwise find first —
+/// see [`check_host_tool_currency_once`]'s own doc comment for the fuller
+/// reasoning and [`crate::host_tool_bin`]'s module doc comment for why this
+/// is a `PATH`-prepend, not a resolved path threaded through every one of
+/// those modules' many call sites.
 fn spawn_host_tool_currency_checks(mise_bin: String, host_tools_dir: PathBuf) {
     tokio::spawn(async move {
         loop {
@@ -338,29 +344,42 @@ fn spawn_host_tool_currency_checks(mise_bin: String, host_tools_dir: PathBuf) {
 /// [`HOST_TOOL_RECHECK_INTERVAL`] tick regardless of whether this attempt
 /// succeeded.
 ///
-/// **Explicit scope boundary, not a gap left by accident**: this proves
-/// and logs whether `jj`/`zellij` are current under `choosh-hostd`'s own
-/// `mise`-managed `host_tools_dir` — it does not redirect
-/// `jj_ops.rs`/`zellij_ops.rs`/`pty.rs`'s existing `Command::new("jj")`/
-/// `Command::new("zellij")` call sites (which resolve via `$PATH`) to the
-/// path this resolves. Doing that would mean either prepending this
-/// resolved binary's directory onto `PATH` for every process this crate
-/// spawns (including every Zellij-tab-launched process, via the same
-/// `env KEY=VALUE ...` argv-prefix mechanism `agent_launch.rs` already
-/// uses for `CHOOSH_*`/project-pinned `mise` vars — itself a plausible
-/// follow-up), or threading a resolved binary path through every `jj`/
-/// `zellij` call site in this crate — either one a materially larger,
-/// cross-cutting change than "keep `jj`/`zellij` current," and one that
-/// would touch files well beyond this task's stated scope. Currency
-/// checking (this function) is complete and tested; "which binary the
-/// rest of the crate calls" is a deliberate, separate, reported gap.
+/// **This governs which binary the rest of the crate actually invokes, not
+/// just what gets logged.** A successful resolution records the resolved
+/// binary's *directory* in `crate::host_tool_bin` (`set_jj_dir`/
+/// `set_zellij_dir`) — from which every `Command::new("jj")`/
+/// `Command::new("zellij")` call site in `jj_ops.rs`/`zellij_ops.rs`/
+/// `pty.rs` prepends it onto that spawned child's own `PATH`, so `$PATH`
+/// search (still an ordinary search — argv is never changed) finds the
+/// mise-resolved binary first. See `crate::host_tool_bin`'s module doc
+/// comment for why this is a `PATH`-prepend (mirroring the `env KEY=VALUE
+/// ...` argv-prefix mechanism `agent_launch.rs` already uses for
+/// `CHOOSH_*`/project-pinned `mise` vars, adapted for the fact that this
+/// crate spawns `jj`/`zellij` directly rather than indirectly through a
+/// Zellij-tab-launched process) rather than threading a resolved path
+/// through every one of `jj_ops.rs`/`zellij_ops.rs`'s many call sites
+/// (`rpc.rs`'s own test module alone has ~50 that would otherwise need to
+/// change).
+///
+/// A failed resolution deliberately does NOT clear a previously-recorded
+/// directory: a transient `mise`/network failure this cycle should not
+/// revert every subsequent invocation to unpredictable, un-vetted `$PATH`
+/// resolution when a still-current, already-proven binary is right there —
+/// it's retried next interval regardless, and either updates the record
+/// again (a newer release) or leaves it exactly as is (still current).
 async fn check_host_tool_currency_once(mise_bin: &str, host_tools_dir: &std::path::Path) {
     match crate::mise_ops::ensure_jj(mise_bin, host_tools_dir).await {
-        Ok(path) => tracing::info!(resolved = %path.display(), "jj currency check ok"),
+        Ok(path) => {
+            tracing::info!(resolved = %path.display(), "jj currency check ok");
+            crate::host_tool_bin::set_jj_dir(path.parent().map(std::path::Path::to_path_buf));
+        }
         Err(error) => tracing::warn!(%error, "jj currency check failed; will retry on the next interval"),
     }
     match crate::mise_ops::ensure_zellij(mise_bin, host_tools_dir).await {
-        Ok(path) => tracing::info!(resolved = %path.display(), "zellij currency check ok"),
+        Ok(path) => {
+            tracing::info!(resolved = %path.display(), "zellij currency check ok");
+            crate::host_tool_bin::set_zellij_dir(path.parent().map(std::path::Path::to_path_buf));
+        }
         Err(error) => tracing::warn!(%error, "zellij currency check failed; will retry on the next interval"),
     }
 }
