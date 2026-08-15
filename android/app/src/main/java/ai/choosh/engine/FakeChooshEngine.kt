@@ -334,6 +334,43 @@ class FakeChooshEngine : ChooshEngine {
         projectPrimaryOverrides[projectId] = workspaceId
     }
 
+    // --- docs/specs/agent-events.md fakes -----------------------------------
+
+    /** Test/demo-injected live pushes, drained (in order) by [pollAgentEvents] — never populated on its own. */
+    private val agentEventQueue = ArrayDeque<AgentEventPush>()
+
+    /** Lets a test/preview simulate a live agent-event push arriving, without a real backend. */
+    fun enqueueAgentEvent(push: AgentEventPush) {
+        agentEventQueue.addLast(push)
+    }
+
+    override suspend fun pollAgentEvents(): List<AgentEventPush> {
+        delay(FAKE_LATENCY_MS)
+        val drained = agentEventQueue.toList()
+        agentEventQueue.clear()
+        return drained
+    }
+
+    /** Per-`workspaceId` fixture history [agentEventsResume] replays from — seeded by a test via [setAgentEventHistory]. */
+    private val agentEventHistory = mutableMapOf<String, List<SequencedAgentEvent>>()
+
+    /** Set by a test to exercise [AgentEventsResumeOutcome.SnapshotRequired] without clearing [agentEventHistory]. */
+    var simulateSnapshotRequired: Boolean = false
+
+    /** Seeds [agentEventsResume]'s fixture history for `workspaceId`, oldest first. */
+    fun setAgentEventHistory(workspaceId: String, events: List<SequencedAgentEvent>) {
+        agentEventHistory[workspaceId] = events
+    }
+
+    override suspend fun agentEventsResume(deviceId: String, workspaceId: String, afterSequence: Long?): AgentEventsResumeOutcome {
+        delay(FAKE_LATENCY_MS)
+        if (simulateSnapshotRequired) return AgentEventsResumeOutcome.SnapshotRequired
+        val history = agentEventHistory[workspaceId].orEmpty()
+        val after = afterSequence ?: 0L
+        val replay = history.filter { it.sequence > after }
+        return AgentEventsResumeOutcome.Replayed(events = replay, latestSequence = history.maxOfOrNull { it.sequence } ?: after)
+    }
+
     override fun close() {
         connected = false
     }

@@ -133,8 +133,8 @@ Not blocking, but real and worth tracking rather than leaving implicit:
   process has ever created or released one of these assertions, and
   whether it actually prevents sleep/reconnect-loss in practice is
   untested.
-- **`agent-events.md`'s replay/sequencing machinery — hostd side is real,
-  Android client wiring is not.** `choosh-hostd` now assigns a real,
+- **`agent-events.md`'s replay/sequencing machinery — now real end to end,
+  hostd and Android both (follow-up).** `choosh-hostd` assigns a real,
   monotonically increasing per-workspace sequence to every agent event
   (`rust/choosh-hostd/src/agent_event_spool.rs`) and retains a bounded
   per-workspace spool (500 events or 1 hour, whichever is smaller) that a
@@ -142,26 +142,36 @@ Not blocking, but real and worth tracking rather than leaving implicit:
   tunnel (`choosh_protocol::relay::AgentEventsResumeRequest`/
   `AgentEventsResumeResponse`, handled in `serve.rs` alongside the existing
   `"rpc"`/`"pty:"`/`"web:"` tunnel purposes) — a request older than the
-  retained window gets `snapshot_required`, never a silent gap. Verified
-  with real sequencing/eviction/replay unit tests and real end-to-end
-  `serve_dispatch` integration tests, including one that drops and
-  re-establishes the relayd connection mid-stream and confirms nothing
-  emitted during the gap is lost. Still in-memory only — no persistence
-  across a `serve` *restart* (a `serve` restart's spool starts empty, so a
-  stale client falls back to `snapshot_required`, but a genuine multi-day
-  event history does not survive a restart). **Not done**: the Android
-  client has no code path that subscribes to live agent events at all yet
-  (only the FCM notification backstop parser exists,
-  `ChooshFirebaseMessagingService.kt`) — there is no relay control
-  connection client, no per-workspace last-acknowledged-sequence tracking,
-  and no reconnect-time resume call. Wiring the resume half in isolation,
-  with no live-subscription path underneath it to resume *into*, would not
-  be a meaningful or testable addition; building the whole client-side
-  subscription mechanism (relay control connection handling in the
-  Rust/JNI bridge, sequence-cursor persistence, `workspace.status`/
-  `workspace.list` fallback on `snapshot_required`) is real, separate,
-  sizable work, honestly deferred rather than left as a stub that looks
-  wired but isn't.
+  retained window gets `snapshot_required`, never a silent gap. Still
+  in-memory only — no persistence across a `serve` *restart* (a `serve`
+  restart's spool starts empty, so a stale client falls back to
+  `snapshot_required`, but a genuine multi-day event history does not
+  survive a restart).
+  Android side is now real too: `choosh-android-transport::PhoneConnection`
+  takes a dedicated `agent_event_rx` (decoupled from the RPC command
+  channel, so a live push never blocks behind — or is blocked by — an
+  in-flight RPC) and exposes `resume_agent_events` over its own fresh
+  `"agent-events"`-purpose tunnel, mirroring `call_rpc`'s shape.
+  `choosh-android-bridge::Engine` pumps that receiver into a bounded
+  drain-on-poll queue (`Engine::poll_agent_events`) — a polling shape,
+  chosen deliberately over a JNI callback, since no existing "Rust calls
+  back into Kotlin unprompted" mechanism exists anywhere in this crate and
+  a callback isn't unit-testable the way this needed. Kotlin's
+  `ai.choosh.agentevents` package (`AgentEventSubscription`,
+  `AgentEventCursorStore`, `AgentAttentionTracker`) is one process-wide
+  subscription — not one per open workspace screen, since `relayd` forwards
+  live pushes to whichever phone Identity is connected, with no per-relay
+  "subscribe to workspace X" concept — tracking each workspace's
+  last-acknowledged sequence (in-memory only; disk persistence across an
+  app restart was scoped out, an explicit stretch goal not attempted) and
+  falling back to the real `workspace.status` RPC on `SnapshotRequired`
+  (`workspace.list` itself still isn't wired into `ChooshEngine` at all — a
+  separate, pre-existing, tracked gap). `FleetViewModel` is the first real
+  UI consumer: before this pass nothing in the app read live agent events
+  at all (only the FCM notification backstop, `ChooshFirebaseMessagingService.kt`,
+  existed) — the fleet drawer's "needs attention" badge was fixture-only
+  data; it's now a live union of fixture data and `AgentAttentionTracker`'s
+  real `input_required`/`turn_completed` signal.
 - **Terminal accessibility and hardware keyboard input — fixed (M8
   accessibility follow-up pass).** `TerminalSurfaceView` now exposes the
   terminal's live visible-grid text to TalkBack via a real

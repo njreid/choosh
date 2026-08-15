@@ -1,5 +1,6 @@
 package ai.choosh.fleet
 
+import ai.choosh.agentevents.AgentAttentionTracker
 import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.ConnectionState
 import ai.choosh.engine.DevHostPresence
@@ -44,8 +45,22 @@ sealed interface FleetNavigationEvent {
  *  - RECENT: flat, most-recently-active Workspace first, no grouping.
  * Attention flagging is a property of the row (`FleetRow.needsAttention`),
  * computed the same way in every mode — never a fourth mode.
+ *
+ * [attentionTracker], when supplied by the composition root (see
+ * [ai.choosh.agentevents.AgentEventSubscription]'s own doc comment for why
+ * a single process-wide subscription feeds every ViewModel that cares
+ * about live agent-event state rather than each ViewModel polling on its
+ * own), is `docs/specs/agent-events.md`'s live `input_required` signal —
+ * the one real, wired data source behind what [Workspace.needsAttention]
+ * otherwise reads only as [FleetFixtures]' static demo data. `null`
+ * (the default) preserves this ViewModel's pre-existing,
+ * fixture-data-only behavior exactly — every existing call site/test that
+ * doesn't pass one keeps working unchanged.
  */
-class FleetViewModel(private val engine: ChooshEngine) : ViewModel() {
+class FleetViewModel(
+    private val engine: ChooshEngine,
+    private val attentionTracker: AgentAttentionTracker? = null,
+) : ViewModel() {
     private val _state = MutableStateFlow(FleetUiState())
     val state: StateFlow<FleetUiState> = _state.asStateFlow()
 
@@ -54,6 +69,14 @@ class FleetViewModel(private val engine: ChooshEngine) : ViewModel() {
 
     init {
         refresh()
+        // Recompute rows on every live attention change, independent of
+        // `refresh()`'s own RPC-driven cadence — an `input_required` push
+        // (or its resolution) must reach the drawer's badge without
+        // waiting for the next full `listDevhosts`/`projectList` round
+        // trip.
+        attentionTracker?.let { tracker ->
+            viewModelScope.launch { tracker.needsAttention.collect { recompute() } }
+        }
     }
 
     fun refresh() {
@@ -153,8 +176,32 @@ class FleetViewModel(private val engine: ChooshEngine) : ViewModel() {
     fun onWorkspaceTapped(workspace: Workspace): FleetNavigationEvent =
         FleetNavigationEvent.OpenWorkspace(workspace.workspaceId, workspace.devHostId)
 
+    /**
+     * Merges [attentionTracker]'s live `needsAttention` set into
+     * [projects] before deriving rows via [rowsFor] — deliberately a
+     * union with each [Workspace]'s own (fixture-sourced) flag, never a
+     * downgrade: this ViewModel has no way to *clear* a fixture's
+     * hardcoded `needsAttention = true`, only to add a live one on top.
+     * [rowsFor] itself stays a pure function of plain data (unaffected by
+     * this merge, still directly unit-tested by `FleetRowsForTest`) — the
+     * live signal is folded in here, not threaded into that function's
+     * own signature.
+     */
     private fun recompute() {
-        val rows = rowsFor(_state.value.sortMode, devHosts, projects)
+        val liveAttention = attentionTracker?.needsAttention?.value.orEmpty()
+        val effectiveProjects = if (liveAttention.isEmpty()) {
+            projects
+        } else {
+            projects.map { project ->
+                project.copy(
+                    workspaces = project.workspaces.map { workspace ->
+                        if (workspace.needsAttention || workspace.workspaceId !in liveAttention) workspace
+                        else workspace.copy(needsAttention = true)
+                    },
+                )
+            }
+        }
+        val rows = rowsFor(_state.value.sortMode, devHosts, effectiveProjects)
         _state.value = _state.value.copy(rows = rows, isLoading = false, error = null)
     }
 

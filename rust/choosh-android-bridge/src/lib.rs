@@ -385,6 +385,36 @@ fn native_project_set_primary_workspace<'local>(
     JString::new(env, body)
 }
 
+/// Drains every live agent-event push received since the last call — see
+/// `engine::Engine::poll_agent_events`'s doc comment for the JSON shape.
+/// Kotlin is expected to call this on a timer (or whenever it's convenient
+/// to check), the same "Kotlin polls, native returns current state" shape
+/// every other native method here already uses — see `docs/specs/agent-events.md`.
+fn native_poll_agent_events<'local>(env: &mut Env<'local>, _class: JClass<'local>, handle: jlong) -> Result<JString<'local>, jni::errors::Error> {
+    let body = with_handle(handle, "[]".to_string(), |h| h.runtime.block_on(h.engine.poll_agent_events()));
+    JString::new(env, body)
+}
+
+// `target_device_id`/`workspace_id` stay `JString<'local>` by value to
+// match `native_method!`'s macro-generated wrapper — see `native_init`'s
+// comment.
+#[allow(clippy::needless_pass_by_value)]
+fn native_agent_events_resume<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    target_device_id: JString<'local>,
+    workspace_id: JString<'local>,
+    after_sequence: jlong,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let target_device_id = jstring_to_string(env, &target_device_id)?;
+    let workspace_id = jstring_to_string(env, &workspace_id)?;
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| {
+        h.runtime.block_on(h.engine.agent_events_resume(&target_device_id, &workspace_id, after_sequence))
+    });
+    JString::new(env, body)
+}
+
 // `native_method!`'s non-raw mode always expects a `Result` return (it's
 // what gives every other native method here panic-safety and Java
 // exception translation for free) even though this particular method never
@@ -497,6 +527,16 @@ const _PROJECT_SET_PRIMARY_WORKSPACE: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",
     static extern fn NativeBridge::native_project_set_primary_workspace(handle: jlong, target_device_id: JString, project_id: JString, workspace_id: JString) -> JString,
     fn = native_project_set_primary_workspace,
+};
+const _POLL_AGENT_EVENTS: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_poll_agent_events(handle: jlong) -> JString,
+    fn = native_poll_agent_events,
+};
+const _AGENT_EVENTS_RESUME: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_agent_events_resume(handle: jlong, target_device_id: JString, workspace_id: JString, after_sequence: jlong) -> JString,
+    fn = native_agent_events_resume,
 };
 
 #[cfg(test)]

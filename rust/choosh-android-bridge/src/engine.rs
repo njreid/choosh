@@ -3,10 +3,13 @@
 //! anywhere in this module. `lib.rs`'s `extern "system"` functions are thin
 //! marshaling wrappers around this.
 
-use choosh_android_transport::{CallError, PhoneConnection, PtyTunnelHandle, WebTunnelHandle};
+use choosh_android_transport::{AgentEventPush, CallError, PhoneConnection, PtyTunnelHandle, WebTunnelHandle};
 use choosh_protocol::host_rpc::{ByteRange, RpcRequest, RpcResponse};
+use choosh_protocol::relay::AgentEventsResumeResponse;
 use serde::Serialize;
 use serde_json::json;
+use std::collections::VecDeque;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Every fallible call here returns this shape as its `Ok` payload — never
@@ -19,11 +22,34 @@ fn error_json(message: &str) -> String {
     json!({ "error": message }).to_string()
 }
 
+/// Bound on how many un-polled live agent-event pushes [`Engine`] holds at
+/// once (see [`Engine::agent_events`]) — same order of magnitude as
+/// `choosh-hostd::agent_event_spool::MAX_EVENTS_PER_WORKSPACE` (500) and the
+/// identical reasoning: these are coarse lifecycle signals, not
+/// high-frequency telemetry, so this only needs to comfortably outlast a
+/// Kotlin caller that's briefly slow to poll (backgrounded, mid-recompose),
+/// not buffer forever. Once full, the oldest un-polled push is dropped to
+/// make room for the newest — losing an old, stale-by-now push in favor of
+/// current state is the right trade for a live-status queue (unlike, say, a
+/// log), and any real gap this causes is still recoverable: the next
+/// `agent_events_resume` call replays from the workspace's own
+/// last-acknowledged sequence regardless of what this queue held onto.
+const AGENT_EVENT_QUEUE_CAPACITY: usize = 500;
+
 pub struct Engine {
     http: reqwest::Client,
     http_base_url: String,
     ws_url: String,
     connection: Mutex<Option<PhoneConnection>>,
+    /// Live agent-event pushes received on the current (or most recent)
+    /// connection, oldest first, drained by [`Self::poll_agent_events`].
+    /// Deliberately its own `Mutex`, separate from `connection` — populated
+    /// by a background pump task (spawned in [`Self::connect`]) that reads
+    /// off `PhoneConnection::take_agent_event_receiver`'s receiver, which is
+    /// itself decoupled from `connection`'s lock for exactly this reason
+    /// (see that method's doc comment): polling this queue, or an ordinary
+    /// RPC call locking `connection`, never blocks behind the other.
+    agent_events: Arc<Mutex<VecDeque<AgentEventPush>>>,
 }
 
 impl Engine {
@@ -34,6 +60,7 @@ impl Engine {
             http_base_url,
             ws_url,
             connection: Mutex::new(None),
+            agent_events: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -78,9 +105,19 @@ impl Engine {
     /// phone-reuse path. `true` on `AuthResult::Ok`; `false` on any
     /// rejection or transport failure — the caller (Kotlin) is expected to
     /// force a fresh `WebAuthn` ceremony on `false`, not retry blindly.
+    ///
+    /// Also takes ownership of the fresh connection's agent-event push
+    /// receiver (`PhoneConnection::take_agent_event_receiver`) and spawns
+    /// [`pump_agent_events`] to drain it into [`Self::agent_events`] for the
+    /// lifetime of this connection — see that function's doc comment for
+    /// why this happens here, before the connection is stored behind
+    /// `self.connection`'s lock, rather than lazily on first poll.
     pub async fn connect(&self, session_credential: &str) -> bool {
         match PhoneConnection::connect(&self.ws_url, session_credential).await {
-            Ok(connection) => {
+            Ok(mut connection) => {
+                if let Some(agent_event_rx) = connection.take_agent_event_receiver() {
+                    tokio::spawn(pump_agent_events(agent_event_rx, Arc::clone(&self.agent_events)));
+                }
                 *self.connection.lock().await = Some(connection);
                 true
             }
@@ -530,9 +567,105 @@ impl Engine {
         }
     }
 
+    /// Drains every live agent-event push received since the last call,
+    /// oldest first, as a bare JSON array of `{"from_device_id", "event",
+    /// "sequence"}` objects (`event` is `WireAgentEvent`'s own tagged JSON
+    /// shape, verbatim). Kotlin is expected to poll this periodically (see
+    /// this crate's design notes on why a polling queue, not a JNI
+    /// callback, mirrors this crate's existing `item_list`/`workspace_status`
+    /// shape) and apply every returned push to its own per-workspace
+    /// sequence cursor, never regressing it. Always succeeds — an empty
+    /// array (not an `{"error": ...}` shape) if nothing has arrived, or if
+    /// this engine was never connected, so callers can poll unconditionally
+    /// without a "not connected" special case.
+    pub async fn poll_agent_events(&self) -> String {
+        let drained: Vec<AgentEventPush> = {
+            let mut guard = self.agent_events.lock().await;
+            guard.drain(..).collect()
+        };
+        let json_ready: Vec<AgentEventPushJson<'_>> = drained
+            .iter()
+            .map(|push| AgentEventPushJson { from_device_id: &push.from_device_id, event: &push.event, sequence: push.sequence })
+            .collect();
+        to_json(&json_ready)
+    }
+
+    /// `agent-events.md`'s "Delivery and replay" resume request:
+    /// `AgentEventsResumeRequest { workspace_id, after_sequence }` sent over
+    /// a fresh `"agent-events"`-purpose tunnel to `target_device_id`.
+    /// `after_sequence <= 0` means "no prior acknowledged sequence" (a
+    /// first-ever subscribe) — real sequence numbers start at 1, so this
+    /// mirrors `choosh-hostd::agent_event_spool`'s own "`Some(0)` behaves
+    /// identically to `None`" convention rather than needing a second,
+    /// JNI-only sentinel value. Returns one of:
+    ///
+    /// - `{"outcome":"replayed","events":[{"sequence":...,"event":{...}},...],"latest_sequence":...}`
+    /// - `{"outcome":"snapshot_required"}` — per agent-events.md, the caller
+    ///   MUST refresh via `workspace.status`/`workspace.list` rather than
+    ///   treat this as an error or an empty replay.
+    /// - `{"error": "..."}` — not connected, or a transport-level failure.
+    pub async fn agent_events_resume(&self, target_device_id: &str, workspace_id: &str, after_sequence: i64) -> String {
+        let after_sequence = u64::try_from(after_sequence).ok().filter(|sequence| *sequence > 0);
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return error_json("not connected: call nativeConnect first");
+        };
+        match connection.resume_agent_events(target_device_id, workspace_id, after_sequence).await {
+            Ok(AgentEventsResumeResponse::Replayed { events, latest_sequence, .. }) => {
+                to_json(&json!({ "outcome": "replayed", "events": events, "latest_sequence": latest_sequence }))
+            }
+            Ok(AgentEventsResumeResponse::SnapshotRequired { .. }) => to_json(&json!({ "outcome": "snapshot_required" })),
+            Err(error) => {
+                // Same "drop a connection that just failed a call" posture
+                // as list_devhosts/call_jj_rpc.
+                *guard = None;
+                error_json(&format!("agent_events_resume failed: {error}"))
+            }
+        }
+    }
+
     pub async fn close(&self) {
         *self.connection.lock().await = None;
+        // Discard anything un-polled from the connection just closed — a
+        // fresh `connect` starts this queue clean rather than handing
+        // Kotlin pushes that arrived under a since-closed connection. Safe
+        // regardless: Kotlin's own sequence cursor is idempotent/monotonic
+        // (never regresses), so even a push that *did* survive this clear
+        // would just be re-delivered, never mis-applied, by the next
+        // `agent_events_resume`.
+        self.agent_events.lock().await.clear();
     }
+}
+
+/// Drains [`Engine::agent_events`] into whatever a live [`PhoneConnection`]'s
+/// agent-event push receiver yields, for the lifetime of that receiver.
+/// Deliberately decoupled from `Engine::connection`'s lock (see
+/// `PhoneConnection::take_agent_event_receiver`'s doc comment) — this task
+/// never contends with an in-flight RPC, and vice versa. Ends naturally
+/// (the `while let` falls through) once every sender for this channel is
+/// dropped, which happens when the underlying connection's background I/O
+/// task ends (disconnect, `Engine::close`, or the connection being replaced
+/// by a later `Engine::connect`) — no explicit cancellation needed.
+async fn pump_agent_events(mut agent_event_rx: tokio::sync::mpsc::Receiver<AgentEventPush>, queue: Arc<Mutex<VecDeque<AgentEventPush>>>) {
+    while let Some(push) = agent_event_rx.recv().await {
+        let mut guard = queue.lock().await;
+        if guard.len() >= AGENT_EVENT_QUEUE_CAPACITY {
+            // See AGENT_EVENT_QUEUE_CAPACITY's doc comment: drop the
+            // oldest un-polled push to make room for the newest.
+            guard.pop_front();
+        }
+        guard.push_back(push);
+    }
+}
+
+/// JSON shape for one queued push, per [`Engine::poll_agent_events`]'s doc
+/// comment — borrowed fields, since this is only ever constructed
+/// transiently to serialize a batch already held by value elsewhere.
+#[derive(Serialize)]
+struct AgentEventPushJson<'a> {
+    from_device_id: &'a str,
+    event: &'a choosh_protocol::relay::WireAgentEvent,
+    sequence: Option<u64>,
 }
 
 /// [`read_whole_file`]'s error shape — deliberately distinct from a bare
@@ -862,6 +995,20 @@ mod tests {
     async fn read_workspace_file_range_before_connect_is_a_typed_error() {
         let error = unconnected_engine().read_workspace_file_range("dev-1", "ws-1", "a.txt", None).await.unwrap_err();
         assert!(error.contains("not connected"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn agent_events_resume_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().agent_events_resume("dev-1", "ws-1", 0).await);
+    }
+
+    /// [`Engine::poll_agent_events`] never errors, connected or not — an
+    /// unconnected engine simply has nothing queued yet.
+    #[tokio::test]
+    async fn poll_agent_events_before_connect_is_an_empty_array_not_an_error() {
+        let body = unconnected_engine().poll_agent_events().await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed, serde_json::json!([]), "{body}");
     }
 
     // --- shared fake-relayd test harness -----------------------------------
@@ -1363,5 +1510,237 @@ mod tests {
         let body = engine.open_document("dev-1", "ws-1", "a.txt").await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["type"], "offline", "{body}");
+    }
+
+    // --- agent-events.md subscription tests --------------------------------
+    //
+    // The three scenarios this pass's verification section calls for by
+    // name: a live push surfacing through `poll_agent_events`, a
+    // `Replayed` resume applying in order with no duplicates, and a
+    // `SnapshotRequired` resume being reported distinctly rather than
+    // silently doing nothing.
+
+    /// Polls `poll_agent_events` until it returns a non-empty array or a
+    /// generous deadline elapses — the live push arrives on a background
+    /// pump task ([`pump_agent_events`]) whose exact scheduling relative to
+    /// this test's own polling isn't guaranteed, so a single immediate poll
+    /// would be flaky. Panics (via `expect`) rather than returning empty on
+    /// timeout, so a regression that stops delivering pushes fails loudly.
+    async fn poll_until_nonempty(engine: &Engine) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let body = engine.poll_agent_events().await;
+                let parsed: Value = serde_json::from_str(&body).unwrap();
+                if parsed.as_array().is_some_and(|array| !array.is_empty()) {
+                    return parsed;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("poll_agent_events must eventually surface the live push")
+    }
+
+    /// A fake relayd pushes a live `ServerPush::AgentEvent` with no request
+    /// from this side at all — proves the bridge surfaces it through
+    /// `poll_agent_events`, and that a second poll comes back empty (the
+    /// queue is drained, not merely peeked).
+    #[tokio::test]
+    async fn live_agent_event_push_is_surfaced_through_poll_agent_events() {
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+            send_control(
+                &mut ws,
+                &choosh_protocol::relay::ServerPush::AgentEvent {
+                    from_device_id: "dev-1".to_string(),
+                    event: choosh_protocol::relay::WireAgentEvent::TurnCompleted {
+                        workspace_id: "ws-1".to_string(),
+                        item_id: "item-1".to_string(),
+                    },
+                    sequence: Some(9),
+                },
+            )
+            .await;
+            // Keep the socket open past the push — dropping it immediately
+            // could race the pump task's read against the test's poll loop
+            // on some schedulers.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let engine = Engine::new("http://unused".to_string(), ws_url);
+        assert!(engine.connect("good-cred").await);
+
+        let events = poll_until_nonempty(&engine).await;
+        let events = events.as_array().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["from_device_id"], "dev-1");
+        assert_eq!(events[0]["sequence"], 9);
+        assert_eq!(events[0]["event"]["kind"], "turn_completed");
+        assert_eq!(events[0]["event"]["workspace_id"], "ws-1");
+
+        let second_poll = engine.poll_agent_events().await;
+        assert_eq!(serde_json::from_str::<Value>(&second_poll).unwrap(), serde_json::json!([]), "{second_poll}");
+        server.await.unwrap();
+    }
+
+    /// A fake relayd answers `AgentEventsResumeRequest` with `Replayed`
+    /// carrying several events — proves they come back through
+    /// `agent_events_resume` in order, with no duplicates and no gaps
+    /// (mirroring exactly what the fake relayd sent).
+    #[tokio::test]
+    async fn agent_events_resume_applies_a_replayed_batch_in_order_with_no_duplicates() {
+        use choosh_protocol::relay::{
+            AgentEventsResumeRequest, AgentEventsResumeResponse, ControlRequest, ControlResponse, SequencedAgentEvent,
+            WireAgentEvent, WireAgentStatus, encode_tunnel_id_hex,
+        };
+
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, purpose, .. } = open else { panic!("expected open-tunnel") };
+            assert_eq!(purpose, "agent-events");
+            let tunnel_id: [u8; choosh_protocol::relay::TUNNEL_ID_BYTES] = [3, 3, 3, 3, 3, 3, 3, 3];
+            send_control(&mut ws, &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) }).await;
+
+            let (id, payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(id, tunnel_id);
+            let (_inner_class, inner_body) = payload.split_first().unwrap();
+            let request: AgentEventsResumeRequest = serde_json::from_slice(inner_body).unwrap();
+            assert_eq!(request.workspace_id, "ws-1");
+            assert_eq!(request.after_sequence, Some(5));
+
+            let response = AgentEventsResumeResponse::Replayed {
+                request_id: request.request_id,
+                events: vec![
+                    SequencedAgentEvent {
+                        sequence: 6,
+                        event: WireAgentEvent::AgentStatus {
+                            workspace_id: "ws-1".to_string(),
+                            item_id: "item-1".to_string(),
+                            status: WireAgentStatus::Waiting,
+                        },
+                    },
+                    SequencedAgentEvent {
+                        sequence: 7,
+                        event: WireAgentEvent::InputRequired {
+                            workspace_id: "ws-1".to_string(),
+                            item_id: "item-1".to_string(),
+                            reason: choosh_protocol::relay::WireInputReason::NextPrompt,
+                        },
+                    },
+                ],
+                latest_sequence: 7,
+            };
+            let mut response_payload = vec![choosh_protocol::relay::FRAME_CLASS_CONTROL];
+            response_payload.extend(serde_json::to_vec(&response).unwrap());
+            send_tunnel_frame(&mut ws, tunnel_id, &response_payload).await;
+            let _ = recv_tunnel_frame(&mut ws).await; // proactive close, per resume_agent_events' fresh-tunnel-per-call contract
+        });
+
+        let engine = Engine::new("http://unused".to_string(), ws_url);
+        assert!(engine.connect("good-cred").await);
+        let body = engine.agent_events_resume("dev-1", "ws-1", 5).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["outcome"], "replayed", "{body}");
+        assert_eq!(parsed["latest_sequence"], 7, "{body}");
+        let events = parsed["events"].as_array().unwrap();
+        let sequences: Vec<u64> = events.iter().map(|event| event["sequence"].as_u64().unwrap()).collect();
+        assert_eq!(sequences, vec![6, 7], "events must be applied oldest-first with no gaps or duplicates: {body}");
+        assert_eq!(events[0]["event"]["kind"], "agent_status");
+        assert_eq!(events[1]["event"]["kind"], "input_required");
+        server.await.unwrap();
+    }
+
+    /// A fake relayd answers `AgentEventsResumeRequest` with
+    /// `SnapshotRequired` — proves this comes back as its own, distinct
+    /// outcome the caller (Kotlin) can branch on to trigger a full
+    /// `workspace.status`/`workspace.list` refresh, per agent-events.md,
+    /// rather than being swallowed as an empty/no-op replay.
+    #[tokio::test]
+    async fn agent_events_resume_reports_snapshot_required_distinctly() {
+        use choosh_protocol::relay::{AgentEventsResumeRequest, AgentEventsResumeResponse, ControlRequest, ControlResponse, encode_tunnel_id_hex};
+
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, purpose, .. } = open else { panic!("expected open-tunnel") };
+            assert_eq!(purpose, "agent-events");
+            let tunnel_id: [u8; choosh_protocol::relay::TUNNEL_ID_BYTES] = [4, 4, 4, 4, 4, 4, 4, 4];
+            send_control(&mut ws, &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) }).await;
+
+            let (_id, payload) = recv_tunnel_frame(&mut ws).await;
+            let (_inner_class, inner_body) = payload.split_first().unwrap();
+            let request: AgentEventsResumeRequest = serde_json::from_slice(inner_body).unwrap();
+
+            let response =
+                AgentEventsResumeResponse::SnapshotRequired { request_id: request.request_id, workspace_id: request.workspace_id };
+            let mut response_payload = vec![choosh_protocol::relay::FRAME_CLASS_CONTROL];
+            response_payload.extend(serde_json::to_vec(&response).unwrap());
+            send_tunnel_frame(&mut ws, tunnel_id, &response_payload).await;
+            let _ = recv_tunnel_frame(&mut ws).await;
+        });
+
+        let engine = Engine::new("http://unused".to_string(), ws_url);
+        assert!(engine.connect("good-cred").await);
+        // A very old/unknown sequence — this is exactly the shape a real
+        // devhost spool would answer with snapshot_required for.
+        let body = engine.agent_events_resume("dev-1", "ws-1", 999_999).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "outcome": "snapshot_required" }), "{body}");
+        server.await.unwrap();
+    }
+
+    /// `after_sequence <= 0` (Kotlin's "no prior ack" convention, per
+    /// [`Engine::agent_events_resume`]'s doc comment) must reach the wire as
+    /// `None`, matching `choosh-hostd::agent_event_spool`'s own "`Some(0)`
+    /// behaves like `None`" treatment — proves the JNI-facing sentinel
+    /// translation actually happens rather than sending a bogus `Some(0)`/
+    /// `Some(-1)` a real devhost spool was never designed to receive.
+    #[tokio::test]
+    async fn agent_events_resume_maps_zero_and_negative_after_sequence_to_none() {
+        use choosh_protocol::relay::{AgentEventsResumeRequest, AgentEventsResumeResponse, ControlRequest, ControlResponse, encode_tunnel_id_hex};
+
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            for _ in 0..2 {
+                let open: ControlRequest = recv_control(&mut ws).await;
+                let ControlRequest::OpenTunnel { request_id, purpose, .. } = open else { panic!("expected open-tunnel") };
+                assert_eq!(purpose, "agent-events");
+                let tunnel_id: [u8; choosh_protocol::relay::TUNNEL_ID_BYTES] = [5, 5, 5, 5, 5, 5, 5, 5];
+                send_control(&mut ws, &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) }).await;
+
+                let (_id, payload) = recv_tunnel_frame(&mut ws).await;
+                let (_inner_class, inner_body) = payload.split_first().unwrap();
+                let request: AgentEventsResumeRequest = serde_json::from_slice(inner_body).unwrap();
+                assert_eq!(request.after_sequence, None, "expected None on the wire, got {:?}", request.after_sequence);
+
+                let response = AgentEventsResumeResponse::Replayed { request_id: request.request_id, events: vec![], latest_sequence: 0 };
+                let mut response_payload = vec![choosh_protocol::relay::FRAME_CLASS_CONTROL];
+                response_payload.extend(serde_json::to_vec(&response).unwrap());
+                send_tunnel_frame(&mut ws, tunnel_id, &response_payload).await;
+                let _ = recv_tunnel_frame(&mut ws).await;
+            }
+        });
+
+        let engine = Engine::new("http://unused".to_string(), ws_url);
+        assert!(engine.connect("good-cred").await);
+        let _ = engine.agent_events_resume("dev-1", "ws-1", 0).await;
+        let _ = engine.agent_events_resume("dev-1", "ws-1", -1).await;
+        server.await.unwrap();
     }
 }

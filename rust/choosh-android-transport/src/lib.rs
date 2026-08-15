@@ -33,8 +33,9 @@ use std::collections::HashMap;
 
 use choosh_protocol::host_rpc::{RpcRequest, RpcResponse};
 use choosh_protocol::relay::{
-    AuthResult, ClientAuth, ControlRequest, ControlResponse, DevHostPresence, FRAME_CLASS_CONTROL,
-    FRAME_CLASS_TUNNEL, PhoneAuth, ServerHello, ServerPush, TUNNEL_ID_BYTES, decode_tunnel_id_hex,
+    AgentEventsResumeRequest, AgentEventsResumeResponse, AuthResult, ClientAuth, ControlRequest, ControlResponse,
+    DevHostPresence, FRAME_CLASS_CONTROL, FRAME_CLASS_TUNNEL, PhoneAuth, ServerHello, ServerPush, TUNNEL_ID_BYTES,
+    WireAgentEvent, decode_tunnel_id_hex,
 };
 use frame_channel::{ChannelError, FrameChannel};
 use tokio::sync::{mpsc, oneshot};
@@ -132,6 +133,37 @@ const PTY_TUNNEL_CHANNEL_CAPACITY: usize = 64;
 /// `choosh-android-bridge::web_gateway`).
 const WEB_TUNNEL_CHANNEL_CAPACITY: usize = 128;
 
+/// One `ServerPush::AgentEvent` delivered on the phone's normal control
+/// connection, per `agent-events.md`'s "Delivery and replay" section —
+/// unwrapped into an owned value a long-lived consumer (see
+/// [`PhoneConnection::take_agent_event_receiver`]) can hold onto
+/// independently of the frame it arrived in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentEventPush {
+    pub from_device_id: String,
+    pub event: WireAgentEvent,
+    /// Verbatim copy of the wire push's own `sequence` — `None` only for
+    /// [`WireAgentEvent::AuthRequired`], per that field's own doc comment.
+    pub sequence: Option<u64>,
+}
+
+/// Bound of [`PhoneConnection`]'s agent-event push channel. Per
+/// `choosh-hostd::agent_event_spool`'s own bound reasoning, these are
+/// coarse lifecycle signals (on the order of one every few seconds even for
+/// a busy workspace), not high-frequency telemetry — this just needs to
+/// comfortably outlast a consumer that's briefly slow to drain (a JNI
+/// caller between polls), not buffer an unbounded backlog. Delivery here
+/// uses `try_send` ([`handle_control_frame`]): once this bound is reached, a
+/// newly-arriving push is dropped (logged, not silently) rather than this
+/// task blocking the single reader loop every other frame (control and
+/// tunnel alike) also depends on — the same non-blocking backpressure
+/// posture [`handle_tunnel_frame`] already applies to a slow tunnel reader,
+/// just "drop the newest" here instead of "drop the whole tunnel", since an
+/// occasional missed live push is recoverable (the next
+/// `AgentEventsResumeRequest` replays it) where losing an entire tunnel
+/// isn't.
+const AGENT_EVENT_CHANNEL_CAPACITY: usize = 256;
+
 /// One ask sent to the background I/O task via [`PhoneConnection`]'s
 /// command channel. The task owns the socket exclusively — mirroring
 /// `choosh-hostd`'s `serve_dispatch`'s single-task-owns-the-channel shape —
@@ -191,6 +223,13 @@ enum PendingReply {
 /// not any explicit close call.
 pub struct PhoneConnection {
     command_tx: mpsc::UnboundedSender<IoCommand>,
+    /// `None` after [`Self::take_agent_event_receiver`] has already
+    /// consumed it — deliberately a *separate* channel from
+    /// `command_tx`/`io_task` (not gated behind whatever holds this whole
+    /// struct locked) so a long-lived consumer of live agent-event pushes
+    /// never contends with, or blocks behind, an ordinary RPC call. See
+    /// that method's own doc comment.
+    agent_event_rx: Option<mpsc::Receiver<AgentEventPush>>,
     /// `None` after [`Self::hold_until_closed`] has already consumed it —
     /// guards against a caller calling it twice rather than panicking (it's
     /// only ever called once, by [`run_with_reconnect`], but this stays
@@ -234,8 +273,9 @@ impl PhoneConnection {
         match result {
             AuthResult::Ok(_) => {
                 let (command_tx, command_rx) = mpsc::unbounded_channel();
-                let io_task = tokio::spawn(run_io_task(channel, command_rx));
-                Ok(Self { command_tx, io_task: Some(io_task) })
+                let (agent_event_tx, agent_event_rx) = mpsc::channel(AGENT_EVENT_CHANNEL_CAPACITY);
+                let io_task = tokio::spawn(run_io_task(channel, command_rx, agent_event_tx));
+                Ok(Self { command_tx, agent_event_rx: Some(agent_event_rx), io_task: Some(io_task) })
             }
             AuthResult::Failed(failed) => Err(ConnectError::Rejected(failed.reason)),
         }
@@ -308,6 +348,75 @@ impl PhoneConnection {
             ControlResponse::Error { code, message, .. } => Err(CallError::Server { code, message }),
             _ => Err(CallError::UnexpectedResponse),
         }
+    }
+
+    /// Takes ownership of this connection's live agent-event push receiver
+    /// (`ServerPush::AgentEvent`, per `agent-events.md`'s "Delivery and
+    /// replay" section) — callable once; `None` on any later call. A caller
+    /// (`choosh-android-bridge::engine::Engine`) is expected to take this
+    /// immediately after a successful [`Self::connect`] and hand it to its
+    /// own long-lived pump task, decoupled from every other method on this
+    /// type (which all go through `command_tx`/lock behind
+    /// `Engine::connection`) so draining live pushes never contends with,
+    /// or is starved behind, an ordinary in-flight RPC call.
+    pub fn take_agent_event_receiver(&mut self) -> Option<mpsc::Receiver<AgentEventPush>> {
+        self.agent_event_rx.take()
+    }
+
+    /// Opens a fresh `"agent-events"`-purpose tunnel, sends one
+    /// [`AgentEventsResumeRequest`], awaits its
+    /// [`AgentEventsResumeResponse`], then proactively closes the tunnel —
+    /// the exact same fresh-tunnel-per-call shape [`Self::call_rpc`] uses
+    /// for `"rpc"`-purpose tunnels (see that method's doc comment for the
+    /// design rationale), just carrying `agent-events.md`'s resume/replay
+    /// wire types instead of [`RpcRequest`]/[`RpcResponse`] — per
+    /// `choosh_protocol::relay`'s module doc comment, this rides its own
+    /// tunnel purpose rather than a `host-rpc.md` RPC method.
+    ///
+    /// # Errors
+    ///
+    /// See [`CallError`]. A [`AgentEventsResumeResponse::SnapshotRequired`]
+    /// is NOT a [`CallError`] — like `call_rpc`'s `RpcResponse::Error`, it's
+    /// a well-formed, documented outcome the caller inspects, not a
+    /// transport failure.
+    pub async fn resume_agent_events(
+        &mut self,
+        target_device_id: &str,
+        workspace_id: &str,
+        after_sequence: Option<u64>,
+    ) -> Result<AgentEventsResumeResponse, CallError> {
+        let (tunnel_id, mut response_rx) =
+            self.open_tunnel(target_device_id, "agent-events".to_string(), RPC_TUNNEL_CHANNEL_CAPACITY).await?;
+
+        let request_id = new_request_id();
+        let request = AgentEventsResumeRequest { request_id: request_id.clone(), workspace_id: workspace_id.to_string(), after_sequence };
+        let mut payload = Vec::with_capacity(1 + 96);
+        payload.push(FRAME_CLASS_CONTROL);
+        serde_json::to_writer(&mut payload, &request).map_err(|error| CallError::Transport(ChannelError::from(error)))?;
+        self.command_tx
+            .send(IoCommand::SendTunnelBytes { tunnel_id, payload, ack: None })
+            .map_err(|_| CallError::Transport(ChannelError::Closed))?;
+
+        let response_payload = response_rx.recv().await.ok_or(CallError::Transport(ChannelError::Closed))?;
+        // Fresh-tunnel-per-call, same as call_rpc: done after exactly one
+        // response, close now rather than leaking it for its idle timeout.
+        let _ = self.command_tx.send(IoCommand::CloseTunnel { tunnel_id });
+
+        let (inner_class, inner_body) = response_payload.split_first().ok_or(CallError::UnexpectedResponse)?;
+        if *inner_class != FRAME_CLASS_CONTROL {
+            return Err(CallError::UnexpectedResponse);
+        }
+        let response: AgentEventsResumeResponse =
+            serde_json::from_slice(inner_body).map_err(|error| CallError::Transport(ChannelError::from(error)))?;
+        let response_request_id = match &response {
+            AgentEventsResumeResponse::Replayed { request_id, .. } | AgentEventsResumeResponse::SnapshotRequired { request_id, .. } => {
+                request_id
+            }
+        };
+        if response_request_id != &request_id {
+            return Err(CallError::UnexpectedResponse);
+        }
+        Ok(response)
     }
 
     /// Opens a tunnel of the given `purpose` and, on success, returns its
@@ -583,7 +692,11 @@ impl WebTunnelHandle {
 /// this loop keeps servicing whichever is ready first. Returns the terminal
 /// [`ChannelError`] that ended the connection (or [`ChannelError::Closed`]
 /// if every command-channel sender was simply dropped).
-async fn run_io_task(mut channel: WsChannel, mut command_rx: mpsc::UnboundedReceiver<IoCommand>) -> ChannelError {
+async fn run_io_task(
+    mut channel: WsChannel,
+    mut command_rx: mpsc::UnboundedReceiver<IoCommand>,
+    agent_event_tx: mpsc::Sender<AgentEventPush>,
+) -> ChannelError {
     let mut pending_control: HashMap<String, PendingReply> = HashMap::new();
     let mut tunnels: HashMap<TunnelId, mpsc::Sender<Vec<u8>>> = HashMap::new();
 
@@ -603,7 +716,7 @@ async fn run_io_task(mut channel: WsChannel, mut command_rx: mpsc::UnboundedRece
             frame = channel.recv_raw() => {
                 match frame {
                     Ok((FRAME_CLASS_CONTROL, body)) => {
-                        handle_control_frame(&body, &mut pending_control, &mut tunnels);
+                        handle_control_frame(&body, &mut pending_control, &mut tunnels, &agent_event_tx);
                     }
                     Ok((FRAME_CLASS_TUNNEL, body)) => {
                         if let Err(error) = handle_tunnel_frame(&body, &mut tunnels) {
@@ -671,6 +784,7 @@ fn handle_control_frame(
     body: &[u8],
     pending_control: &mut HashMap<String, PendingReply>,
     tunnels: &mut HashMap<TunnelId, mpsc::Sender<Vec<u8>>>,
+    agent_event_tx: &mpsc::Sender<AgentEventPush>,
 ) {
     match serde_json::from_slice::<ControlResponse>(body) {
         Ok(response) => {
@@ -703,12 +817,19 @@ fn handle_control_frame(
         // fallback dispatch relay-protocol.md's own participants use. A
         // phone that opens a tunnel is never itself its target (see this
         // crate's module docs), so it never legitimately receives
-        // `TunnelOffered`; `AgentEvent` pushes have no handler yet in this
-        // pass (the terminal/notifications follow-on work). Both are logged
-        // and dropped rather than treated as fatal, matching
+        // `TunnelOffered`. `AgentEvent` pushes (`agent-events.md`'s live
+        // delivery path) are forwarded to `agent_event_tx` — see
+        // [`AGENT_EVENT_CHANNEL_CAPACITY`]'s doc comment for the
+        // non-blocking `try_send`/drop-on-backpressure posture. Anything
+        // else is logged and dropped rather than treated as fatal, matching
         // choosh-hostd's posture that an unrecognized-but-well-formed frame
         // doesn't end the connection.
         Err(_) => match serde_json::from_slice::<ServerPush>(body) {
+            Ok(ServerPush::AgentEvent { from_device_id, event, sequence }) => {
+                if agent_event_tx.try_send(AgentEventPush { from_device_id, event, sequence }).is_err() {
+                    tracing::warn!("agent-event push channel is full or has no receiver, dropping this push");
+                }
+            }
             Ok(push) => tracing::debug!(?push, "ignoring server push with no handler in this pass"),
             Err(error) => tracing::debug!(%error, "unrecognized control frame, ignoring"),
         },
@@ -845,8 +966,8 @@ mod tests {
     use choosh_protocol::framing::encode_frame;
     use choosh_protocol::host_rpc::WorkspaceSummary;
     use choosh_protocol::relay::{
-        AuthOk, ConnectionState, IdentityClass, MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES, decode_tunnel_frame,
-        encode_tunnel_frame, encode_tunnel_id_hex,
+        AuthOk, ConnectionState, IdentityClass, MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES, SequencedAgentEvent,
+        WireAgentStatus, WireInputReason, decode_tunnel_frame, encode_tunnel_frame, encode_tunnel_id_hex,
     };
     use futures_util::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
@@ -1076,6 +1197,167 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+        server.await.unwrap();
+    }
+
+    /// The live-delivery half of `agent-events.md`'s "Delivery and replay"
+    /// section: a fake relayd pushes `ServerPush::AgentEvent` unprompted
+    /// (no `request_id` this side ever sent) on the ordinary control
+    /// connection, and [`PhoneConnection::take_agent_event_receiver`]'s
+    /// receiver surfaces it, `from_device_id`/`event`/`sequence` intact.
+    #[tokio::test]
+    async fn live_agent_event_push_is_surfaced_on_the_agent_event_receiver() {
+        let (listener, url) = bind_fake_relayd().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+            send_control(
+                &mut ws,
+                &ServerPush::AgentEvent {
+                    from_device_id: "dev-1".to_string(),
+                    event: WireAgentEvent::InputRequired {
+                        workspace_id: "ws-1".to_string(),
+                        item_id: "item-1".to_string(),
+                        reason: WireInputReason::Approval,
+                    },
+                    sequence: Some(3),
+                },
+            )
+            .await;
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let mut agent_events = connection.take_agent_event_receiver().expect("receiver must be available exactly once");
+        let push = tokio::time::timeout(std::time::Duration::from_secs(5), agent_events.recv())
+            .await
+            .expect("must not hang waiting for the live push")
+            .expect("channel must not be closed while the connection is alive");
+        assert_eq!(push.from_device_id, "dev-1");
+        assert_eq!(push.sequence, Some(3));
+        assert_eq!(
+            push.event,
+            WireAgentEvent::InputRequired {
+                workspace_id: "ws-1".to_string(),
+                item_id: "item-1".to_string(),
+                reason: WireInputReason::Approval,
+            }
+        );
+        // Only ever consumable once.
+        assert!(connection.take_agent_event_receiver().is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_agent_events_round_trips_a_replayed_response_over_its_own_tunnel_purpose() {
+        let (listener, url) = bind_fake_relayd().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, target_device_id, purpose } = open else {
+                panic!("expected open-tunnel");
+            };
+            assert_eq!(target_device_id, "dev-1");
+            assert_eq!(purpose, "agent-events");
+            let tunnel_id: TunnelId = [9, 9, 9, 9, 9, 9, 9, 9];
+            send_control(&mut ws, &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) })
+                .await;
+
+            let (id, payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(id, tunnel_id);
+            let (inner_class, inner_body) = payload.split_first().unwrap();
+            assert_eq!(*inner_class, FRAME_CLASS_CONTROL);
+            let request: AgentEventsResumeRequest = serde_json::from_slice(inner_body).unwrap();
+            assert_eq!(request.workspace_id, "ws-1");
+            assert_eq!(request.after_sequence, Some(2));
+
+            let response = AgentEventsResumeResponse::Replayed {
+                request_id: request.request_id,
+                events: vec![
+                    SequencedAgentEvent {
+                        sequence: 3,
+                        event: WireAgentEvent::AgentStatus {
+                            workspace_id: "ws-1".to_string(),
+                            item_id: "item-1".to_string(),
+                            status: WireAgentStatus::Busy,
+                        },
+                    },
+                    SequencedAgentEvent {
+                        sequence: 4,
+                        event: WireAgentEvent::TurnCompleted { workspace_id: "ws-1".to_string(), item_id: "item-1".to_string() },
+                    },
+                ],
+                latest_sequence: 4,
+            };
+            let mut response_payload = vec![FRAME_CLASS_CONTROL];
+            response_payload.extend(serde_json::to_vec(&response).unwrap());
+            send_tunnel_frame(&mut ws, tunnel_id, &response_payload).await;
+
+            // Same "closes its fresh, one-shot tunnel proactively" contract
+            // call_rpc's own test already proves for the "rpc" purpose.
+            let (closed_id, closed_payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(closed_id, tunnel_id);
+            assert!(closed_payload.is_empty());
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let response = connection
+            .resume_agent_events("dev-1", "ws-1", Some(2))
+            .await
+            .expect("resume_agent_events should succeed");
+        match response {
+            AgentEventsResumeResponse::Replayed { events, latest_sequence, .. } => {
+                assert_eq!(latest_sequence, 4);
+                let sequences: Vec<u64> = events.iter().map(|event| event.sequence).collect();
+                // Oldest first, no gaps, no duplicates.
+                assert_eq!(sequences, vec![3, 4]);
+            }
+            AgentEventsResumeResponse::SnapshotRequired { .. } => panic!("expected a replay, got snapshot_required"),
+        }
+        server.await.unwrap();
+    }
+
+    /// The `snapshot_required` fallback path: proves it comes back as a
+    /// well-formed, distinguishable outcome (not a [`CallError`], not
+    /// silently treated as an empty replay).
+    #[tokio::test]
+    async fn resume_agent_events_reports_snapshot_required_distinctly_from_a_replay() {
+        let (listener, url) = bind_fake_relayd().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, purpose, .. } = open else { panic!("expected open-tunnel") };
+            assert_eq!(purpose, "agent-events");
+            let tunnel_id: TunnelId = [7, 7, 7, 7, 7, 7, 7, 7];
+            send_control(&mut ws, &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) })
+                .await;
+
+            let (_id, payload) = recv_tunnel_frame(&mut ws).await;
+            let (_inner_class, inner_body) = payload.split_first().unwrap();
+            let request: AgentEventsResumeRequest = serde_json::from_slice(inner_body).unwrap();
+
+            let response = AgentEventsResumeResponse::SnapshotRequired {
+                request_id: request.request_id,
+                workspace_id: request.workspace_id,
+            };
+            let mut response_payload = vec![FRAME_CLASS_CONTROL];
+            response_payload.extend(serde_json::to_vec(&response).unwrap());
+            send_tunnel_frame(&mut ws, tunnel_id, &response_payload).await;
+            let _ = recv_tunnel_frame(&mut ws).await; // proactive close
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let response = connection.resume_agent_events("dev-1", "ws-1", Some(500)).await.expect("must not be a CallError");
+        let AgentEventsResumeResponse::SnapshotRequired { workspace_id, .. } = &response else {
+            panic!("expected snapshot_required, got {response:?}")
+        };
+        assert_eq!(workspace_id, "ws-1");
         server.await.unwrap();
     }
 

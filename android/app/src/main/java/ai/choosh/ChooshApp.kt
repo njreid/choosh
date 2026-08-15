@@ -1,5 +1,8 @@
 package ai.choosh
 
+import ai.choosh.agentevents.AgentAttentionTracker
+import ai.choosh.agentevents.AgentEventCursorStore
+import ai.choosh.agentevents.AgentEventSubscription
 import ai.choosh.connection.ConnectionScreen
 import ai.choosh.connection.ConnectionViewModel
 import ai.choosh.connection.SessionCredentialStore
@@ -25,11 +28,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -116,6 +121,39 @@ fun ChooshApp(context: Context) {
     // check on a configuration change anyway — not worth a custom Saver for this pass.
     var screen by remember { mutableStateOf<Screen>(Screen.Connection) }
 
+    // docs/specs/agent-events.md's live subscription — one process-wide
+    // instance, per AgentEventSubscription's own doc comment on why this
+    // isn't one-per-screen. `attentionTracker` feeds FleetViewModel's
+    // needsAttention badges below; `cursorStore` and the subscription
+    // itself are otherwise consumed only through `subscription.subscribe`/
+    // `startPolling`.
+    val cursorStore = remember { AgentEventCursorStore() }
+    val attentionTracker = remember { AgentAttentionTracker() }
+    // `onSnapshotRequired` calls the real `workspace.status` RPC per
+    // agent-events.md: "the client refreshes full workspace/item state via
+    // workspace.status/workspace.list" (`workspace.list` itself isn't
+    // wired into [ChooshEngine] yet — a separate, tracked gap; see
+    // FleetViewModel's own doc comment — so `workspace.status` is the real
+    // refresh available to wire to). Its result isn't routed into a
+    // specific screen's visible state here: [WorkspaceScreen] constructs
+    // its own [ai.choosh.explorer.ExplorerViewModel] internally rather than
+    // the composition root holding a reference to it, so there's no
+    // existing hook to push a background refresh's result into — that
+    // workspace's own ExplorerViewModel re-fetches current state via its
+    // own `init { refresh() }` the next time it's opened regardless. A
+    // real cross-screen workspace-status cache is future work, not
+    // something this pass silently pretends to have.
+    val subscription = remember {
+        AgentEventSubscription(
+            engine = engine,
+            cursorStore = cursorStore,
+            attentionTracker = attentionTracker,
+            onSnapshotRequired = { deviceId, workspaceId -> runCatching { engine.workspaceStatus(deviceId, workspaceId) } },
+        )
+    }
+    val agentEventPollScope = rememberCoroutineScope()
+    LaunchedEffect(subscription) { subscription.startPolling(agentEventPollScope) }
+
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
             when (val current = screen) {
@@ -130,7 +168,7 @@ fun ChooshApp(context: Context) {
 
                 is Screen.Fleet -> {
                     val viewModel: FleetViewModel = viewModel(
-                        factory = singleInstanceFactory { FleetViewModel(engine) },
+                        factory = singleInstanceFactory { FleetViewModel(engine, attentionTracker) },
                     )
                     val state by viewModel.state.collectAsState()
                     FleetDrawer(
@@ -147,20 +185,30 @@ fun ChooshApp(context: Context) {
                     )
                 }
 
-                is Screen.Workspace -> WorkspaceScreen(
-                    engine = engine,
-                    workspaceId = current.workspaceId,
-                    deviceId = current.deviceId,
-                    onBack = { screen = Screen.Fleet },
-                    // Demo entry points — the explorer doesn't yet surface real
-                    // AgentTerminal/SourceEditor pinned items to tap directly
-                    // (item.list wiring is a later increment), so these open a
-                    // fixed item/path against the current workspace instead.
-                    onOpenTerminal = { screen = Screen.Terminal(deviceId = current.deviceId, itemId = current.workspaceId) },
-                    onOpenEditor = { path -> screen = Screen.SourceEditor(current.deviceId, current.workspaceId, path) },
-                    onOpenWebServiceDemo = { screen = Screen.WebServiceDemo(current.deviceId, current.workspaceId) },
-                    onOpenMarkdownDemo = { screen = Screen.MarkdownDemo },
-                )
+                is Screen.Workspace -> {
+                    // Subscribes this workspace to the live agent-event
+                    // stream the moment it's opened — idempotent/re-entrant
+                    // per AgentEventSubscription.subscribe's own doc
+                    // comment, so this is safe on every recomposition, not
+                    // just the first.
+                    LaunchedEffect(current.workspaceId, current.deviceId) {
+                        subscription.subscribe(current.deviceId, current.workspaceId)
+                    }
+                    WorkspaceScreen(
+                        engine = engine,
+                        workspaceId = current.workspaceId,
+                        deviceId = current.deviceId,
+                        onBack = { screen = Screen.Fleet },
+                        // Demo entry points — the explorer doesn't yet surface real
+                        // AgentTerminal/SourceEditor pinned items to tap directly
+                        // (item.list wiring is a later increment), so these open a
+                        // fixed item/path against the current workspace instead.
+                        onOpenTerminal = { screen = Screen.Terminal(deviceId = current.deviceId, itemId = current.workspaceId) },
+                        onOpenEditor = { path -> screen = Screen.SourceEditor(current.deviceId, current.workspaceId, path) },
+                        onOpenWebServiceDemo = { screen = Screen.WebServiceDemo(current.deviceId, current.workspaceId) },
+                        onOpenMarkdownDemo = { screen = Screen.MarkdownDemo },
+                    )
+                }
 
                 is Screen.DevHostPlaceholder -> PlaceholderScreen(
                     title = "DevHost ${current.deviceId}",

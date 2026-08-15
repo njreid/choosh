@@ -1,5 +1,9 @@
 package ai.choosh
 
+import ai.choosh.engine.AgentEvent
+import ai.choosh.engine.AgentEventPush
+import ai.choosh.engine.AgentEventsResumeOutcome
+import ai.choosh.engine.AgentRunStatus
 import ai.choosh.engine.ChangeGraphNode
 import ai.choosh.engine.ChangeKind
 import ai.choosh.engine.ChangedPath
@@ -12,10 +16,12 @@ import ai.choosh.engine.DiffSegment
 import ai.choosh.engine.DiffSegmentKind
 import ai.choosh.engine.DocumentOpenResult
 import ai.choosh.engine.DocumentSaveResult
+import ai.choosh.engine.InputReason
 import ai.choosh.engine.ItemSummary
 import ai.choosh.engine.ItemType
 import ai.choosh.engine.OperationLogEntry
 import ai.choosh.engine.ProjectSummary
+import ai.choosh.engine.SequencedAgentEvent
 import ai.choosh.engine.WebServiceStatus
 import ai.choosh.engine.WebauthnResult
 import ai.choosh.engine.WorkspaceStatus
@@ -26,7 +32,9 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonContentPolymorphicSerializer
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * The real, JNI-backed [ChooshEngine] implementation, wrapping
@@ -141,6 +149,15 @@ class NativeChooshEngine : ChooshEngine {
         }
     }
 
+    override suspend fun pollAgentEvents(): List<AgentEventPush> =
+        withContext(Dispatchers.IO) { decodeAgentEventPushes(NativeBridge.nativePollAgentEvents(handle)) }
+
+    override suspend fun agentEventsResume(deviceId: String, workspaceId: String, afterSequence: Long?): AgentEventsResumeOutcome =
+        withContext(Dispatchers.IO) {
+            val raw = NativeBridge.nativeAgentEventsResume(handle, deviceId, workspaceId, afterSequence ?: 0L)
+            decodeOrThrow(raw) { body -> decodeAgentEventsResumeOutcome(body) }
+        }
+
     /** Exposes this instance's raw JNI connection handle to `WebGatewayBridge`/`MarkdownGatewayBridge`, mirroring [ai.choosh.terminal.TerminalSession.attachPty]'s existing `connectionHandle` pattern. */
     val connectionHandle: Long get() = handle
 
@@ -201,6 +218,15 @@ private object NativeBridge {
     // host-rpc.md's fleet-drawer Project-mode RPCs.
     @JvmStatic external fun nativeProjectList(handle: Long, targetDeviceId: String): String
     @JvmStatic external fun nativeProjectSetPrimaryWorkspace(handle: Long, targetDeviceId: String, projectId: String, workspaceId: String): String
+
+    // docs/specs/agent-events.md's live-subscription/resume surface.
+    @JvmStatic external fun nativePollAgentEvents(handle: Long): String
+
+    // `afterSequence <= 0` means "no prior acknowledged sequence" — mirrors
+    // `choosh-hostd::agent_event_spool`'s own "`Some(0)` behaves like
+    // `None`" convention; see `Engine::agent_events_resume`'s doc comment
+    // on the Rust side for where this sentinel is translated back to `Option<u64>`.
+    @JvmStatic external fun nativeAgentEventsResume(handle: Long, targetDeviceId: String, workspaceId: String, afterSequence: Long): String
 }
 
 /**
@@ -475,5 +501,104 @@ private fun decodeDocumentSaveResult(raw: String): DocumentSaveResult {
         )
         "offline" -> DocumentSaveResult.Offline(wire.message ?: "offline")
         else -> DocumentSaveResult.Rejected(wire.code ?: "unknown", wire.message ?: "native engine returned no message")
+    }
+}
+
+// --- docs/specs/agent-events.md wire shapes -----------------------------
+//
+// `choosh_protocol::relay::WireAgentEvent` is `#[serde(tag = "kind",
+// rename_all = "snake_case")]` — a real discriminant field, unlike
+// [WireDiffFileEntry]'s untagged-by-field-presence shape above. Decoded
+// manually via [JsonElement] (the same "look at a string field, branch and
+// construct" style [decodeDocumentOpenResult]/[decodeWebauthnResult] above
+// already use) rather than a kotlinx.serialization polymorphic annotation,
+// since a `kind` this client doesn't yet recognize must decode to
+// [AgentEvent.Unknown] rather than fail the whole containing array/object —
+// kotlinx's built-in polymorphic dispatch has no first-class "unknown
+// subtype" fallback as forgiving as a plain `when`'s `else` branch.
+
+private fun wireInputReasonToDomain(reason: String): InputReason = when (reason) {
+    "approval" -> InputReason.APPROVAL
+    "permission" -> InputReason.PERMISSION
+    "question" -> InputReason.QUESTION
+    "elicitation" -> InputReason.ELICITATION
+    "next_prompt" -> InputReason.NEXT_PROMPT
+    else -> InputReason.UNKNOWN
+}
+
+private fun wireAgentRunStatusToDomain(status: String): AgentRunStatus = when (status) {
+    "starting" -> AgentRunStatus.STARTING
+    "busy" -> AgentRunStatus.BUSY
+    "waiting" -> AgentRunStatus.WAITING
+    "stopped" -> AgentRunStatus.STOPPED
+    "failed" -> AgentRunStatus.FAILED
+    else -> AgentRunStatus.UNKNOWN
+}
+
+/**
+ * Decodes one `WireAgentEvent`-shaped [JsonElement] into [AgentEvent]. A
+ * missing/malformed field within an otherwise-recognized `kind` falls back
+ * to an empty string/list rather than throwing — matching this file's
+ * existing `WireError`-first, "never crash on a shape mismatch" posture for
+ * every other native-engine response — since a partially-decodable live
+ * push is still far more useful surfaced than dropped outright.
+ */
+private fun decodeWireAgentEvent(element: JsonElement): AgentEvent {
+    val obj = element.jsonObject
+    fun field(name: String): String = obj[name]?.jsonPrimitive?.content.orEmpty()
+    return when (field("kind")) {
+        "input_required" -> AgentEvent.InputRequired(
+            workspaceId = field("workspace_id"),
+            itemId = field("item_id"),
+            reason = wireInputReasonToDomain(field("reason")),
+        )
+        "turn_completed" -> AgentEvent.TurnCompleted(workspaceId = field("workspace_id"), itemId = field("item_id"))
+        "files_changed" -> AgentEvent.FilesChanged(
+            workspaceId = field("workspace_id"),
+            itemId = field("item_id"),
+            paths = obj["paths"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList(),
+        )
+        "agent_status" -> AgentEvent.AgentStatusChanged(
+            workspaceId = field("workspace_id"),
+            itemId = field("item_id"),
+            status = wireAgentRunStatusToDomain(field("status")),
+        )
+        "editor_attached" -> AgentEvent.EditorAttached(workspaceId = field("workspace_id"))
+        "editor_detached" -> AgentEvent.EditorDetached(workspaceId = field("workspace_id"))
+        "auth_required" -> AgentEvent.AuthRequired(
+            provider = field("provider"),
+            userCode = field("user_code"),
+            verificationUri = field("verification_uri"),
+        )
+        else -> AgentEvent.Unknown
+    }
+}
+
+@Serializable
+private data class WireAgentEventPush(val from_device_id: String, val event: JsonElement, val sequence: Long? = null)
+
+private fun decodeAgentEventPushes(raw: String): List<AgentEventPush> =
+    json.decodeFromString<List<WireAgentEventPush>>(raw).map {
+        AgentEventPush(fromDeviceId = it.from_device_id, event = decodeWireAgentEvent(it.event), sequence = it.sequence)
+    }
+
+@Serializable
+private data class WireSequencedAgentEvent(val sequence: Long, val event: JsonElement)
+
+@Serializable
+private data class WireAgentEventsResumeOutcome(
+    val outcome: String,
+    val events: List<WireSequencedAgentEvent> = emptyList(),
+    val latest_sequence: Long = 0L,
+)
+
+private fun decodeAgentEventsResumeOutcome(raw: String): AgentEventsResumeOutcome {
+    val wire = json.decodeFromString<WireAgentEventsResumeOutcome>(raw)
+    return when (wire.outcome) {
+        "replayed" -> AgentEventsResumeOutcome.Replayed(
+            events = wire.events.map { SequencedAgentEvent(sequence = it.sequence, event = decodeWireAgentEvent(it.event)) },
+            latestSequence = wire.latest_sequence,
+        )
+        else -> AgentEventsResumeOutcome.SnapshotRequired
     }
 }

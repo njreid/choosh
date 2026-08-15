@@ -138,8 +138,108 @@ interface ChooshEngine {
      */
     suspend fun setPrimaryWorkspace(deviceId: String, projectId: String, workspaceId: String)
 
+    /**
+     * Drains every live `agent-event` push (docs/specs/agent-events.md)
+     * received on the persistent connection since the last call, oldest
+     * first. Always succeeds — an empty list, never a thrown exception,
+     * including when nothing has ever connected — callers are expected to
+     * poll this on an interval; see [ai.choosh.agentevents.AgentEventSubscription],
+     * which owns exactly that loop plus the per-workspace sequence-cursor
+     * bookkeeping this method's caller must not duplicate.
+     */
+    suspend fun pollAgentEvents(): List<AgentEventPush>
+
+    /**
+     * `agent-events.md`'s "Delivery and replay" resume request, ridden over
+     * its own `"agent-events"`-purpose relay tunnel (see
+     * `rust/choosh-protocol/src/relay.rs`'s module doc comment): replays
+     * every retained agent event for `workspaceId` strictly after
+     * `afterSequence`, oldest first, or reports
+     * [AgentEventsResumeOutcome.SnapshotRequired] if `afterSequence` is
+     * older than the owning devhost's retained window. `afterSequence` of
+     * `null` means "no prior acknowledged sequence for this workspace" —
+     * e.g. a first-ever subscribe — which is answered with every
+     * currently-retained event, never `SnapshotRequired` (there's no gap to
+     * detect when the caller was never caught up to begin with).
+     *
+     * Throws on failure (not connected, or a transport-level error) —
+     * callers (again, normally only [ai.choosh.agentevents.AgentEventSubscription])
+     * are expected to catch and retry on their own schedule, the same
+     * "throw on transport failure" convention [workspaceStatus]/[workspaceDiff]
+     * already use.
+     */
+    suspend fun agentEventsResume(deviceId: String, workspaceId: String, afterSequence: Long?): AgentEventsResumeOutcome
+
     /** Closes the relay connection. Idempotent. */
     fun close()
+}
+
+// --- docs/specs/agent-events.md domain types --------------------------
+
+/** Mirrors `choosh_protocol::relay::WireInputReason`. */
+enum class InputReason { APPROVAL, PERMISSION, QUESTION, ELICITATION, NEXT_PROMPT, UNKNOWN }
+
+/** Mirrors `choosh_protocol::relay::WireAgentStatus`. */
+enum class AgentRunStatus { STARTING, BUSY, WAITING, STOPPED, FAILED, UNKNOWN }
+
+/**
+ * Mirrors `choosh_protocol::relay::WireAgentEvent` — docs/specs/agent-events.md's
+ * normalized event set, one variant per `kind` on the wire.
+ * [Unknown] is the forward-compatibility fallback for a `kind` this client
+ * build doesn't recognize yet (a future normalized event landing
+ * server-side before this client is updated) — decoded, never a crash or a
+ * dropped/unparseable push, matching this codebase's existing
+ * unrecognized-value convention (e.g. [ai.choosh.engine.WebServiceStatus.UNKNOWN]).
+ */
+sealed interface AgentEvent {
+    data class InputRequired(val workspaceId: String, val itemId: String, val reason: InputReason) : AgentEvent
+    data class TurnCompleted(val workspaceId: String, val itemId: String) : AgentEvent
+    data class FilesChanged(val workspaceId: String, val itemId: String, val paths: List<String>) : AgentEvent
+    data class AgentStatusChanged(val workspaceId: String, val itemId: String, val status: AgentRunStatus) : AgentEvent
+    data class EditorAttached(val workspaceId: String) : AgentEvent
+    data class EditorDetached(val workspaceId: String) : AgentEvent
+
+    /** Carries no `workspaceId`/`itemId` — see `WireAgentEvent::AuthRequired`'s own doc comment. */
+    data class AuthRequired(val provider: String, val userCode: String, val verificationUri: String) : AgentEvent
+
+    data object Unknown : AgentEvent
+}
+
+/**
+ * The workspace this event is attributable to, mirroring
+ * `WireAgentEvent::workspace_id`'s doc comment — `null` only for
+ * [AgentEvent.AuthRequired] (deliberately unscoped) and [AgentEvent.Unknown]
+ * (unrecognized, so no field to trust).
+ */
+val AgentEvent.workspaceIdOrNull: String?
+    get() = when (this) {
+        is AgentEvent.InputRequired -> workspaceId
+        is AgentEvent.TurnCompleted -> workspaceId
+        is AgentEvent.FilesChanged -> workspaceId
+        is AgentEvent.AgentStatusChanged -> workspaceId
+        is AgentEvent.EditorAttached -> workspaceId
+        is AgentEvent.EditorDetached -> workspaceId
+        is AgentEvent.AuthRequired, AgentEvent.Unknown -> null
+    }
+
+/** One live agent-event push, per [ChooshEngine.pollAgentEvents]. */
+data class AgentEventPush(val fromDeviceId: String, val event: AgentEvent, val sequence: Long?)
+
+/** One replayed event, per [ChooshEngine.agentEventsResume]'s [AgentEventsResumeOutcome.Replayed]. */
+data class SequencedAgentEvent(val sequence: Long, val event: AgentEvent)
+
+/** Outcome of [ChooshEngine.agentEventsResume], per `agent-events.md`'s "Delivery and replay". */
+sealed interface AgentEventsResumeOutcome {
+    /** Oldest first, strictly increasing, no gaps, no duplicates — mirrors `AgentEventsResumeResponse::Replayed`. */
+    data class Replayed(val events: List<SequencedAgentEvent>, val latestSequence: Long) : AgentEventsResumeOutcome
+
+    /**
+     * `afterSequence` is older than the owning devhost's retained window —
+     * per `agent-events.md`, the caller MUST refresh full workspace/item
+     * state via `workspace.status`/`workspace.list` rather than treat this
+     * as an error or a silent no-op.
+     */
+    data object SnapshotRequired : AgentEventsResumeOutcome
 }
 
 /**
