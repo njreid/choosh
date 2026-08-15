@@ -152,6 +152,19 @@ pub enum RpcRequest {
         base_revision: String,
         content_base64: String,
     },
+    /// `host-rpc.md`'s `project.list`: every Project the requesting
+    /// Identity can reach, across every devhost — the fleet drawer's
+    /// Project-mode data source.
+    ProjectList {
+        request_id: String,
+    },
+    /// `host-rpc.md`'s `project.set_primary_workspace`: `workspace_id`
+    /// MUST already belong to `project_id`.
+    ProjectSetPrimaryWorkspace {
+        request_id: String,
+        project_id: String,
+        workspace_id: String,
+    },
 }
 
 impl RpcRequest {
@@ -171,7 +184,9 @@ impl RpcRequest {
             | Self::WorkspaceOpLog { request_id, .. }
             | Self::WorkspaceOpUndo { request_id, .. }
             | Self::WorkspaceOpRestore { request_id, .. }
-            | Self::WorkspaceFileWrite { request_id, .. } => request_id,
+            | Self::WorkspaceFileWrite { request_id, .. }
+            | Self::ProjectList { request_id }
+            | Self::ProjectSetPrimaryWorkspace { request_id, .. } => request_id,
         }
     }
 }
@@ -230,6 +245,19 @@ pub struct WorkspaceSummary {
     pub devhost_id: String,
     pub project_id: String,
     pub created_at: String,
+}
+
+/// `host-rpc.md`'s `project.list` row: `{ project_id, name,
+/// primary_workspace_id, active }`. `active` mirrors
+/// `android-navigation.md`'s Host sort-mode definition (at least one
+/// Workspace with a connected agent/service Item or a recent event) —
+/// `hostd` computes this, the client never infers it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub project_id: String,
+    pub name: String,
+    pub primary_workspace_id: Option<String>,
+    pub active: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -415,6 +443,13 @@ pub enum RpcResponse {
         current_revision: String,
         current_content_base64: String,
     },
+    ProjectListOk {
+        request_id: String,
+        projects: Vec<ProjectSummary>,
+    },
+    ProjectSetPrimaryWorkspaceOk {
+        request_id: String,
+    },
     Error {
         request_id: String,
         /// One of `host-rpc.md`'s fixed error codes: `not_found`,
@@ -444,15 +479,28 @@ impl RpcResponse {
             | Self::WorkspaceOpRestoreOk { request_id, .. }
             | Self::WorkspaceFileWriteOk { request_id, .. }
             | Self::WorkspaceFileWriteStale { request_id, .. }
+            | Self::ProjectListOk { request_id, .. }
+            | Self::ProjectSetPrimaryWorkspaceOk { request_id, .. }
             | Self::Error { request_id, .. } => request_id,
         }
     }
 }
 
 /// `host-rpc.md`'s bounds: page size for `workspace.tree.list`, and the max
-/// byte range for `workspace.file.read`.
+/// byte range for `workspace.file.read` (also used as `workspace.file.write`'s
+/// max content size).
+///
+/// 128 KiB, not 4 MiB: both an RPC response's `content_base64` and an RPC
+/// request's own `content_base64` travel inside a single `"rpc"`-purpose
+/// tunnel frame, bounded by `crate::relay::MAX_TUNNEL_FRAME_BYTES` (256
+/// KiB) — a request/response is never split across frames. Base64 inflates
+/// raw bytes by ~4/3, so a 4 MiB range could never have fit; 128 KiB raw
+/// encodes to ~171 KiB, leaving real margin under the 256 KiB frame cap for
+/// the surrounding JSON envelope. `host-rpc.md`'s own bound-table entry
+/// already anticipated "larger files require multiple ranged requests" —
+/// this was a bound-value bug, not a missing mechanism.
 pub const MAX_TREE_LIST_PAGE: usize = 500;
-pub const MAX_FILE_READ_RANGE_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_FILE_READ_RANGE_BYTES: u64 = 128 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -502,6 +550,42 @@ mod tests {
             assert_eq!(json, wire);
             assert_eq!(serde_json::from_str::<ItemStatus>(&json).unwrap(), status);
         }
+    }
+
+    #[test]
+    fn project_list_request_and_response_round_trip() {
+        let request = RpcRequest::ProjectList { request_id: "id".to_string() };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"type\":\"project-list\""));
+        assert_eq!(serde_json::from_str::<RpcRequest>(&json).unwrap(), request);
+
+        let response = RpcResponse::ProjectListOk {
+            request_id: "id".to_string(),
+            projects: vec![ProjectSummary {
+                project_id: "proj-1".to_string(),
+                name: "app".to_string(),
+                primary_workspace_id: Some("ws-1".to_string()),
+                active: true,
+            }],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(serde_json::from_str::<RpcResponse>(&json).unwrap(), response);
+        assert_eq!(response.request_id(), "id");
+    }
+
+    #[test]
+    fn project_set_primary_workspace_request_and_response_round_trip() {
+        let request = RpcRequest::ProjectSetPrimaryWorkspace {
+            request_id: "id".to_string(),
+            project_id: "proj-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"type\":\"project-set-primary-workspace\""));
+        assert_eq!(serde_json::from_str::<RpcRequest>(&json).unwrap(), request);
+
+        let response = RpcResponse::ProjectSetPrimaryWorkspaceOk { request_id: "id".to_string() };
+        assert_eq!(response.request_id(), "id");
     }
 
     #[test]

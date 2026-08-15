@@ -112,9 +112,49 @@ interface ChooshEngine {
      */
     suspend fun itemList(deviceId: String, workspaceId: String): List<ItemSummary>
 
+    /**
+     * `project.list`: every Project `deviceId` (a single devhost's own
+     * registry) knows about, per docs/specs/host-rpc.md — the fleet
+     * drawer's Project-mode data source. Like every other RPC here, this
+     * is scoped to one devhost's tunnel; per host-rpc.md's `workspace.list`
+     * precedent ("this is called once per devhost after list-devhosts"),
+     * callers assembling the whole fleet's Project list call this once per
+     * reachable devhost and merge by `projectId`. `active` is computed
+     * entirely by `hostd` (`android-navigation.md`'s Host sort-mode
+     * definition) — this client never infers or overrides it.
+     */
+    suspend fun projectList(deviceId: String): List<ProjectSummary>
+
+    /**
+     * `project.set_primary_workspace`: changes which Workspace
+     * [projectList] reports as [ProjectSummary.primaryWorkspaceId] for
+     * `projectId`, and which one the fleet drawer opens when that Project
+     * row is tapped. `workspaceId` MUST already belong to `projectId` —
+     * `hostd` rejects a mismatched pair (see docs/specs/host-rpc.md)
+     * rather than silently applying it, surfaced here as a thrown
+     * exception (this call's only failure mode besides "not connected"),
+     * mirroring [saveDocument]'s [DocumentSaveResult.Rejected] posture of
+     * never silently swallowing a `hostd`-side rejection.
+     */
+    suspend fun setPrimaryWorkspace(deviceId: String, projectId: String, workspaceId: String)
+
     /** Closes the relay connection. Idempotent. */
     fun close()
 }
+
+/**
+ * Mirrors `choosh_protocol::host_rpc::ProjectSummary` exactly: `{
+ * project_id, name, primary_workspace_id, active }`. `active` is
+ * `hostd`-computed (`docs/specs/host-rpc.md`'s `project.list`,
+ * `docs/specs/android-navigation.md`'s Host sort-mode definition) — never
+ * derived client-side from this type's own fields.
+ */
+data class ProjectSummary(
+    val projectId: String,
+    val name: String,
+    val primaryWorkspaceId: String?,
+    val active: Boolean,
+)
 
 /**
  * Mirrors `choosh_protocol::host_rpc::ItemType`. `WEB_SERVICE` is the only

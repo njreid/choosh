@@ -258,12 +258,23 @@ impl Engine {
 
     /// Opens a document per editor-protocol.md's "Opening a document":
     /// `workspace.file.read { workspace_id, path }` (no `revision`/`range`
-    /// — defaults to the live working copy `@`, whole file). The returned
-    /// JSON is one of:
+    /// — defaults to the live working copy `@`, whole file). Internally this
+    /// may issue *multiple* `workspace.file.read` calls (see
+    /// [`read_whole_file`]'s doc comment): a single response can never carry
+    /// more than `choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES` of
+    /// content (that bound exists so one request/response fits inside one
+    /// `"rpc"`-purpose relay tunnel frame — see that constant's own doc
+    /// comment), so a document larger than the bound needs more than one
+    /// round trip to fetch in full. Callers of this method still see one
+    /// logical "open" and get the document's true, complete content back
+    /// regardless of its size. The returned JSON is one of:
     ///
     /// - `{"type":"ok","content_base64":...,"revision":...,"total_size":...}`
     /// - `{"type":"error","code":...,"message":...}` — a `hostd`-side
-    ///   rejection (e.g. binary/oversized, per editor-protocol.md's "Limits").
+    ///   rejection (e.g. binary/oversized, per editor-protocol.md's "Limits"),
+    ///   or the file changing on disk while this method was still fetching
+    ///   its later chunks (a genuine, if narrow, race — see
+    ///   [`read_whole_file`]'s revision-stability check).
     /// - `{"type":"offline","message":...}` — a transport-level failure
     ///   (not connected, or `call_rpc` itself failed) — editor-protocol.md's
     ///   `offline` save state, not an application error.
@@ -272,28 +283,21 @@ impl Engine {
         let Some(connection) = guard.as_mut() else {
             return offline_json("not connected: call nativeConnect first");
         };
-        let request = RpcRequest::WorkspaceFileRead {
-            request_id: new_request_id(),
-            workspace_id: workspace_id.to_string(),
-            path: path.to_string(),
-            revision: None,
-            range: None,
-        };
-        match connection.call_rpc(target_device_id, request).await {
-            Ok(RpcResponse::WorkspaceFileReadOk { content_base64, total_size, revision, .. }) => {
+        match read_whole_file(connection, target_device_id, workspace_id, path).await {
+            Ok((content, total_size, revision)) => {
+                use base64::Engine as _;
+                let content_base64 = base64::engine::general_purpose::STANDARD.encode(content);
                 json!({ "type": "ok", "content_base64": content_base64, "revision": revision, "total_size": total_size }).to_string()
             }
-            Ok(RpcResponse::Error { code, message, .. }) => error_json_with_code(&code, &message),
-            Ok(other) => error_json_with_code("internal", &format!("unexpected response to workspace.file.read: {other:?}")),
-            Err(error) => {
+            Err(WholeFileReadError::Application { code, message }) => error_json_with_code(&code, &message),
+            Err(WholeFileReadError::Other(message)) => error_json_with_code("internal", &message),
+            Err(WholeFileReadError::Transport(message)) => {
                 // Per relay-protocol.md's reconnect-discontinuity rule and
                 // this module's existing `list_devhosts` precedent: a failed
                 // call on a stale/dropped connection drops it so the next
                 // attempt doesn't reuse a known-broken channel.
-                if matches!(error, CallError::Transport(_)) {
-                    *guard = None;
-                }
-                offline_json(&format!("workspace.file.read failed: {error}"))
+                *guard = None;
+                offline_json(&format!("workspace.file.read failed: {message}"))
             }
         }
     }
@@ -368,6 +372,43 @@ impl Engine {
     /// legitimately never calls this despite it being real, tested (via
     /// this crate's Android-target build) production code.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    /// Returns `project.list`'s `projects` array (`Vec<ProjectSummary>`) as
+    /// a bare JSON array — the fleet drawer's Project-mode data source
+    /// (`host-rpc.md`'s `project.list`). Each entry's `active` is computed
+    /// entirely by `hostd`; this crate never infers or overrides it. Same
+    /// error-shape convention as `workspace_status`/`item_list`.
+    pub async fn project_list(&self, target_device_id: &str) -> String {
+        let request = RpcRequest::ProjectList { request_id: new_request_id() };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::ProjectListOk { projects, .. }) => to_json(&projects),
+            Ok(other) => unexpected_or_error_json("project.list", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// `project.set_primary_workspace` — changes which Workspace
+    /// `project.list` reports as `primary_workspace_id` for `project_id`.
+    /// `workspace_id` MUST already belong to `project_id`
+    /// (`host-rpc.md`) — `hostd` rejects a mismatched pair rather than
+    /// silently applying it, surfaced here the same way every other
+    /// `hostd`-side rejection is (`unexpected_or_error_json`'s `Error`
+    /// arm). Returns `{"ok":true}` on success, mirroring
+    /// `workspace_op_undo`'s "small confirmation payload" style rather
+    /// than a bare boolean, so a caller-visible failure reason survives
+    /// the JNI boundary instead of collapsing to `false`.
+    pub async fn project_set_primary_workspace(&self, target_device_id: &str, project_id: &str, workspace_id: &str) -> String {
+        let request = RpcRequest::ProjectSetPrimaryWorkspace {
+            request_id: new_request_id(),
+            project_id: project_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+        };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::ProjectSetPrimaryWorkspaceOk { .. }) => json!({ "ok": true }).to_string(),
+            Ok(other) => unexpected_or_error_json("project.set_primary_workspace", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
     pub async fn open_pty_tunnel(&self, target_device_id: &str, item_id: &str) -> Result<PtyTunnelHandle, String> {
         let mut guard = self.connection.lock().await;
         let Some(connection) = guard.as_mut() else {
@@ -422,6 +463,16 @@ impl Engine {
     /// `choosh_web::markdown::render_markdown` or an HTTP response body,
     /// never into Kotlin/JNI.
     ///
+    /// `range: Some(...)` is passed straight through as a single RPC call —
+    /// the caller (the `/asset` route's own HTTP-range translation) chose
+    /// that exact byte window on purpose and is responsible for keeping its
+    /// length within `MAX_FILE_READ_RANGE_BYTES` itself (see
+    /// `markdown_gateway::MAX_ASSET_CHUNK_BYTES`), so this method must not
+    /// silently redefine what a caller-specified range means. `range: None`
+    /// (the `/doc` route's "whole document" fetch) goes through
+    /// [`read_whole_file`] instead, since "whole file" can legitimately be
+    /// larger than one RPC response can carry.
+    ///
     /// # Errors
     ///
     /// `Err("not_found: ...")`-prefixed message on a `hostd`-side
@@ -440,12 +491,25 @@ impl Engine {
         let Some(connection) = guard.as_mut() else {
             return Err("not connected: call nativeConnect first".to_string());
         };
+
+        let Some((offset, length)) = range else {
+            return match read_whole_file(connection, target_device_id, workspace_id, path).await {
+                Ok((content, total_size, _revision)) => Ok((content, total_size)),
+                Err(WholeFileReadError::Application { code, message }) => Err(format!("{code}: {message}")),
+                Err(WholeFileReadError::Other(message)) => Err(message),
+                Err(WholeFileReadError::Transport(message)) => {
+                    *guard = None;
+                    Err(format!("workspace.file.read failed: {message}"))
+                }
+            };
+        };
+
         let request = RpcRequest::WorkspaceFileRead {
             request_id: new_request_id(),
             workspace_id: workspace_id.to_string(),
             path: path.to_string(),
             revision: None,
-            range: range.map(|(offset, length)| ByteRange { offset, length }),
+            range: Some(ByteRange { offset, length }),
         };
         match connection.call_rpc(target_device_id, request).await {
             Ok(RpcResponse::WorkspaceFileReadOk { content_base64, total_size, .. }) => {
@@ -468,6 +532,110 @@ impl Engine {
 
     pub async fn close(&self) {
         *self.connection.lock().await = None;
+    }
+}
+
+/// [`read_whole_file`]'s error shape — deliberately distinct from a bare
+/// `String` so each of its two callers ([`Engine::open_document`],
+/// [`Engine::read_workspace_file_range`]) can apply its own
+/// connection-drop/error-JSON convention without this helper having to know
+/// which caller it's serving.
+enum WholeFileReadError {
+    /// A [`CallError`] from `call_rpc` itself — every existing method in
+    /// this module drops its connection on this and reports "offline"
+    /// (`open_document`) or a bare message (`read_workspace_file_range`);
+    /// this variant carries just the formatted message so both call sites
+    /// can keep doing exactly that.
+    Transport(String),
+    /// A well-formed `RpcResponse::Error` from `hostd` — a real
+    /// application-level rejection (`not_found`, `bound_exceeded`,
+    /// binary content, etc.), never a reason to drop the connection.
+    Application { code: String, message: String },
+    /// Anything else: an unexpected response variant, a `content_base64`
+    /// that failed to decode, or — the case unique to this multi-request
+    /// helper — the file's `revision` changing between chunks (see below).
+    Other(String),
+}
+
+/// Issues repeated `workspace.file.read` calls (offset increasing by
+/// `choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES` each time) and
+/// assembles the complete file content, because a single
+/// `WorkspaceFileReadOk.content_base64` can never carry more than that
+/// bound (it has to fit inside one `"rpc"`-purpose relay tunnel frame — see
+/// `MAX_FILE_READ_RANGE_BYTES`'s own doc comment). Passing `range: None`
+/// through to `hostd` unmodified would silently return only the file's
+/// *first* chunk while still reporting the file's true `total_size` —
+/// exactly the "reads `total_size` correctly but the content is truncated"
+/// bug this loop exists to close. Shared by [`Engine::open_document`] (the
+/// Kotlin-facing editor path) and [`Engine::read_workspace_file_range`]'s
+/// own `range: None` case (the Markdown-document-render path) — the two
+/// real "I want the whole file" callers in this crate; the asset-serving
+/// range path deliberately does NOT go through this, since a caller-chosen
+/// range means exactly the bytes it asked for, once, not "keep looping
+/// until you have the whole file."
+///
+/// Every chunk's `revision` is a hash of the file's *entire* current
+/// content as of that specific read (`fs_ops::read_file_range`'s own doc
+/// comment: a ranged read still reflects the whole file so a stale write
+/// can be detected against a part of the file the client never even read).
+/// That means a concurrent write between this loop's chunk N and chunk N+1
+/// changes the revision chunk N+1 comes back with — assembling those two
+/// chunks together would silently stitch bytes from two different points in
+/// time into content that was never a real, single snapshot of the file.
+/// Detected here (comparing every chunk's revision against the first) and
+/// reported as [`WholeFileReadError::Other`] rather than risking that.
+async fn read_whole_file(
+    connection: &mut PhoneConnection,
+    target_device_id: &str,
+    workspace_id: &str,
+    path: &str,
+) -> Result<(Vec<u8>, u64, String), WholeFileReadError> {
+    use base64::Engine as _;
+
+    let mut content = Vec::new();
+    let mut first_revision: Option<String> = None;
+    let mut offset = 0_u64;
+
+    loop {
+        let request = RpcRequest::WorkspaceFileRead {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            path: path.to_string(),
+            revision: None,
+            range: Some(ByteRange { offset, length: choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES }),
+        };
+        let response = connection
+            .call_rpc(target_device_id, request)
+            .await
+            .map_err(|error| WholeFileReadError::Transport(format!("{error}")))?;
+        match response {
+            RpcResponse::WorkspaceFileReadOk { content_base64, total_size, revision, .. } => {
+                match &first_revision {
+                    None => first_revision = Some(revision),
+                    Some(seen) if *seen != revision => {
+                        return Err(WholeFileReadError::Other(format!(
+                            "{path} changed on disk while it was being read in chunks (revision went from {seen} to {revision}) — retry the read"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+                let chunk = base64::engine::general_purpose::STANDARD
+                    .decode(&content_base64)
+                    .map_err(|error| WholeFileReadError::Other(format!("hostd returned invalid base64: {error}")))?;
+                let chunk_len = chunk.len() as u64;
+                content.extend_from_slice(&chunk);
+                offset += chunk_len;
+                // `chunk_len == 0` guards against an empty response that
+                // never advances `offset` (which would otherwise spin
+                // forever) — a well-behaved `hostd` never returns one short
+                // of `total_size`, but this loop must not trust that blindly.
+                if offset >= total_size || chunk_len == 0 {
+                    return Ok((content, total_size, first_revision.unwrap_or_default()));
+                }
+            }
+            RpcResponse::Error { code, message, .. } => return Err(WholeFileReadError::Application { code, message }),
+            other => return Err(WholeFileReadError::Other(format!("unexpected response to workspace.file.read: {other:?}"))),
+        }
     }
 }
 
@@ -657,6 +825,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_list_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().project_list("dev-1").await);
+    }
+
+    #[tokio::test]
+    async fn project_set_primary_workspace_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().project_set_primary_workspace("dev-1", "proj-1", "ws-1").await);
+    }
+
+    #[tokio::test]
     async fn open_document_before_connect_is_offline_not_error() {
         assert_offline_json_mentions_not_connected(&unconnected_engine().open_document("dev-1", "ws-1", "a.txt").await);
     }
@@ -835,6 +1013,221 @@ mod tests {
         engine
     }
 
+    /// Like `connect_and_serve_one_rpc`, but drives a whole *sequence* of
+    /// `expected_requests` RPC round trips, each over its own fresh tunnel
+    /// (`call_rpc`'s documented fresh-tunnel-per-call discipline) —
+    /// needed for [`read_whole_file`]'s multi-chunk tests, which must
+    /// observe (and correctly assemble) more than one `workspace.file.read`
+    /// response. `respond` is called once per request, in arrival order.
+    async fn connect_and_serve_rpc_sequence(
+        expected_requests: usize,
+        mut respond: impl FnMut(RpcRequest) -> RpcResponse + Send + 'static,
+    ) -> Engine {
+        use choosh_protocol::relay::{ControlRequest, ControlResponse, FRAME_CLASS_CONTROL as TUNNEL_INNER_CONTROL, encode_tunnel_id_hex};
+
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            for index in 0..expected_requests {
+                let open: ControlRequest = recv_control(&mut ws).await;
+                let ControlRequest::OpenTunnel { request_id, purpose, .. } = open else { panic!("expected open-tunnel") };
+                assert_eq!(purpose, "rpc");
+                let tunnel_id: [u8; choosh_protocol::relay::TUNNEL_ID_BYTES] =
+                    [1, 2, 3, 4, 5, 6, 7, u8::try_from(index + 1).unwrap()];
+                send_control(&mut ws, &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) })
+                    .await;
+
+                let (id, payload) = recv_tunnel_frame(&mut ws).await;
+                assert_eq!(id, tunnel_id);
+                let (inner_class, inner_body) = payload.split_first().unwrap();
+                assert_eq!(*inner_class, TUNNEL_INNER_CONTROL);
+                let request: RpcRequest = serde_json::from_slice(inner_body).unwrap();
+                let response = respond(request);
+
+                let mut response_payload = vec![TUNNEL_INNER_CONTROL];
+                response_payload.extend(serde_json::to_vec(&response).unwrap());
+                send_tunnel_frame(&mut ws, tunnel_id, &response_payload).await;
+
+                let (closed_id, closed_payload) = recv_tunnel_frame(&mut ws).await;
+                assert_eq!(closed_id, tunnel_id);
+                assert!(closed_payload.is_empty());
+            }
+        });
+
+        let engine = Engine::new("http://unused".to_string(), ws_url);
+        assert!(engine.connect("good-cred").await, "connect should succeed against a well-behaved fake relayd");
+        engine
+    }
+
+    /// The load-bearing test for this pass: `open_document` must fetch a
+    /// file bigger than one `workspace.file.read` response can carry
+    /// (`choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES`) by issuing
+    /// *multiple* chunked requests and assembling them, not silently
+    /// returning just the first chunk while still reporting the file's true
+    /// `total_size` (the exact bug `read_whole_file` exists to close — see
+    /// its doc comment). The fake relayd below is wired via
+    /// `connect_and_serve_rpc_sequence(2, ...)`: if `open_document` only
+    /// issued one request (the old, buggy behavior), the second `.accept`-
+    /// side expectation would simply never be driven and this test would
+    /// hang past its `tokio::test` default rather than silently pass — so a
+    /// regression back to single-shot reads fails loudly, not quietly.
+    #[tokio::test]
+    async fn open_document_assembles_multiple_chunks_for_a_file_larger_than_one_rpc_response() {
+        use base64::Engine as _;
+
+        let bound = choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES;
+        let total_len = usize::try_from(bound).unwrap() + 1000;
+        // Not all-zero: a byte pattern that would fail an equality check if
+        // any chunk landed at the wrong offset or got truncated/duplicated.
+        let content: Vec<u8> = (0..total_len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        let expected_revision = "rev-fixed".to_string();
+
+        let content_for_server = content.clone();
+        let revision_for_server = expected_revision.clone();
+        let engine = connect_and_serve_rpc_sequence(2, move |request| {
+            let RpcRequest::WorkspaceFileRead { request_id, range, .. } = request else { panic!("expected workspace.file.read") };
+            let range = range.expect("open_document's chunked reader must always pass an explicit range");
+            let start = usize::try_from(range.offset).unwrap();
+            let end = (start + usize::try_from(range.length).unwrap()).min(content_for_server.len());
+            assert!(start < end, "must never issue a request for an empty/out-of-bounds range");
+            RpcResponse::WorkspaceFileReadOk {
+                request_id,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(&content_for_server[start..end]),
+                total_size: content_for_server.len() as u64,
+                revision: revision_for_server.clone(),
+            }
+        })
+        .await;
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(10), engine.open_document("dev-1", "ws-1", "big.txt"))
+            .await
+            .expect("open_document must not hang waiting on a request the fake relayd never receives");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["type"], "ok", "{body}");
+        assert_eq!(parsed["revision"], expected_revision, "{body}");
+        assert_eq!(parsed["total_size"], content.len() as u64, "{body}");
+
+        let returned = base64::engine::general_purpose::STANDARD.decode(parsed["content_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(returned.len(), content.len(), "content must be the full file, not truncated to the first chunk");
+        assert_eq!(returned, content, "assembled content must be byte-identical to the source across the chunk boundary");
+    }
+
+    /// [`read_workspace_file_range`]'s `range: None` case (the Markdown
+    /// gateway's `/doc` fetch) must chunk exactly like `open_document`
+    /// does — same underlying [`read_whole_file`] helper, exercised through
+    /// the other public entry point so a future refactor that wires one but
+    /// not the other back up to a single-shot request gets caught here too.
+    #[tokio::test]
+    async fn read_workspace_file_range_with_no_range_assembles_multiple_chunks() {
+        let bound = choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES;
+        let total_len = usize::try_from(bound).unwrap() + 1000;
+        let content: Vec<u8> = (0..total_len).map(|i| u8::try_from((i * 7) % 251).unwrap()).collect();
+
+        let content_for_server = content.clone();
+        let engine = connect_and_serve_rpc_sequence(2, move |request| {
+            use base64::Engine as _;
+            let RpcRequest::WorkspaceFileRead { request_id, range, .. } = request else { panic!("expected workspace.file.read") };
+            let range = range.expect("read_workspace_file_range(None) must still pass an explicit range downstream");
+            let start = usize::try_from(range.offset).unwrap();
+            let end = (start + usize::try_from(range.length).unwrap()).min(content_for_server.len());
+            RpcResponse::WorkspaceFileReadOk {
+                request_id,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(&content_for_server[start..end]),
+                total_size: content_for_server.len() as u64,
+                revision: "rev-fixed".to_string(),
+            }
+        })
+        .await;
+
+        let (returned, total_size) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.read_workspace_file_range("dev-1", "ws-1", "big.md", None),
+        )
+        .await
+        .expect("must not hang")
+        .unwrap();
+        assert_eq!(total_size, content.len() as u64);
+        assert_eq!(returned, content, "assembled content must be byte-identical to the source across the chunk boundary");
+    }
+
+    /// The counterpart to the two chunking tests above: an *explicit* range
+    /// (the `/asset` route's own use, per [`Self::read_workspace_file_range`]'s
+    /// doc comment) must stay a single request even when its length happens
+    /// to reach all the way to `total_size` — this path must never
+    /// second-guess a caller-chosen range into "keep looping until whole
+    /// file," which would break asset byte-range semantics (e.g. an HTTP
+    /// `Range` request that's deliberately smaller than the whole file).
+    /// `connect_and_serve_rpc_sequence(1, ...)` only ever drives one
+    /// request/response pair — if `read_workspace_file_range` tried to
+    /// issue a second one, the `timeout` below is what turns that into a
+    /// clean test failure instead of a hang.
+    #[tokio::test]
+    async fn read_workspace_file_range_with_an_explicit_range_issues_exactly_one_request() {
+        let content = vec![9_u8; 10];
+        let content_for_server = content.clone();
+        let engine = connect_and_serve_rpc_sequence(1, move |request| {
+            use base64::Engine as _;
+            let RpcRequest::WorkspaceFileRead { request_id, range, .. } = request else { panic!("expected workspace.file.read") };
+            let range = range.expect("an explicit-range call must pass that range through unmodified");
+            assert_eq!((range.offset, range.length), (0, 10));
+            RpcResponse::WorkspaceFileReadOk {
+                request_id,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(&content_for_server),
+                total_size: content_for_server.len() as u64,
+                revision: "rev-fixed".to_string(),
+            }
+        })
+        .await;
+
+        let (returned, total_size) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.read_workspace_file_range("dev-1", "ws-1", "small.png", Some((0, 10))),
+        )
+        .await
+        .expect("must not hang — a second request here would mean this path is wrongly chunking an explicit range")
+        .unwrap();
+        assert_eq!(total_size, 10);
+        assert_eq!(returned, content);
+    }
+
+    /// The revision-stability guard: if the file changes on disk between
+    /// this loop's chunk 1 and chunk 2 (a concurrent `workspace.file.write`
+    /// from another session), `read_whole_file`'s own doc comment says
+    /// assembling those chunks would silently stitch bytes from two
+    /// different points in time. This proves that's caught and reported as
+    /// an application-level error rather than ever reaching the caller as a
+    /// falsely-successful `{"type":"ok", ...}`.
+    #[tokio::test]
+    async fn open_document_reports_an_error_if_the_file_changes_between_chunks_instead_of_silently_stitching_them() {
+        let bound = choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES;
+        let total_len = bound + 10;
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let call_count_for_server = std::sync::Arc::clone(&call_count);
+        let engine = connect_and_serve_rpc_sequence(2, move |request| {
+            use base64::Engine as _;
+            let RpcRequest::WorkspaceFileRead { request_id, .. } = request else { panic!("expected workspace.file.read") };
+            let call = call_count_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let chunk_len: usize = if call == 0 { usize::try_from(bound).unwrap() } else { 10 };
+            RpcResponse::WorkspaceFileReadOk {
+                request_id,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(vec![0_u8; chunk_len]),
+                total_size: total_len,
+                revision: if call == 0 { "rev-1".to_string() } else { "rev-2".to_string() },
+            }
+        })
+        .await;
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(10), engine.open_document("dev-1", "ws-1", "big.txt"))
+            .await
+            .expect("must not hang");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["type"], "error", "{body}");
+        assert!(parsed["message"].as_str().unwrap().contains("changed on disk"), "{body}");
+    }
+
     /// The "wrong response variant" error path: `hostd` (or, here, the fake
     /// relayd standing in for it) answers a `workspace.diff` request with a
     /// well-formed but *different* RPC response — a genuine possibility if
@@ -873,6 +1266,78 @@ mod tests {
         let body = engine.workspace_log("dev-1", "ws-1", "", 50).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["error"], "not_found: no such workspace", "{body}");
+    }
+
+    /// `project.list`'s happy path, round-tripped through a real (fake)
+    /// relayd/tunnel exactly like `connect_then_list_devhosts_...` does for
+    /// `list_devhosts` — proves the bare-JSON-array shape and that `active`
+    /// (a `hostd`-computed value this crate never touches) survives
+    /// untouched.
+    #[tokio::test]
+    async fn project_list_round_trips_projects_with_active_flag() {
+        use choosh_protocol::host_rpc::ProjectSummary;
+
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ProjectList { request_id } = request else { panic!("expected project.list") };
+            RpcResponse::ProjectListOk {
+                request_id,
+                projects: vec![
+                    ProjectSummary {
+                        project_id: "proj-1".to_string(),
+                        name: "app".to_string(),
+                        primary_workspace_id: Some("ws-1".to_string()),
+                        active: true,
+                    },
+                    ProjectSummary { project_id: "proj-2".to_string(), name: "idle".to_string(), primary_workspace_id: None, active: false },
+                ],
+            }
+        })
+        .await;
+
+        let body = engine.project_list("dev-1").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed[0]["project_id"], "proj-1");
+        assert_eq!(parsed[0]["active"], true);
+        assert_eq!(parsed[1]["project_id"], "proj-2");
+        assert_eq!(parsed[1]["active"], false);
+        assert!(parsed[1]["primary_workspace_id"].is_null());
+    }
+
+    /// `project.set_primary_workspace`'s happy path.
+    #[tokio::test]
+    async fn project_set_primary_workspace_round_trips_success() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ProjectSetPrimaryWorkspace { request_id, project_id, workspace_id } = request else {
+                panic!("expected project.set_primary_workspace")
+            };
+            assert_eq!(project_id, "proj-1");
+            assert_eq!(workspace_id, "ws-2");
+            RpcResponse::ProjectSetPrimaryWorkspaceOk { request_id }
+        })
+        .await;
+
+        let body = engine.project_set_primary_workspace("dev-1", "proj-1", "ws-2").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["ok"], true);
+    }
+
+    /// `hostd`'s `invalid_argument` rejection (`workspace_id` not
+    /// belonging to `project_id`, per `host-rpc.md`) surfaces as this
+    /// module's shared `{"error": "<code>: <message>"}` shape, same as
+    /// `workspace_log_reports_a_hostd_side_rpc_error`.
+    #[tokio::test]
+    async fn project_set_primary_workspace_reports_a_hostd_side_rejection() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ProjectSetPrimaryWorkspace { request_id, .. } = request else {
+                panic!("expected project.set_primary_workspace")
+            };
+            RpcResponse::Error { request_id, code: "invalid_argument".to_string(), message: "workspace_id does not belong to project_id".to_string() }
+        })
+        .await;
+
+        let body = engine.project_set_primary_workspace("dev-1", "proj-1", "ws-other-project").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "invalid_argument: workspace_id does not belong to project_id", "{body}");
     }
 
     /// Transport failure mid-call: the fake relayd disappears (drops the

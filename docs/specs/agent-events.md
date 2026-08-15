@@ -117,16 +117,37 @@ A reconnect after any gap — network loss, app backgrounding, or the relay
 connection itself cycling — MUST resume from the last acknowledged sequence
 or fall back to `snapshot_required`; it MUST NOT silently drop events.
 
-**Not yet implemented**: `choosh-hostd` currently forwards agent events
-through a single bounded, in-memory channel
-(`rust/choosh-hostd/src/serve.rs`'s `agent_event_tx`/`agent_event_rx`, a
-plain `tokio::sync::mpsc::channel(256)`) with no per-event sequence number,
-no per-workspace spool, no on-disk persistence across a `serve` restart,
-and no `snapshot_required` response anywhere in the wire types — the code's
-own comment at that channel's construction site calls this out explicitly
-as a real, documented gap versus the replay/sequence machinery described
-above. A reconnect today simply resumes the live event stream from
-whatever arrives next; it does not detect or fill a gap.
+**Implementation note**: the sequencing/spool/resume machinery above is
+implemented in `choosh-hostd` (`rust/choosh-hostd/src/agent_event_spool.rs`
+for the per-workspace sequencer/spool; `rust/choosh-hostd/src/serve.rs`'s
+`agent_event_rx` branch of `serve_dispatch` for where every locally-emitted
+event gets sequenced before its live `agent-event` control frame is sent).
+The `agent_event_tx`/`agent_event_rx` channel this paragraph used to
+describe as the *entire* delivery mechanism still exists, unchanged — it's
+still how every event producer (`choosh-hostd emit`, the pty auth-code
+detector, the SSH bridge's editor-presence hooks, the self-update failure
+report) reaches `serve_dispatch` — but it now feeds the spool as well as
+the live send, so a reconnect never has to rely on "whatever arrives next"
+alone.
+
+The resume request/response ride their own `"agent-events"`-purpose
+`open-tunnel` (relay-protocol.md's tunnel mechanism), opened by a phone
+directly to the devhost that owns the workspace being resumed — the same
+shape a phone already uses to open an `"rpc"`-purpose tunnel for
+`host-rpc.md` traffic, just a distinct purpose tag and payload shape
+(`choosh_protocol::relay::AgentEventsResumeRequest`/
+`AgentEventsResumeResponse`), handled directly in `choosh-hostd::serve`
+rather than through `choosh-hostd::rpc`'s `host-rpc.md` dispatch. See
+`rust/choosh-protocol/src/relay.rs`'s module doc comment for the fuller
+rationale (this vs. a new `host-rpc.md` RPC method vs. a new
+`relayd`-side workspace-to-devhost routing capability).
+
+**Real, remaining gap**: still no on-disk persistence across a `serve`
+restart (`PLAN.md`) — the spool is in-memory only, scoped to one `serve`
+process's lifetime, same as `agent_event_tx`/`agent_event_rx` always were.
+A restart is answered by `snapshot_required` (the spool has no record of
+any workspace immediately after starting), not a silent gap, but it is not
+the persistence a genuine multi-day event history would need.
 
 ## Android notifications
 

@@ -97,15 +97,6 @@ Not blocking, but real and worth tracking rather than leaving implicit:
   independently block obtaining a real FCM registration token to send *to*
   — not verified either way in this pass. Both gaps are about live external
   credentials/devices, not missing code.
-- **`choosh-hostd` shells out to the `jj` CLI instead of using `jj-lib`'s
-  programmatic API** (`rust/choosh-hostd/src/jj_ops.rs`): a deliberate,
-  reported deviation from `jj-integration.md`'s "embed `jj-lib` directly"
-  design — `jj-lib` is a real, compiling dependency, but assembling its
-  API for clone/workspace/diff correctly was judged more work than a
-  single-pass increment could responsibly cover. Every invocation still
-  uses a fixed executable and fully-encoded argv, never a shell string.
-  Replacing this module's internals with real `jj-lib` calls behind the
-  same RPC surface is a scoped follow-up.
 - **`host-deployment.md`'s macOS power-assertion requirement has a real
   implementation (`rust/choosh-hostd/src/power_assertion.rs`,
   `IOPMAssertionCreateWithName`/`IOPMAssertionRelease` against
@@ -142,25 +133,35 @@ Not blocking, but real and worth tracking rather than leaving implicit:
   process has ever created or released one of these assertions, and
   whether it actually prevents sleep/reconnect-loss in practice is
   untested.
-- **`agent-events.md`'s replay/sequencing machinery is unimplemented**:
-  `choosh-hostd` forwards agent events through a single bounded in-memory
-  channel (`serve.rs`'s `agent_event_tx`/`agent_event_rx`, a plain
-  `tokio::sync::mpsc::channel(256)`) with no per-event sequence number, no
-  per-workspace spool, no persistence across a `serve` restart, and no
-  `snapshot_required` response anywhere in the wire types — the code's own
-  comment at that channel's construction site calls this out explicitly. A
-  reconnect resumes the live stream from whatever arrives next rather than
-  detecting or filling a gap.
-- **`host-rpc.md`'s `project.list`/`project.set_primary_workspace` RPCs
-  have no implementation anywhere** — no `RpcRequest`/`RpcResponse` variant
-  in `rust/choosh-protocol/src/host_rpc.rs`, no handler in
-  `choosh-hostd`, and no real call site in the Android app: the fleet
-  drawer's Project-mode rows are rendered entirely from
-  `FleetFixtures.projectsFor(devHosts)` fixture data
-  (`android/app/src/main/java/ai/choosh/fleet/FleetViewModel.kt`), not a
-  live RPC. `hostd`'s registry already tracks a `project_id` internally
-  (surfaced via `workspace.create`/`workspace.list`), but nothing exposes
-  it as its own listable/settable resource yet.
+- **`agent-events.md`'s replay/sequencing machinery — hostd side is real,
+  Android client wiring is not.** `choosh-hostd` now assigns a real,
+  monotonically increasing per-workspace sequence to every agent event
+  (`rust/choosh-hostd/src/agent_event_spool.rs`) and retains a bounded
+  per-workspace spool (500 events or 1 hour, whichever is smaller) that a
+  phone can resume from via a dedicated `"agent-events"`-purpose relay
+  tunnel (`choosh_protocol::relay::AgentEventsResumeRequest`/
+  `AgentEventsResumeResponse`, handled in `serve.rs` alongside the existing
+  `"rpc"`/`"pty:"`/`"web:"` tunnel purposes) — a request older than the
+  retained window gets `snapshot_required`, never a silent gap. Verified
+  with real sequencing/eviction/replay unit tests and real end-to-end
+  `serve_dispatch` integration tests, including one that drops and
+  re-establishes the relayd connection mid-stream and confirms nothing
+  emitted during the gap is lost. Still in-memory only — no persistence
+  across a `serve` *restart* (a `serve` restart's spool starts empty, so a
+  stale client falls back to `snapshot_required`, but a genuine multi-day
+  event history does not survive a restart). **Not done**: the Android
+  client has no code path that subscribes to live agent events at all yet
+  (only the FCM notification backstop parser exists,
+  `ChooshFirebaseMessagingService.kt`) — there is no relay control
+  connection client, no per-workspace last-acknowledged-sequence tracking,
+  and no reconnect-time resume call. Wiring the resume half in isolation,
+  with no live-subscription path underneath it to resume *into*, would not
+  be a meaningful or testable addition; building the whole client-side
+  subscription mechanism (relay control connection handling in the
+  Rust/JNI bridge, sequence-cursor persistence, `workspace.status`/
+  `workspace.list` fallback on `snapshot_required`) is real, separate,
+  sizable work, honestly deferred rather than left as a stub that looks
+  wired but isn't.
 - **Terminal accessibility and hardware keyboard input — fixed (M8
   accessibility follow-up pass).** `TerminalSurfaceView` now exposes the
   terminal's live visible-grid text to TalkBack via a real
@@ -239,13 +240,93 @@ Not blocking, but real and worth tracking rather than leaving implicit:
   `gcloud auth login --no-launch-browser`'s real flow is structurally
   different (no short code printed) and the `gcp` detector arm is
   documented scaffolding, not a working match (M7 SSO bridge).
+- **Claude Code's hook-config JSON schema (`hooks.rs`'s `install_claude_hooks`
+  and the `emit`-payload-parsing heuristic in `extract_candidate_paths`) was
+  never verified against a live payload** — this development environment's
+  own `~/.claude/settings.json` has no `hooks` key configured, so there was
+  nothing to check the installer's merge logic or the surface-name/matcher-
+  group shape against directly. Implemented against `agent-events.md`'s
+  documented surface table and Claude Code's public hooks docs as best
+  understood, not confirmed live. Needs a follow-up check against a real
+  Claude Code installation with hooks firing for real `PermissionRequest`/
+  `Notification`/`FileChanged`/`PostToolUse`/`Stop`/`UserPromptSubmit`
+  events, to confirm both that `install_claude_hooks` merges into the real
+  file shape correctly and that `normalize_claude`'s payload-field
+  assumptions (`file_path`/`path`/`tool_input.file_path`) match real hook
+  payloads.
 - **libghostty-vt was not wired in** despite a successful Zig
   cross-compile proof — the terminal engine ships a pure-Rust `vte`-backed
   parser instead, a deliberate scope decision from M2, not a dead end.
-- **`workspace.file.read`'s 4 MiB range bound exceeds `MAX_TUNNEL_FRAME_BYTES`
-  (256 KiB)** — a full-range read can't fit in one tunnel frame and neither
-  side does multi-frame reassembly yet (flagged by the M5 Android fork,
-  unfixed — affects large-file reads over the RPC tunnel).
+- **`workspace.file.read`'s range bound vs. `MAX_TUNNEL_FRAME_BYTES` — fixed
+  (Wave-2 follow-up).** `MAX_FILE_READ_RANGE_BYTES` is now 128 KiB (was 4
+  MiB — base64-encoded content could never have fit inside one 256 KiB
+  `"rpc"`-tunnel frame; `host-rpc.md`'s bound table is updated to match).
+  `choosh-android-bridge::engine`'s `read_whole_file` gives both real
+  "whole file" callers (`Engine::open_document`, the Kotlin editor path;
+  `Engine::read_workspace_file_range`'s `range: None` case, the Markdown
+  `/doc` fetch) a real multi-request chunking/reassembly loop, including a
+  revision-stability check that reports (rather than silently stitches) a
+  file that changes on disk mid-fetch. The `/asset` route's own explicit
+  `Range`-header path was left as a single request per call, by design —
+  a caller-chosen byte range must mean exactly those bytes. A related,
+  previously-shipped regression was caught and fixed in the same pass:
+  `markdown_gateway::MAX_ASSET_CHUNK_BYTES` had stayed hardcoded at the
+  stale 4 MiB, so a rangeless `/asset` request would have asked `hostd`
+  for more than the new bound allows and gotten a hard `bound_exceeded`
+  rejection instead of any content — now tied directly to
+  `MAX_FILE_READ_RANGE_BYTES` instead of a separately-maintained literal.
+  On the write side, `workspace.file.write`'s content is bounded by the
+  same constant with no chunking (one atomic RPC, no partial-write
+  semantics) — an oversized save is now a clear, plain-language rejection
+  in `SourceEditorViewModel` ("too large to save over the phone
+  connection") rather than raw wire text, with edits kept as Dirty, never
+  lost. Verified with a genuine >128 KiB round-trip test (byte-identical
+  assembly across a real chunk boundary, requiring more than one RPC round
+  trip) plus a confirmed regression check that the old single-shot
+  behavior fails that same test.
+- **`host-rpc.md`'s `project.list`/`project.set_primary_workspace` RPCs —
+  implemented (Wave-2 follow-up).** Real `RpcRequest`/`RpcResponse`
+  variants and `ProjectSummary` in `host_rpc.rs`; `choosh-hostd`'s
+  `handle_project_list`/`handle_project_set_primary_workspace` (`rpc.rs`)
+  compute `active` themselves — a Project counts as active if any of its
+  Workspaces has a connected `AgentTerminal`/`WebService` item
+  (`Running`/`Starting`) or a recent agent event (`Registry::record_event`/
+  `has_recent_event`, a 5-minute window recorded at `serve.rs`'s single
+  agent-event funnel point — `android-navigation.md` explicitly leaves this
+  bound as a `hostd`-side implementation choice, not a wire contract).
+  `set_primary_workspace` validates `workspace_id` genuinely belongs to
+  `project_id` (`not_found` for an unknown id, `invalid_argument` for a
+  real workspace under the wrong project). Android: `Engine::project_list`/
+  `project_set_primary_workspace` (Rust bridge + JNI), `ChooshEngine`/
+  `NativeChooshEngine`/`FakeChooshEngine`, and `FleetViewModel.loadProjects`
+  now call the real RPC per online devhost instead of
+  `FleetFixtures.projectsFor(devHosts)` directly. Still fixture-backed:
+  each Project's nested Workspace list (`Project.workspaces`) still comes
+  from `FleetFixtures.workspacesFor`, since `workspace.list` itself isn't
+  wired into `ChooshEngine` yet — a real, separate, tracked gap, not
+  papered over.
+- **`choosh-hostd` shells out to the `jj` CLI instead of using `jj-lib`'s
+  programmatic API — partially migrated (Wave-2 follow-up).** `status`,
+  `current_commit_id`/`commit_id_at`, and `log` now use real `jj-lib`
+  calls (a from-scratch revset engine wiring plus a `snapshot_and_reload`
+  foundation that keeps the colocated Git side in sync via
+  `jj_lib::git::update_intent_to_add`/`export_refs`, since other
+  operations in this module still shell out against the same repos) behind
+  the exact same public function signatures — `rpc.rs`'s call sites needed
+  no changes. Left on the CLI shim, each for a specific, documented reason
+  in `jj_ops.rs`'s module doc comment: `clone` (real Git remote transport,
+  the original doc comment's own called-out hard case);
+  `ensure_colocated`/`rename_workspace`/`workspace_add`/`forget_workspace`
+  (the workspace-mutation family, deliberately deprioritized behind the
+  read path, ran out of scope this pass); `diff` (needs `jj-lib`'s separate
+  `Store::get_copy_records`/`CopyRecords` subsystem for rename/copy
+  pairing, not verified to the same standard as the existing rename/binary
+  regression test); `op_log`/`op_undo`/`op_restore` (timestamp
+  wire-format fidelity and real operation-mutating `Transaction`s,
+  respectively, not completed this pass). All existing `jj_ops.rs` tests —
+  including the real two-workspace-conflicted-merge test and the
+  rename/binary-diff regression test — pass unchanged against the migrated
+  functions.
 - **`jj`/`zellij` currency checks (M7) don't redirect the rest of
   `choosh-hostd`'s existing `Command::new("jj"/"zellij")` call sites** to
   the `mise`-resolved binary — currency is checked and logged, but not yet

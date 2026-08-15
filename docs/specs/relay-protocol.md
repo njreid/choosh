@@ -100,8 +100,11 @@ auth-and-enrollment.md's capability table and
 Any authenticated Identity. Request:
 `{ target_device_id, purpose }` where `purpose` is an opaque tag the two
 tunnel endpoints agree on out of band (e.g. `"rpc"`, `"pty:<item_id>"`,
-`"ssh"`, `"web:<item_id>"`) — `relayd` does not validate `purpose`
-beyond passing it to the target's tunnel-offer notification. Response:
+`"ssh"`, `"web:<item_id>"`, `"agent-events"` — see
+[agent-events.md](agent-events.md)'s "Delivery and replay" section for the
+resume-request/response JSON this last one carries) — `relayd` does not
+validate `purpose` beyond passing it to the target's tunnel-offer
+notification. Response:
 `{ tunnel_id }` on success, or a typed failure if `target_device_id` is
 offline or the requesting Identity lacks a capability scope permitting a
 tunnel to that target (see auth-and-enrollment.md's capability scopes).

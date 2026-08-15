@@ -15,6 +15,7 @@ import ai.choosh.engine.DocumentSaveResult
 import ai.choosh.engine.ItemSummary
 import ai.choosh.engine.ItemType
 import ai.choosh.engine.OperationLogEntry
+import ai.choosh.engine.ProjectSummary
 import ai.choosh.engine.WebServiceStatus
 import ai.choosh.engine.WebauthnResult
 import ai.choosh.engine.WorkspaceStatus
@@ -128,6 +129,18 @@ class NativeChooshEngine : ChooshEngine {
         decodeOrThrow(raw) { body -> json.decodeFromString<List<WireItemSummary>>(body).map { it.toDomain() } }
     }
 
+    override suspend fun projectList(deviceId: String): List<ProjectSummary> = withContext(Dispatchers.IO) {
+        val raw = NativeBridge.nativeProjectList(handle, deviceId)
+        decodeOrThrow(raw) { body -> json.decodeFromString<List<WireProjectSummary>>(body).map { it.toDomain() } }
+    }
+
+    override suspend fun setPrimaryWorkspace(deviceId: String, projectId: String, workspaceId: String) {
+        withContext(Dispatchers.IO) {
+            val raw = NativeBridge.nativeProjectSetPrimaryWorkspace(handle, deviceId, projectId, workspaceId)
+            decodeOrThrow(raw) { /* {"ok":true} on success; decodeOrThrow already throws on the shared {"error":...} shape. */ }
+        }
+    }
+
     /** Exposes this instance's raw JNI connection handle to `WebGatewayBridge`/`MarkdownGatewayBridge`, mirroring [ai.choosh.terminal.TerminalSession.attachPty]'s existing `connectionHandle` pattern. */
     val connectionHandle: Long get() = handle
 
@@ -184,6 +197,10 @@ private object NativeBridge {
 
     // M5 service-tunnels.md item listing.
     @JvmStatic external fun nativeItemList(handle: Long, targetDeviceId: String, workspaceId: String): String
+
+    // host-rpc.md's fleet-drawer Project-mode RPCs.
+    @JvmStatic external fun nativeProjectList(handle: Long, targetDeviceId: String): String
+    @JvmStatic external fun nativeProjectSetPrimaryWorkspace(handle: Long, targetDeviceId: String, projectId: String, workspaceId: String): String
 }
 
 /**
@@ -433,6 +450,19 @@ private data class WireItemSummary(
         status = wireItemStatusToDomain(status),
         port = port,
     )
+}
+
+// --- host-rpc.md Project-mode wire shapes -------------------------------
+
+/** Mirrors `choosh_protocol::host_rpc::ProjectSummary` field-for-field. */
+@Serializable
+private data class WireProjectSummary(
+    val project_id: String,
+    val name: String,
+    val primary_workspace_id: String? = null,
+    val active: Boolean,
+) {
+    fun toDomain() = ProjectSummary(projectId = project_id, name = name, primaryWorkspaceId = primary_workspace_id, active = active)
 }
 
 private fun decodeDocumentSaveResult(raw: String): DocumentSaveResult {

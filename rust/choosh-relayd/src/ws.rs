@@ -720,11 +720,11 @@ async fn dispatch(
         ControlRequest::OpenTunnel { request_id, target_device_id, purpose } => {
             handle_open_tunnel(state, authenticated, request_id, target_device_id, purpose).await
         }
-        ControlRequest::AgentEvent { request_id, event } => {
+        ControlRequest::AgentEvent { request_id, event, sequence } => {
             if authenticated.identity_class != IdentityClass::Devhost {
                 return not_permitted(&request_id, "agent-event");
             }
-            route_agent_event(state, &authenticated.device_id, event).await;
+            route_agent_event(state, &authenticated.device_id, event, sequence).await;
             ControlResponse::AgentEventOk { request_id }
         }
         ControlRequest::RegisterFcmToken { request_id, fcm_token } => {
@@ -918,7 +918,13 @@ async fn list_devhost_ssh_endpoints(state: &AppState, request_id: String) -> Con
 /// credentials (auth-and-enrollment.md: "may hold multiple passkey
 /// credentials"), so this fans out to all of them rather than assuming
 /// exactly one.
-async fn route_agent_event(state: &AppState, from_device_id: &str, event: WireAgentEvent) {
+///
+/// `sequence` is `choosh-hostd`'s per-workspace spool sequence for `event`
+/// (`agent-events.md`'s "Delivery and replay" section) — `relayd` neither
+/// assigns nor interprets it, only forwards it verbatim in the matching
+/// `ServerPush::AgentEvent` so a connected phone can track its own
+/// last-acknowledged sequence per workspace without a separate round trip.
+async fn route_agent_event(state: &AppState, from_device_id: &str, event: WireAgentEvent, sequence: Option<u64>) {
     // `phone_sessions` is keyed by session credential, not `device_id` — the
     // real device_id (what `online_devices`/`connections`/`fcm_tokens` are
     // keyed by) lives in `PhoneSession::device_id`. Collect distinct
@@ -933,7 +939,7 @@ async fn route_agent_event(state: &AppState, from_device_id: &str, event: WireAg
     for phone_id in phone_ids {
         if online.contains_key(&phone_id) {
             if let Some(sender) = connections.get(&phone_id) {
-                let push = ServerPush::AgentEvent { from_device_id: from_device_id.to_string(), event: event.clone() };
+                let push = ServerPush::AgentEvent { from_device_id: from_device_id.to_string(), event: event.clone(), sequence };
                 if let Ok(wire) = encode_control(&push) {
                     let _ = sender.try_send(wire);
                 }

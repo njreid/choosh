@@ -25,15 +25,31 @@ data class Workspace(
  * Per docs/specs/android-navigation.md: a Project has a designated primary
  * Workspace (explicit, defaults to the first one registered) that tapping
  * the Project row opens directly.
+ *
+ * [active] is `null` when this `Project` wasn't built from a real
+ * `project.list` response (e.g. still-fixture-only test construction) —
+ * [isActive] falls back to the old workspace-derived heuristic in that
+ * case. Once [FleetViewModel] sources Projects from
+ * [ai.choosh.engine.ChooshEngine.projectList], [active] is always non-null
+ * and *is* the value shown, per host-rpc.md's `project.list`: "`hostd`
+ * computes it, the client does not" — this domain type must not
+ * recompute a value the server already decided.
  */
 data class Project(
     val projectId: String,
     val name: String,
     val primaryWorkspaceId: String,
     val workspaces: List<Workspace>,
+    val active: Boolean? = null,
 ) {
-    /** Per android-navigation.md's Host-mode definition: any workspace with a live item or a recent event. */
-    val isActive: Boolean get() = workspaces.any { it.needsAttention } || workspaces.isNotEmpty()
+    /**
+     * `hostd`-computed [active] when present (the real `project.list`
+     * path); otherwise the pre-RPC heuristic (any workspace with a live
+     * item or a recent event), preserved only so fixture-only test
+     * construction that predates `project.list` keeps its existing
+     * behavior.
+     */
+    val isActive: Boolean get() = active ?: (workspaces.any { it.needsAttention } || workspaces.isNotEmpty())
     val needsAttention: Boolean get() = workspaces.any { it.needsAttention }
 }
 
@@ -60,12 +76,26 @@ sealed interface FleetRow {
 enum class SortMode { PROJECT, HOST, RECENT }
 
 /**
- * Fixture Project/Workspace data for this pass (see class doc above).
- * Deliberately includes at least one attention-needing workspace and one
- * devhost with no active project, per the fork directive's UI-coverage
- * requirement.
+ * Fixture Project/Workspace data (see class doc above). Deliberately
+ * includes at least one attention-needing workspace and one devhost with
+ * no active project, per the fork directive's UI-coverage requirement.
+ *
+ * As of `project.list`/`project.set_primary_workspace` landing
+ * (docs/specs/host-rpc.md), a Project's own identity/`active` flag comes
+ * from [ai.choosh.engine.ChooshEngine.projectList] (see [FleetViewModel]),
+ * never from here directly — [FakeChooshEngine]'s own `projectList` still
+ * leans on [projectsFor] to synthesize realistic `ProjectSummary` rows,
+ * and [FleetViewModel] still leans on [workspacesFor] to fill in each
+ * real Project's nested Workspace list, since `workspace.list` isn't
+ * wired into [ai.choosh.engine.ChooshEngine] yet (a separate, tracked
+ * gap — see PLAN.md's "Known follow-ups") — but no caller should reach
+ * for [projectsFor] as a substitute for the real RPC anymore.
  */
 object FleetFixtures {
+    /** [Project.workspaces] fixture data for one already-known `projectId`, keyed the same way [projectsFor] is. */
+    fun workspacesFor(projectId: String, devHosts: List<DevHostPresence>): List<Workspace> =
+        projectsFor(devHosts).firstOrNull { it.projectId == projectId }?.workspaces.orEmpty()
+
     fun projectsFor(devHosts: List<DevHostPresence>): List<Project> {
         val mbp = devHosts.firstOrNull { it.alias == "mbp-home" }?.deviceId ?: return emptyList()
         val buildBox = devHosts.firstOrNull { it.alias == "build-box-large" }?.deviceId ?: mbp

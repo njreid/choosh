@@ -193,8 +193,25 @@ class SourceEditorViewModel(
             is DocumentSaveResult.Rejected -> {
                 // Not a conflict and not connectivity loss — keep the edits (Dirty, not Clean) and
                 // surface why, rather than inventing a sixth save state for an application error.
+                //
+                // "bound_exceeded" (choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES, also
+                // workspace.file.write's own max content size — see fs_ops.rs's write_file) gets
+                // a dedicated, plain-language message rather than the raw "code: message" wire
+                // text: that bound exists purely so one request fits inside one relay tunnel
+                // frame, a detail meaningless to a user staring at a failed save. Sora keeps the
+                // edits locally either way (Dirty, not Clean/lost) — this is a UX call, not a data-
+                // loss one: a save this large simply cannot go over the phone-to-relay tunnel in
+                // one shot, and there is no chunking to fall back to for a single atomic write
+                // (unlike the read side's workspace.file.read, which can and does chunk — see
+                // Engine::read_whole_file in the Rust bridge).
                 val current = _state.value as? SourceEditorUiState.Editing ?: return
-                _state.value = current.copy(saveState = SaveState.Dirty, lastSaveError = "${result.code}: ${result.message}")
+                val message = if (result.code == "bound_exceeded") {
+                    "This file is too large to save over the phone connection (over $MAX_SAVE_SIZE_DESCRIPTION). " +
+                        "Your edits are kept here — try trimming the file, or save this change from a laptop instead."
+                } else {
+                    "${result.code}: ${result.message}"
+                }
+                _state.value = current.copy(saveState = SaveState.Dirty, lastSaveError = message)
             }
         }
     }
@@ -242,6 +259,20 @@ class SourceEditorViewModel(
     }
 
     companion object {
+        /**
+         * Human-readable stand-in for
+         * `choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES` (128 KiB) in
+         * the "bound_exceeded" save-rejection message above. Deliberately a
+         * plain string, not threaded down from the Rust constant itself —
+         * this crosses the JNI boundary as an untyped `(code, message)` pair
+         * (see [ai.choosh.NativeChooshEngine]'s `decodeDocumentSaveResult`),
+         * so there is no real value the wire already carries here worth
+         * parsing back out of `result.message`; a fixed, occasionally-
+         * reviewed description is simpler and no less correct than false
+         * precision extracted from a string meant for logs, not arithmetic.
+         */
+        private const val MAX_SAVE_SIZE_DESCRIPTION = "128 KB"
+
         /**
          * Explicit UTF-8, never a platform-default charset — per
          * editor-protocol.md's "Encoding and line endings MUST round-trip

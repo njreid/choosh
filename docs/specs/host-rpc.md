@@ -168,7 +168,7 @@ string interpolation to construct it.
 | --- | --- |
 | Control-frame payload | 1 MiB |
 | `workspace.tree.list` page size | 500 entries, cursor-paginated |
-| `workspace.file.read` range | 4 MiB per request; larger files require multiple ranged requests |
+| `workspace.file.read` range / `workspace.file.write` content | 128 KiB per request (base64-encoded, this fits inside one `"rpc"`-purpose tunnel frame's `MAX_TUNNEL_FRAME_BYTES` — see relay-protocol.md); larger files require multiple ranged requests |
 | Directory traversal depth per `tree.list` call | one level; recursion is client-driven |
 
 A request exceeding a bound MUST be rejected with a typed, bounded error

@@ -24,6 +24,20 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 directories = "6.0.0"
 jj-lib = { version = "0.44.0", features = ["git"] }
+# `chrono` and `futures-executor` are here only for `jj_ops.rs`'s direct
+# `jj-lib` usage: `chrono` builds the `DatePatternContext` `jj-lib`'s revset
+# parser requires (even for revsets that don't use a date pattern — it's a
+# mandatory field, not an optional one), and `futures-executor::block_on`
+# drives `jj-lib`'s revset-evaluation `Stream` (`jj_lib::revset::Revset`'s
+# `LocalBoxStream`, deliberately `!Send`) to completion synchronously so it
+# never has to be held across an `.await` in one of this crate's own `async
+# fn`s — every one of which must stay `Send` end-to-end for
+# `tokio::spawn(serve_dispatch(..))` in `serve.rs` to keep compiling. Both are
+# already transitive dependencies (of `jj-lib` and `tokio-tungstenite`
+# respectively, per `Cargo.lock`), so this only makes an existing dependency
+# direct, not a new one.
+chrono = "0.4"
+futures-executor = "0.3"
 time = { version = "0.3.55", features = ["formatting"] }
 nix = { version = "0.31.3", features = ["fs", "term", "user"] }
 # `termios` only, for `PtyWriteHalf::resize`'s `tcsetwinsize`/`tcgetwinsize`

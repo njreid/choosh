@@ -237,4 +237,38 @@ class SourceEditorViewModelTest {
             val recovered = viewModel.state.value as SourceEditorUiState.Editing
             assertEquals(SaveState.Clean, recovered.saveState)
         }
+
+    /**
+     * `bound_exceeded` (a save whose content would exceed
+     * `choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES` — the same
+     * bound one relay tunnel frame can carry, per `fs_ops.rs`'s
+     * `write_file`) gets its own plain-language message rather than the raw
+     * `"bound_exceeded: bound exceeded: content is N bytes, max is N"` wire
+     * text — this is the write-side half of this pass's chunking work: a
+     * save can't be chunked the way a read can (one atomic
+     * `workspace.file.write`, no partial-write RPC), so an oversized save is
+     * an explicit, clearly-worded rejection instead. Edits must still
+     * survive as Dirty, exactly like any other rejection.
+     */
+    @Test
+    fun `a bound_exceeded save rejection surfaces a plain-language size message, not the raw wire text`() =
+        runTest(mainDispatcherRule.dispatcher) {
+            val engine = FakeChooshEngine()
+            val viewModel = SourceEditorViewModel(engine, deviceId, workspaceId, path, debounceMs = 500L)
+            advanceUntilIdle()
+
+            engine.forceNextSaveRejection = "bound_exceeded" to "bound exceeded: content is 500000 bytes, max is 131072"
+            viewModel.onContentChanged("a save that would be too large")
+            advanceUntilIdle()
+
+            val state = viewModel.state.value as SourceEditorUiState.Editing
+            assertEquals(SaveState.Dirty, state.saveState)
+            assertEquals("a save that would be too large", state.content)
+            val message = state.lastSaveError
+            assertTrue("expected a plain-language size message, got: $message", message?.contains("too large") == true)
+            assertTrue(
+                "must not leak the raw bound_exceeded wire code/message to the user: $message",
+                message?.contains("bound_exceeded") != true && message?.contains("131072") != true,
+            )
+        }
 }

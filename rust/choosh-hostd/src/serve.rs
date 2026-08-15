@@ -131,11 +131,20 @@ pub async fn run() -> Result<(), ServeError> {
     // forwarded once reconnected. Bounded, not unbounded — a burst of
     // hook events during an extended outage backpressures onto `emit`
     // (which fails closed and exits non-zero) rather than growing memory
-    // without limit; there is deliberately no persistence across a
-    // `serve` restart itself (no on-disk spool) — a real, documented gap,
-    // not the full replay/sequence machinery `agent-events.md` describes,
-    // which is out of scope for this increment.
+    // without limit.
     let (agent_event_tx, agent_event_rx) = tokio::sync::mpsc::channel(256);
+
+    // `agent-events.md`'s "Delivery and replay" per-workspace spool +
+    // sequencer (`crate::agent_event_spool`'s module doc comment covers the
+    // bound reasoning) — like `agent_event_tx`/`agent_event_rx` above, this
+    // lives for the whole `serve` process lifetime, not per-connection: a
+    // relayd reconnect must be able to resume from a sequence assigned
+    // before the drop, which only works if the spool outlives the
+    // connection that recorded it. Still in-memory only, so a `serve`
+    // *restart* (not just a relayd reconnect) resets it — a real,
+    // documented gap (`PLAN.md`), distinct from the reconnect-across-a-live-
+    // process case this spool does cover.
+    let agent_event_spool = std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::new());
 
     // If a prior run of this binary applied a self-update whose health
     // check ultimately failed (`update::run_monitor`'s rollback path),
@@ -214,7 +223,7 @@ pub async fn run() -> Result<(), ServeError> {
     // project-pinned `mise_project_tools_dir`).
     spawn_host_tool_currency_checks(mise_bin, host_tools_dir);
 
-    connect_loop(&config, &credential, &rpc_context, agent_event_rx, ssh_port, pty_auth_detect_tx).await;
+    connect_loop(&config, &credential, &rpc_context, agent_event_rx, ssh_port, pty_auth_detect_tx, &agent_event_spool).await;
     Ok(())
 }
 
@@ -453,6 +462,7 @@ async fn connect_loop(
     mut agent_event_rx: tokio::sync::mpsc::Receiver<WireAgentEvent>,
     ssh_port: Option<u16>,
     agent_event_tx: tokio::sync::mpsc::Sender<WireAgentEvent>,
+    agent_event_spool: &std::sync::Arc<crate::agent_event_spool::AgentEventSpool>,
 ) {
     let mut attempt: u32 = 0;
     // docs/specs/host-deployment.md's "Power assertions" requirement
@@ -467,7 +477,7 @@ async fn connect_loop(
     loop {
         let shutdown = tokio::signal::ctrl_c();
         tokio::select! {
-            () = run_one_connection(config, credential, rpc_context, &mut agent_event_rx, ssh_port, &agent_event_tx) => {
+            () = run_one_connection(config, credential, rpc_context, &mut agent_event_rx, ssh_port, &agent_event_tx, agent_event_spool) => {
                 let delay = compute_backoff(attempt, rand_unit());
                 attempt = attempt.saturating_add(1);
                 tracing::warn!(?delay, attempt, "connection to relayd ended; reconnecting");
@@ -496,6 +506,7 @@ async fn run_one_connection(
     agent_event_rx: &mut tokio::sync::mpsc::Receiver<WireAgentEvent>,
     ssh_port: Option<u16>,
     agent_event_tx: &tokio::sync::mpsc::Sender<WireAgentEvent>,
+    agent_event_spool: &std::sync::Arc<crate::agent_event_spool::AgentEventSpool>,
 ) {
     let mut channel = match dial(&config.relay_url).await {
         Ok(channel) => channel,
@@ -551,7 +562,7 @@ async fn run_one_connection(
         }
     }
 
-    serve_dispatch(&mut channel, rpc_context, agent_event_rx, ssh_port, agent_event_tx).await;
+    serve_dispatch(&mut channel, rpc_context, agent_event_rx, ssh_port, agent_event_tx, agent_event_spool).await;
 }
 
 type WsChannel = FrameChannel<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>;
@@ -604,24 +615,34 @@ const WEB_TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 const WEB_TUNNEL_READ_BUF_SIZE: usize = 8192;
 
 /// Processes frames on an authenticated connection until it ends: `rpc`-,
-/// `pty:<item_id>`-, `web:<item_id>`-, and `zellij-web`-purpose tunnels
-/// (`docs/specs/host-rpc.md`, `docs/milestones/M2-terminal-and-agents.md`,
-/// `docs/specs/service-tunnels.md`), plus forwarding any locally-emitted
-/// agent events (from `choosh-hostd emit`, via `local_ipc`) as
-/// `agent-event` control requests.
+/// `pty:<item_id>`-, `web:<item_id>`-, `zellij-web`-, and `agent-events`-
+/// purpose tunnels (`docs/specs/host-rpc.md`,
+/// `docs/milestones/M2-terminal-and-agents.md`, `docs/specs/service-tunnels.md`,
+/// `docs/specs/agent-events.md`'s "Delivery and replay" section), plus
+/// forwarding any locally-emitted agent events (from `choosh-hostd emit`,
+/// via `local_ipc`) as sequenced `agent-event` control requests.
 async fn serve_dispatch(
     channel: &mut WsChannel,
     rpc_context: &RpcContext,
     agent_event_rx: &mut tokio::sync::mpsc::Receiver<WireAgentEvent>,
     ssh_port: Option<u16>,
     agent_event_tx: &tokio::sync::mpsc::Sender<WireAgentEvent>,
+    agent_event_spool: &std::sync::Arc<crate::agent_event_spool::AgentEventSpool>,
 ) {
     // `rpc`-purpose tunnels offered on this connection are tracked here;
     // per relay-protocol.md's reconnect-discontinuity rule, tunnels never
     // survive a reconnect, so this set is deliberately scoped to one
     // connection attempt, not `connect_loop`'s outer state. Same for
-    // `pty_tunnels`/`web_tunnels` and the output-forwarding channel below.
+    // `pty_tunnels`/`web_tunnels`/`agent_event_resume_tunnels` and the
+    // output-forwarding channel below.
     let mut rpc_tunnels: HashSet<[u8; TUNNEL_ID_BYTES]> = HashSet::new();
+    // `"agent-events"`-purpose tunnels (`agent-events.md`'s resume/replay
+    // mechanism, `crate::agent_event_spool`): tracked exactly like
+    // `rpc_tunnels` above, just answered from `agent_event_spool` instead
+    // of `crate::rpc::dispatch` — see `relay.rs`'s module doc comment for
+    // why this is its own tunnel purpose rather than a new `RpcRequest`
+    // variant.
+    let mut agent_event_resume_tunnels: HashSet<[u8; TUNNEL_ID_BYTES]> = HashSet::new();
     let mut pty_tunnels: HashMap<[u8; TUNNEL_ID_BYTES], PtyWriteHalf> = HashMap::new();
     let mut web_tunnels: HashMap<[u8; TUNNEL_ID_BYTES], WebWriteHalf> = HashMap::new();
     // M7's `dev-exec` cross-host offload (`"offload"`-purpose tunnels):
@@ -651,9 +672,28 @@ async fn serve_dispatch(
             // waiting behind a burst of terminal output would be a real
             // regression), and `agent-event`'s payload is always tiny.
             Some(event) = agent_event_rx.recv() => {
+                // Recorded into the spool unconditionally, before the send
+                // attempt below and regardless of whether it succeeds —
+                // per agent-events.md's "Delivery and replay" section, a
+                // reconnect must be able to resume this event even if this
+                // exact send is what fails (a slow/dropping connection) or
+                // if the phone was never reachable to receive it live at
+                // all. This is also the single point every event producer
+                // (`local_ipc`, the pty auth-code detector, the SSH bridge,
+                // `update`'s pending-failure report) funnels through, so
+                // sequencing it here covers all of them uniformly.
+                let sequence = agent_event_spool.record(&event);
+                // `rpc.rs`'s `handle_project_list` "recent event" half of
+                // `project.list`'s `active` computation (host-rpc.md) —
+                // recorded at the same single funnel point as the spool
+                // entry above. In-memory only; see `Registry::record_event`'s
+                // doc comment for why that's deliberate, not an oversight.
+                if let Some(workspace_id) = event.workspace_id() {
+                    rpc_context.registry.lock().await.record_event(workspace_id, time::OffsetDateTime::now_utc());
+                }
                 let request_id = new_request_id();
-                if let Err(error) = channel.send(FRAME_CLASS_CONTROL, &ControlRequest::AgentEvent { request_id, event }).await {
-                    tracing::warn!(%error, "failed to send agent-event; dropping it rather than blocking the connection");
+                if let Err(error) = channel.send(FRAME_CLASS_CONTROL, &ControlRequest::AgentEvent { request_id, event, sequence }).await {
+                    tracing::warn!(%error, "failed to send agent-event; it remains in the spool for a future resume, but this connection will not retry it live");
                 }
             }
 
@@ -691,10 +731,10 @@ async fn serve_dispatch(
 
             frame = channel.recv_raw() => match frame {
                 Ok((FRAME_CLASS_CONTROL, body)) => {
-                    handle_control_push(&body, rpc_context, &tunnel_output_tx, &mut rpc_tunnels, &mut pty_tunnels, &mut web_tunnels, &mut offload_pending, ssh_port, agent_event_tx).await;
+                    handle_control_push(&body, rpc_context, &tunnel_output_tx, &mut rpc_tunnels, &mut agent_event_resume_tunnels, &mut pty_tunnels, &mut web_tunnels, &mut offload_pending, ssh_port, agent_event_tx).await;
                 }
                 Ok((FRAME_CLASS_TUNNEL, body)) => {
-                    if handle_tunnel_frame(&body, channel, rpc_context, &tunnel_output_tx, &mut rpc_tunnels, &mut pty_tunnels, &mut web_tunnels, &mut offload_pending, &mut offload_active).await == FrameOutcome::Disconnect {
+                    if handle_tunnel_frame(&body, channel, rpc_context, &tunnel_output_tx, &mut rpc_tunnels, &mut agent_event_resume_tunnels, &mut pty_tunnels, &mut web_tunnels, &mut offload_pending, &mut offload_active, agent_event_spool).await == FrameOutcome::Disconnect {
                         return;
                     }
                 }
@@ -767,6 +807,7 @@ async fn handle_control_push(
     rpc_context: &RpcContext,
     tunnel_output_tx: &tokio::sync::mpsc::Sender<TunnelOutput>,
     rpc_tunnels: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
+    agent_event_resume_tunnels: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
     pty_tunnels: &mut HashMap<[u8; TUNNEL_ID_BYTES], PtyWriteHalf>,
     web_tunnels: &mut HashMap<[u8; TUNNEL_ID_BYTES], WebWriteHalf>,
     offload_pending: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
@@ -777,6 +818,16 @@ async fn handle_control_push(
         Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose == "rpc" => {
             if let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) {
                 rpc_tunnels.insert(id);
+            }
+        }
+        // `agent-events.md`'s "Delivery and replay" resume mechanism (see
+        // `relay.rs`'s module doc comment for why this is its own tunnel
+        // purpose rather than a `host-rpc.md` `RpcRequest` variant): a
+        // phone opens this exactly like it opens `"rpc"`, directly to the
+        // devhost that owns the workspace it wants to resume.
+        Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose == "agent-events" => {
+            if let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) {
+                agent_event_resume_tunnels.insert(id);
             }
         }
         Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose.starts_with("pty:") => {
@@ -887,21 +938,26 @@ async fn handle_control_push(
 
 /// Handles one `FRAME_CLASS_TUNNEL` frame: routes to an active pty or web
 /// tunnel's write half, or dispatches as an `rpc`-tunnel `host-rpc.md`
-/// request. Returns [`FrameOutcome::Disconnect`] only for a malformed
-/// frame or a send failure that per relay-protocol.md means the
-/// connection itself is unrecoverable — every other outcome is
-/// [`FrameOutcome::Continue`].
+/// request or an `agent-events`-tunnel resume request (`agent-events.md`'s
+/// "Delivery and replay" section, answered from `agent_event_spool` rather
+/// than `crate::rpc::dispatch` — see `relay.rs`'s module doc comment for
+/// why). Returns [`FrameOutcome::Disconnect`] only for a malformed frame or
+/// a send failure that per relay-protocol.md means the connection itself is
+/// unrecoverable — every other outcome is [`FrameOutcome::Continue`].
 #[allow(clippy::too_many_arguments)] // one tracking collection per tunnel purpose this dispatch routes, per this doc comment; a params struct would just move the count, not reduce it, for a single call site.
+#[allow(clippy::too_many_lines)] // one self-contained branch per tunnel purpose (pty/web/agent-events/rpc), each already as short as its own protocol allows; splitting further would just move the line count into more functions, not reduce it.
 async fn handle_tunnel_frame(
     body: &[u8],
     channel: &mut WsChannel,
     rpc_context: &RpcContext,
     tunnel_output_tx: &tokio::sync::mpsc::Sender<TunnelOutput>,
     rpc_tunnels: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
+    agent_event_resume_tunnels: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
     pty_tunnels: &mut HashMap<[u8; TUNNEL_ID_BYTES], PtyWriteHalf>,
     web_tunnels: &mut HashMap<[u8; TUNNEL_ID_BYTES], WebWriteHalf>,
     offload_pending: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
     offload_active: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
+    agent_event_spool: &std::sync::Arc<crate::agent_event_spool::AgentEventSpool>,
 ) -> FrameOutcome {
     if body.len() < TUNNEL_ID_BYTES {
         tracing::warn!("tunnel frame shorter than a tunnel ID; per relay-protocol.md this is malformed");
@@ -947,8 +1003,59 @@ async fn handle_tunnel_frame(
         return FrameOutcome::Continue;
     }
 
+    if agent_event_resume_tunnels.contains(&tunnel_id) {
+        if payload.is_empty() {
+            // Zero-length payload is the tunnel close signal.
+            agent_event_resume_tunnels.remove(&tunnel_id);
+            return FrameOutcome::Continue;
+        }
+        let Some((inner_class, inner_body)) = payload.split_first() else {
+            return FrameOutcome::Continue;
+        };
+        if *inner_class != FRAME_CLASS_CONTROL {
+            tracing::warn!("agent-events tunnel payload used an unexpected inner frame class");
+            return FrameOutcome::Continue;
+        }
+        let request: choosh_protocol::relay::AgentEventsResumeRequest = match serde_json::from_slice(inner_body) {
+            Ok(request) => request,
+            Err(error) => {
+                // Matches the `rpc`-tunnel branch below's own posture: a
+                // malformed request on this tunnel purpose gets no reply
+                // and no disconnect, just a dropped frame — the caller's
+                // own request/response correlation (`request_id`) means it
+                // will simply time out and can retry, exactly as an
+                // unparseable `host-rpc.md` request already does.
+                tracing::warn!(%error, "malformed agent-events resume request on agent-events tunnel");
+                return FrameOutcome::Continue;
+            }
+        };
+        let response = match agent_event_spool.resume(&request.workspace_id, request.after_sequence) {
+            crate::agent_event_spool::ResumeOutcome::Replay { events, latest_sequence } => {
+                choosh_protocol::relay::AgentEventsResumeResponse::Replayed { request_id: request.request_id, events, latest_sequence }
+            }
+            crate::agent_event_spool::ResumeOutcome::SnapshotRequired => {
+                choosh_protocol::relay::AgentEventsResumeResponse::SnapshotRequired {
+                    request_id: request.request_id,
+                    workspace_id: request.workspace_id,
+                }
+            }
+        };
+        let mut response_payload = Vec::with_capacity(TUNNEL_ID_BYTES + 1 + 128);
+        response_payload.extend_from_slice(&tunnel_id);
+        response_payload.push(FRAME_CLASS_CONTROL);
+        if let Err(error) = serde_json::to_writer(&mut response_payload, &response) {
+            tracing::error!(%error, "failed to serialize agent-events resume response");
+            return FrameOutcome::Continue;
+        }
+        if let Err(error) = channel.send_bytes(FRAME_CLASS_TUNNEL, &response_payload).await {
+            tracing::warn!(%error, "failed to send agent-events resume response over tunnel");
+            return FrameOutcome::Disconnect;
+        }
+        return FrameOutcome::Continue;
+    }
+
     if !rpc_tunnels.contains(&tunnel_id) {
-        tracing::debug!("tunnel frame for an unknown/non-rpc/non-pty/non-web tunnel id, ignoring");
+        tracing::debug!("tunnel frame for an unknown/non-rpc/non-agent-events/non-pty/non-web tunnel id, ignoring");
         return FrameOutcome::Continue;
     }
     if payload.is_empty() {
@@ -1460,8 +1567,8 @@ mod tunnel_tests {
     use choosh_protocol::framing::{FrameDecoder, FrameLimits, encode_frame};
     use choosh_protocol::host_rpc::{ItemStatus, ItemType};
     use choosh_protocol::relay::{
-        FRAME_CLASS_CONTROL as CTRL, FRAME_CLASS_TUNNEL as TUNNEL, MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES, WireAuthProvider,
-        encode_tunnel_id_hex,
+        FRAME_CLASS_CONTROL as CTRL, FRAME_CLASS_TUNNEL as TUNNEL, MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES, WireAgentStatus,
+        WireAuthProvider, encode_tunnel_id_hex,
     };
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -1552,10 +1659,11 @@ mod tunnel_tests {
         let (_dir, ctx, item_id) = registry_with_web_service_item(http_port, ItemStatus::Running);
         let (listener, relay_url) = bind_fake_relayd().await;
         let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(1);
+        let agent_event_spool = std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::new());
 
         let dispatch_and_dial = async {
             let mut channel = dial(&relay_url).await.unwrap();
-            let _ = tokio::time::timeout(Duration::from_secs(15), serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, None, &agent_tx)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(15), serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, None, &agent_tx, &agent_event_spool)).await;
         };
 
         let server_fut = async {
@@ -1604,10 +1712,11 @@ mod tunnel_tests {
         let (_dir, ctx, item_id) = registry_with_web_service_item(http_port, ItemStatus::Starting);
         let (listener, relay_url) = bind_fake_relayd().await;
         let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(1);
+        let agent_event_spool = std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::new());
 
         let dispatch_and_dial = async {
             let mut channel = dial(&relay_url).await.unwrap();
-            let _ = tokio::time::timeout(Duration::from_secs(10), serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, None, &agent_tx)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, None, &agent_tx, &agent_event_spool)).await;
         };
 
         let server_fut = async {
@@ -1666,10 +1775,11 @@ mod tunnel_tests {
         };
         let (listener, relay_url) = bind_fake_relayd().await;
         let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(1);
+        let agent_event_spool = std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::new());
 
         let dispatch_and_dial = async {
             let mut channel = dial(&relay_url).await.unwrap();
-            let _ = tokio::time::timeout(Duration::from_secs(10), serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, Some(ssh_port), &agent_tx)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, Some(ssh_port), &agent_tx, &agent_event_spool)).await;
         };
 
         let server_fut = async {
@@ -1707,6 +1817,369 @@ mod tunnel_tests {
         };
 
         tokio::join!(server_fut, dispatch_and_dial);
+    }
+
+    // --- `agent-events.md`'s "Delivery and replay" resume/replay mechanism ---
+    //
+    // These tests drive the real `serve_dispatch`/`handle_control_push`/
+    // `handle_tunnel_frame` path end to end, exactly like the `web:`/`ssh`
+    // tests above — nothing about `AgentEventSpool` or the `"agent-events"`
+    // tunnel purpose is mocked at the boundary being tested.
+
+    /// An `RpcContext` for tests that never touch the registry at all — the
+    /// `"agent-events"` tunnel path resolves everything through
+    /// `agent_event_spool`, not `rpc_context`, so an empty registry is all
+    /// this needs (same reasoning `ssh_purpose_tunnel_bridges_to_the_real_loopback_ssh_server`'s
+    /// own context comment gives for its own bare context).
+    fn empty_rpc_context(dir: &std::path::Path) -> RpcContext {
+        let registry = crate::registry::Registry::load(&dir.join("registry.json")).unwrap();
+        RpcContext {
+            registry: std::sync::Arc::new(tokio::sync::Mutex::new(registry)),
+            devhost_id: "dev-1".to_string(),
+            workspaces_dir: dir.to_path_buf(),
+            mise_bin: "mise-not-used-in-this-test".to_string(),
+            mise_project_tools_dir: dir.join("mise-project-tools"),
+        }
+    }
+
+    fn status_event(workspace_id: &str, status: WireAgentStatus) -> WireAgentEvent {
+        WireAgentEvent::AgentStatus { workspace_id: workspace_id.to_string(), item_id: "item-1".to_string(), status }
+    }
+
+    /// Reads control/tunnel frames off `ws` until `want` returns `Some`,
+    /// applying it to each decoded frame in turn — shared polling loop for
+    /// the three tests below, which otherwise differ only in what frame
+    /// shape they're waiting for (a live `ControlRequest::AgentEvent`, or an
+    /// `agent-events`-tunnel response).
+    async fn recv_until<T>(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        decoder: &mut FrameDecoder,
+        deadline: tokio::time::Instant,
+        mut want: impl FnMut(u8, &[u8]) -> Option<T>,
+    ) -> T {
+        loop {
+            assert!(tokio::time::Instant::now() < deadline, "timed out waiting for the expected frame");
+            let Ok(Some(Ok(Message::Binary(bytes)))) = tokio::time::timeout(Duration::from_secs(2), ws.next()).await else { continue };
+            for frame in decoder.feed(&bytes).unwrap() {
+                let (class, body) = frame.split_first().unwrap();
+                if let Some(result) = want(*class, body) {
+                    return result;
+                }
+            }
+        }
+    }
+
+    /// The core replay proof: three workspace-scoped events emitted through
+    /// the real `agent_event_tx` -> `serve_dispatch` path get real,
+    /// monotonically increasing sequence numbers on the wire (observed on
+    /// their live `ControlRequest::AgentEvent` frames), and a subsequent
+    /// `"agent-events"`-purpose tunnel request to resume after the first of
+    /// them replays exactly the other two, in order, with matching
+    /// sequences — no duplicates, no gaps.
+    #[tokio::test]
+    async fn agent_events_resume_tunnel_replays_exactly_the_missed_events_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = empty_rpc_context(dir.path());
+        let (listener, relay_url) = bind_fake_relayd().await;
+        let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(8);
+        let agent_event_spool = std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::new());
+
+        let dispatch_and_dial = async {
+            let mut channel = dial(&relay_url).await.unwrap();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(10), serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, None, &agent_tx, &agent_event_spool))
+                    .await;
+        };
+
+        let server_fut = async {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut decoder = FrameDecoder::new(FrameLimits::new(MAX_TUNNEL_FRAME_BYTES.max(MAX_CONTROL_FRAME_BYTES), 8).unwrap());
+
+            for status in [WireAgentStatus::Starting, WireAgentStatus::Busy, WireAgentStatus::Waiting] {
+                agent_tx.send(status_event("ws-1", status)).await.unwrap();
+            }
+
+            // Observe the three live frames to learn the real sequence
+            // numbers `serve_dispatch` assigned on the real forwarding
+            // path (not by calling the spool directly).
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut live_sequences = Vec::new();
+            while live_sequences.len() < 3 {
+                let sequence = recv_until(&mut ws, &mut decoder, deadline, |class, body| {
+                    if class != CTRL {
+                        return None;
+                    }
+                    let ControlRequest::AgentEvent { sequence, .. } = serde_json::from_slice::<ControlRequest>(body).ok()? else {
+                        return None;
+                    };
+                    Some(sequence)
+                })
+                .await;
+                live_sequences.push(sequence.expect("a workspace-scoped event must carry a real sequence"));
+            }
+            assert_eq!(live_sequences, vec![1, 2, 3], "sequences must be assigned in emission order, starting at 1");
+
+            // Now, as a reconnecting phone would: open an "agent-events"
+            // tunnel and ask to resume after sequence 1.
+            let tunnel_id = [3u8; TUNNEL_ID_BYTES];
+            let request = choosh_protocol::relay::AgentEventsResumeRequest {
+                request_id: "resume-1".to_string(),
+                workspace_id: "ws-1".to_string(),
+                after_sequence: Some(1),
+            };
+            let mut request_bytes = vec![CTRL];
+            request_bytes.extend(serde_json::to_vec(&request).unwrap());
+            send_tunnel_offer_and_data(&mut ws, tunnel_id, "agent-events", &request_bytes).await;
+
+            let response = recv_until(&mut ws, &mut decoder, deadline, |class, body| {
+                if class != TUNNEL || body.len() < TUNNEL_ID_BYTES {
+                    return None;
+                }
+                let (id_bytes, payload) = body.split_at(TUNNEL_ID_BYTES);
+                if id_bytes != tunnel_id || payload.is_empty() {
+                    return None;
+                }
+                let (inner_class, inner_body) = payload.split_first()?;
+                if *inner_class != CTRL {
+                    return None;
+                }
+                serde_json::from_slice::<choosh_protocol::relay::AgentEventsResumeResponse>(inner_body).ok()
+            })
+            .await;
+
+            let choosh_protocol::relay::AgentEventsResumeResponse::Replayed { events, latest_sequence, .. } = response else {
+                panic!("expected a replay, got {response:?}")
+            };
+            assert_eq!(latest_sequence, 3);
+            assert_eq!(events.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![2, 3], "must replay exactly the missed events, in order, no duplicates, no gaps");
+            assert_eq!(events[0].event, status_event("ws-1", WireAgentStatus::Busy));
+            assert_eq!(events[1].event, status_event("ws-1", WireAgentStatus::Waiting));
+            let _ = ws.close(None).await;
+        };
+
+        tokio::join!(server_fut, dispatch_and_dial);
+    }
+
+    /// The `snapshot_required` half of the same mechanism: a resume request
+    /// naming a sequence older than the retained window gets
+    /// `snapshot_required`, never a silently gapped/partial replay. Uses a
+    /// tiny `max_events` bound (`AgentEventSpool::with_bounds`) so the
+    /// eviction is real and immediate rather than requiring hundreds of
+    /// events.
+    #[tokio::test]
+    async fn agent_events_resume_tunnel_returns_snapshot_required_for_a_stale_sequence_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = empty_rpc_context(dir.path());
+        let (listener, relay_url) = bind_fake_relayd().await;
+        let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(8);
+        let agent_event_spool =
+            std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::with_bounds(1, crate::agent_event_spool::RETENTION));
+
+        let dispatch_and_dial = async {
+            let mut channel = dial(&relay_url).await.unwrap();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(10), serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, None, &agent_tx, &agent_event_spool))
+                    .await;
+        };
+
+        let server_fut = async {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut decoder = FrameDecoder::new(FrameLimits::new(MAX_TUNNEL_FRAME_BYTES.max(MAX_CONTROL_FRAME_BYTES), 8).unwrap());
+
+            // max_events = 1: the second event evicts the first the moment
+            // it's recorded.
+            for status in [WireAgentStatus::Starting, WireAgentStatus::Busy] {
+                agent_tx.send(status_event("ws-1", status)).await.unwrap();
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut seen = 0;
+            while seen < 2 {
+                recv_until(&mut ws, &mut decoder, deadline, |class, body| {
+                    if class != CTRL {
+                        return None;
+                    }
+                    matches!(serde_json::from_slice::<ControlRequest>(body), Ok(ControlRequest::AgentEvent { .. })).then_some(())
+                })
+                .await;
+                seen += 1;
+            }
+
+            // `after_sequence: None`/`Some(0)` ("no prior ack at all") is
+            // deliberately always answerable in this spool (never a gap —
+            // see `AgentEventSpool::resume`'s doc comment), so proving a
+            // real gap needs a caller that already has *some* sequence the
+            // window no longer covers. With `max_events = 1`, only the most
+            // recently recorded event is ever retained — so after this
+            // third event, the caller's next-needed event (2, following its
+            // acknowledged sequence 1) has been evicted, leaving only
+            // sequence 3 retained. That's the genuine, provable gap this
+            // test's `after_sequence: Some(1)` request below exercises.
+            agent_tx.send(status_event("ws-1", WireAgentStatus::Waiting)).await.unwrap(); // sequence 3, evicts sequence 2
+            recv_until(&mut ws, &mut decoder, deadline, |class, body| {
+                if class != CTRL {
+                    return None;
+                }
+                matches!(serde_json::from_slice::<ControlRequest>(body), Ok(ControlRequest::AgentEvent { .. })).then_some(())
+            })
+            .await;
+
+            let tunnel_id = [5u8; TUNNEL_ID_BYTES];
+            let request = choosh_protocol::relay::AgentEventsResumeRequest {
+                request_id: "resume-1".to_string(),
+                workspace_id: "ws-1".to_string(),
+                after_sequence: Some(1), // needs sequence 2, which is now gone (only 3 is retained).
+            };
+            let mut request_bytes = vec![CTRL];
+            request_bytes.extend(serde_json::to_vec(&request).unwrap());
+            send_tunnel_offer_and_data(&mut ws, tunnel_id, "agent-events", &request_bytes).await;
+
+            let response = recv_until(&mut ws, &mut decoder, deadline, |class, body| {
+                if class != TUNNEL || body.len() < TUNNEL_ID_BYTES {
+                    return None;
+                }
+                let (id_bytes, payload) = body.split_at(TUNNEL_ID_BYTES);
+                if id_bytes != tunnel_id || payload.is_empty() {
+                    return None;
+                }
+                let (inner_class, inner_body) = payload.split_first()?;
+                if *inner_class != CTRL {
+                    return None;
+                }
+                serde_json::from_slice::<choosh_protocol::relay::AgentEventsResumeResponse>(inner_body).ok()
+            })
+            .await;
+
+            let choosh_protocol::relay::AgentEventsResumeResponse::SnapshotRequired { workspace_id, .. } = response else {
+                panic!("expected snapshot_required for a resume request older than the retained window, got {response:?}")
+            };
+            assert_eq!(workspace_id, "ws-1");
+            let _ = ws.close(None).await;
+        };
+
+        tokio::join!(server_fut, dispatch_and_dial);
+    }
+
+    /// The genuine reconnect proof required alongside the two above: the
+    /// hostd-relayd connection drops mid-stream (network loss / the relay
+    /// connection cycling, per agent-events.md's own framing of what a
+    /// reconnect covers), more events are emitted while disconnected, and a
+    /// *second* connection — sharing the same `agent_event_spool` and
+    /// `agent_event_tx`/`agent_event_rx`, exactly as two real
+    /// `connect_loop` iterations against the same long-lived `serve`
+    /// process would — proves nothing emitted before, during, or after the
+    /// drop is silently lost: every event either arrives live on the new
+    /// connection or is recovered by an explicit resume request.
+    #[tokio::test]
+    async fn reconnect_after_a_gap_resumes_from_the_last_acknowledged_sequence_with_no_event_silently_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = empty_rpc_context(dir.path());
+        let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(8);
+        let agent_event_spool = std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::new());
+
+        // --- Connection 1: emits one event, then the connection drops. ---
+        let (listener1, relay_url1) = bind_fake_relayd().await;
+        let dial_and_dispatch_1 = async {
+            let mut channel = dial(&relay_url1).await.unwrap();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, None, &agent_tx, &agent_event_spool),
+            )
+            .await;
+        };
+        let server_1 = async {
+            let (stream, _addr) = listener1.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut decoder = FrameDecoder::new(FrameLimits::new(MAX_TUNNEL_FRAME_BYTES.max(MAX_CONTROL_FRAME_BYTES), 8).unwrap());
+            agent_tx.send(status_event("ws-1", WireAgentStatus::Starting)).await.unwrap(); // sequence 1
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let acked_sequence = recv_until(&mut ws, &mut decoder, deadline, |class, body| {
+                if class != CTRL {
+                    return None;
+                }
+                let ControlRequest::AgentEvent { sequence, .. } = serde_json::from_slice::<ControlRequest>(body).ok()? else {
+                    return None;
+                };
+                sequence
+            })
+            .await;
+            assert_eq!(acked_sequence, 1, "the phone's own last-acknowledged sequence before the drop");
+            // Simulate the relay connection cycling: close this side right
+            // now, without the phone ever having asked to resume anything.
+            let _ = ws.close(None).await;
+            acked_sequence
+        };
+        let (acked_sequence, ()) = tokio::join!(server_1, dial_and_dispatch_1);
+
+        // While "disconnected" (no `serve_dispatch` currently running),
+        // more events for the same workspace are emitted exactly as
+        // `local_ipc`/the pty auth detector/the SSH bridge would — they
+        // queue in the still-live `agent_event_tx`/`agent_event_rx` channel,
+        // per `run()`'s own doc comment on why that channel outlives any
+        // one connection.
+        agent_tx.send(status_event("ws-1", WireAgentStatus::Busy)).await.unwrap(); // sequence 2
+        agent_tx.send(status_event("ws-1", WireAgentStatus::Waiting)).await.unwrap(); // sequence 3
+
+        // --- Connection 2: the reconnect. Shares the same spool/channel. ---
+        let (listener2, relay_url2) = bind_fake_relayd().await;
+        let dial_and_dispatch_2 = async {
+            let mut channel = dial(&relay_url2).await.unwrap();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, None, &agent_tx, &agent_event_spool),
+            )
+            .await;
+        };
+        let server_2 = async {
+            let (stream, _addr) = listener2.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut decoder = FrameDecoder::new(FrameLimits::new(MAX_TUNNEL_FRAME_BYTES.max(MAX_CONTROL_FRAME_BYTES), 8).unwrap());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+            // Per agent-events.md: a reconnect after a gap MUST resume from
+            // the last acknowledged sequence — never silently resume the
+            // live stream and hope nothing was missed. This is that
+            // resume call, over the brand-new connection's own
+            // "agent-events" tunnel.
+            let tunnel_id = [7u8; TUNNEL_ID_BYTES];
+            let request = choosh_protocol::relay::AgentEventsResumeRequest {
+                request_id: "resume-after-reconnect".to_string(),
+                workspace_id: "ws-1".to_string(),
+                after_sequence: Some(acked_sequence),
+            };
+            let mut request_bytes = vec![CTRL];
+            request_bytes.extend(serde_json::to_vec(&request).unwrap());
+            send_tunnel_offer_and_data(&mut ws, tunnel_id, "agent-events", &request_bytes).await;
+
+            let response = recv_until(&mut ws, &mut decoder, deadline, |class, body| {
+                if class != TUNNEL || body.len() < TUNNEL_ID_BYTES {
+                    return None;
+                }
+                let (id_bytes, payload) = body.split_at(TUNNEL_ID_BYTES);
+                if id_bytes != tunnel_id || payload.is_empty() {
+                    return None;
+                }
+                let (inner_class, inner_body) = payload.split_first()?;
+                if *inner_class != CTRL {
+                    return None;
+                }
+                serde_json::from_slice::<choosh_protocol::relay::AgentEventsResumeResponse>(inner_body).ok()
+            })
+            .await;
+
+            let choosh_protocol::relay::AgentEventsResumeResponse::Replayed { events, latest_sequence, .. } = response else {
+                panic!("expected a replay recovering the events missed across the reconnect, got {response:?}")
+            };
+            assert_eq!(latest_sequence, 3);
+            assert_eq!(
+                events.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+                vec![2, 3],
+                "every event emitted during the disconnected window must be recovered exactly, no loss, no duplicates"
+            );
+            let _ = ws.close(None).await;
+        };
+        tokio::join!(server_2, dial_and_dispatch_2);
     }
 
     /// Registers a real `Shell` item backed by a real Zellij session/tab
@@ -1805,10 +2278,11 @@ mod tunnel_tests {
         let (_dir, ctx, item_id) = registry_with_shell_item(&session_name, tab_name);
         let (listener, relay_url) = bind_fake_relayd().await;
         let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(4);
+        let agent_event_spool = std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::new());
 
         let dispatch_and_dial = async {
             let mut channel = dial(&relay_url).await.unwrap();
-            let _ = tokio::time::timeout(attempt_deadline, serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, None, &agent_tx)).await;
+            let _ = tokio::time::timeout(attempt_deadline, serve_dispatch(&mut channel, &ctx, &mut agent_event_rx, None, &agent_tx, &agent_event_spool)).await;
         };
 
         let server_fut = async {
@@ -2114,6 +2588,7 @@ mod tunnel_tests {
         // target" invariant deterministically rather than racing.
         let mut target_channel = dial(&relay_url).await.unwrap();
         let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(4);
+        let agent_event_spool = std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::new());
 
         // Proves, via the command's OWN streamed output: (a) it can read the
         // target workspace's real, shared content (`SHARED_ORIGIN_FILE.txt`); (b)
@@ -2135,7 +2610,7 @@ mod tunnel_tests {
         let recorded_err = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let dispatch_fut = async {
-            let _ = tokio::time::timeout(Duration::from_secs(20), serve_dispatch(&mut target_channel, &target_ctx, &mut agent_event_rx, None, &agent_tx)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(20), serve_dispatch(&mut target_channel, &target_ctx, &mut agent_event_rx, None, &agent_tx, &agent_event_spool)).await;
         };
 
         let client_fut = async {
@@ -2193,11 +2668,12 @@ mod tunnel_tests {
         tokio::spawn(run_two_party_fake_relayd(listener));
         let mut target_channel = dial(&relay_url).await.unwrap();
         let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(4);
+        let agent_event_spool = std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::new());
 
         let request = OffloadRequest { workspace_name: "never-registered".to_string(), commit_id: "deadbeef".to_string(), argv: vec!["true".to_string()] };
 
         let dispatch_fut = async {
-            let _ = tokio::time::timeout(Duration::from_secs(10), serve_dispatch(&mut target_channel, &target_ctx, &mut agent_event_rx, None, &agent_tx)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), serve_dispatch(&mut target_channel, &target_ctx, &mut agent_event_rx, None, &agent_tx, &agent_event_spool)).await;
         };
         let client_fut = async {
             let credential = fake_dev_exec_credential();
@@ -2254,6 +2730,7 @@ mod tunnel_tests {
         tokio::spawn(run_two_party_fake_relayd(listener));
         let mut target_channel = dial(&relay_url).await.unwrap();
         let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(4);
+        let agent_event_spool = std::sync::Arc::new(crate::agent_event_spool::AgentEventSpool::new());
 
         // A well-formed-looking but entirely fictitious commit hash — this
         // store never saw it, since it was never derived from any real
@@ -2266,7 +2743,7 @@ mod tunnel_tests {
         let request = OffloadRequest { workspace_name: "app".to_string(), commit_id: bogus_commit_id, argv: vec!["true".to_string()] };
 
         let dispatch_fut = async {
-            let _ = tokio::time::timeout(Duration::from_secs(10), serve_dispatch(&mut target_channel, &target_ctx, &mut agent_event_rx, None, &agent_tx)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(10), serve_dispatch(&mut target_channel, &target_ctx, &mut agent_event_rx, None, &agent_tx, &agent_event_spool)).await;
         };
         let client_fut = async {
             let credential = fake_dev_exec_credential();

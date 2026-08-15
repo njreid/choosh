@@ -515,6 +515,7 @@ async fn a_broken_pushed_binary_is_rolled_back_and_reported_upstream() {
         if let choosh_protocol::relay::ControlRequest::AgentEvent {
             event: WireAgentEvent::AgentStatus { workspace_id, item_id, status: WireAgentStatus::Failed },
             request_id,
+            sequence: _,
         } = &request
         {
             assert_eq!(workspace_id, choosh_hostd::update::SELF_UPDATE_WORKSPACE_ID);

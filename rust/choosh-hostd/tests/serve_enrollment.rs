@@ -1,3 +1,8 @@
+// See `lib.rs`'s matching attribute: this integration-test crate root calls
+// into `choosh_hostd::serve::run()`, whose future nesting (deepened by
+// `jj_ops.rs`'s real `jj-lib` calls) overflows rustc's default query-depth
+// recursion limit — verified against a real build.
+#![recursion_limit = "512"]
 //! Integration coverage for `choosh-hostd serve`'s enrollment path against a
 //! hand-rolled fake `relayd`, per `docs/specs/auth-and-enrollment.md`'s
 //! devhost enrollment sequence. Deliberately does not depend on the real

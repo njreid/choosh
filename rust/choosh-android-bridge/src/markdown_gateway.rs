@@ -55,8 +55,19 @@
 //! absent, an internally chosen bounded first-chunk read) into
 //! `workspace.file.read`'s `range: {offset, length}` parameter — never
 //! reading a whole large asset into memory or inlining it as a base64 data
-//! URI. `host-rpc.md`'s stated per-request range bound (4 MiB) is this
-//! module's own [`MAX_ASSET_CHUNK_BYTES`].
+//! URI. `choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES`'s own doc
+//! comment is this module's authority for the per-request range bound (it
+//! exists so one `workspace.file.read` request/response fits inside one
+//! `"rpc"`-purpose relay tunnel frame — not an independent number this
+//! module gets to pick); this module's own [`MAX_ASSET_CHUNK_BYTES`] tracks
+//! it directly rather than restating it, since restating a bound as a
+//! separate literal is exactly how it went stale here once already (this
+//! constant used to hardcode a now-incorrect 4 MiB, from before
+//! `MAX_FILE_READ_RANGE_BYTES` itself was lowered to fit inside one 256 KiB
+//! tunnel frame — a real, previously-shipped bug: every `/asset` request
+//! without an explicit small `Range` header would have asked `hostd` for a
+//! chunk larger than it now allows, and gotten a hard `bound_exceeded`
+//! rejection instead of any content at all).
 
 // See http_lite.rs's identical attribute/comment: this module's real,
 // non-test call site (`gateway_jni.rs`) is android-only.
@@ -76,12 +87,21 @@ use tokio::sync::{Semaphore, watch};
 
 pub const TOKEN_COOKIE_NAME: &str = "choosh_md_token";
 
-/// Per `host-rpc.md`: "`workspace.file.read` range: 4 MiB per request;
-/// larger files require multiple ranged requests" — this module's own
-/// per-`/asset`-request chunk bound, so a single RPC round trip (and this
-/// gateway's own per-response memory use) never exceeds that regardless of
-/// how large the underlying asset is.
-pub const MAX_ASSET_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+/// This module's own per-`/asset`-request chunk bound, so a single RPC
+/// round trip (and this gateway's own per-response memory use) never
+/// exceeds that regardless of how large the underlying asset is — tied
+/// directly to `choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES`
+/// rather than a separately-maintained literal, since a `workspace.file.read`
+/// request for more than that bound is a hard `bound_exceeded` rejection
+/// from `hostd`, not a silent clamp. "Larger files require multiple ranged
+/// requests" (`host-rpc.md`) is exactly what `serve_asset_response`'s own
+/// `Range`-header handling already provides: a `WebView`/browser asset
+/// fetch that needs more than one chunk gets a `206 Partial Content` with
+/// `Content-Range`, and issues its own follow-up `Range` request for the
+/// rest — the same multi-request mechanism `read_whole_file` in `engine.rs`
+/// builds explicitly for the (rangeless) document-fetch path, just driven
+/// by the HTTP client instead of by this crate's own code.
+pub const MAX_ASSET_CHUNK_BYTES: u64 = choosh_protocol::host_rpc::MAX_FILE_READ_RANGE_BYTES;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 

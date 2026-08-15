@@ -1,3 +1,13 @@
+// `jj_ops.rs`'s real `jj-lib` calls (see its module doc comment) add real
+// async-call-chain depth on top of this crate's already-deep
+// `serve::run()`/`serve_dispatch()` future nesting — enough that rustc's
+// default recursion limit (128) overflows while computing that future's
+// layout (`query depth increased by 130`, verified against a real build
+// after adding `jj-lib` usage). This raises the *compile-time* type-layout
+// recursion budget only; it has no runtime effect (the existing
+// `Box::pin(choosh_hostd::run(..))` in `main.rs` already handles the
+// separate, runtime concern of a large top-level future's stack footprint).
+#![recursion_limit = "512"]
 //! `choosh-hostd`: the devhost daemon (`serve`) and laptop bridge (`proxy`).
 //! See `docs/specs/auth-and-enrollment.md`, `docs/specs/relay-protocol.md`,
 //! and `docs/specs/host-deployment.md` for the behavior this crate
@@ -7,6 +17,7 @@
 //! subcommand bodies land in follow-up increments per
 //! `docs/milestones/M0-enrollment.md`.
 
+pub mod agent_event_spool;
 mod agent_launch;
 pub mod auth_detect;
 mod backoff;

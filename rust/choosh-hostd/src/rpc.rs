@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use choosh_protocol::host_rpc::{
     ChangeGraphNode, ChangedPath, DiffFileEntry, DiffHunk, DiffSegment, DiffSegmentKind, ItemStatus, ItemSummary, ItemType,
-    MAX_FILE_READ_RANGE_BYTES, MAX_TREE_LIST_PAGE, OperationLogEntry, ProjectSource, RpcRequest, RpcResponse, WorkspaceSummary,
+    MAX_FILE_READ_RANGE_BYTES, MAX_TREE_LIST_PAGE, OperationLogEntry, ProjectSource, ProjectSummary, RpcRequest, RpcResponse,
+    WorkspaceSummary,
 };
 use tokio::sync::Mutex;
 
@@ -92,6 +93,10 @@ pub async fn dispatch(ctx: &RpcContext, request: RpcRequest) -> RpcResponse {
         }
         RpcRequest::WorkspaceFileWrite { workspace_id, path, base_revision, content_base64, .. } => {
             handle_file_write(ctx, request_id, &workspace_id, &path, &base_revision, &content_base64).await
+        }
+        RpcRequest::ProjectList { .. } => handle_project_list(ctx, request_id).await,
+        RpcRequest::ProjectSetPrimaryWorkspace { project_id, workspace_id, .. } => {
+            handle_project_set_primary_workspace(ctx, request_id, &project_id, &workspace_id).await
         }
     }
 }
@@ -394,6 +399,97 @@ async fn handle_file_write(
             current_content_base64: base64::engine::general_purpose::STANDARD.encode(current_content),
         },
         Err(fs_error) => fs_error_response(request_id, &fs_error),
+    }
+}
+
+/// `handle_project_list`'s "recent event" bound — see that function's doc
+/// comment for the full reasoning. Five minutes: long enough to survive a
+/// normal reconnect/relay hiccup without a Project's active state
+/// flickering off (per PLAN.md's noted `agent-events.md` gap, a reconnect
+/// resumes the live stream rather than replaying any gap, so a too-short
+/// window would be actively misleading around an ordinary brief
+/// disconnect) while still being short enough that "active" means
+/// "something happened recently", not "sometime today". Not pinned by
+/// `host-rpc.md`/`android-navigation.md` — both explicitly leave this
+/// bound as a `hostd`-side implementation choice.
+const PROJECT_ACTIVE_EVENT_WINDOW: time::Duration = time::Duration::minutes(5);
+
+/// `host-rpc.md`'s `project.list`: every registered Project on this host,
+/// with `active` computed here — never by the client, per `host-rpc.md`:
+/// "hostd computes it, the client does not".
+///
+/// `active` definition (a bounded, defensible choice; `android-navigation.md`
+/// deliberately leaves "the exact staleness bound" as "an implementation
+/// choice, not a wire contract"): a Project counts as active if any of its
+/// Workspaces has —
+///
+/// 1. a **connected agent/service Item**: a registered `AgentTerminal` or
+///    `WebService` item (the "agent"/"service" halves of the phrase, per
+///    `host-rpc.md`'s Item RPCs section — `Shell` is neither) whose status
+///    is `Running` or `Starting`. `Starting` counts as "connected" too: a
+///    `WebService` mid-launch isn't yet probeable, but it's unambiguously
+///    live work, not idle — `Stopped`/`Failed`/`Unknown` are the only
+///    statuses that mean "no live process" for this purpose; or
+/// 2. a **recent event**: [`Registry::has_recent_event`] within
+///    [`PROJECT_ACTIVE_EVENT_WINDOW`] of now, fed by every `WireAgentEvent`
+///    that carries a `workspace_id` — `serve.rs`'s `serve_dispatch` records
+///    one the moment it's about to forward the event onward (see that
+///    module's `agent_event_rx.recv()` branch for the exact call site).
+async fn handle_project_list(ctx: &RpcContext, request_id: String) -> RpcResponse {
+    let now = time::OffsetDateTime::now_utc();
+    let registry = ctx.registry.lock().await;
+    let projects = registry
+        .list_projects()
+        .iter()
+        .map(|project| {
+            let active = registry.list_workspaces().iter().filter(|workspace| workspace.project_id == project.project_id).any(
+                |workspace| {
+                    registry.list_items(&workspace.workspace_id).into_iter().any(|item| {
+                        matches!(item.item_type, ItemType::AgentTerminal | ItemType::WebService)
+                            && matches!(item.status, ItemStatus::Running | ItemStatus::Starting)
+                    }) || registry.has_recent_event(&workspace.workspace_id, now, PROJECT_ACTIVE_EVENT_WINDOW)
+                },
+            );
+            ProjectSummary {
+                project_id: project.project_id.clone(),
+                name: project.name.clone(),
+                primary_workspace_id: project.primary_workspace_id.clone(),
+                active,
+            }
+        })
+        .collect();
+    RpcResponse::ProjectListOk { request_id, projects }
+}
+
+/// `host-rpc.md`'s `project.set_primary_workspace`: `workspace_id` "MUST
+/// already belong to `project_id`" — rejected as a real, typed error rather
+/// than silently accepted-then-wrong or silently no-op'd.
+///
+/// Error code choice, documented per this task's own ask: an unknown
+/// `workspace_id`/`project_id` (`RegistryError::WorkspaceNotFound`/
+/// `ProjectNotFound`) maps to `not_found`, matching every other unknown-id
+/// RPC error in this module (see e.g. `lookup_root`'s callers). A
+/// `workspace_id` that resolves fine but names a Workspace under a
+/// *different* Project (`RegistryError::WorkspaceNotInProject`) maps to
+/// `invalid_argument` instead — the id itself is real, but this request's
+/// particular `project_id`/`workspace_id` combination is what's invalid,
+/// the same category `handle_item_create`'s argument-validation failures
+/// already use in this module.
+async fn handle_project_set_primary_workspace(
+    ctx: &RpcContext,
+    request_id: String,
+    project_id: &str,
+    workspace_id: &str,
+) -> RpcResponse {
+    let mut registry = ctx.registry.lock().await;
+    match registry.set_primary_workspace(project_id, workspace_id) {
+        Ok(()) => RpcResponse::ProjectSetPrimaryWorkspaceOk { request_id },
+        Err(RegistryError::WorkspaceNotFound(_)) => error(request_id, "not_found", "workspace_id is not registered on this host"),
+        Err(RegistryError::ProjectNotFound(_)) => error(request_id, "not_found", "project_id is not registered on this host"),
+        Err(RegistryError::WorkspaceNotInProject { .. }) => {
+            error(request_id, "invalid_argument", "workspace_id does not belong to project_id")
+        }
+        Err(other) => error(request_id, "internal", other.to_string()),
     }
 }
 
@@ -2146,5 +2242,175 @@ mod tests {
         zellij_ops::kill_session(&name_b).await.ok();
         assert_eq!(content_a.trim(), "marker=value-a", "workspace A's spawned process must see only workspace A's mise env");
         assert_eq!(content_b.trim(), "marker=value-b", "workspace B's spawned process must see only workspace B's mise env");
+    }
+
+    #[tokio::test]
+    async fn project_list_reflects_registered_projects_and_computes_active_from_a_connected_item() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m-projlist").await;
+        let project_id = ctx.registry.lock().await.find_workspace(&workspace_id).unwrap().project_id.clone();
+
+        // No items, no recorded event yet: not active.
+        let list_response = dispatch(&ctx, RpcRequest::ProjectList { request_id: "r1".to_string() }).await;
+        let RpcResponse::ProjectListOk { projects, .. } = list_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected ProjectListOk, got {list_response:?}");
+        };
+        let project = projects.iter().find(|p| p.project_id == project_id).expect("project should be listed");
+        assert!(!project.active, "a project with no items and no recent events must not be active");
+        assert_eq!(project.primary_workspace_id.as_deref(), Some(workspace_id.as_str()));
+
+        // A registered WebService item makes the project active — `Starting`
+        // counts as "connected" (see `handle_project_list`'s doc comment),
+        // so this doesn't need to wait for the readiness prober.
+        let create_item = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r2".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::WebService,
+                name: "web".to_string(),
+                agent: None,
+                command: Some(vec!["cat".to_string()]),
+                port: Some(reserve_ephemeral_port()),
+            },
+        )
+        .await;
+        assert!(matches!(create_item, RpcResponse::ItemCreateOk { .. }), "expected ItemCreateOk, got {create_item:?}");
+
+        let list_response = dispatch(&ctx, RpcRequest::ProjectList { request_id: "r3".to_string() }).await;
+        let RpcResponse::ProjectListOk { projects, .. } = list_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected ProjectListOk, got {list_response:?}");
+        };
+        let project = projects.iter().find(|p| p.project_id == project_id).expect("project should still be listed");
+        zellij_ops::kill_session(&name).await.ok();
+        assert!(project.active, "a project with a connected WebService item must be active");
+    }
+
+    #[tokio::test]
+    async fn project_list_recent_event_alone_makes_a_project_active() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m-projlist-event").await;
+        let project_id = ctx.registry.lock().await.find_workspace(&workspace_id).unwrap().project_id.clone();
+
+        // No items registered at all — only an event was seen (the same
+        // signal `serve.rs`'s `serve_dispatch` records for a real agent
+        // event on its way out to the phone).
+        ctx.registry.lock().await.record_event(&workspace_id, time::OffsetDateTime::now_utc());
+
+        let list_response = dispatch(&ctx, RpcRequest::ProjectList { request_id: "r1".to_string() }).await;
+        let RpcResponse::ProjectListOk { projects, .. } = list_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected ProjectListOk, got {list_response:?}");
+        };
+        let project = projects.iter().find(|p| p.project_id == project_id).expect("project should be listed");
+        zellij_ops::kill_session(&name).await.ok();
+        assert!(project.active, "a recent event with no items must still make a project active");
+    }
+
+    #[tokio::test]
+    async fn project_set_primary_workspace_succeeds_reflects_in_list_and_rejects_a_mismatched_project() {
+        let (_dir, ctx, name, workspace_id_a) = setup_m3_workspace("m-projprimary").await;
+        let project_id = ctx.registry.lock().await.find_workspace(&workspace_id_a).unwrap().project_id.clone();
+
+        // Register a second workspace directly under the same project (no
+        // need for a real second `jj`/Zellij session — this exercises the
+        // registry/RPC logic under test, not `jj workspace add`'s own
+        // mechanics, which `jj_ops.rs`'s own tests already cover).
+        let workspace_id_b = format!("ws-{}", uuid::Uuid::new_v4());
+        ctx.registry
+            .lock()
+            .await
+            .register_workspace(
+                workspace_id_b.clone(),
+                format!("agent-b-{}", uuid::Uuid::new_v4()),
+                "dev-1".to_string(),
+                project_id.clone(),
+                "app".to_string(),
+                PathBuf::from(format!("/workspaces/{workspace_id_b}")),
+                "2026-08-14T00:00:01Z".to_string(),
+            )
+            .unwrap();
+
+        let switch_response = dispatch(
+            &ctx,
+            RpcRequest::ProjectSetPrimaryWorkspace {
+                request_id: "r1".to_string(),
+                project_id: project_id.clone(),
+                workspace_id: workspace_id_b.clone(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(switch_response, RpcResponse::ProjectSetPrimaryWorkspaceOk { .. }),
+            "expected ProjectSetPrimaryWorkspaceOk, got {switch_response:?}"
+        );
+
+        let list_response = dispatch(&ctx, RpcRequest::ProjectList { request_id: "r2".to_string() }).await;
+        let RpcResponse::ProjectListOk { projects, .. } = list_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected ProjectListOk, got {list_response:?}");
+        };
+        let project = projects.iter().find(|p| p.project_id == project_id).expect("project should be listed");
+        assert_eq!(
+            project.primary_workspace_id.as_deref(),
+            Some(workspace_id_b.as_str()),
+            "project.list must reflect the new primary workspace"
+        );
+
+        // A workspace_id that belongs to a different project is rejected —
+        // `invalid_argument`, not silently applied — and the earlier switch
+        // is left untouched.
+        let workspace_id_other_project = format!("ws-{}", uuid::Uuid::new_v4());
+        ctx.registry
+            .lock()
+            .await
+            .register_workspace(
+                workspace_id_other_project.clone(),
+                format!("unrelated-{}", uuid::Uuid::new_v4()),
+                "dev-1".to_string(),
+                "proj-unrelated".to_string(),
+                "unrelated".to_string(),
+                PathBuf::from(format!("/workspaces/{workspace_id_other_project}")),
+                "2026-08-14T00:00:02Z".to_string(),
+            )
+            .unwrap();
+        let reject_response = dispatch(
+            &ctx,
+            RpcRequest::ProjectSetPrimaryWorkspace {
+                request_id: "r3".to_string(),
+                project_id: project_id.clone(),
+                workspace_id: workspace_id_other_project,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&reject_response, RpcResponse::Error { code, .. } if code == "invalid_argument"),
+            "expected invalid_argument for a workspace belonging to a different project, got {reject_response:?}"
+        );
+
+        let list_after_reject = dispatch(&ctx, RpcRequest::ProjectList { request_id: "r4".to_string() }).await;
+        let RpcResponse::ProjectListOk { projects, .. } = list_after_reject else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected ProjectListOk, got {list_after_reject:?}");
+        };
+        let project = projects.iter().find(|p| p.project_id == project_id).unwrap();
+        assert_eq!(
+            project.primary_workspace_id.as_deref(),
+            Some(workspace_id_b.as_str()),
+            "a rejected switch must not clobber the earlier successful one"
+        );
+
+        // An unknown workspace_id is not_found, not invalid_argument.
+        let not_found_response = dispatch(
+            &ctx,
+            RpcRequest::ProjectSetPrimaryWorkspace {
+                request_id: "r5".to_string(),
+                project_id: project_id.clone(),
+                workspace_id: "ws-does-not-exist".to_string(),
+            },
+        )
+        .await;
+        zellij_ops::kill_session(&name).await.ok();
+        assert!(matches!(&not_found_response, RpcResponse::Error { code, .. } if code == "not_found"), "expected not_found, got {not_found_response:?}");
     }
 }

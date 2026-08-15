@@ -8,6 +8,31 @@
 //! read (M6), and the `relayd`-pushed self-update instruction (M8). Shared by
 //! `choosh-relayd` and `choosh-hostd` so both sides serialize/deserialize
 //! identical Rust types rather than independently-drifting JSON shapes.
+//!
+//! **`agent-events.md`'s "Delivery and replay" machinery** ([`SequencedAgentEvent`],
+//! [`AgentEventsResumeRequest`], [`AgentEventsResumeResponse`], and the
+//! `sequence` field on [`ControlRequest::AgentEvent`]/[`ServerPush::AgentEvent`])
+//! lands here rather than as new `RpcRequest`/`RpcResponse` variants in
+//! `host_rpc.rs`. Both are real options — the spec section itself frames
+//! this as "phone tells the owning `choosh-hostd` 'resume workspace X from
+//! sequence N', over the `rpc`-purpose tunnel it already opens to that
+//! devhost, since that tunnel is already point-to-point to where the spool
+//! lives and `relayd` doesn't track workspace-to-devhost ownership" — but
+//! resuming *literally* over the `"rpc"` purpose would mean adding a
+//! `RpcRequest` variant, which `choosh-hostd::rpc::dispatch` must then
+//! exhaustively match on. This crate has no dependency on that dispatch
+//! function, so nothing here *forces* that coupling — the resume
+//! request/response ride their own `"agent-events"` tunnel purpose instead
+//! (opened with the exact same `ControlRequest::OpenTunnel` a phone already
+//! uses for `"rpc"`; `relayd`'s `open-tunnel` purpose is an opaque tag it
+//! never validates, per relay-protocol.md, so a second purpose string costs
+//! `relayd` nothing new) and are handled directly in `choosh-hostd::serve`'s
+//! existing tunnel-frame dispatch, alongside `pty:`/`web:`/`ssh`/`offload` —
+//! not through `choosh-hostd::rpc`'s `RpcRequest` surface at all. The
+//! *routing* shape is identical to the RPC-tunnel design either way (a
+//! phone-to-specific-devhost point-to-point tunnel, no new `relayd`-side
+//! workspace-to-devhost resolution capability); only which existing dispatch
+//! surface it rides differs.
 
 use serde::{Deserialize, Serialize};
 
@@ -180,6 +205,94 @@ pub enum WireAgentEvent {
     },
 }
 
+impl WireAgentEvent {
+    /// The workspace this event is attributable to, per `agent-events.md`'s
+    /// "Delivery and replay" section ("MUST receive a monotonically
+    /// increasing sequence number per workspace"). `None` only for
+    /// [`Self::AuthRequired`] — per its own doc comment, that variant is
+    /// deliberately not scoped to a single workspace, so it is not
+    /// sequenced or retained in [`SequencedAgentEvent`]'s per-workspace
+    /// spool (`choosh-hostd::agent_event_spool`); it is still delivered
+    /// live exactly as before, just outside the replay mechanism.
+    #[must_use]
+    pub fn workspace_id(&self) -> Option<&str> {
+        match self {
+            Self::InputRequired { workspace_id, .. }
+            | Self::TurnCompleted { workspace_id, .. }
+            | Self::FilesChanged { workspace_id, .. }
+            | Self::AgentStatus { workspace_id, .. }
+            | Self::EditorAttached { workspace_id, .. }
+            | Self::EditorDetached { workspace_id, .. } => Some(workspace_id),
+            Self::AuthRequired { .. } => None,
+        }
+    }
+}
+
+/// One workspace-scoped agent event as retained in `choosh-hostd`'s
+/// per-workspace spool or replayed in an [`AgentEventsResumeResponse`],
+/// carrying the sequence number `agent-events.md`'s "Delivery and replay"
+/// section requires. Only ever constructed for an event whose
+/// [`WireAgentEvent::workspace_id`] is `Some` — the spool never assigns a
+/// sequence to (or retains) a [`WireAgentEvent::AuthRequired`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SequencedAgentEvent {
+    pub sequence: u64,
+    pub event: WireAgentEvent,
+}
+
+/// Phone -> `choosh-hostd` "resume this workspace's agent-event stream
+/// after this sequence" request, per `agent-events.md`'s "Delivery and
+/// replay" section. Carried as a JSON tunnel-data frame over an
+/// `"agent-events"`-purpose `open-tunnel` (relay-protocol.md's tunnel
+/// mechanism, same shape `host-rpc.md`'s `"rpc"`-purpose tunnel already
+/// uses for request/response JSON over tunnel frames) opened directly to
+/// the devhost that owns `workspace_id` — deliberately its own tunnel
+/// purpose rather than a new `host-rpc.md` `RpcRequest` variant, so this
+/// module (and `choosh-hostd::serve`, which handles it) can implement and
+/// test the whole mechanism without touching `choosh-hostd::rpc`'s
+/// `RpcRequest` dispatch surface at all. See this crate's `relay` module
+/// doc comment for the fuller design rationale (RPC-tunnel vs. a new
+/// `relayd`-side workspace-to-devhost routing capability).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentEventsResumeRequest {
+    pub request_id: String,
+    pub workspace_id: String,
+    /// Replay every retained event with a sequence strictly greater than
+    /// this. `None` means "no prior acknowledged sequence for this
+    /// workspace" (e.g. a first subscribe) — answered with every event
+    /// currently retained for `workspace_id`, oldest first, same as
+    /// `Some(0)` would be (sequence numbers are assigned starting at 1, so
+    /// no real event ever has sequence 0).
+    pub after_sequence: Option<u64>,
+}
+
+/// `choosh-hostd`'s answer to [`AgentEventsResumeRequest`]. `SnapshotRequired`
+/// is not an error — it is the documented, correct answer per
+/// `agent-events.md` whenever `after_sequence` names a sequence older than
+/// what the bounded spool still retains: replaying anyway would either skip
+/// silently-evicted events (a gap) or panic/underflow trying to find them,
+/// neither of which this type's shape allows a caller to accidentally do.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AgentEventsResumeResponse {
+    Replayed {
+        request_id: String,
+        /// Oldest first, strictly increasing, every `sequence` strictly
+        /// greater than the request's `after_sequence` and less than or
+        /// equal to `latest_sequence` — never a gap, never a duplicate.
+        events: Vec<SequencedAgentEvent>,
+        /// The highest sequence now retained for this workspace, even when
+        /// `events` is empty because the caller was already fully caught
+        /// up — lets the caller advance its acknowledged cursor without
+        /// having received a new event.
+        latest_sequence: u64,
+    },
+    SnapshotRequired {
+        request_id: String,
+        workspace_id: String,
+    },
+}
+
 /// The four named cloud/SSO providers `agent-events.md`'s `auth_required`
 /// event covers. Serializes exactly as the spec's payload shape shows
 /// (`"aws"`/`"gcp"`/`"azure"`/`"github"`), not as `PascalCase`.
@@ -278,6 +391,14 @@ pub enum ControlRequest {
     AgentEvent {
         request_id: String,
         event: WireAgentEvent,
+        /// The sequence `choosh-hostd` assigned this event in its
+        /// per-workspace spool (see [`SequencedAgentEvent`]), or `None` for
+        /// an event with no [`WireAgentEvent::workspace_id`] (only
+        /// `AuthRequired`). Added additively alongside the pre-existing
+        /// `event` field, per `agent-events.md`'s "Delivery and replay"
+        /// section — `relayd` forwards it unmodified in the matching
+        /// `ServerPush::AgentEvent`.
+        sequence: Option<u64>,
     },
     /// Phone-only. Replaces any previously registered token for this phone
     /// Identity — `relayd` holds at most one FCM token per phone Identity.
@@ -441,6 +562,10 @@ pub enum ServerPush {
     AgentEvent {
         from_device_id: String,
         event: WireAgentEvent,
+        /// Verbatim copy of the originating [`ControlRequest::AgentEvent`]'s
+        /// `sequence` — `relayd` never assigns or reinterprets it, it only
+        /// routes it through, same as `event` itself.
+        sequence: Option<u64>,
     },
     /// `relayd`-pushed self-update instruction, per relay-protocol.md's
     /// `update_binary` section and host-deployment.md's "Self-update".
@@ -658,10 +783,30 @@ mod tests {
                 item_id: "item-1".to_string(),
                 reason: WireInputReason::Approval,
             },
+            sequence: Some(7),
         };
         let json = serde_json::to_string(&request).expect("serialize");
         assert!(json.contains("\"type\":\"agent-event\""));
         assert!(json.contains("\"kind\":\"input_required\""));
+        assert!(json.contains("\"sequence\":7"));
+        let decoded: ControlRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn agent_event_request_with_no_sequence_round_trips_through_json() {
+        // The `AuthRequired` case: no `workspace_id`, so no sequence.
+        let request = ControlRequest::AgentEvent {
+            request_id: "id".to_string(),
+            event: WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Github,
+                user_code: "WDJB-MJHT".to_string(),
+                verification_uri: "https://example.com/device".to_string(),
+            },
+            sequence: None,
+        };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"sequence\":null"));
         let decoded: ControlRequest = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, request);
     }
@@ -686,11 +831,79 @@ mod tests {
         let push = ServerPush::AgentEvent {
             from_device_id: "dev-1".to_string(),
             event: WireAgentEvent::TurnCompleted { workspace_id: "ws-1".to_string(), item_id: "item-1".to_string() },
+            sequence: Some(3),
         };
         let json = serde_json::to_string(&push).expect("serialize");
         assert!(serde_json::from_str::<ControlResponse>(&json).is_err());
         let decoded: ServerPush = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, push);
+    }
+
+    #[test]
+    fn wire_agent_event_workspace_id_is_none_only_for_auth_required() {
+        assert_eq!(
+            WireAgentEvent::TurnCompleted { workspace_id: "ws-1".to_string(), item_id: "item-1".to_string() }.workspace_id(),
+            Some("ws-1")
+        );
+        assert_eq!(
+            WireAgentEvent::AuthRequired {
+                provider: WireAuthProvider::Aws,
+                user_code: "WDJB-MJHT".to_string(),
+                verification_uri: "https://example.com/device".to_string(),
+            }
+            .workspace_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn sequenced_agent_event_round_trips_through_json() {
+        let event = SequencedAgentEvent {
+            sequence: 42,
+            event: WireAgentEvent::TurnCompleted { workspace_id: "ws-1".to_string(), item_id: "item-1".to_string() },
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        let decoded: SequencedAgentEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn agent_events_resume_request_round_trips_through_json() {
+        let request =
+            AgentEventsResumeRequest { request_id: "id".to_string(), workspace_id: "ws-1".to_string(), after_sequence: Some(5) };
+        let json = serde_json::to_string(&request).expect("serialize");
+        let decoded: AgentEventsResumeRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, request);
+
+        let no_prior_ack =
+            AgentEventsResumeRequest { request_id: "id".to_string(), workspace_id: "ws-1".to_string(), after_sequence: None };
+        let json = serde_json::to_string(&no_prior_ack).expect("serialize");
+        assert!(json.contains("\"after_sequence\":null"));
+        let decoded: AgentEventsResumeRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, no_prior_ack);
+    }
+
+    #[test]
+    fn agent_events_resume_response_variants_round_trip_through_json_and_use_disjoint_shapes() {
+        let replayed = AgentEventsResumeResponse::Replayed {
+            request_id: "id".to_string(),
+            events: vec![SequencedAgentEvent {
+                sequence: 1,
+                event: WireAgentEvent::TurnCompleted { workspace_id: "ws-1".to_string(), item_id: "item-1".to_string() },
+            }],
+            latest_sequence: 1,
+        };
+        let json = serde_json::to_string(&replayed).expect("serialize");
+        assert!(json.contains("\"outcome\":\"replayed\""));
+        let decoded: AgentEventsResumeResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, replayed);
+
+        let snapshot_required =
+            AgentEventsResumeResponse::SnapshotRequired { request_id: "id".to_string(), workspace_id: "ws-1".to_string() };
+        let json = serde_json::to_string(&snapshot_required).expect("serialize");
+        assert!(json.contains("\"outcome\":\"snapshot_required\""));
+        let decoded: AgentEventsResumeResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, snapshot_required);
     }
 
     #[test]

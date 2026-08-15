@@ -564,9 +564,11 @@ version = "0.0.0"
 dependencies = [
  "base64 0.23.1",
  "choosh-protocol",
+ "chrono",
  "clap",
  "directories",
  "ed25519-dalek",
+ "futures-executor",
  "futures-util",
  "jj-lib",
  "nix",

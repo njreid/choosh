@@ -58,6 +58,19 @@ pub enum RegistryError {
     Corrupt(String),
     WorkspaceNameTaken(String),
     ItemNameTaken(String),
+    /// `project.set_primary_workspace`'s `project_id` doesn't name a
+    /// registered Project.
+    ProjectNotFound(String),
+    /// `project.set_primary_workspace`'s `workspace_id` doesn't name a
+    /// registered Workspace.
+    WorkspaceNotFound(String),
+    /// `project.set_primary_workspace`'s `workspace_id` names a real
+    /// Workspace, but one registered under a different Project — per
+    /// `host-rpc.md`, `workspace_id` "MUST already belong to `project_id`".
+    /// Kept distinct from [`Self::WorkspaceNotFound`] so `rpc.rs` can pick
+    /// the right typed error code for each case (see
+    /// `handle_project_set_primary_workspace`'s doc comment for which).
+    WorkspaceNotInProject { project_id: String, workspace_id: String },
 }
 
 impl std::fmt::Display for RegistryError {
@@ -70,6 +83,11 @@ impl std::fmt::Display for RegistryError {
             }
             Self::ItemNameTaken(name) => {
                 write!(f, "item name {name:?} is already registered in this workspace")
+            }
+            Self::ProjectNotFound(project_id) => write!(f, "project {project_id:?} is not registered on this host"),
+            Self::WorkspaceNotFound(workspace_id) => write!(f, "workspace {workspace_id:?} is not registered on this host"),
+            Self::WorkspaceNotInProject { project_id, workspace_id } => {
+                write!(f, "workspace {workspace_id:?} does not belong to project {project_id:?}")
             }
         }
     }
@@ -91,6 +109,17 @@ impl From<io::Error> for RegistryError {
 pub struct Registry {
     path: PathBuf,
     state: RegistryState,
+    /// In-memory-only "last agent/service event seen" per `workspace_id`,
+    /// used by `rpc.rs`'s `handle_project_list` for `project.list`'s
+    /// `active` computation (`host-rpc.md`: "a connected agent/service Item
+    /// or a recent event"). Deliberately not part of `RegistryState` / never
+    /// persisted: unlike Projects/Workspaces/Items (which must survive a
+    /// `choosh-hostd` restart per this module's own doc comment), "was
+    /// there recent activity" is a liveness signal, not registered state —
+    /// a restart already drops the live Zellij/PTY/agent processes that
+    /// would have produced these events, so there is nothing meaningful to
+    /// carry across one.
+    last_event_at: std::collections::HashMap<String, time::OffsetDateTime>,
 }
 
 impl Registry {
@@ -110,7 +139,7 @@ impl Registry {
             Err(error) if error.kind() == io::ErrorKind::NotFound => RegistryState::default(),
             Err(error) => return Err(RegistryError::Io(error)),
         };
-        Ok(Self { path: path.to_path_buf(), state })
+        Ok(Self { path: path.to_path_buf(), state, last_event_at: std::collections::HashMap::new() })
     }
 
     /// The default per-devhost registry file location:
@@ -172,6 +201,47 @@ impl Registry {
     #[must_use]
     pub fn find_project(&self, project_id: &str) -> Option<&Project> {
         self.state.projects.iter().find(|p| p.project_id == project_id)
+    }
+
+    /// Every registered Project on this host — `project.list`'s (`rpc.rs`'s
+    /// `handle_project_list`) source of rows.
+    #[must_use]
+    pub fn list_projects(&self) -> &[Project] {
+        &self.state.projects
+    }
+
+    /// Changes `project_id`'s `primary_workspace_id` to `workspace_id`, per
+    /// `host-rpc.md`'s `project.set_primary_workspace`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::WorkspaceNotFound`] if `workspace_id` isn't
+    /// registered at all, or [`RegistryError::WorkspaceNotInProject`] if it
+    /// is registered but under a different Project than `project_id` — per
+    /// `host-rpc.md`'s "`workspace_id` MUST already belong to
+    /// `project_id`". Returns [`RegistryError::ProjectNotFound`] if
+    /// `project_id` itself isn't registered (checked after the workspace
+    /// lookup so a mismatched-project error is reported precisely rather
+    /// than masked by an equally-plausible "no such project" one).
+    pub fn set_primary_workspace(&mut self, project_id: &str, workspace_id: &str) -> Result<(), RegistryError> {
+        let workspace_project_id = self
+            .find_workspace(workspace_id)
+            .map(|workspace| workspace.project_id.clone())
+            .ok_or_else(|| RegistryError::WorkspaceNotFound(workspace_id.to_string()))?;
+        if workspace_project_id != project_id {
+            return Err(RegistryError::WorkspaceNotInProject {
+                project_id: project_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+            });
+        }
+        let project = self
+            .state
+            .projects
+            .iter_mut()
+            .find(|p| p.project_id == project_id)
+            .ok_or_else(|| RegistryError::ProjectNotFound(project_id.to_string()))?;
+        project.primary_workspace_id = Some(workspace_id.to_string());
+        self.save()
     }
 
     /// Registers a new Workspace under `project_id` (creating the Project
@@ -304,6 +374,24 @@ impl Registry {
         item.status = status;
         self.save()
     }
+
+    /// Records that a `WireAgentEvent` was just seen for `workspace_id`, at
+    /// `at` — the "recent event" half of `project.list`'s `active`
+    /// computation (`host-rpc.md`). In-memory only, per this field's own
+    /// doc comment; never fails and never calls [`Self::save`].
+    pub fn record_event(&mut self, workspace_id: &str, at: time::OffsetDateTime) {
+        self.last_event_at.insert(workspace_id.to_string(), at);
+    }
+
+    /// Whether `workspace_id` has had a recorded event within `window` of
+    /// `now`. `now` is caller-supplied (rather than read internally via
+    /// `OffsetDateTime::now_utc()`) so `rpc.rs`'s tests can assert both the
+    /// "still recent" and "aged out" boundary deterministically instead of
+    /// racing a real clock.
+    #[must_use]
+    pub fn has_recent_event(&self, workspace_id: &str, now: time::OffsetDateTime, window: time::Duration) -> bool {
+        self.last_event_at.get(workspace_id).is_some_and(|at| now - *at <= window)
+    }
 }
 
 #[cfg(test)]
@@ -408,5 +496,109 @@ mod tests {
             .unwrap();
         assert_eq!(registry.find_project("proj-1").unwrap().primary_workspace_id.as_deref(), Some("ws-1"));
         assert_eq!(registry.list_workspaces().len(), 2);
+    }
+
+    #[test]
+    fn set_primary_workspace_succeeds_and_is_reflected_immediately() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+        registry
+            .register_workspace(
+                "ws-1".to_string(),
+                "app".to_string(),
+                "dev-1".to_string(),
+                "proj-1".to_string(),
+                "app".to_string(),
+                PathBuf::from("/workspaces/app"),
+                "2026-08-14T00:00:00Z".to_string(),
+            )
+            .unwrap();
+        registry
+            .register_workspace(
+                "ws-2".to_string(),
+                "app-agent-b".to_string(),
+                "dev-1".to_string(),
+                "proj-1".to_string(),
+                "app".to_string(),
+                PathBuf::from("/workspaces/app-agent-b"),
+                "2026-08-14T00:00:01Z".to_string(),
+            )
+            .unwrap();
+        assert_eq!(registry.find_project("proj-1").unwrap().primary_workspace_id.as_deref(), Some("ws-1"));
+
+        registry.set_primary_workspace("proj-1", "ws-2").unwrap();
+        assert_eq!(registry.find_project("proj-1").unwrap().primary_workspace_id.as_deref(), Some("ws-2"));
+
+        // Persists, same as every other registry mutation.
+        let reloaded = Registry::load(&path).unwrap();
+        assert_eq!(reloaded.find_project("proj-1").unwrap().primary_workspace_id.as_deref(), Some("ws-2"));
+    }
+
+    #[test]
+    fn set_primary_workspace_rejects_a_workspace_from_a_different_project() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+        registry
+            .register_workspace(
+                "ws-1".to_string(),
+                "app".to_string(),
+                "dev-1".to_string(),
+                "proj-1".to_string(),
+                "app".to_string(),
+                PathBuf::from("/workspaces/app"),
+                "2026-08-14T00:00:00Z".to_string(),
+            )
+            .unwrap();
+        registry
+            .register_workspace(
+                "ws-2".to_string(),
+                "other".to_string(),
+                "dev-1".to_string(),
+                "proj-2".to_string(),
+                "other".to_string(),
+                PathBuf::from("/workspaces/other"),
+                "2026-08-14T00:00:01Z".to_string(),
+            )
+            .unwrap();
+
+        let result = registry.set_primary_workspace("proj-1", "ws-2");
+        assert!(
+            matches!(&result, Err(RegistryError::WorkspaceNotInProject { project_id, workspace_id })
+                if project_id == "proj-1" && workspace_id == "ws-2"),
+            "expected WorkspaceNotInProject, got {result:?}"
+        );
+        // Rejected, not silently applied.
+        assert_eq!(registry.find_project("proj-1").unwrap().primary_workspace_id.as_deref(), Some("ws-1"));
+    }
+
+    #[test]
+    fn set_primary_workspace_rejects_an_unknown_workspace_id() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+        registry
+            .register_workspace(
+                "ws-1".to_string(),
+                "app".to_string(),
+                "dev-1".to_string(),
+                "proj-1".to_string(),
+                "app".to_string(),
+                PathBuf::from("/workspaces/app"),
+                "2026-08-14T00:00:00Z".to_string(),
+            )
+            .unwrap();
+        let result = registry.set_primary_workspace("proj-1", "ws-does-not-exist");
+        assert!(matches!(result, Err(RegistryError::WorkspaceNotFound(id)) if id == "ws-does-not-exist"));
+    }
+
+    #[test]
+    fn recent_event_is_recognized_within_window_and_not_after() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+        let t0 = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        registry.record_event("ws-1", t0);
+
+        assert!(registry.has_recent_event("ws-1", t0 + time::Duration::minutes(1), time::Duration::minutes(5)));
+        assert!(!registry.has_recent_event("ws-1", t0 + time::Duration::minutes(10), time::Duration::minutes(5)));
+        assert!(!registry.has_recent_event("ws-unknown", t0, time::Duration::minutes(5)));
     }
 }

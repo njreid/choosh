@@ -806,16 +806,20 @@ async fn agent_event_from_devhost_is_pushed_to_a_connected_phone() {
 
     send_control(
         &mut devhost,
-        &ControlRequest::AgentEvent { request_id: "e1".to_string(), event: input_required_event("ws-1", "item-1") },
+        &ControlRequest::AgentEvent { request_id: "e1".to_string(), event: input_required_event("ws-1", "item-1"), sequence: Some(1) },
     )
     .await;
     let response: ControlResponse = recv_control(&mut devhost).await;
     assert!(matches!(response, ControlResponse::AgentEventOk { .. }), "expected AgentEventOk, got {response:?}");
 
     let push: ServerPush = recv_control(&mut phone).await;
-    let ServerPush::AgentEvent { from_device_id, event } = push else { panic!("expected AgentEvent push, got {push:?}") };
+    let ServerPush::AgentEvent { from_device_id, event, sequence } = push else { panic!("expected AgentEvent push, got {push:?}") };
     assert_eq!(from_device_id, device_id);
     assert_eq!(event, input_required_event("ws-1", "item-1"));
+    // Forwarded verbatim from the devhost's own `ControlRequest::AgentEvent`
+    // — `relayd` never assigns or reinterprets it (`route_agent_event`'s
+    // doc comment).
+    assert_eq!(sequence, Some(1));
 }
 
 #[tokio::test]
@@ -825,7 +829,7 @@ async fn agent_event_from_a_non_devhost_identity_is_rejected() {
 
     send_control(
         &mut phone,
-        &ControlRequest::AgentEvent { request_id: "e1".to_string(), event: input_required_event("ws-1", "item-1") },
+        &ControlRequest::AgentEvent { request_id: "e1".to_string(), event: input_required_event("ws-1", "item-1"), sequence: Some(1) },
     )
     .await;
     let response: ControlResponse = recv_control(&mut phone).await;
@@ -881,7 +885,7 @@ async fn agent_event_with_no_phone_connected_does_not_error_the_devhost() {
 
     send_control(
         &mut devhost,
-        &ControlRequest::AgentEvent { request_id: "e1".to_string(), event: input_required_event("ws-1", "item-1") },
+        &ControlRequest::AgentEvent { request_id: "e1".to_string(), event: input_required_event("ws-1", "item-1"), sequence: Some(1) },
     )
     .await;
     let response: ControlResponse = recv_control(&mut devhost).await;

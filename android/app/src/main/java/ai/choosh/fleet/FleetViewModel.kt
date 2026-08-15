@@ -1,7 +1,9 @@
 package ai.choosh.fleet
 
 import ai.choosh.engine.ChooshEngine
+import ai.choosh.engine.ConnectionState
 import ai.choosh.engine.DevHostPresence
+import ai.choosh.engine.ProjectSummary
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -59,7 +61,7 @@ class FleetViewModel(private val engine: ChooshEngine) : ViewModel() {
             _state.value = _state.value.copy(isLoading = true, error = null)
             runCatching {
                 devHosts = engine.listDevhosts()
-                projects = FleetFixtures.projectsFor(devHosts)
+                projects = loadProjects(devHosts)
             }.onSuccess {
                 recompute()
             }.onFailure { failure ->
@@ -71,6 +73,72 @@ class FleetViewModel(private val engine: ChooshEngine) : ViewModel() {
     fun setSortMode(mode: SortMode) {
         _state.value = _state.value.copy(sortMode = mode)
         recompute()
+    }
+
+    /**
+     * `project.set_primary_workspace` (docs/specs/host-rpc.md), then a
+     * full [refresh] so the drawer reflects the change immediately.
+     * Failure (a mismatched `workspaceId`/`projectId`, or a transport
+     * error) surfaces through [FleetUiState.error], the same observable
+     * path [refresh] itself uses — callers watch [state], not a thrown
+     * exception out of this function.
+     */
+    fun setPrimaryWorkspace(project: Project, workspace: Workspace) {
+        viewModelScope.launch {
+            runCatching {
+                engine.setPrimaryWorkspace(workspace.devHostId, project.projectId, workspace.workspaceId)
+            }.onSuccess {
+                refresh()
+            }.onFailure { failure ->
+                _state.value = _state.value.copy(error = failure.message ?: "failed to set primary workspace")
+            }
+        }
+    }
+
+    /**
+     * `project.list`, called once per *online* devhost — mirroring
+     * host-rpc.md's `workspace.list` precedent ("called once per devhost
+     * after list-devhosts"), since `project.list` is itself an RPC scoped
+     * to a single devhost's tunnel despite host-rpc.md's own prose
+     * describing its result as "every Project the requesting Identity can
+     * reach, across every devhost". An offline devhost is skipped
+     * outright (no live tunnel to call over, per `list-devhosts`'
+     * `connectionState`); a thrown failure from an *online* devhost's call
+     * propagates to [refresh]'s `runCatching`, surfacing as this
+     * ViewModel's normal error state rather than silently dropping that
+     * devhost's Projects.
+     *
+     * Merge rule when the same `projectId` is reported by more than one
+     * devhost (a Project with Workspaces spread across hosts): `active`
+     * is OR'd together (active anywhere counts as active for the
+     * Project as a whole) and the first-seen devhost's `name`/
+     * `primaryWorkspaceId` wins — a deliberate, documented simplification
+     * host-rpc.md doesn't itself pin down.
+     *
+     * Each merged [ProjectSummary]'s nested [Project.workspaces] still
+     * comes from [FleetFixtures.workspacesFor] rather than a real
+     * per-project RPC — `workspace.list` isn't wired into [ChooshEngine]
+     * yet, a separate, tracked gap (PLAN.md's "Known follow-ups"), not
+     * something this pass silently papers over.
+     */
+    private suspend fun loadProjects(devHosts: List<DevHostPresence>): List<Project> {
+        val summaries = linkedMapOf<String, ProjectSummary>()
+        for (host in devHosts) {
+            if (host.connectionState != ConnectionState.ONLINE) continue
+            for (summary in engine.projectList(host.deviceId)) {
+                val existing = summaries[summary.projectId]
+                summaries[summary.projectId] = if (existing == null) summary else existing.copy(active = existing.active || summary.active)
+            }
+        }
+        return summaries.values.map { summary ->
+            Project(
+                projectId = summary.projectId,
+                name = summary.name,
+                primaryWorkspaceId = summary.primaryWorkspaceId.orEmpty(),
+                workspaces = FleetFixtures.workspacesFor(summary.projectId, devHosts),
+                active = summary.active,
+            )
+        }
     }
 
     /** Per android-navigation.md: tapping a Project opens its primary Workspace directly. */

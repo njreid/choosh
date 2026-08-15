@@ -1,5 +1,6 @@
 package ai.choosh.engine
 
+import ai.choosh.fleet.FleetFixtures
 import java.util.Base64
 import kotlinx.coroutines.delay
 
@@ -278,6 +279,59 @@ class FakeChooshEngine : ChooshEngine {
                 port = null,
             ),
         )
+    }
+
+    /**
+     * `setPrimaryWorkspace` overrides, keyed by `projectId` — lets a
+     * subsequent [projectList] call actually reflect a successful switch,
+     * mirroring [workspaceOpUndo]/[workspaceOpRestore]'s "real mutation,
+     * not a static stub" precedent rather than a no-op fake.
+     */
+    private val projectPrimaryOverrides = mutableMapOf<String, String>()
+
+    /** Set by a test to exercise [ChooshEngine.projectList]'s failure/error-state path without touching [connected]. */
+    var simulateProjectListFailure: Boolean = false
+
+    /**
+     * Scoped to `deviceId`, per [ChooshEngine.projectList]'s doc comment —
+     * only Projects with at least one [FleetFixtures] workspace on this
+     * devhost are returned, the same "one devhost's own registry" scoping
+     * the real RPC has. `active` mirrors [Project.isActive] computed from
+     * the fixture Workspace data, standing in for `hostd`'s real
+     * computation (host-rpc.md: "`hostd` computes it, the client does
+     * not" — this fake plays the `hostd` role here, [FleetViewModel]
+     * never recomputes it).
+     */
+    override suspend fun projectList(deviceId: String): List<ProjectSummary> {
+        delay(FAKE_LATENCY_MS)
+        check(connected) { "projectList() called before connect() succeeded" }
+        if (simulateProjectListFailure) error("fake project.list failure")
+        return FleetFixtures.projectsFor(FIXTURE_DEVHOSTS)
+            .filter { project -> project.workspaces.any { it.devHostId == deviceId } }
+            .map { project ->
+                ProjectSummary(
+                    projectId = project.projectId,
+                    name = project.name,
+                    primaryWorkspaceId = projectPrimaryOverrides[project.projectId] ?: project.primaryWorkspaceId,
+                    active = project.isActive,
+                )
+            }
+    }
+
+    /**
+     * Real validation, mirroring `hostd`'s own "`workspace_id` MUST
+     * already belong to `project_id`" rejection (host-rpc.md) rather than
+     * a no-op stub that always succeeds.
+     */
+    override suspend fun setPrimaryWorkspace(deviceId: String, projectId: String, workspaceId: String) {
+        delay(FAKE_LATENCY_MS)
+        check(connected) { "setPrimaryWorkspace() called before connect() succeeded" }
+        val project = FleetFixtures.projectsFor(FIXTURE_DEVHOSTS).firstOrNull { it.projectId == projectId }
+            ?: error("not_found: project_id is not registered")
+        if (project.workspaces.none { it.workspaceId == workspaceId }) {
+            error("invalid_argument: workspace_id does not belong to project_id")
+        }
+        projectPrimaryOverrides[projectId] = workspaceId
     }
 
     override fun close() {

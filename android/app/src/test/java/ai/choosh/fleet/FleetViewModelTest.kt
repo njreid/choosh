@@ -57,7 +57,8 @@ class FleetViewModelTest {
         engine.connect("fake-session-credential")
         val viewModel = FleetViewModel(engine)
         advanceUntilIdle()
-        // FleetFixtures.projectsFor(FIXTURE_DEVHOSTS) always returns exactly 2 projects.
+        // FakeChooshEngine.projectList, merged across FIXTURE_DEVHOSTS's two online
+        // devhosts, always returns exactly 2 projects (see loadProjects's doc comment).
         assertEquals(2, viewModel.state.value.rows.size)
 
         viewModel.setSortMode(SortMode.HOST)
@@ -69,4 +70,92 @@ class FleetViewModelTest {
         // than leaving PROJECT mode's stale list in place.
         assertEquals(FakeChooshEngine.FIXTURE_DEVHOSTS.size, hostState.rows.size)
     }
+
+    // --- project.list / project.set_primary_workspace RPC-backed path ------
+    //
+    // `refresh()` used to build `projects` straight from
+    // `FleetFixtures.projectsFor(devHosts)` — now it goes through
+    // `ChooshEngine.projectList`, per devhost, merged (`loadProjects`'s own
+    // doc comment). These tests exercise that path's loading/error states,
+    // not just the happy path the tests above already cover incidentally.
+
+    @Test
+    fun `a project-list failure on an online devhost surfaces as an error state, not a crash`() =
+        runTest(mainDispatcherRule.dispatcher) {
+            val engine = FakeChooshEngine()
+            engine.connect("fake-session-credential")
+            engine.simulateProjectListFailure = true
+            val viewModel = FleetViewModel(engine)
+            advanceUntilIdle()
+
+            val state = viewModel.state.value
+            assertTrue(!state.isLoading)
+            assertNotNull("a failed project.list must populate an error message, not throw", state.error)
+            assertTrue("a failed refresh must not leave stale rows", state.rows.isEmpty())
+        }
+
+    @Test
+    fun `a project-list failure does not corrupt an already-loaded fleet until the retry actually succeeds`() =
+        runTest(mainDispatcherRule.dispatcher) {
+            val engine = FakeChooshEngine()
+            engine.connect("fake-session-credential")
+            val viewModel = FleetViewModel(engine)
+            advanceUntilIdle()
+            assertEquals(2, viewModel.state.value.rows.size)
+
+            engine.simulateProjectListFailure = true
+            viewModel.refresh()
+            advanceUntilIdle()
+
+            val state = viewModel.state.value
+            assertNotNull("a second, failing refresh must surface an error", state.error)
+            assertEquals("previous rows are left in place, not silently cleared", 2, state.rows.size)
+        }
+
+    @Test
+    fun `setPrimaryWorkspace succeeds and is reflected after the automatic refresh`() = runTest(mainDispatcherRule.dispatcher) {
+        val engine = FakeChooshEngine()
+        engine.connect("fake-session-credential")
+        val viewModel = FleetViewModel(engine)
+        advanceUntilIdle()
+
+        val projectRow = viewModel.state.value.rows.filterIsInstance<FleetRow.ProjectRow>().single { it.project.projectId == "proj-choosh" }
+        val project = projectRow.project
+        assertEquals("ws-choosh-app", project.primaryWorkspaceId)
+        val newPrimary = project.workspaces.single { it.workspaceId == "ws-choosh-agent-b" }
+
+        viewModel.setPrimaryWorkspace(project, newPrimary)
+        advanceUntilIdle()
+
+        val updated = viewModel.state.value.rows.filterIsInstance<FleetRow.ProjectRow>().single { it.project.projectId == "proj-choosh" }
+        assertEquals("ws-choosh-agent-b", updated.project.primaryWorkspaceId)
+        assertEquals(null, viewModel.state.value.error)
+    }
+
+    @Test
+    fun `setPrimaryWorkspace with a workspace outside the project is rejected, not silently applied`() =
+        runTest(mainDispatcherRule.dispatcher) {
+            val engine = FakeChooshEngine()
+            engine.connect("fake-session-credential")
+            val viewModel = FleetViewModel(engine)
+            advanceUntilIdle()
+
+            val projectRow = viewModel.state.value.rows.filterIsInstance<FleetRow.ProjectRow>().single { it.project.projectId == "proj-choosh" }
+            val project = projectRow.project
+            val foreignWorkspace = Workspace(
+                workspaceId = "ws-sidecar-main",
+                name = "main",
+                devHostId = "dev-build-box-large",
+                needsAttention = false,
+                lastActiveAt = "2026-08-14T18:00:00Z",
+            )
+
+            viewModel.setPrimaryWorkspace(project, foreignWorkspace)
+            advanceUntilIdle()
+
+            val state = viewModel.state.value
+            assertNotNull("a mismatched project/workspace pair must surface an error, not silently apply", state.error)
+            val unchanged = state.rows.filterIsInstance<FleetRow.ProjectRow>().single { it.project.projectId == "proj-choosh" }
+            assertEquals("ws-choosh-app", unchanged.project.primaryWorkspaceId)
+        }
 }
