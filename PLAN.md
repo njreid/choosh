@@ -41,11 +41,27 @@ tunnel, no client-side auth" posture.
 
 Not blocking, but real and worth tracking rather than leaving implicit:
 
-- **No live `relayd` deployment.** First real end-to-end verification
-  (phone → relay → devhost, `NativeChooshEngine` instead of the fake)
-  hasn't happened. `just deploy` and its rollback path are verified
-  against a real EC2 instance (`devhost`, used as a stand-in), but no
-  dedicated `relayd` production instance exists yet.
+- **A real `relayd` deployment now exists, but only the `relayd` half of
+  end-to-end verification is done.** A temporary EC2 instance
+  (`i-01b9022a1d5d83ed0`, tagged `relayd-test`, `t3.micro`, us-east-1, own
+  minimal security group with no inbound rules — SSM Run Command needs
+  none) was provisioned and `just deploy relayd-test us-east-1` shipped a
+  real release build of `choosh-relayd` to it over the already-verified
+  SSM deploy path — the first real, non-`devhost`-stand-in use of that
+  path. Independently re-verified (a separate SSM Run Command, not the
+  deploy script's own health check): `systemctl is-active
+  choosh-relayd.service` → `active`, `GET /healthz` → `200 ok`. Still not
+  a phone → relay → devhost round trip: `choosh-relayd` binds loopback-only
+  (`127.0.0.1:7443`, per `deploy-relayd.sh`'s default) with no public
+  inbound rule, no TLS termination, and no DNS name — the Android app's
+  release default (`wss://relay.choosh.ai/connect`) needs all three plus a
+  matching WebAuthn RP ID before a real device could enroll against it.
+  Opening this instance to the public internet is a distinct, more
+  consequential decision (real inbound exposure, a real cert/DNS) than
+  provisioning the instance itself, and wasn't taken unilaterally. No
+  `choosh-hostd` has enrolled against this instance either. This instance
+  is temporary and should be terminated once its purpose is served —
+  not left running as an unmanaged, unmonitored resource.
 - **`relayd`'s registry (`devices`, `tokens`, `phone_sessions`, `fcm_tokens`)
   is in-memory only, with no disk persistence beyond the enrollment CA key
   itself** — `rust/choosh-relayd/src/state.rs`'s crate-level doc comment
