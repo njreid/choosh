@@ -33,7 +33,7 @@ public final class NotificationServiceLifecycle {
 
     public boolean isStarted() { return started; }
 
-    private void onIntent(NotificationIntent intent) {
+    private void onIntent(RenderableNotification intent) {
         if (started) projector.apply(Objects.requireNonNull(intent, "intent"));
     }
 }

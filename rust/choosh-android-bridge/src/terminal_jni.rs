@@ -262,6 +262,11 @@ fn native_terminal_surface_created<'local>(env: &mut Env<'local>, _class: JClass
                 renderer.resize(width, height);
                 let (cols, rows) = renderer.cells_for_size(width, height);
                 engine.resize(cols, rows);
+                // See `native_terminal_surface_changed`'s identical rationale.
+                alog(&format!(
+                    "terminal_surface_resized(deferred) width_px={width} height_px={height} cell_width={} cell_height={} cols={cols} rows={rows}",
+                    renderer.cell_width, renderer.cell_height
+                ));
             }
         }
         drop(guard);
@@ -284,6 +289,20 @@ fn native_terminal_surface_changed(_env: &mut Env<'_>, _class: JClass<'_>, handl
             renderer.resize(width_px, height_px);
             let (cols, rows) = renderer.cells_for_size(width_px, height_px);
             engine.resize(cols, rows);
+            // Real, low-frequency (once per surface resize — rotation,
+            // window resize, DeX/external-display attach) diagnostic
+            // logging: the authoritative on-device evidence that `cols`/
+            // `rows` are genuinely derived from the real surface pixel
+            // size and the loaded font's measured cell metrics, per
+            // `terminal-experience.md`'s "derive terminal cell metrics
+            // from the exact loaded face" and
+            // `docs/accessibility-device-report.md`'s item 3/4 finding
+            // that the grid stayed pinned at a hardcoded 80x24 regardless
+            // of real surface size.
+            alog(&format!(
+                "terminal_surface_resized width_px={width_px} height_px={height_px} cell_width={} cell_height={} cols={cols} rows={rows}",
+                renderer.cell_width, renderer.cell_height
+            ));
             renderer.draw(engine);
             *pending_size = None;
         }
@@ -323,10 +342,19 @@ fn native_terminal_send_key(
     let Some(key) = key_from_code(key_code) else { return Ok(()) };
     let mods = Modifiers { ctrl, alt, shift };
     with_session(handle, (), |h| {
-        let bytes = {
+        let (bytes, attached) = {
             let guard = h.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.engine.encode_key(key, mods)
+            (guard.engine.encode_key(key, mods), guard.pty_tx.is_some())
         };
+        // Real, low-frequency (human-typing-paced) diagnostic logging —
+        // key codes and modifier flags only, never any character content,
+        // per `terminal-experience.md`'s "Clipboard contents and terminal
+        // text MUST NOT be logged". This is the on-device evidence channel
+        // for confirming a real hardware key genuinely reached the Rust
+        // engine (`docs/accessibility-device-report.md`'s item 2): before
+        // this pass there was no call site anywhere that could produce
+        // this log line at all.
+        alog(&format!("terminal_send_key key_code={key_code} ctrl={ctrl} alt={alt} shift={shift} encoded_len={} pty_attached={attached}", bytes.len()));
         send_bytes(h, &bytes);
     });
     Ok(())
@@ -357,15 +385,20 @@ fn key_from_code(code: jint) -> Option<Key> {
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 fn native_terminal_send_text<'local>(env: &mut Env<'local>, _class: JClass<'local>, handle: jlong, text: JString<'local>, ctrl: jboolean, alt: jboolean) -> Result<(), jni::errors::Error> {
     let text = jstring_to_string(env, &text);
+    let char_count = text.chars().count();
     let mods = Modifiers { ctrl, alt, shift: false };
     with_session(handle, (), |h| {
         let mut out = Vec::new();
-        {
+        let attached = {
             let guard = h.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for ch in text.chars() {
                 out.extend(guard.engine.encode_key(Key::Char(ch), mods));
             }
-        }
+            guard.pty_tx.is_some()
+        };
+        // See `native_terminal_send_key`'s identical rationale — length and
+        // modifier flags only, never the committed text itself.
+        alog(&format!("terminal_send_text char_count={char_count} ctrl={ctrl} alt={alt} encoded_len={} pty_attached={attached}", out.len()));
         send_bytes(h, &out);
     });
     Ok(())
@@ -460,6 +493,19 @@ fn native_terminal_test_inject<'local>(env: &mut Env<'local>, _class: JClass<'lo
     Ok(())
 }
 
+/// Returns the current visible grid as plain text (see
+/// [`choosh_terminal_engine::Engine::visible_text`]) — the accessibility
+/// content source `TerminalSurfaceView`'s `ExploreByTouchHelper` virtual
+/// node reads, per `docs/accessibility-device-report.md`'s item 1, gap 2
+/// ("the Terminal surface has zero accessible content") and
+/// `terminal-experience.md`'s "Kotlin owns... accessibility semantics".
+/// Returns an empty string (never null) for an absent/destroyed handle so
+/// Kotlin callers never need a null check.
+fn native_terminal_get_text<'local>(env: &mut Env<'local>, _class: JClass<'local>, handle: jlong) -> Result<JString<'local>, jni::errors::Error> {
+    let text = with_session(handle, String::new(), |h| h.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).engine.visible_text());
+    JString::new(env, text)
+}
+
 #[allow(clippy::unnecessary_wraps)]
 fn native_terminal_destroy(_env: &mut Env<'_>, _class: JClass<'_>, handle: jlong) -> Result<(), jni::errors::Error> {
     if let Some(removed) = SESSIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&handle) {
@@ -523,6 +569,11 @@ const _TEST_INJECT: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.TerminalBridge",
     static extern fn TerminalBridge::native_terminal_test_inject(handle: jlong, bytes: jbyte[]) -> void,
     fn = native_terminal_test_inject,
+};
+const _GET_TEXT: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.TerminalBridge",
+    static extern fn TerminalBridge::native_terminal_get_text(handle: jlong) -> JString,
+    fn = native_terminal_get_text,
 };
 const _DESTROY: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.TerminalBridge",

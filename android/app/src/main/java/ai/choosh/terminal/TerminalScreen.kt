@@ -1,18 +1,28 @@
 package ai.choosh.terminal
 
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import java.nio.charset.StandardCharsets
@@ -75,12 +85,81 @@ fun TerminalScreen(deviceId: String, itemId: String, connectionHandle: Long?, on
             // `factory` call within the same composition isn't guaranteed,
             // so `session.handle` may still be 0 the first time `factory`
             // runs. `update` re-runs whenever the `handle` Compose `State`
-            // it reads changes, so the view gets attached to the real
-            // handle as soon as `create()` actually completes.
-            update = { view -> view.attachSession(session.handle) },
+            // it reads changes (read via `session.handle` below, even
+            // though `attachSession` now takes the whole `session`), so the
+            // view gets attached to the real handle as soon as `create()`
+            // actually completes.
+            update = { view ->
+                @Suppress("UNUSED_EXPRESSION") session.handle // read as a Compose State dependency, see comment above
+                view.attachSession(session)
+            },
             onRelease = { view -> view.detachSession() },
         )
+
+        ExtraKeysBar(session)
     }
+}
+
+/**
+ * The native Compose extra-keys bar `terminal-experience.md`'s "Extra-keys
+ * bar" section requires "immediately above the regular Android keyboard":
+ * one-shot Ctrl, Escape/Tab, the arrow cluster, and Home/End/PgUp/PgDn —
+ * every button sends a typed key command through [TerminalSession.sendKey]
+ * (never a hard-coded escape string), same as the hardware-keyboard path in
+ * [TerminalSurfaceView]. Ctrl is one-shot (applies to the next key on this
+ * bar, then clears itself), per that section's "one-shot behavior is the V1
+ * default". A full `WindowInsets.ime`-following implementation (this bar
+ * always stays docked at the bottom of the column, not truly IME-relative)
+ * and Alt/Meta modifiers are a further increment this pass didn't reach —
+ * this is the required key set, not the full insets/haptics/repeat
+ * polish the spec's fuller bullet list also asks for.
+ */
+@Composable
+private fun ExtraKeysBar(session: TerminalSession) {
+    var ctrlActive by remember { mutableStateOf(false) }
+
+    fun sendKey(code: Int) {
+        session.sendKey(code, ctrl = ctrlActive)
+        ctrlActive = false
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 4.dp, vertical = 4.dp)
+            .testTag("terminal-extra-keys-bar"),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        ExtraKey("Ctrl", "Ctrl modifier, applies to next key", active = ctrlActive, onClick = { ctrlActive = !ctrlActive }, tag = "extra-key-ctrl")
+        ExtraKey("Esc", "Escape", onClick = { sendKey(TerminalKeyMapper.KEY_ESCAPE) }, tag = "extra-key-escape")
+        ExtraKey("Tab", "Tab", onClick = { sendKey(TerminalKeyMapper.KEY_TAB) }, tag = "extra-key-tab")
+        ExtraKey("←", "Left arrow", onClick = { sendKey(TerminalKeyMapper.KEY_LEFT) }, tag = "extra-key-left")
+        ExtraKey("↑", "Up arrow", onClick = { sendKey(TerminalKeyMapper.KEY_UP) }, tag = "extra-key-up")
+        ExtraKey("↓", "Down arrow", onClick = { sendKey(TerminalKeyMapper.KEY_DOWN) }, tag = "extra-key-down")
+        ExtraKey("→", "Right arrow", onClick = { sendKey(TerminalKeyMapper.KEY_RIGHT) }, tag = "extra-key-right")
+        ExtraKey("Home", "Home", onClick = { sendKey(TerminalKeyMapper.KEY_HOME) }, tag = "extra-key-home")
+        ExtraKey("End", "End", onClick = { sendKey(TerminalKeyMapper.KEY_END) }, tag = "extra-key-end")
+        ExtraKey("PgUp", "Page up", onClick = { sendKey(TerminalKeyMapper.KEY_PAGE_UP) }, tag = "extra-key-pgup")
+        ExtraKey("PgDn", "Page down", onClick = { sendKey(TerminalKeyMapper.KEY_PAGE_DOWN) }, tag = "extra-key-pgdn")
+    }
+}
+
+@Composable
+private fun ExtraKey(label: String, description: String, active: Boolean = false, onClick: () -> Unit, tag: String) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier
+            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+            .testTag(tag)
+            .semantics { contentDescription = if (active) "$description, active" else description },
+        colors = if (active) {
+            ButtonDefaults.buttonColors()
+        } else {
+            ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant, contentColor = MaterialTheme.colorScheme.onSurfaceVariant)
+        },
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+    ) { Text(label, style = MaterialTheme.typography.labelLarge) }
 }
 
 /** ANSI byte sequence resembling a colored shell prompt plus `ls -la` output. */

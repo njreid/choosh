@@ -164,14 +164,36 @@ the `device_id` from `relayd`'s active-identity registry immediately.
   notify a revoked device, since it has no standing capability to exercise
   in the meantime (it isn't connected).
 
-**Not yet implemented**: the operator-initiated revoke operation itself —
-a control frame or HTTP route that actually sets a device or phone
-credential revoked — does not exist in `choosh-relayd` today.
-`EnrolledDevice.revoked` and phone-session validity are checked everywhere
-the bullets above describe, so a device that *is* revoked correctly fails
-closed, but nothing in the codebase ever performs the revoke. See
-`docs/security/relayd-threat-model.md` (Case 3) and
-[PLAN.md](../../PLAN.md)'s Known follow-ups.
+**Implemented**: two phone-only control frames,
+`ControlRequest::RevokeDevice { device_id }` and
+`ControlRequest::RevokePhoneSession { device_id }`
+(`rust/choosh-protocol/src/relay.rs`), give an already-authenticated phone
+connection a real way to revoke a device credential or log out a different
+enrolled phone/browser's session — gated to `phone` specifically because
+it's the only Identity class with a `WebAuthn`-authenticated human behind
+it, matching this section's "operator-initiated revoke (from the phone/web,
+itself passkey-gated)" and the capability table above (no other class may
+call either). `RevokeDevice` sets `EnrolledDevice.revoked = true`, which
+`authenticate_device`/`check_open_tunnel_permitted` already honored;
+`RevokePhoneSession` removes every `phone_sessions` entry recorded against
+the target `device_id`. Both go further than only failing a *future*
+connection attempt: `rust/choosh-relayd/src/ws.rs`'s `dispatch` also fires a
+per-connection kill switch (`Registry::kill_switches`, a `oneshot` channel
+`serve_authenticated_loop`'s `tokio::select!` listens on) that closes the
+target's live connection immediately, if it has one, satisfying "no
+in-flight tunnels for that device survive revocation" without waiting for
+it to disconnect on its own. Covered by
+`revoking_a_device_closes_its_live_connection_immediately`,
+`a_revoked_devices_next_connection_attempt_fails_to_authenticate`, and
+`revoking_a_phone_session_closes_its_live_connection_immediately`
+(`rust/choosh-relayd/src/integration_tests.rs`), each against a real
+already-connected socket, not just the registry state. Revocation still only
+holds for one running `relayd` process's lifetime, since `Registry` has no
+disk persistence yet — see [PLAN.md](../../PLAN.md)'s Known follow-ups for
+that gap on its own terms (a restart already invalidates every credential in
+the fleet, a strictly stronger reset than any specific revoke, so this
+doesn't weaken the guarantee above, just bounds its scope to "while `relayd`
+has been running continuously").
 
 ## Explicit non-goal
 

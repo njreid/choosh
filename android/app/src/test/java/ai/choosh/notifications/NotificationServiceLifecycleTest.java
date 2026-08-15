@@ -21,6 +21,17 @@ public final class NotificationServiceLifecycleTest {
         assertEquals(1, source.stops);
     }
 
+    @Test public void projectsAuthRequiredIntentsThroughTheSameLifecycle() {
+        FakeSource source = new FakeSource();
+        RecordingSink sink = new RecordingSink();
+        NotificationServiceLifecycle service = new NotificationServiceLifecycle(source,
+                new NotificationProjector(sink));
+        service.start();
+        source.emit(new AuthNotificationIntent("h", "aws", "WDJB-MJHT", "https://example.com/device"));
+        service.stop();
+        assertEquals(List.of("upsert:h:auth:aws", "clear:h:auth:aws"), sink.operations);
+    }
+
     @Test public void stopBeforeStartDoesNothing() {
         FakeSource source = new FakeSource();
         NotificationServiceLifecycle service = new NotificationServiceLifecycle(source,
@@ -34,14 +45,14 @@ public final class NotificationServiceLifecycleTest {
         return new NotificationIntent("h", "w", id, "Workspace", "Agent", "question");
     }
     private static final class FakeSource implements NotificationSource {
-        Consumer<NotificationIntent> listener; int starts; int stops;
-        public void start(Consumer<NotificationIntent> listener) { this.listener = listener; starts++; }
+        Consumer<RenderableNotification> listener; int starts; int stops;
+        public void start(Consumer<RenderableNotification> listener) { this.listener = listener; starts++; }
         public void stop() { stops++; }
-        void emit(NotificationIntent intent) { listener.accept(intent); }
+        void emit(RenderableNotification intent) { listener.accept(intent); }
     }
     private static final class RecordingSink implements NotificationSink {
         final List<String> operations = new ArrayList<>();
-        public void upsert(NotificationIntent i) { operations.add("upsert:" + i.key()); }
+        public void upsert(RenderableNotification i) { operations.add("upsert:" + i.key()); }
         public void clear(String key) { operations.add("clear:" + key); }
     }
 }

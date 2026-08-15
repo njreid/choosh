@@ -222,6 +222,15 @@ WantedBy=default.target
 # KillMode=process fix above, for the exact same reason (Zellij's server
 # and choosh-hostd::update's rollback watchdog must survive a self-update
 # restart).
+#
+# No plist keys are added here for docs/specs/host-deployment.md's power-
+# assertion requirement (rust/choosh-hostd/src/power_assertion.rs):
+# IOPMAssertionCreateWithName is a runtime IOKit call the running process
+# makes for itself, not a launchd job-configuration concern — there is no
+# ProcessType/LowPriorityIO-style plist key that grants or is required for
+# permission to hold a power assertion, and the per-user LaunchAgent
+# GUI-session context this plist already runs in (RunAtLoad/KeepAlive
+# above) is sufficient for that call to succeed.
 write_launchd_plist() {
 	plist_dir="$HOME/Library/LaunchAgents"
 	plist_path="$plist_dir/ai.choosh.hostd.plist"

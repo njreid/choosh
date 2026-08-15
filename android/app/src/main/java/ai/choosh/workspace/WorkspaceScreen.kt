@@ -8,14 +8,19 @@ import ai.choosh.jj.JjChangeGraphViewModel
 import ai.choosh.jj.JjDiffScreen
 import ai.choosh.jj.JjDiffViewModel
 import ai.choosh.singleInstanceFactory
+import ai.choosh.ui.WindowWidthSizeClass
+import ai.choosh.ui.rememberWindowWidthSizeClass
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.Button
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
@@ -109,49 +114,102 @@ fun WorkspaceScreen(
                 }
             }
         }
-        TabRow(selectedTabIndex = tab) {
-            WorkspaceTab.entries.forEachIndexed { index, entry ->
-                Tab(
-                    selected = tab == index,
-                    onClick = { tab = index },
-                    text = { Text(entry.name.lowercase().replaceFirstChar { it.uppercase() }) },
-                    modifier = Modifier.testTag("workspace-tab-${entry.name.lowercase()}"),
-                )
-            }
-        }
-
-        when (WorkspaceTab.entries[tab]) {
-            WorkspaceTab.EXPLORER -> {
-                val state by explorerViewModel.state.collectAsState()
+        // Adaptive layout, per `docs/accessibility-device-report.md`'s
+        // item 3/4: at Compact/Medium widths, keep the existing
+        // single-pane tab behavior unchanged (a phone-shaped three-way
+        // tab switcher is the right shape there). At Expanded widths
+        // (tablet, DeX, external display), a real master-detail split —
+        // Explorer permanently visible on the left, Diff/Graph switchable
+        // on the right — uses the extra width instead of stretching the
+        // same single pane the phone layout uses, per that finding's
+        // "no master-detail split... that doesn't make sense at desktop
+        // aspect ratio".
+        if (rememberWindowWidthSizeClass() == WindowWidthSizeClass.EXPANDED) {
+            var detailTab by remember { mutableIntStateOf(WorkspaceTab.DIFF.ordinal) }
+            Row(Modifier.fillMaxSize().testTag("workspace-expanded-master-detail")) {
+                val explorerState by explorerViewModel.state.collectAsState()
                 ExplorerScreen(
-                    state = state,
-                    onFileClick = { tab = WorkspaceTab.DIFF.ordinal },
+                    state = explorerState,
+                    onFileClick = { detailTab = WorkspaceTab.DIFF.ordinal },
                     onRefresh = explorerViewModel::refresh,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.width(360.dp).fillMaxHeight().testTag("workspace-master-pane"),
                 )
+                HorizontalDivider(modifier = Modifier.fillMaxHeight().width(1.dp))
+                Column(Modifier.weight(1f).fillMaxHeight().testTag("workspace-detail-pane")) {
+                    TabRow(selectedTabIndex = detailTab - WorkspaceTab.DIFF.ordinal) {
+                        listOf(WorkspaceTab.DIFF, WorkspaceTab.GRAPH).forEachIndexed { index, entry ->
+                            Tab(
+                                selected = detailTab == entry.ordinal,
+                                onClick = { detailTab = entry.ordinal },
+                                text = { Text(entry.name.lowercase().replaceFirstChar { it.uppercase() }) },
+                                modifier = Modifier.testTag("workspace-detail-tab-${entry.name.lowercase()}"),
+                            )
+                        }
+                    }
+                    when (WorkspaceTab.entries[detailTab]) {
+                        WorkspaceTab.DIFF -> {
+                            val state by diffViewModel.state.collectAsState()
+                            JjDiffScreen(state = state, onFromChange = diffViewModel::setFrom, onToChange = diffViewModel::setTo, onLoad = diffViewModel::load, modifier = Modifier.weight(1f))
+                        }
+                        else -> {
+                            val state by graphViewModel.state.collectAsState()
+                            JjChangeGraphScreen(
+                                state = state,
+                                onNodeTap = graphViewModel::selectChange,
+                                onDismissSelection = graphViewModel::dismissSelection,
+                                onUndoMostRecent = graphViewModel::undoMostRecentOperation,
+                                onRestore = graphViewModel::restore,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            TabRow(selectedTabIndex = tab) {
+                WorkspaceTab.entries.forEachIndexed { index, entry ->
+                    Tab(
+                        selected = tab == index,
+                        onClick = { tab = index },
+                        text = { Text(entry.name.lowercase().replaceFirstChar { it.uppercase() }) },
+                        modifier = Modifier.testTag("workspace-tab-${entry.name.lowercase()}"),
+                    )
+                }
             }
 
-            WorkspaceTab.DIFF -> {
-                val state by diffViewModel.state.collectAsState()
-                JjDiffScreen(
-                    state = state,
-                    onFromChange = diffViewModel::setFrom,
-                    onToChange = diffViewModel::setTo,
-                    onLoad = diffViewModel::load,
-                    modifier = Modifier.weight(1f),
-                )
-            }
+            when (WorkspaceTab.entries[tab]) {
+                WorkspaceTab.EXPLORER -> {
+                    val state by explorerViewModel.state.collectAsState()
+                    ExplorerScreen(
+                        state = state,
+                        onFileClick = { tab = WorkspaceTab.DIFF.ordinal },
+                        onRefresh = explorerViewModel::refresh,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
 
-            WorkspaceTab.GRAPH -> {
-                val state by graphViewModel.state.collectAsState()
-                JjChangeGraphScreen(
-                    state = state,
-                    onNodeTap = graphViewModel::selectChange,
-                    onDismissSelection = graphViewModel::dismissSelection,
-                    onUndoMostRecent = graphViewModel::undoMostRecentOperation,
-                    onRestore = graphViewModel::restore,
-                    modifier = Modifier.weight(1f),
-                )
+                WorkspaceTab.DIFF -> {
+                    val state by diffViewModel.state.collectAsState()
+                    JjDiffScreen(
+                        state = state,
+                        onFromChange = diffViewModel::setFrom,
+                        onToChange = diffViewModel::setTo,
+                        onLoad = diffViewModel::load,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+
+                WorkspaceTab.GRAPH -> {
+                    val state by graphViewModel.state.collectAsState()
+                    JjChangeGraphScreen(
+                        state = state,
+                        onNodeTap = graphViewModel::selectChange,
+                        onDismissSelection = graphViewModel::dismissSelection,
+                        onUndoMostRecent = graphViewModel::undoMostRecentOperation,
+                        onRestore = graphViewModel::restore,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
             }
         }
     }

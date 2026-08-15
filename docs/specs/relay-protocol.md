@@ -177,8 +177,30 @@ frame received from that Identity, control or tunnel.
   faster than `relayd` can process (e.g. `list-devhosts` polling) MUST be
   rate limited per-Identity; exceeding the limit MUST close the connection
   rather than silently dropping requests, so a client can detect and back
-  off rather than getting inconsistent responses. **Not yet implemented**:
-  `choosh-relayd` has no connection-flood or per-Identity request-rate
-  limiting today — an accepted-risk gap tracked in
-  `docs/security/relayd-threat-model.md` (Case 5) and
-  [PLAN.md](../../PLAN.md)'s Known follow-ups.
+  off rather than getting inconsistent responses. **Implemented**: a
+  connection-local token bucket (`rust/choosh-relayd/src/ws.rs`'s
+  `RateLimiter`) enforces this on every dispatched control frame, including
+  `open-tunnel` — burst `CONTROL_FRAME_RATE_LIMIT_BURST` (40) requests,
+  refilling at `CONTROL_FRAME_RATE_LIMIT_PER_SECOND` (20) per second
+  (`rust/choosh-relayd/src/state.rs`), both generous relative to any
+  legitimate control-plane workload this codebase exercises today.
+  Exceeding it sends a typed `ControlResponse::Error { code: "rate_limited",
+  .. }` best-effort, then closes the connection, matching this section's
+  requirement exactly rather than silently dropping requests. Per-connection
+  state suffices, not a shared registry structure, since this protocol's
+  Transport section already guarantees exactly one live connection per
+  Identity at a time. Covered by
+  `exceeding_the_control_frame_rate_limit_returns_a_typed_error_and_closes_the_connection`
+  and `a_moderate_burst_of_control_frames_is_never_rate_limited`
+  (`rust/choosh-relayd/src/integration_tests.rs`).
+- Similarly, an authenticated connection that never completes another frame
+  at all (control or tunnel) — as opposed to a *tunnel* with no data frames,
+  which the "Close" bullet above already covers — is closed by `relayd`
+  after `AppState::connection_idle_timeout` (production default 30 minutes;
+  `rust/choosh-relayd/src/lib.rs`/`state.rs`'s `CONNECTION_IDLE_TIMEOUT_SECONDS`).
+  Set well above the tunnel timeout since this protocol has no periodic
+  application-level heartbeat, so an authenticated machine Identity sitting
+  idle with no open tunnels is an ordinary, legitimate state, not itself a
+  sign of a stalled connection. Covered by
+  `an_authenticated_connection_that_sends_nothing_further_is_eventually_closed`
+  and `a_connection_that_keeps_sending_frames_is_not_reaped_as_idle`.

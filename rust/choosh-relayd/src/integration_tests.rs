@@ -25,6 +25,16 @@ struct TestServer {
 }
 
 async fn spawn_server() -> TestServer {
+    spawn_server_with_connection_idle_timeout(None).await
+}
+
+/// [`spawn_server`]'s sibling for the connection-idle-timeout test, which
+/// needs `relayd` to reap an idle connection within a real `#[tokio::test]`'s
+/// patience rather than the real (30-minute) production value —
+/// `connection_idle_timeout` is overridden via `Arc::get_mut` while this
+/// function is still the state's sole owner, before it's cloned into the
+/// router and spawned.
+async fn spawn_server_with_connection_idle_timeout(override_timeout: Option<std::time::Duration>) -> TestServer {
     // Off by default; set RUST_LOG=trace (or similar) to see wire-level
     // tracing when debugging a failing test.
     let _ = tracing_subscriber::fmt()
@@ -32,7 +42,12 @@ async fn spawn_server() -> TestServer {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
     let dir = std::env::temp_dir().join(format!("choosh-relayd-itest-{}", uuid::Uuid::new_v4()));
-    let state = build_state_in(&dir);
+    let mut state = build_state_in(&dir);
+    if let Some(timeout) = override_timeout {
+        Arc::get_mut(&mut state)
+            .expect("sole owner of state before it's cloned into the router")
+            .connection_idle_timeout = timeout;
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
     let app = router(state.clone());
@@ -237,20 +252,32 @@ async fn open_tunnel(requester: &mut WsStream, target: &mut WsStream, target_dev
 }
 
 async fn authenticated_phone(server: &TestServer) -> WsStream {
+    authenticated_phone_with_device_id(server, "phone-test").await.0
+}
+
+/// [`authenticated_phone`]'s parameterized sibling, needed by any test that
+/// authenticates more than one distinct phone/browser Identity at once (e.g.
+/// a revoke-phone-session test, which needs a "revoker" session and a
+/// distinct "target" session with its own `device_id` — `authenticated_phone`
+/// alone can't express that, since every call it makes uses the same fixed
+/// `"phone-test"` `device_id`). Returns the live connection, the `device_id`
+/// the caller asked for, and the raw session credential (so a test can try
+/// re-authenticating with it directly after a revoke).
+async fn authenticated_phone_with_device_id(server: &TestServer, device_id: &str) -> (WsStream, String, String) {
     let credential = format!("test-session-{}", uuid::Uuid::new_v4());
     server.state.registry.phone_sessions.write().await.insert(
         credential.clone(),
         crate::state::PhoneSession {
-            device_id: "phone-test".to_string(),
+            device_id: device_id.to_string(),
             expires_at_unix: now_unix() + 900,
         },
     );
     let mut ws = connect(server).await;
     recv_hello(&mut ws).await;
-    send_control(&mut ws, &ClientAuth::Phone(PhoneAuth { session_credential: credential })).await;
+    send_control(&mut ws, &ClientAuth::Phone(PhoneAuth { session_credential: credential.clone() })).await;
     let auth: AuthResult = recv_control(&mut ws).await;
     assert!(matches!(auth, AuthResult::Ok(_)), "expected phone auth to succeed, got {auth:?}");
-    ws
+    (ws, device_id.to_string(), credential)
 }
 
 #[tokio::test]
@@ -1006,4 +1033,307 @@ async fn fleet_view_tracks_two_devhosts_in_different_accounts_with_independent_p
     let (received_id, payload) = recv_tunnel_frame(&mut devhost_b).await;
     assert_eq!(received_id, tunnel_id);
     assert_eq!(payload, b"still isolated");
+}
+
+// --- M8 follow-ups: revocation, per-Identity rate limiting, idle-connection
+// timeout -----------------------------------------------------------------
+//
+// Closes the three real gaps `docs/security/relayd-threat-model.md` named
+// and left unfixed (Cases 3 and 5): no working revoke path for a device or a
+// phone passkey session, no per-Identity control-frame rate limit despite
+// relay-protocol.md requiring one, and no idle timeout on a connection that
+// authenticates and then never completes another frame.
+
+/// The headline revocation requirement from the task at hand: revoking an
+/// already-*connected* device must disconnect it now, not merely reject its
+/// next reconnect attempt (that half is covered by
+/// `a_revoked_devices_next_connection_attempt_fails_to_authenticate` below).
+#[tokio::test]
+async fn revoking_a_device_closes_its_live_connection_immediately() {
+    let server = spawn_server().await;
+    let mut phone = authenticated_phone(&server).await;
+    let (mut devhost, devhost_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+
+    send_control(&mut phone, &ControlRequest::RevokeDevice { request_id: "r".to_string(), device_id: devhost_id.clone() }).await;
+    let response: ControlResponse = recv_control(&mut phone).await;
+    assert!(
+        matches!(&response, ControlResponse::RevokeDeviceOk { device_id, .. } if device_id == &devhost_id),
+        "expected RevokeDeviceOk echoing the target device_id, got {response:?}"
+    );
+
+    // The live connection must close promptly (bounded wait, not a hang —
+    // a hang here would mean the revoke only updated the registry without
+    // actually disconnecting anything).
+    let next = tokio::time::timeout(std::time::Duration::from_secs(2), devhost.next())
+        .await
+        .expect("revoked device's live connection must close promptly, not hang");
+    assert!(
+        next.is_none() || matches!(next, Some(Ok(WsMessage::Close(_)))),
+        "revoked device's live connection must close, got {next:?}"
+    );
+
+    assert!(
+        server.state.registry.devices.read().await.get(&devhost_id).expect("device still enrolled").revoked,
+        "the registry entry itself must be marked revoked"
+    );
+}
+
+/// The other half of revocation's contract (auth-and-enrollment.md): a
+/// revoked device that was never connected (or has since disconnected) must
+/// fail closed on its *next* connection attempt too, not just have the
+/// registry flag set with no enforced effect.
+#[tokio::test]
+async fn a_revoked_devices_next_connection_attempt_fails_to_authenticate() {
+    let server = spawn_server().await;
+    let mut phone = authenticated_phone(&server).await;
+    let key = SigningKey::generate(&mut crate::rng::os_rng());
+    let (device_id, certificate) = enroll_devhost(&server, &key).await; // enrolled, never connected
+
+    send_control(&mut phone, &ControlRequest::RevokeDevice { request_id: "r".to_string(), device_id: device_id.clone() }).await;
+    let response: ControlResponse = recv_control(&mut phone).await;
+    assert!(matches!(response, ControlResponse::RevokeDeviceOk { .. }), "expected RevokeDeviceOk, got {response:?}");
+
+    let mut ws = connect(&server).await;
+    let nonce = recv_hello(&mut ws).await;
+    send_control(&mut ws, &device_auth_for(&nonce, &device_id, &key, certificate)).await;
+    let auth: AuthResult = recv_control(&mut ws).await;
+    assert!(matches!(auth, AuthResult::Failed(_)), "a revoked device must fail to authenticate: {auth:?}");
+}
+
+#[tokio::test]
+async fn revoke_device_is_rejected_from_a_non_phone_identity() {
+    let server = spawn_server().await;
+    let (mut devhost, devhost_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+
+    send_control(&mut devhost, &ControlRequest::RevokeDevice { request_id: "r".to_string(), device_id: devhost_id }).await;
+    let response: ControlResponse = recv_control(&mut devhost).await;
+    assert!(
+        matches!(&response, ControlResponse::Error { code, .. } if code == "not_permitted"),
+        "a devhost calling revoke-device must be rejected: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn revoking_an_unknown_device_id_returns_a_typed_error() {
+    let server = spawn_server().await;
+    let mut phone = authenticated_phone(&server).await;
+
+    send_control(&mut phone, &ControlRequest::RevokeDevice { request_id: "r".to_string(), device_id: "dev-does-not-exist".to_string() }).await;
+    let response: ControlResponse = recv_control(&mut phone).await;
+    assert!(
+        matches!(&response, ControlResponse::Error { code, .. } if code == "unknown_device"),
+        "revoking a never-enrolled device_id must fail with a typed error, got {response:?}"
+    );
+}
+
+/// The phone-session analogue of `revoking_a_device_closes_its_live_connection_immediately`:
+/// one already-authenticated phone session ("revoker") logs out a *different*
+/// enrolled phone/browser's session ("target"), and the target's live
+/// connection must close immediately, not merely have its session credential
+/// invalidated for a future reconnect it never attempts in this test.
+#[tokio::test]
+async fn revoking_a_phone_session_closes_its_live_connection_immediately() {
+    let server = spawn_server().await;
+    let (mut revoker, _revoker_id, _revoker_credential) =
+        authenticated_phone_with_device_id(&server, "phone-revoker").await;
+    let (mut target, target_id, target_credential) =
+        authenticated_phone_with_device_id(&server, "phone-target").await;
+
+    send_control(&mut revoker, &ControlRequest::RevokePhoneSession { request_id: "r".to_string(), device_id: target_id.clone() }).await;
+    let response: ControlResponse = recv_control(&mut revoker).await;
+    assert!(
+        matches!(&response, ControlResponse::RevokePhoneSessionOk { device_id, .. } if device_id == &target_id),
+        "expected RevokePhoneSessionOk echoing the target device_id, got {response:?}"
+    );
+
+    let next = tokio::time::timeout(std::time::Duration::from_secs(2), target.next())
+        .await
+        .expect("revoked phone session's live connection must close promptly, not hang");
+    assert!(
+        next.is_none() || matches!(next, Some(Ok(WsMessage::Close(_)))),
+        "revoked phone session's live connection must close, got {next:?}"
+    );
+
+    // The stored session credential itself must be gone, so a future
+    // reconnect attempt with it fails closed too (auth-and-enrollment.md: "a
+    // revoked phone passkey credential invalidates that credential's stored
+    // session token immediately").
+    let mut reconnect = connect(&server).await;
+    recv_hello(&mut reconnect).await;
+    send_control(&mut reconnect, &ClientAuth::Phone(PhoneAuth { session_credential: target_credential })).await;
+    let auth: AuthResult = recv_control(&mut reconnect).await;
+    assert!(matches!(auth, AuthResult::Failed(_)), "a revoked phone session credential must fail to re-authenticate: {auth:?}");
+}
+
+#[tokio::test]
+async fn revoke_phone_session_is_rejected_from_a_non_phone_identity() {
+    let server = spawn_server().await;
+    let (mut devhost, _devhost_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+
+    send_control(&mut devhost, &ControlRequest::RevokePhoneSession { request_id: "r".to_string(), device_id: "phone-test".to_string() }).await;
+    let response: ControlResponse = recv_control(&mut devhost).await;
+    assert!(
+        matches!(&response, ControlResponse::Error { code, .. } if code == "not_permitted"),
+        "a devhost calling revoke-phone-session must be rejected: {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn revoking_an_unknown_phone_session_device_id_returns_a_typed_error() {
+    let server = spawn_server().await;
+    let mut phone = authenticated_phone(&server).await;
+
+    send_control(&mut phone, &ControlRequest::RevokePhoneSession { request_id: "r".to_string(), device_id: "phone-does-not-exist".to_string() }).await;
+    let response: ControlResponse = recv_control(&mut phone).await;
+    assert!(
+        matches!(&response, ControlResponse::Error { code, .. } if code == "unknown_device"),
+        "revoking a device_id with no recorded phone session must fail with a typed error, got {response:?}"
+    );
+}
+
+/// relay-protocol.md's "Errors and backpressure": control-frame requests
+/// exceeding the per-Identity rate limit "MUST close the connection rather
+/// than silently dropping requests, so a client can detect and back off".
+/// This sends comfortably more requests than `CONTROL_FRAME_RATE_LIMIT_BURST`
+/// back-to-back (no `.await`-yielding delay between sends, so the token
+/// bucket's real-time refill cannot meaningfully replenish mid-burst) and
+/// asserts both halves of that requirement: a typed `rate_limited` error is
+/// actually observed (not a silent drop), and the connection then genuinely
+/// closes (not just refuses further requests while staying open).
+#[tokio::test]
+async fn exceeding_the_control_frame_rate_limit_returns_a_typed_error_and_closes_the_connection() {
+    let server = spawn_server().await;
+    let mut phone = authenticated_phone(&server).await;
+
+    let burst = crate::state::CONTROL_FRAME_RATE_LIMIT_BURST as usize;
+    let attempts = burst + 20;
+    for i in 0..attempts {
+        let request = ControlRequest::ListDevhosts { request_id: format!("r{i}") };
+        let frame = encode_control(&request).expect("encodable control frame");
+        // Tolerant of a write failing partway through: the server may have
+        // already closed the connection by the time we try to send a later
+        // request in this burst, which is a pass condition for this test,
+        // not a bug to paper over.
+        if phone.send(WsMessage::Binary(frame.into())).await.is_err() {
+            break;
+        }
+    }
+
+    let mut decoder = new_decoder();
+    let mut ok_count = 0usize;
+    let mut saw_rate_limited = false;
+    let mut saw_close = false;
+    let read_all = async {
+        loop {
+            let Some(message) = phone.next().await else {
+                saw_close = true;
+                break;
+            };
+            let Ok(message) = message else {
+                saw_close = true;
+                break;
+            };
+            match message {
+                WsMessage::Binary(bytes) => {
+                    let frames = decoder.feed(&bytes).expect("well-formed frame");
+                    for frame in frames {
+                        let response: ControlResponse =
+                            crate::wire::decode_control(&frame).expect("decodable control frame");
+                        match response {
+                            ControlResponse::ListDevhostsOk { .. } => ok_count += 1,
+                            ControlResponse::Error { code, .. } if code == "rate_limited" => {
+                                saw_rate_limited = true;
+                            }
+                            other => panic!("unexpected response: {other:?}"),
+                        }
+                    }
+                }
+                WsMessage::Close(_) => {
+                    saw_close = true;
+                    break;
+                }
+                _ => {}
+            }
+            if saw_rate_limited && saw_close {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), read_all)
+        .await
+        .expect("rate-limited connection must close promptly, not hang or silently keep accepting");
+
+    assert!(ok_count >= burst.saturating_sub(1), "expected close to the full burst allowance to succeed before rejection, got {ok_count}");
+    assert!(saw_rate_limited, "expected a typed rate_limited error, not a silent drop");
+    assert!(saw_close, "expected the connection to actually close after the rate limit is exceeded");
+}
+
+/// A real, bursty-but-legitimate caller (comfortably under the burst
+/// allowance, not back-to-back with zero delay) must never observe the rate
+/// limit — this is the negative complement to the flood test above, guarding
+/// against the bound being accidentally too tight for ordinary use.
+#[tokio::test]
+async fn a_moderate_burst_of_control_frames_is_never_rate_limited() {
+    let server = spawn_server().await;
+    let mut phone = authenticated_phone(&server).await;
+
+    let burst = crate::state::CONTROL_FRAME_RATE_LIMIT_BURST as usize;
+    for i in 0..(burst / 2) {
+        send_control(&mut phone, &ControlRequest::ListDevhosts { request_id: format!("r{i}") }).await;
+        let response: ControlResponse = recv_control(&mut phone).await;
+        assert!(
+            matches!(response, ControlResponse::ListDevhostsOk { .. }),
+            "request {i} of a moderate burst must not be rate limited, got {response:?}"
+        );
+    }
+}
+
+/// Covers relayd-threat-model.md's "no idle timeout on a connection stalled
+/// mid-frame" finding: an authenticated connection that sends nothing
+/// further — not even a truncated frame — must eventually be closed by
+/// `relayd`, rather than held open indefinitely. Uses a short, test-only
+/// override of `AppState::connection_idle_timeout` (real time, no
+/// `tokio::time::pause`/`advance` needed) so this observes the real
+/// production code path within a `#[tokio::test]`'s patience.
+#[tokio::test]
+async fn an_authenticated_connection_that_sends_nothing_further_is_eventually_closed() {
+    let idle_timeout = std::time::Duration::from_millis(300);
+    let server = spawn_server_with_connection_idle_timeout(Some(idle_timeout)).await;
+    let (mut devhost, _devhost_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+
+    // Authenticating itself completes real frames (ServerHello, ClientAuth,
+    // AuthResult) before `serve_authenticated_loop` even starts, so the idle
+    // clock only starts ticking once that's done — send nothing at all from
+    // here on and just wait past the override.
+    let next = tokio::time::timeout(idle_timeout * 10, devhost.next())
+        .await
+        .expect("a genuinely silent connection must eventually close, not hang forever");
+    assert!(
+        next.is_none() || matches!(next, Some(Ok(WsMessage::Close(_)))),
+        "a connection with no frames since authenticating must be closed once idle, got {next:?}"
+    );
+}
+
+/// The negative complement: a connection that keeps completing frames (even
+/// ones the request stream never reads a response to matters less than the
+/// fact that *a* frame keeps completing) must NOT be reaped just because the
+/// override is short — the idle clock has to genuinely reset on activity,
+/// not just run out unconditionally after the override elapses once.
+#[tokio::test]
+async fn a_connection_that_keeps_sending_frames_is_not_reaped_as_idle() {
+    let idle_timeout = std::time::Duration::from_millis(300);
+    let server = spawn_server_with_connection_idle_timeout(Some(idle_timeout)).await;
+    let mut phone = authenticated_phone(&server).await;
+
+    // Keep the connection active for several multiples of the idle timeout
+    // by sending a real control frame well inside every window.
+    for i in 0..6 {
+        tokio::time::sleep(idle_timeout / 3).await;
+        send_control(&mut phone, &ControlRequest::ListDevhosts { request_id: format!("r{i}") }).await;
+        let response: ControlResponse = recv_control(&mut phone).await;
+        assert!(
+            matches!(response, ControlResponse::ListDevhostsOk { .. }),
+            "an actively-used connection must not be closed as idle, got {response:?}"
+        );
+    }
 }

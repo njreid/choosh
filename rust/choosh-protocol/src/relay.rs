@@ -285,6 +285,58 @@ pub enum ControlRequest {
         request_id: String,
         fcm_token: String,
     },
+    /// Phone-only. Sets `revoked = true` for `device_id` (a previously
+    /// enrolled devhost or laptop-proxy Identity), per
+    /// auth-and-enrollment.md's "Revocation" section — `relayd` is the sole
+    /// source of truth for whether a `device_id` is still valid, not
+    /// certificate expiry alone. A revoked device's *next* connection
+    /// attempt already fails closed at the challenge/signature step
+    /// (`authenticate_device`); this frame additionally disconnects that
+    /// device's *current* live connection immediately, if it has one,
+    /// rather than leaving it to keep running under a since-revoked
+    /// credential until it happens to reconnect.
+    RevokeDevice {
+        request_id: String,
+        device_id: String,
+    },
+    /// Phone-only. Invalidates every phone-session credential recorded
+    /// against `device_id` (auth-and-enrollment.md: "may hold multiple
+    /// passkey credentials, one per enrolled phone/browser") and
+    /// disconnects that Identity's live connection immediately if it's
+    /// currently online — the phone-session analogue of `RevokeDevice`,
+    /// e.g. "log out this device's passkey session" from another
+    /// already-authenticated phone session. `device_id` here identifies the
+    /// enrolled phone/browser being logged out (`PhoneSession::device_id`),
+    /// not the opaque session-credential bearer token itself, which a
+    /// revoking session has no legitimate way to know for a session other
+    /// than its own.
+    RevokePhoneSession {
+        request_id: String,
+        device_id: String,
+    },
+}
+
+impl ControlRequest {
+    /// Every variant carries a client-generated `request_id`, echoed back in
+    /// the matching [`ControlResponse`] (see [`ControlResponse::request_id`])
+    /// per relay-protocol.md's "Control frames" section. Used by `relayd`
+    /// to attach a caller's own `request_id` to an error it needs to send
+    /// before a request has been fully dispatched (e.g. a per-Identity
+    /// rate-limit rejection).
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Enroll { request_id, .. }
+            | Self::RequestEnrollmentToken { request_id, .. }
+            | Self::ListDevhosts { request_id, .. }
+            | Self::ListDevhostSshEndpoints { request_id, .. }
+            | Self::OpenTunnel { request_id, .. }
+            | Self::AgentEvent { request_id, .. }
+            | Self::RegisterFcmToken { request_id, .. }
+            | Self::RevokeDevice { request_id, .. }
+            | Self::RevokePhoneSession { request_id, .. } => request_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -327,6 +379,18 @@ pub enum ControlResponse {
     RegisterFcmTokenOk {
         request_id: String,
     },
+    /// `device_id` echoes the revoked target, matching `RevokeDevice`'s
+    /// request field.
+    RevokeDeviceOk {
+        request_id: String,
+        device_id: String,
+    },
+    /// `device_id` echoes the logged-out target, matching
+    /// `RevokePhoneSession`'s request field.
+    RevokePhoneSessionOk {
+        request_id: String,
+        device_id: String,
+    },
     Error {
         request_id: String,
         code: String,
@@ -345,6 +409,8 @@ impl ControlResponse {
             | Self::OpenTunnelOk { request_id, .. }
             | Self::AgentEventOk { request_id, .. }
             | Self::RegisterFcmTokenOk { request_id, .. }
+            | Self::RevokeDeviceOk { request_id, .. }
+            | Self::RevokePhoneSessionOk { request_id, .. }
             | Self::Error { request_id, .. } => request_id,
         }
     }
@@ -492,6 +558,19 @@ mod tests {
         assert!(json.contains("\"type\":\"enroll\""));
         let decoded: ControlRequest = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn control_request_variants_carry_request_id() {
+        assert_eq!(
+            ControlRequest::ListDevhosts { request_id: "id".to_string() }.request_id(),
+            "id"
+        );
+        assert_eq!(
+            ControlRequest::RevokeDevice { request_id: "id".to_string(), device_id: "dev-1".to_string() }
+                .request_id(),
+            "id"
+        );
     }
 
     #[test]
@@ -731,6 +810,36 @@ mod tests {
         assert!(serde_json::from_str::<ControlResponse>(&json).is_err());
         let decoded: ServerPush = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, push);
+    }
+
+    #[test]
+    fn revoke_device_request_round_trips_through_json() {
+        let request = ControlRequest::RevokeDevice { request_id: "id".to_string(), device_id: "dev-1".to_string() };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"type\":\"revoke-device\""));
+        let decoded: ControlRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn revoke_phone_session_request_round_trips_through_json() {
+        let request = ControlRequest::RevokePhoneSession { request_id: "id".to_string(), device_id: "phone-1".to_string() };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"type\":\"revoke-phone-session\""));
+        let decoded: ControlRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn revoke_ok_responses_carry_request_id() {
+        assert_eq!(
+            ControlResponse::RevokeDeviceOk { request_id: "id".to_string(), device_id: "dev-1".to_string() }.request_id(),
+            "id"
+        );
+        assert_eq!(
+            ControlResponse::RevokePhoneSessionOk { request_id: "id".to_string(), device_id: "phone-1".to_string() }.request_id(),
+            "id"
+        );
     }
 
     #[test]

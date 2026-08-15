@@ -53,6 +53,14 @@ impl Engine {
         &self.terminal
     }
 
+    /// The current visible grid rendered as plain text (see
+    /// [`Grid::visible_text`]) — the accessibility-tree content source for
+    /// Kotlin's virtual `TerminalSurfaceView` accessibility node.
+    #[must_use]
+    pub fn visible_text(&self) -> String {
+        self.terminal.grid().visible_text()
+    }
+
     /// Rows whose content changed since the caller last called
     /// [`Self::clear_row_dirty`] — the renderer's per-row damage cache
     /// input, porting Zelland's `row_cache`/dirty-row design (see
@@ -106,6 +114,13 @@ mod tests {
         assert!(engine.dirty_rows().is_empty());
         engine.write(b"x");
         assert_eq!(engine.dirty_rows(), vec![0]);
+    }
+
+    #[test]
+    fn visible_text_reflects_written_bytes() {
+        let mut engine = Engine::new(5, 2);
+        engine.write(b"hi");
+        assert_eq!(engine.visible_text(), "hi\n");
     }
 
     #[test]

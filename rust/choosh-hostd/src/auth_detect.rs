@@ -20,11 +20,19 @@
 //! comment for how it was captured); `azure` is matched against the
 //! device-code message's well-documented, years-stable phrasing
 //! (cross-checked via public documentation, not captured from a live `az`
-//! binary — none was installed in the environment this was built in);
-//! `gcp` is the weakest of the four — see [`detect_gcp`]'s doc comment for
-//! why the real, currently-shipping `gcloud auth login --no-launch-browser`
-//! flow does not actually emit anything this module can match, and what
-//! this implementation does instead.
+//! binary — none was installed in the environment this was built in, and
+//! none was installed to check this: see [`detect_azure`]'s doc comment for
+//! why, and for the additional research corroboration found while
+//! rechecking this). **`gcp` has no matcher at all** — there is no
+//! `detect_gcp` function and no `Gcp` arm in [`AuthCodeDetector::feed`]'s
+//! dispatch chain, deliberately. See the doc comment on the `gcp_*` tests
+//! near the bottom of this file for why: the real, currently-shipping
+//! `gcloud` device-login flows do not print anything this module's
+//! `(provider, user_code, verification_uri)` shape could ever hold, so a
+//! matcher here would necessarily be unverifiable scaffolding pretending to
+//! be a working detector. `WireAuthProvider::Gcp` remains a valid wire enum
+//! variant (owned by `choosh-protocol`, not this module) — it is simply
+//! never produced by this detector today.
 //!
 //! **Extraction, not capture.** Every `detect_*` function returns only the
 //! three named fields, each independently bounds- and shape-checked before
@@ -98,10 +106,11 @@ impl AuthCodeDetector {
             self.buffer = self.buffer.chars().skip(overflow).collect();
         }
 
-        let (provider, user_code, verification_uri) = detect_github(&self.buffer)
-            .or_else(|| detect_aws(&self.buffer))
-            .or_else(|| detect_azure(&self.buffer))
-            .or_else(|| detect_gcp(&self.buffer))?;
+        // No `detect_gcp` here, deliberately — see this module's top-level
+        // doc comment and the `gcp_*` tests below for why `gcp` has no
+        // matcher to dispatch to.
+        let (provider, user_code, verification_uri) =
+            detect_github(&self.buffer).or_else(|| detect_aws(&self.buffer)).or_else(|| detect_azure(&self.buffer))?;
 
         if self.already_fired.as_ref() == Some(&(provider, user_code.clone())) {
             return None;
@@ -221,9 +230,8 @@ fn first_https_url(text: &str) -> Option<&str> {
 }
 
 /// The *last* `https://` URL in `text` — used where a provider prints the
-/// verification URL before the code (AWS, and the constructed `gcp`
-/// scaffolding): with [`detect_aws`]/[`detect_gcp`] anchoring on the
-/// *last* (most recent) occurrence of their code marker via `str::rfind`
+/// verification URL before the code (AWS): with [`detect_aws`] anchoring on
+/// the *last* (most recent) occurrence of their code marker via `str::rfind`
 /// (so a buffer holding more than one completed login attempt still
 /// reports the current one, not a stale earlier one), the URL that
 /// belongs to that same, most-recent attempt is symmetrically the nearest
@@ -354,16 +362,36 @@ fn detect_aws(text: &str) -> Option<(WireAuthProvider, String, String)> {
     Some((WireAuthProvider::Aws, code.to_string(), uri.to_string()))
 }
 
-/// **Not verified against a real `az` binary** — the Azure CLI is not
-/// installed in the environment this was built in (`az --version` ->
-/// command not found). Matched instead against `az login`'s device-code
-/// message, which is extremely widely and consistently documented and has
-/// been stable in this exact phrasing across the CLI's history (cross-
-/// checked via public documentation/search rather than a live capture):
+/// **Still not verified against a real `az` binary, as of a second pass
+/// specifically checking whether one could be captured here.** The Azure
+/// CLI is not installed in this environment (`az --version` -> command not
+/// found), the environment has no passwordless `sudo` (`sudo -n true` ->
+/// "a password is required") so `dnf`/`yum` are not usable to install it,
+/// and this environment's root filesystem had only ~2.3GiB free at the time
+/// this was checked (`df -h /` — a shared tree with several other
+/// concurrent tasks writing to it) — too little headroom to responsibly
+/// attempt azure-cli's `pip install` route either, which pulls in a large,
+/// multi-package dependency tree. None of that is a fundamental blocker (a
+/// machine with `sudo` and disk headroom could add Microsoft's package repo
+/// and install `azure-cli` cleanly), just not something to force here.
+///
+/// Matched instead against `az login`'s device-code message, cross-checked
+/// via public documentation/search rather than a live capture:
 ///
 /// ```text
 /// To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code <CODE> to authenticate.
 /// ```
+///
+/// This message is unusually well-corroborated for something unverified
+/// against a real binary: it is not `az`-specific client-side text at all
+/// — it is the `message` field Microsoft Entra ID's own `/oauth2/devicecode`
+/// endpoint returns as part of the OAuth 2.0 device authorization response
+/// body (RFC 8628), which `az` (via MSAL) prints verbatim rather than
+/// composing itself. That means the exact phrasing is shared, and has
+/// stayed stable, across every Microsoft tool that speaks this same
+/// server-driven flow — `az`, the `Az` PowerShell module, Visual Studio,
+/// etc. — not just `az`'s own release history, which is a materially
+/// stronger signal than "one CLI's help text hasn't changed in a while."
 ///
 /// Unlike the other three providers, both fields sit on one line — the URL
 /// is the token right after "use a web browser to open the page ", the
@@ -385,48 +413,55 @@ fn detect_azure(text: &str) -> Option<(WireAuthProvider, String, String)> {
     Some((WireAuthProvider::Azure, code.to_string(), uri.to_string()))
 }
 
-/// **Not verified against a real `gcloud` binary, and — unlike the other
-/// three providers — not expected to match one either, honestly.** Google
-/// Cloud SDK is not installed in the environment this was built in, but
-/// more importantly: research into `gcloud auth login --no-launch-browser`'s
-/// actual, currently-shipping behavior (Google's own documentation, cross-
-/// checked across multiple pages) shows it does **not** use the "device
-/// prints a short code, user types it into a browser" flow the other three
-/// providers use and this module's payload shape assumes. It uses the
-/// *reverse*, out-of-band flow: `gcloud` prints a long
-/// `https://accounts.google.com/o/oauth2/auth?...` authorization URL, the
-/// user completes sign-in in a browser on a *different* device, that
-/// browser page displays a verification code, and the user pastes *that*
-/// code back into `gcloud`'s own "Enter authorization code:" terminal
-/// prompt. There is no short `user_code` ever printed to `gcloud`'s own
-/// stdout for this detector to see — so a real headless `gcloud auth
-/// login` session will not fire this matcher today, no matter how it's
-/// tuned, because the field this module needs to extract is never in the
-/// stream at all.
-///
-/// This function is still implemented — matching a hypothetical RFC 8628
-/// ("OAuth 2.0 Device Authorization Grant")-shaped message, which is what
-/// `agent-events.md`'s own example payload (`user_code: "WDJB-MJHT"` is
-/// literally RFC 8628 §3.3's example value) appears to assume `gcp` would
-/// look like — so the `gcp` arm of the provider enum and this module's
-/// dispatch are complete and ready the moment either (a) `gcloud` ships a
-/// real device-code mode, or (b) this is pointed at a different
-/// Google-ecosystem tool that already speaks true RFC 8628 (e.g. some
-/// `gcloud`-adjacent or embedded-device Google auth tooling does). Treat
-/// this one function, uniquely among the four, as unverified scaffolding
-/// rather than a working detector for `gcloud auth login` as it exists
-/// today — flagged here and in the top-level report, not silently assumed
-/// to work.
-fn detect_gcp(text: &str) -> Option<(WireAuthProvider, String, String)> {
-    const MARKER: &str = "enter the code:";
-    let marker_pos = text.rfind(MARKER)?;
-    let code = take_token(text, marker_pos + MARKER.len())?;
-    if !looks_like_device_code(code) {
-        return None;
-    }
-    let uri = last_https_url(&text[..marker_pos])?;
-    Some((WireAuthProvider::Gcp, code.to_string(), uri.to_string()))
-}
+// **There is deliberately no `detect_gcp` function.** An earlier version of
+// this module shipped one, matching a hypothetical RFC 8628 ("OAuth 2.0
+// Device Authorization Grant")-shaped message — the shape
+// `agent-events.md`'s own example payload (`user_code: "WDJB-MJHT"`,
+// literally RFC 8628 §3.3's example value) appears to assume `gcp` would
+// look like. It was flagged even then as unverified against any real
+// `gcloud` binary. A closer look at `gcloud`'s actual, currently-shipping
+// behavior shows that matcher could never fire on real output, for a
+// structural reason no amount of pattern tuning fixes: `gcloud auth login`
+// does not use the "CLI prints a short code, user types it into a browser"
+// flow the other three providers use and this module's
+// `(provider, user_code, verification_uri)` return shape assumes. Both of
+// its headless flows run in the *opposite* direction — research (Google's
+// own `gcloud auth login`/`auth application-default login` reference docs,
+// cross-checked across multiple pages, no live `gcloud` binary available in
+// this environment either) turned up two of them, and neither ever prints a
+// short device code to `gcloud`'s own stdout for this module to extract:
+//
+// - `--no-launch-browser` (the flag this module's earlier scaffolding was
+//   written against): `gcloud` prints a long
+//   `https://accounts.google.com/o/oauth2/auth?...` authorization URL, the
+//   user completes sign-in in a browser on a *different* device, that
+//   browser page then displays a verification code, and the user pastes
+//   *that* code back into `gcloud`'s own "Enter authorization code:"
+//   terminal prompt — the code flows from the user into `gcloud`, never out
+//   of it.
+// - `--no-browser` (current `gcloud`'s replacement flow): `gcloud` prints a
+//   long `gcloud auth login --remote-bootstrap=...` command for the user to
+//   copy and run on a *different*, browser-having machine; that machine's
+//   `gcloud` prints a long callback URL, which the user pastes back into
+//   the first machine's "Enter the output of the above command" prompt. No
+//   short code is printed by either side at all — the artifact handed back
+//   is itself a full URL.
+//
+// Either way, there is no `user_code` value anywhere in the stream for a
+// detector to find — the field `agent-events.md`'s `auth_required` event
+// requires is simply never produced by real `gcloud` output. Representing
+// this flow correctly would need a different event shape entirely (e.g. an
+// optional/absent `user_code`, or a distinct "paste this back" event kind),
+// which is a wire-format change to `choosh_protocol::relay::WireAgentEvent`
+// — out of scope here. So rather than keep a matcher that can only ever be
+// exercised by a constructed fixture and never by anything `gcloud` really
+// prints (see this module's `gcp_realistic_no_launch_browser_output_is_not_a_false_positive`
+// and `gcp_realistic_no_browser_remote_bootstrap_output_is_not_a_false_positive`
+// tests below, which assert exactly that non-match against realistic,
+// research-based reconstructions of both flows), this module ships no `gcp`
+// matcher and [`AuthCodeDetector::feed`]'s dispatch chain has no `gcp` arm.
+// `WireAuthProvider::Gcp` remains defined in `choosh-protocol` — this module
+// just never constructs one.
 
 #[cfg(test)]
 mod tests {
@@ -594,22 +629,37 @@ mod tests {
         );
     }
 
+    /// A realistic reconstruction of `gcloud auth login --no-launch-browser`'s
+    /// real, currently-documented output (see the block comment above
+    /// [`AuthCodeDetector`]'s `feed` dispatch chain for the research this is
+    /// based on — no `gcloud` binary was available in this environment to
+    /// capture it live). The load-bearing property under test isn't the
+    /// exact wording, it's the *shape*: `gcloud` never prints a short code
+    /// here at all, only a prompt asking the user to type one in — so no
+    /// pattern tuned against this module's `(provider, user_code,
+    /// verification_uri)` shape could ever legitimately match it.
+    const GCP_NO_LAUNCH_BROWSER_REALISTIC: &str = "Go to the following link in your browser:\n\n    https://accounts.google.com/o/oauth2/auth?response_type=code&client_id=32555940559.apps.googleusercontent.com&redirect_uri=urn%3Aietf%3Awg%3Aoauth%3A2.0%3Aoob&scope=openid+https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.email&state=abc123\n\nEnter authorization code: ";
+
+    /// A realistic reconstruction of `gcloud auth login --no-browser`'s
+    /// current remote-bootstrap output — the *other* real headless flow
+    /// `gcloud` ships, structurally different again (a full command to run
+    /// on another machine, not a code), same conclusion: no short code
+    /// anywhere in it.
+    const GCP_NO_BROWSER_REMOTE_BOOTSTRAP_REALISTIC: &str = "To sign in, run this command on a machine with a web browser:\n\n  gcloud auth login --remote-bootstrap=\"https://accounts.google.com/o/oauth2/auth?response_type=code%3A&client_id=32555940559.apps.googleusercontent.com&redirect_uri=https%3A%2F%2Fsdk.cloud.google.com%2Fauthcode.html&scope=openid&state=xyz789\"\n\nEnter the output of the above command: ";
+
     #[test]
-    fn gcp_constructed_fixture_is_detected_by_the_scaffolding_matcher() {
-        // See detect_gcp's doc comment: this fixture does not represent
-        // real gcloud output — it exists to exercise the RFC 8628-shaped
-        // scaffolding this module ships for the `gcp` provider slot.
-        let text = "To continue, open https://accounts.google.com/o/oauth2/device/verify in a browser and enter the code: WDJB-MJHT\n";
+    fn gcp_realistic_no_launch_browser_output_is_not_a_false_positive() {
+        // Proves the "gcp isn't representable in the current event shape"
+        // conclusion is actually enforced, not just asserted in a comment:
+        // this module ships no gcp matcher, so this must not fire.
         let mut detector = AuthCodeDetector::new();
-        let event = detector.feed(text.as_bytes()).unwrap();
-        assert_eq!(
-            event,
-            WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Gcp,
-                user_code: "WDJB-MJHT".to_string(),
-                verification_uri: "https://accounts.google.com/o/oauth2/device/verify".to_string(),
-            }
-        );
+        assert_eq!(detector.feed(GCP_NO_LAUNCH_BROWSER_REALISTIC.as_bytes()), None);
+    }
+
+    #[test]
+    fn gcp_realistic_no_browser_remote_bootstrap_output_is_not_a_false_positive() {
+        let mut detector = AuthCodeDetector::new();
+        assert_eq!(detector.feed(GCP_NO_BROWSER_REMOTE_BOOTSTRAP_REALISTIC.as_bytes()), None);
     }
 
     #[test]

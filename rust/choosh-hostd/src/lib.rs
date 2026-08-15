@@ -18,6 +18,7 @@ pub mod hooks;
 pub mod jj_ops;
 pub mod local_ipc;
 mod mise_ops;
+mod power_assertion;
 pub mod proxy;
 pub mod pty;
 mod readiness;

@@ -29,14 +29,19 @@ public final class AndroidNotificationSink implements NotificationSink {
         ensureChannel();
     }
 
-    @Override public void upsert(NotificationIntent intent) {
+    @Override public void upsert(RenderableNotification intent) {
         Objects.requireNonNull(intent, "intent");
         if (context == null) throw new IllegalStateException("Context required for posting notifications");
         // minSdk is 26, so the channel-less pre-O Builder is unreachable; see ADR 0006.
+        // auth_required notifications are always open-app-only per
+        // notifications.md's "Actionability" section (no .addAction calls
+        // here, for either intent type — input_required's own direct
+        // approve/reject actions are a separate, not-yet-implemented gap;
+        // see PLAN.md's "Terminal accessibility"/actionability follow-ups).
         Notification notification = new Notification.Builder(context, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentTitle(intent.workspaceName() + " · " + intent.agentName())
-                .setContentText(intent.reason())
+                .setContentTitle(titleFor(intent))
+                .setContentText(textFor(intent))
                 .setAutoCancel(true)
                 .setOnlyAlertOnce(true)
                 .build();
@@ -45,6 +50,49 @@ public final class AndroidNotificationSink implements NotificationSink {
 
     @Override public void clear(String stableKey) {
         manager.cancel(TAG, notificationIdForKey(Objects.requireNonNull(stableKey, "stableKey")));
+    }
+
+    /**
+     * Pure, Android-framework-free title/text construction — split out from
+     * {@link #upsert} (which needs a real {@link Context}/
+     * {@link Notification.Builder} to exercise) so this is unit-testable
+     * without Robolectric, mirroring {@link #notificationIdForKey}'s
+     * existing pure-static-helper convention. Both only ever read the
+     * intent's own typed fields, never anything outside them, which is
+     * what keeps a rendered notification's text within
+     * notifications.md's redaction rule.
+     */
+    static String titleFor(RenderableNotification intent) {
+        if (intent instanceof NotificationIntent waiting) {
+            return waiting.workspaceName() + " · " + waiting.agentName();
+        }
+        if (intent instanceof AuthNotificationIntent auth) {
+            return providerDisplayName(auth.provider()) + " sign-in required";
+        }
+        throw new IllegalArgumentException("unknown RenderableNotification: " + intent);
+    }
+
+    static String textFor(RenderableNotification intent) {
+        if (intent instanceof NotificationIntent waiting) {
+            return waiting.reason();
+        }
+        if (intent instanceof AuthNotificationIntent auth) {
+            // user_code and verification_uri are explicitly not secrets on
+            // their own per notifications.md's "Redaction" section — they
+            // are exactly what the user is meant to see and act on here.
+            return auth.userCode() + " · " + auth.verificationUri();
+        }
+        throw new IllegalArgumentException("unknown RenderableNotification: " + intent);
+    }
+
+    static String providerDisplayName(String provider) {
+        return switch (provider) {
+            case "aws" -> "AWS";
+            case "gcp" -> "Google Cloud";
+            case "azure" -> "Azure";
+            case "github" -> "GitHub";
+            default -> provider;
+        };
     }
 
     public static int notificationIdForKey(String key) {

@@ -24,6 +24,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 
 /**
@@ -107,6 +109,21 @@ private fun ChangeNodeChip(node: ChangeGraphNode, onClick: () -> Unit) {
         Modifier
             .clickable(onClick = onClick)
             .testTag("change-node-${node.changeId}")
+            // `docs/accessibility-device-report.md`'s item 1, gap 1 named
+            // `ChangeNodeChip` directly. A meaningful, context-specific
+            // label — the change id, whether it's a merge, and its
+            // description — rather than relying on `mergeDescendants` to
+            // read out the truncated 8-char id and possibly-blank
+            // description text this chip visually shows.
+            .semantics {
+                contentDescription = buildString {
+                    append("Change ${node.changeId.take(8)}")
+                    if (node.parentChangeIds.size >= 2) append(", merge of ${node.parentChangeIds.size} parents")
+                    if (node.isWorkingCopy) append(", working copy")
+                    val description = node.description.lineSequence().firstOrNull().orEmpty()
+                    append(if (description.isBlank()) ", no description" else ", $description")
+                }
+            }
             .background(background, RoundedCornerShape(8.dp))
             .widthIn(min = 96.dp, max = 220.dp)
             .padding(8.dp),
@@ -157,7 +174,17 @@ private fun OperationRow(op: OperationLogEntry, onRestore: () -> Unit) {
                 Text(op.description, style = MaterialTheme.typography.bodyMedium)
                 Text(op.opId, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            TextButton(onClick = onRestore, modifier = Modifier.testTag("restore-button-${op.opId}")) { Text("Restore") }
+            TextButton(
+                onClick = onRestore,
+                modifier = Modifier
+                    .testTag("restore-button-${op.opId}")
+                    // `docs/accessibility-device-report.md`'s item 1, gap 1
+                    // named this Restore button directly: bare "Restore" is
+                    // ambiguous when TalkBack focus can land on it without
+                    // the sibling operation description ever being
+                    // announced — the label now names which operation.
+                    .semantics { contentDescription = "Restore to operation: ${op.description}" },
+            ) { Text("Restore") }
         }
     }
 }

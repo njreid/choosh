@@ -13,6 +13,7 @@ import ai.choosh.markdown.MarkdownFixtureDemoScreen
 import ai.choosh.terminal.TerminalScreen
 import ai.choosh.webservice.WebServiceScreen
 import ai.choosh.webservice.WebServiceViewModel
+import ai.choosh.workspace.WorkspaceScreen
 import android.util.Log
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -273,6 +274,30 @@ class DeviceVerificationHarnessTest {
         }
         composeTestRule.waitForIdle()
         Log.i("DeviceHarness", "ready-fleet")
+        Thread.sleep(45_000)
+    }
+
+    /**
+     * Held for external screenshot capture at multiple display sizes —
+     * specifically to verify [WorkspaceScreen]'s Expanded-width
+     * master-detail split (this pass's M8 accessibility-follow-up
+     * adaptive-layout work; see `docs/accessibility-device-report.md`'s
+     * item 3/4), which no prior harness method exercised.
+     */
+    @Test
+    fun workspaceScreenHeld() {
+        val engine = FakeChooshEngine()
+        kotlinx.coroutines.runBlocking { engine.connect("device-harness-test") }
+        composeTestRule.setContent {
+            WorkspaceScreen(
+                engine = engine,
+                workspaceId = FakeChooshEngine.FIXTURE_WORKSPACE_ID,
+                deviceId = FakeChooshEngine.FIXTURE_DEVICE_ID,
+                onBack = {},
+            )
+        }
+        composeTestRule.waitForIdle()
+        Log.i("DeviceHarness", "ready-workspace")
         Thread.sleep(45_000)
     }
 

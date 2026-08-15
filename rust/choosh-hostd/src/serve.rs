@@ -455,6 +455,15 @@ async fn connect_loop(
     agent_event_tx: tokio::sync::mpsc::Sender<WireAgentEvent>,
 ) {
     let mut attempt: u32 = 0;
+    // docs/specs/host-deployment.md's "Power assertions" requirement
+    // (macOS-only; a real no-op elsewhere — see `power_assertion.rs`'s doc
+    // comment for the exact scope this covers): `connect_loop` IS
+    // "choosh-hostd trying to stay connected to relayd" for this whole
+    // process's run, across every reconnect below, so the assertion is
+    // claimed once here rather than per-connection-attempt, and released
+    // only on the graceful-shutdown path this function itself documents.
+    let mut power_assertion = crate::power_assertion::PowerAssertion::new();
+    power_assertion.acquire("choosh-hostd: maintaining relayd connection");
     loop {
         let shutdown = tokio::signal::ctrl_c();
         tokio::select! {
@@ -469,6 +478,7 @@ async fn connect_loop(
                     tracing::error!(%error, "failed to install shutdown signal handler");
                 }
                 tracing::info!("shutdown requested, closing connection to relayd");
+                power_assertion.release();
                 return;
             }
         }

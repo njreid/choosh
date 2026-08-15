@@ -89,5 +89,14 @@ internal object TerminalBridge {
      */
     @JvmStatic external fun nativeTerminalTestInject(handle: Long, bytes: ByteArray)
 
+    /**
+     * Returns the current visible grid as plain text, one line per row —
+     * the accessibility content source for `TerminalSurfaceView`'s virtual
+     * accessibility node (`docs/accessibility-device-report.md`'s item 1,
+     * gap 2). Always returns a string (never null), empty for an
+     * absent/destroyed handle.
+     */
+    @JvmStatic external fun nativeTerminalGetText(handle: Long): String
+
     @JvmStatic external fun nativeTerminalDestroy(handle: Long)
 }

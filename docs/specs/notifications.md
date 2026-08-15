@@ -98,13 +98,26 @@ the block without the user typing into the agent directly.
 `auth_required` notifications are always open-app-only: tapping opens the
 `verification_uri` in a Custom Tab, per DESIGN.md §6.
 
-**Not yet implemented**: the Android app's notification model
-(`ai.choosh.notifications.NotificationIntent` and everything downstream of
-it) only represents the `input_required` shape (mandatory `workspaceId`/
-`itemId`/`agentName`, keyed `(host_id, workspace_id, item_id)`) — there is
-no code path anywhere in the app that constructs, dedups, or renders an
-`auth_required` notification (`(host_id, provider)`-keyed, no workspace/item
-at all). Separately, both ends of the FCM path are stubs today: `relayd`'s
-dispatch is a logged no-op (`rust/choosh-relayd/src/ws.rs`'s
-`dispatch_fcm_push_stub`) and `ChooshFirebaseMessagingService.onMessageReceived`
-only logs receipt — see [PLAN.md](../../PLAN.md)'s Known follow-ups.
+**Implementation status**: the Android app's notification model now covers
+both shapes — `ai.choosh.notifications.NotificationIntent` for
+`input_required` (`workspaceId`/`itemId`/`agentName`, keyed `(host_id,
+workspace_id, item_id)`) and `ai.choosh.notifications.AuthNotificationIntent`
+for `auth_required` (`provider`/`userCode`/`verificationUri`, keyed
+`(host_id, provider)`, always open-app-only per "Actionability" above),
+both implementing `RenderableNotification` and flowing through the same
+`NotificationSink`/`NotificationProjector`/`NotificationServiceLifecycle`
+path. `relayd`'s FCM dispatch (`rust/choosh-relayd/src/fcm.rs`) is a real
+v1 API implementation (service-account JWT-bearer OAuth2 exchange +
+`messages:send`), and `ChooshFirebaseMessagingService.onMessageReceived`
+parses a real data payload via `FcmNotificationParser` and projects it
+through the same path described above, rather than only logging receipt.
+**Neither has been exercised against a live `fcm.googleapis.com` send or a
+real device** — no service-account credential is available in the
+environment this was built in (see [PLAN.md](../../PLAN.md)'s Known
+follow-ups for the specific finding), so `relayd`'s dispatcher currently
+always takes its logging-only fallback path. The FCM-reconstructed
+`input_required` notification also has a known display-fidelity gap: the
+wire event carries no workspace display name or agent name, so the FCM
+path falls back to raw ids for those fields where the live persistent-
+connection path (once it has a local registry to draw from) would show
+real names — see `FcmNotificationParser`'s doc comment.

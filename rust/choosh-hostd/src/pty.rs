@@ -76,6 +76,17 @@ impl std::error::Error for PtyError {}
 pub struct PtySession {
     master: tokio::fs::File,
     child: Child,
+    /// A `dup`'d clone of `master`, reserved for [`PtyWriteHalf::resize`]'s
+    /// `tcsetwinsize` call. `tokio::io::split`'s `WriteHalf<T>` exposes no
+    /// way to get back a `&T`/fd from the half it owns (confirmed against
+    /// tokio 1.53's `io::split` API), so `resize` needs its own handle onto
+    /// the same underlying pty master — obtained here, once, via
+    /// `File::try_clone` (safe; a plain `dup(2)`), rather than a raw fd
+    /// captured from `master` before splitting, which would need an
+    /// `unsafe` `BorrowedFd::borrow_raw` at every call site and this
+    /// workspace forbids `unsafe_code` (`Cargo.toml`'s
+    /// `[workspace.lints.rust]`).
+    resize_handle: tokio::fs::File,
 }
 
 impl PtySession {
@@ -106,6 +117,7 @@ impl PtySession {
         command.arg("attach").arg(session_name);
         let (master, child) = allocate_and_spawn(command).map_err(PtyError::Spawn)?;
         let master = tokio::fs::File::from_std(master);
+        let resize_handle = master.try_clone().await.map_err(PtyError::Spawn)?;
 
         // Give the attach client a moment to actually connect before
         // asking it to change focus — `go-to-tab-name` targets "the
@@ -114,7 +126,7 @@ impl PtySession {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         crate::zellij_ops::focus_tab(session_name, tab_name).await.map_err(PtyError::FocusTab)?;
 
-        Ok(Self { master, child })
+        Ok(Self { master, child, resize_handle })
     }
 
     /// # Errors
@@ -146,7 +158,7 @@ impl PtySession {
     #[must_use]
     pub fn split(self) -> (PtyReadHalf, PtyWriteHalf) {
         let (read_half, write_half) = tokio::io::split(self.master);
-        (PtyReadHalf(read_half), PtyWriteHalf { inner: write_half, child: self.child })
+        (PtyReadHalf(read_half), PtyWriteHalf { inner: write_half, child: self.child, resize_handle: self.resize_handle })
     }
 }
 
@@ -231,6 +243,9 @@ pub(crate) fn allocate_and_spawn(mut command: Command) -> std::io::Result<(std::
 pub struct PtyWriteHalf {
     inner: tokio::io::WriteHalf<tokio::fs::File>,
     child: Child,
+    /// See [`PtySession::resize_handle`]'s doc comment — moved here
+    /// unchanged by [`PtySession::split`].
+    resize_handle: tokio::fs::File,
 }
 
 impl PtyWriteHalf {
@@ -239,6 +254,35 @@ impl PtyWriteHalf {
     /// An I/O error writing to the pty master.
     pub async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         self.inner.write_all(buf).await
+    }
+
+    /// Sets the pty's kernel-tracked window size (`TIOCSWINSZ`) so the
+    /// attached `zellij attach` client — and, through it, Zellij's own
+    /// notion of that tab's terminal size — sees real dimensions instead
+    /// of whatever `openpty` was given at spawn time, per
+    /// `terminal-experience.md`'s "Live font/cell metrics... use for PTY
+    /// sizing" and `docs/accessibility-device-report.md`'s item 3/4 gap
+    /// ("a real PTY attached via `attachPty` would be told it has an 80×24
+    /// window even on a desktop-sized display").
+    ///
+    /// **Scope note**: this is the real, ioctl-level resize capability —
+    /// unit-tested below against a real allocated pty. Driving it from a
+    /// live Android surface resize needs a new phone-to-devhost control
+    /// message (mirroring `ControlRequest::AgentEvent`'s device-scoped
+    /// push shape) that does not exist in `choosh-protocol`/`choosh-relayd`
+    /// yet; wiring that end-to-end (protocol variant, `relayd` capability
+    /// scope + routing, `serve.rs` dispatch to the right tunnel's
+    /// [`PtyWriteHalf`], and an Android call site) is real, separate,
+    /// cross-crate work this pass didn't do — tracked in `PLAN.md`'s
+    /// Known follow-ups rather than left silently implicit.
+    ///
+    /// # Errors
+    ///
+    /// An OS error from the underlying `tcsetwinsize`/`TIOCSWINSZ` call
+    /// (e.g. an already-closed pty).
+    pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        let winsize = rustix::termios::Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        rustix::termios::tcsetwinsize(&self.resize_handle, winsize).map_err(std::io::Error::from)
     }
 }
 
@@ -294,5 +338,30 @@ mod tests {
 
         crate::zellij_ops::kill_session(&session_name).await.ok();
         assert!(found.is_ok(), "did not observe the echoed marker within the timeout; collected: {:?}", String::from_utf8_lossy(&collected));
+    }
+
+    /// `PtyWriteHalf::resize`'s real ioctl round-trip: sets a window size
+    /// via `TIOCSWINSZ`, then reads it back with `TIOCGWINSZ` on the same
+    /// fd — real kernel state, not a mock, proving the pty master's
+    /// tracked size genuinely changed (which is what `zellij attach`'s own
+    /// size negotiation, and any TUI reading `$COLUMNS`/`$LINES` or
+    /// calling `ioctl(TIOCGWINSZ)` itself, would observe).
+    #[tokio::test]
+    async fn resize_sets_real_kernel_winsize() {
+        let session_name = format!("pty-resize-test-{}", uuid::Uuid::new_v4());
+        let dir = tempfile::tempdir().unwrap();
+        crate::zellij_ops::create_session(&session_name, dir.path()).await.unwrap();
+        crate::zellij_ops::new_tab(&session_name, "shelltab", dir.path(), &[]).await.unwrap();
+
+        let pty = PtySession::attach(&session_name, "shelltab").await.unwrap();
+        let (_read_half, write_half) = pty.split();
+
+        write_half.resize(120, 40).unwrap();
+
+        let readback = rustix::termios::tcgetwinsize(&write_half.resize_handle).unwrap();
+        assert_eq!(readback.ws_col, 120);
+        assert_eq!(readback.ws_row, 40);
+
+        crate::zellij_ops::kill_session(&session_name).await.ok();
     }
 }

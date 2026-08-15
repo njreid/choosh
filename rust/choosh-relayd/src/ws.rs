@@ -3,12 +3,20 @@
 //! control-frame catalog `dispatch` below serves — `request-enrollment-token`/
 //! `list-devhosts` (M0), `open-tunnel` and its `0x02` tunnel-frame routing
 //! (M1), `agent-event`/`register-fcm-token` (M2), `list-devhost-ssh-endpoints`
-//! (M6), and the `offload`-purpose tunnel capability (M7). See
-//! `docs/specs/relay-protocol.md` and `docs/specs/auth-and-enrollment.md`.
+//! (M6), the `offload`-purpose tunnel capability (M7), and — closing three
+//! gaps named in `docs/security/relayd-threat-model.md`'s M8 review —
+//! phone-only `revoke-device`/`revoke-phone-session` control frames (each
+//! closing any live connection immediately, not just blocking its next
+//! reconnect), a per-Identity control-frame rate limit ([`RateLimiter`]),
+//! and a connection-wide idle timeout for a connection stalled mid-frame
+//! (`AppState::connection_idle_timeout`, alongside [`reap_idle_tunnels`]'s
+//! existing per-tunnel one). See `docs/specs/relay-protocol.md` and
+//! `docs/specs/auth-and-enrollment.md`.
 
 use crate::AppState;
 use crate::ca;
 use crate::state::{
+    CONTROL_FRAME_RATE_LIMIT_BURST, CONTROL_FRAME_RATE_LIMIT_PER_SECOND,
     ENROLLMENT_TOKEN_VALIDITY_SECONDS, EnrolledDevice, EnrollmentToken, OUTBOUND_CHANNEL_CAPACITY,
     Registry, SESSION_CREDENTIAL_VALIDITY_SECONDS, TUNNEL_IDLE_TIMEOUT_SECONDS, Tunnel, now_unix,
 };
@@ -26,7 +34,8 @@ use ed25519_dalek::{Signature, VerifyingKey, ed25519::signature::Verifier};
 use futures_util::SinkExt as _;
 use getrandom::rand_core::Rng as _;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 
 pub async fn connect(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_connection(socket, state))
@@ -244,11 +253,14 @@ async fn mark_offline(registry: &Registry, device_id: &str) {
 }
 
 /// Registers this connection's outbound channel (so other connections'
-/// tasks can route tunnel frames and pushes to it), runs the read/route
-/// loop to completion, then unconditionally deregisters and closes every
-/// tunnel this device was party to — the "finally" this fans out to on
-/// every exit path of [`serve_authenticated_loop`], including a socket
-/// error, a malformed frame, or the caller's own eventual disconnect.
+/// tasks can route tunnel frames and pushes to it) and kill switch (so a
+/// revoke elsewhere can force this connection closed — see
+/// `Registry::kill_switches`), runs the read/route loop to completion, then
+/// unconditionally deregisters both and closes every tunnel this device was
+/// party to — the "finally" this fans out to on every exit path of
+/// [`serve_authenticated_loop`], including a socket error, a malformed
+/// frame, a revoke, an idle timeout, or the caller's own eventual
+/// disconnect.
 async fn serve_authenticated(
     socket: &mut WebSocket,
     decoder: &mut choosh_protocol::framing::FrameDecoder,
@@ -256,11 +268,14 @@ async fn serve_authenticated(
     authenticated: &Authenticated,
 ) {
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CHANNEL_CAPACITY);
+    let (kill_tx, kill_rx) = oneshot::channel::<()>();
     state.registry.connections.write().await.insert(authenticated.device_id.clone(), outbound_tx);
+    state.registry.kill_switches.write().await.insert(authenticated.device_id.clone(), kill_tx);
 
-    serve_authenticated_loop(socket, decoder, state, authenticated, &mut outbound_rx).await;
+    serve_authenticated_loop(socket, decoder, state, authenticated, &mut outbound_rx, kill_rx).await;
 
     state.registry.connections.write().await.remove(&authenticated.device_id);
+    state.registry.kill_switches.write().await.remove(&authenticated.device_id);
     close_tunnels_for_device(state, &authenticated.device_id).await;
 }
 
@@ -270,9 +285,29 @@ async fn serve_authenticated_loop(
     state: &AppState,
     authenticated: &Authenticated,
     outbound_rx: &mut mpsc::Receiver<Vec<u8>>,
+    mut kill_rx: oneshot::Receiver<()>,
 ) {
+    let mut rate_limiter =
+        RateLimiter::new(CONTROL_FRAME_RATE_LIMIT_BURST, CONTROL_FRAME_RATE_LIMIT_PER_SECOND);
+    // Tracks the most recent *complete* frame (control or tunnel), not raw
+    // bytes received — a connection trickling partial bytes forever without
+    // ever completing one is exactly relayd-threat-model.md Case 5's
+    // "stalled mid-frame" gap this timeout closes, so raw byte receipt must
+    // not reset it.
+    let mut last_frame_at = std::time::Instant::now();
     loop {
+        let idle_remaining = state.connection_idle_timeout.saturating_sub(last_frame_at.elapsed());
         tokio::select! {
+            () = tokio::time::sleep(idle_remaining) => {
+                tracing::debug!(device_id = %authenticated.device_id, "closing connection idle since its last complete frame");
+                let _ = socket.close().await;
+                return;
+            }
+            _ = &mut kill_rx => {
+                tracing::debug!(device_id = %authenticated.device_id, "closing connection: killed by a revoke");
+                let _ = socket.close().await;
+                return;
+            }
             message = socket.recv() => {
                 let Some(message) = message else { return };
                 let Ok(message) = message else { return };
@@ -285,11 +320,14 @@ async fn serve_authenticated_loop(
                     let _ = socket.close().await;
                     return;
                 };
+                if !frames.is_empty() {
+                    last_frame_at = std::time::Instant::now();
+                }
                 for frame in frames {
                     registry_touch(&state.registry, &authenticated.device_id).await;
                     match frame.first().copied() {
                         Some(FRAME_CLASS_CONTROL) => {
-                            if !handle_control_frame(socket, state, authenticated, &frame).await {
+                            if !handle_control_frame(socket, state, authenticated, &frame, &mut rate_limiter).await {
                                 return;
                             }
                         }
@@ -336,6 +374,54 @@ async fn serve_authenticated_loop(
     }
 }
 
+/// Per-connection control-frame rate limiter — see
+/// `state::CONTROL_FRAME_RATE_LIMIT_BURST`/`CONTROL_FRAME_RATE_LIMIT_PER_SECOND`
+/// for the bound and its reasoning. A token bucket: starts full, drains one
+/// token per accepted control frame, refills continuously over real elapsed
+/// time. Kept as connection-local state (constructed once per
+/// `serve_authenticated_loop` call) rather than threaded through
+/// `Registry`: relay-protocol.md's "exactly one persistent connection per
+/// Identity" means per-connection state already *is* per-Identity state, so
+/// no cross-task sharing or locking is needed to enforce this per-Identity.
+struct RateLimiter {
+    tokens: f64,
+    capacity: f64,
+    refill_per_second: f64,
+    last_refill: std::time::Instant,
+}
+
+impl RateLimiter {
+    fn new(capacity: u32, refill_per_second: u32) -> Self {
+        Self {
+            tokens: f64::from(capacity),
+            capacity: f64::from(capacity),
+            refill_per_second: f64::from(refill_per_second),
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    /// Refills against the real clock, then attempts to take one token.
+    fn try_acquire(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.last_refill = now;
+        self.try_acquire_after(elapsed)
+    }
+
+    /// The pure boundary decision [`Self::try_acquire`] delegates to, split
+    /// out so it's unit-testable without waiting on the real clock — the
+    /// same discipline [`expired_tunnel_ids`] uses for [`reap_idle_tunnels`].
+    fn try_acquire_after(&mut self, elapsed: Duration) -> bool {
+        self.tokens = (self.tokens + elapsed.as_secs_f64() * self.refill_per_second).min(self.capacity);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Decodes and dispatches one class-`0x01` frame, sending its response
 /// directly to `socket`. Returns `false` if the connection was closed
 /// (already done inside) and the caller must stop serving it.
@@ -344,8 +430,28 @@ async fn handle_control_frame(
     state: &AppState,
     authenticated: &Authenticated,
     frame: &[u8],
+    rate_limiter: &mut RateLimiter,
 ) -> bool {
     let response = match decode_control::<ControlRequest>(frame) {
+        Ok(request) if !rate_limiter.try_acquire() => {
+            // relay-protocol.md's "Errors and backpressure": exceeding the
+            // per-Identity control-frame rate "MUST close the connection
+            // rather than silently dropping requests, so a client can
+            // detect and back off". The error frame is sent best-effort
+            // before closing — a client that's still reading gets an
+            // explicit, typed reason rather than an unexplained close.
+            tracing::debug!(device_id = %authenticated.device_id, "closing connection: control-frame rate limit exceeded");
+            let error = ControlResponse::Error {
+                request_id: request.request_id().to_string(),
+                code: "rate_limited".to_string(),
+                message: "control-frame rate limit exceeded".to_string(),
+            };
+            if let Ok(wire) = encode_control(&error) {
+                let _ = socket.send(Message::Binary(wire.into())).await;
+            }
+            let _ = socket.close().await;
+            return false;
+        }
         Ok(request) => dispatch(state, authenticated, request).await,
         Err(err) => {
             // Covers unrecognized `type` values (and anything else that
@@ -612,35 +718,7 @@ async fn dispatch(
             list_devhost_ssh_endpoints(state, request_id).await
         }
         ControlRequest::OpenTunnel { request_id, target_device_id, purpose } => {
-            if let Err(code) =
-                check_open_tunnel_permitted(state, authenticated, &target_device_id, &purpose).await
-            {
-                return ControlResponse::Error {
-                    request_id,
-                    code: code.to_string(),
-                    message: "open-tunnel is not permitted for this Identity class, purpose, or target".to_string(),
-                };
-            }
-            if !state.registry.online_devices.read().await.contains_key(&target_device_id) {
-                return ControlResponse::Error {
-                    request_id,
-                    code: "target_offline".to_string(),
-                    message: "target device is not currently connected".to_string(),
-                };
-            }
-            let tunnel_id = generate_tunnel_id();
-            state.registry.tunnels.write().await.insert(
-                tunnel_id,
-                Tunnel {
-                    requester_device_id: authenticated.device_id.clone(),
-                    target_device_id: target_device_id.clone(),
-                    purpose: purpose.clone(),
-                    last_activity_unix: now_unix(),
-                },
-            );
-            push_tunnel_offered(state, &target_device_id, tunnel_id, &authenticated.device_id, &purpose)
-                .await;
-            ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) }
+            handle_open_tunnel(state, authenticated, request_id, target_device_id, purpose).await
         }
         ControlRequest::AgentEvent { request_id, event } => {
             if authenticated.identity_class != IdentityClass::Devhost {
@@ -659,10 +737,152 @@ async fn dispatch(
             state.registry.fcm_tokens.write().await.insert(authenticated.device_id.clone(), fcm_token);
             ControlResponse::RegisterFcmTokenOk { request_id }
         }
+        ControlRequest::RevokeDevice { request_id, device_id } => {
+            handle_revoke_device(state, authenticated, request_id, device_id).await
+        }
+        ControlRequest::RevokePhoneSession { request_id, device_id } => {
+            handle_revoke_phone_session(state, authenticated, request_id, device_id).await
+        }
         ControlRequest::Enroll { request_id, .. } => {
             // Enroll only runs pre-authentication, per handle_connection.
             not_permitted(&request_id, "enroll")
         }
+    }
+}
+
+/// The `open-tunnel` capability body, split out of [`dispatch`] purely to
+/// keep that function's line count reasonable — permission-checking
+/// (`check_open_tunnel_permitted`) and target-presence checking stay exactly
+/// as they were, just relocated here so `dispatch` only holds the one-line
+/// match arm calling this.
+async fn handle_open_tunnel(
+    state: &AppState,
+    authenticated: &Authenticated,
+    request_id: String,
+    target_device_id: String,
+    purpose: String,
+) -> ControlResponse {
+    if let Err(code) = check_open_tunnel_permitted(state, authenticated, &target_device_id, &purpose).await {
+        return ControlResponse::Error {
+            request_id,
+            code: code.to_string(),
+            message: "open-tunnel is not permitted for this Identity class, purpose, or target".to_string(),
+        };
+    }
+    if !state.registry.online_devices.read().await.contains_key(&target_device_id) {
+        return ControlResponse::Error {
+            request_id,
+            code: "target_offline".to_string(),
+            message: "target device is not currently connected".to_string(),
+        };
+    }
+    let tunnel_id = generate_tunnel_id();
+    state.registry.tunnels.write().await.insert(
+        tunnel_id,
+        Tunnel {
+            requester_device_id: authenticated.device_id.clone(),
+            target_device_id: target_device_id.clone(),
+            purpose: purpose.clone(),
+            last_activity_unix: now_unix(),
+        },
+    );
+    push_tunnel_offered(state, &target_device_id, tunnel_id, &authenticated.device_id, &purpose).await;
+    ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) }
+}
+
+/// The `revoke-device` capability body, split out of [`dispatch`] purely to
+/// keep that function's line count reasonable — permission-checking stays
+/// inline here, mirroring every other capability's own check in `dispatch`
+/// itself; this is only ever called after `dispatch` has already matched the
+/// frame's `type`. Phone-only, per [`ControlRequest::RevokeDevice`]'s doc
+/// comment.
+async fn handle_revoke_device(
+    state: &AppState,
+    authenticated: &Authenticated,
+    request_id: String,
+    device_id: String,
+) -> ControlResponse {
+    if authenticated.identity_class != IdentityClass::Phone {
+        return not_permitted(&request_id, "revoke-device");
+    }
+    if !revoke_device(state, &device_id).await {
+        return ControlResponse::Error {
+            request_id,
+            code: "unknown_device".to_string(),
+            message: "no enrolled device with this device_id".to_string(),
+        };
+    }
+    ControlResponse::RevokeDeviceOk { request_id, device_id }
+}
+
+/// [`handle_revoke_device`]'s sibling for `revoke-phone-session`. Phone-only,
+/// per [`ControlRequest::RevokePhoneSession`]'s doc comment.
+async fn handle_revoke_phone_session(
+    state: &AppState,
+    authenticated: &Authenticated,
+    request_id: String,
+    device_id: String,
+) -> ControlResponse {
+    if authenticated.identity_class != IdentityClass::Phone {
+        return not_permitted(&request_id, "revoke-phone-session");
+    }
+    if !revoke_phone_session(state, &device_id).await {
+        return ControlResponse::Error {
+            request_id,
+            code: "unknown_device".to_string(),
+            message: "no phone session recorded for this device_id".to_string(),
+        };
+    }
+    ControlResponse::RevokePhoneSessionOk { request_id, device_id }
+}
+
+/// Sets `EnrolledDevice.revoked = true` for `device_id` and disconnects its
+/// live connection right now, if it has one. Returns `false` if
+/// `device_id` names no enrolled device at all (the caller reports this as
+/// `unknown_device` rather than a silent no-op success). Only the registry
+/// membership/`revoked` flag is mutated here — the certificate itself stays
+/// valid and verifiable; `authenticate_device`'s `entry.revoked` check
+/// (`ws.rs`, this same module) is what makes a revoked device's *next*
+/// connection attempt fail closed regardless of certificate validity, per
+/// auth-and-enrollment.md's "Revocation" section.
+async fn revoke_device(state: &AppState, device_id: &str) -> bool {
+    let found = {
+        let mut devices = state.registry.devices.write().await;
+        let Some(device) = devices.get_mut(device_id) else { return false };
+        device.revoked = true;
+        true
+    };
+    kill_connection(state, device_id).await;
+    found
+}
+
+/// Invalidates every `phone_sessions` entry recorded against `device_id`
+/// (auth-and-enrollment.md: "may hold multiple passkey credentials, one per
+/// enrolled phone/browser" — normally one entry, but this removes all of
+/// them defensively) and disconnects that Identity's live connection right
+/// now, if it has one. Returns `false` if no session was found for
+/// `device_id` at all.
+async fn revoke_phone_session(state: &AppState, device_id: &str) -> bool {
+    let removed = {
+        let mut sessions = state.registry.phone_sessions.write().await;
+        let before = sessions.len();
+        sessions.retain(|_, session| session.device_id != device_id);
+        before != sessions.len()
+    };
+    kill_connection(state, device_id).await;
+    removed
+}
+
+/// Fires `device_id`'s kill switch, if it's currently connected — see
+/// `Registry::kill_switches`'s doc comment. A `device_id` with no live
+/// connection right now (never connected, or already disconnected) simply
+/// has nothing to kill; that's not an error here, since the registry-level
+/// revocation the caller already performed is what makes its *next*
+/// connection attempt fail, independent of whether this finds a live
+/// connection to close immediately.
+async fn kill_connection(state: &AppState, device_id: &str) {
+    if let Some(kill_tx) = state.registry.kill_switches.write().await.remove(device_id) {
+        let _ = kill_tx.send(());
     }
 }
 
@@ -690,13 +910,14 @@ async fn list_devhost_ssh_endpoints(state: &AppState, request_id: String) -> Con
 }
 
 /// Forwards `event` (sent by `from_device_id`, a devhost) to every currently
-/// connected phone Identity, or triggers the FCM dispatch stub for any
-/// registered phone that's *not* currently connected — per notifications.md,
-/// FCM is the backstop when the phone's persistent connection is closed, not
-/// the primary path. Single-tenant per DESIGN.md §5, but the one user may
-/// hold multiple enrolled phone/browser credentials (auth-and-enrollment.md:
-/// "may hold multiple passkey credentials"), so this fans out to all of
-/// them rather than assuming exactly one.
+/// connected phone Identity, or dispatches a real FCM v1 push (see
+/// `crate::fcm`) for any registered phone that's *not* currently connected
+/// — per notifications.md, FCM is the backstop when the phone's persistent
+/// connection is closed, not the primary path. Single-tenant per DESIGN.md
+/// §5, but the one user may hold multiple enrolled phone/browser
+/// credentials (auth-and-enrollment.md: "may hold multiple passkey
+/// credentials"), so this fans out to all of them rather than assuming
+/// exactly one.
 async fn route_agent_event(state: &AppState, from_device_id: &str, event: WireAgentEvent) {
     // `phone_sessions` is keyed by session credential, not `device_id` — the
     // real device_id (what `online_devices`/`connections`/`fcm_tokens` are
@@ -718,59 +939,18 @@ async fn route_agent_event(state: &AppState, from_device_id: &str, event: WireAg
                 }
             }
         } else if let Some(token) = fcm_tokens.get(&phone_id) {
-            dispatch_fcm_push_stub(token, from_device_id, &event);
+            // Spawned rather than awaited inline: this is a network call
+            // (`crate::fcm::FcmClient::dispatch`), and a slow or hung FCM
+            // request must never delay routing this event to the *next*
+            // phone in this fan-out loop, or delay `dispatch`'s caller from
+            // returning `AgentEventOk` to the devhost that reported it.
+            let fcm = state.fcm.clone();
+            let token = token.clone();
+            let from_device_id = from_device_id.to_string();
+            let event = event.clone();
+            tokio::spawn(async move { fcm.dispatch(&token, &from_device_id, &event).await });
         }
     }
-}
-
-/// **Stub — not a real FCM dispatch.** This environment has no `gcloud`/
-/// `firebase` CLI or GCP service-account credential available, so the
-/// actual FCM HTTP v1 API call (`POST
-/// https://fcm.googleapis.com/v1/projects/<project>/messages:send` with a
-/// service-account-signed `OAuth2` bearer token) cannot be implemented or
-/// tested here. This logs exactly what a real dispatch would send — a
-/// coarse summary only, never command text, file contents, prompts, or
-/// credentials, per notifications.md's redaction rule — and returns as if
-/// it succeeded. To make this real: obtain a Firebase service-account
-/// credential (see DESIGN.md §7's "Push setup"), sign a short-lived `OAuth2`
-/// token from it, and issue the HTTP v1 API call with `token` as the
-/// target's FCM registration token and a data-only (not notification-only)
-/// payload carrying just enough for the Android app to route a deep link.
-fn dispatch_fcm_push_stub(token: &str, from_device_id: &str, event: &WireAgentEvent) {
-    let (workspace_id, item_id, summary) = match event {
-        WireAgentEvent::InputRequired { workspace_id, item_id, reason } => {
-            (workspace_id.as_str(), item_id.as_str(), format!("input_required:{reason:?}"))
-        }
-        WireAgentEvent::TurnCompleted { workspace_id, item_id } => (workspace_id.as_str(), item_id.as_str(), "turn_completed".to_string()),
-        WireAgentEvent::FilesChanged { workspace_id, item_id, .. } => (workspace_id.as_str(), item_id.as_str(), "files_changed".to_string()),
-        WireAgentEvent::AgentStatus { workspace_id, item_id, status } => {
-            (workspace_id.as_str(), item_id.as_str(), format!("agent_status:{status:?}"))
-        }
-        // Editor presence has no `item_id` (it's workspace-scoped, not
-        // item-scoped) and, per ssh-bridge-and-zed.md, is a live indicator
-        // only — it doesn't warrant waking an offline phone via FCM the
-        // way an actionable agent event does, but this stub logs it the
-        // same bounded way for observability rather than special-casing
-        // silence here.
-        WireAgentEvent::EditorAttached { workspace_id, editor } => (workspace_id.as_str(), "", format!("editor_attached:{editor:?}")),
-        WireAgentEvent::EditorDetached { workspace_id, editor } => (workspace_id.as_str(), "", format!("editor_detached:{editor:?}")),
-        // No `workspace_id`/`item_id` per `WireAgentEvent::AuthRequired`'s
-        // own doc comment — this event isn't attributable to a single
-        // workspace item. Only the `provider` tag is logged here, the same
-        // way every other arm above logs a typed tag rather than free-form
-        // content: `user_code`/`verification_uri` are what the phone needs
-        // to display to complete the flow, not what belongs in a relay log
-        // line.
-        WireAgentEvent::AuthRequired { provider, .. } => ("", "", format!("auth_required:{provider:?}")),
-    };
-    tracing::info!(
-        fcm_token_prefix = %token.get(..8).unwrap_or(token),
-        %from_device_id,
-        %workspace_id,
-        %item_id,
-        %summary,
-        "FCM dispatch stub: would push here (no real credential configured in this environment)"
-    );
 }
 
 /// Sends the unsolicited `tunnel-offered` push to the tunnel's target, per
@@ -937,9 +1117,10 @@ pub async fn dev_mint_enrollment_token(State(state): State<Arc<AppState>>) -> im
 
 #[cfg(test)]
 mod tests {
-    use super::{Tunnel, expired_tunnel_ids};
+    use super::{RateLimiter, Tunnel, expired_tunnel_ids};
     use crate::state::TUNNEL_IDLE_TIMEOUT_SECONDS;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn tunnel(last_activity_unix: u64) -> Tunnel {
         Tunnel {
@@ -980,5 +1161,31 @@ mod tests {
     #[test]
     fn an_empty_registry_expires_nothing() {
         assert!(expired_tunnel_ids(&HashMap::new(), 1_000_000).is_empty());
+    }
+
+    // `RateLimiter::try_acquire` itself relies on the real system clock, so
+    // — mirroring `expired_tunnel_ids` above — these exercise the pure
+    // boundary decision (`try_acquire_after`) it delegates to, with
+    // synthetic elapsed durations rather than a real wait.
+    #[test]
+    fn rate_limiter_allows_a_burst_then_rejects_until_refill() {
+        let mut limiter = RateLimiter::new(3, 1);
+        assert!(limiter.try_acquire_after(Duration::ZERO));
+        assert!(limiter.try_acquire_after(Duration::ZERO));
+        assert!(limiter.try_acquire_after(Duration::ZERO));
+        assert!(!limiter.try_acquire_after(Duration::ZERO), "burst of 3 exhausted with no time elapsed to refill");
+        assert!(limiter.try_acquire_after(Duration::from_secs(1)), "1 token refills after 1s at 1/s");
+        assert!(!limiter.try_acquire_after(Duration::ZERO), "the refilled token was just spent");
+    }
+
+    #[test]
+    fn rate_limiter_refill_never_exceeds_capacity() {
+        let mut limiter = RateLimiter::new(2, 100);
+        // A huge elapsed duration would refill far past capacity if
+        // uncapped — asserts the `.min(self.capacity)` clamp actually
+        // bounds the bucket, not just that some tokens refill.
+        assert!(limiter.try_acquire_after(Duration::from_secs(10)));
+        assert!(limiter.try_acquire_after(Duration::ZERO));
+        assert!(!limiter.try_acquire_after(Duration::ZERO), "capacity is 2, both tokens already spent");
     }
 }

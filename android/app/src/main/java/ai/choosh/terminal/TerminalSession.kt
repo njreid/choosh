@@ -55,6 +55,17 @@ class TerminalSession {
         if (handle != 0L) TerminalBridge.nativeTerminalTestInject(handle, bytes)
     }
 
+    /**
+     * The current visible grid as plain text, one line per row — used by
+     * [ai.choosh.terminal.TerminalAccessibilityHelper] to expose real
+     * terminal content to TalkBack. Returns an empty string before
+     * [create] has run.
+     */
+    fun visibleText(): String {
+        val handle = handle
+        return if (handle != 0L) TerminalBridge.nativeTerminalGetText(handle) else ""
+    }
+
     fun destroy() {
         val handle = handle
         if (handle != 0L) {

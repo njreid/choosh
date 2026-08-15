@@ -2,6 +2,8 @@ package ai.choosh.fleet
 
 import ai.choosh.engine.ConnectionState
 import ai.choosh.engine.DevHostPresence
+import ai.choosh.ui.WindowWidthSizeClass
+import ai.choosh.ui.rememberWindowWidthSizeClass
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -12,6 +14,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
@@ -62,14 +67,26 @@ fun FleetDrawer(
                 "No devhosts enrolled yet.",
                 modifier = Modifier.padding(16.dp),
             )
-            else -> LazyColumn(modifier = Modifier.testTag("fleet-row-list")) {
-                items(state.rows, key = { it.id }) { row ->
-                    FleetRowView(
-                        row = row,
-                        onProjectClick = onProjectClick,
-                        onDevHostClick = onDevHostClick,
-                        onWorkspaceClick = onWorkspaceClick,
-                    )
+            else -> {
+                // Adaptive layout, per `docs/accessibility-device-report.md`'s
+                // item 3/4 ("Fleet drawer content occupies a small
+                // top-left region of a 1600x2560 window with no adaptive
+                // use of the extra width or height"). At Medium/Expanded
+                // widths, a multi-column grid uses the real window instead
+                // of a single-column list pinned to the left.
+                val widthClass = rememberWindowWidthSizeClass()
+                if (widthClass == WindowWidthSizeClass.COMPACT) {
+                    LazyColumn(modifier = Modifier.testTag("fleet-row-list")) {
+                        items(state.rows, key = { it.id }) { row ->
+                            FleetRowView(row = row, onProjectClick = onProjectClick, onDevHostClick = onDevHostClick, onWorkspaceClick = onWorkspaceClick)
+                        }
+                    }
+                } else {
+                    LazyVerticalGrid(columns = GridCells.Adaptive(minSize = 320.dp), modifier = Modifier.testTag("fleet-row-list")) {
+                        items(state.rows, key = { it.id }) { row ->
+                            FleetRowView(row = row, onProjectClick = onProjectClick, onDevHostClick = onDevHostClick, onWorkspaceClick = onWorkspaceClick)
+                        }
+                    }
                 }
             }
         }
@@ -159,6 +176,26 @@ private fun FleetRowView(
             .fillMaxWidth()
             .clickable(onClick = onClick)
             .testTag("fleet-row-${row.id}")
+            // `docs/accessibility-device-report.md`'s item 1, gap 1: "by
+            // identical code pattern" to `ExplorerScreen`'s
+            // `ChangedFileRow`, this row's clickable node otherwise carries
+            // an empty accessible label while the real name/sublabel text
+            // sits on non-focusable sibling `Text` children. A real,
+            // context-specific label naming the row's actual name and
+            // sublabel — confirmed via a real on-device `uiautomator dump`
+            // that plain `Modifier.semantics(mergeDescendants = true) {}`
+            // did not surface the children's text in the exposed
+            // `AccessibilityNodeInfo` on this device/Compose version (see
+            // `ExplorerScreen.kt`'s identical finding), so this uses the
+            // explicit `contentDescription` form instead — the same
+            // mechanism already confirmed working for this file's own
+            // `SortModeIcon`/`AttentionDot`.
+            .semantics {
+                contentDescription = buildString {
+                    append("$label, $sublabel")
+                    if (row.needsAttention) append(", needs attention")
+                }
+            }
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,

@@ -2,19 +2,24 @@ package ai.choosh.notifications;
 
 import java.util.Objects;
 
-/** Redacted, platform-neutral notification intent. */
+/**
+ * Redacted, platform-neutral notification intent for {@code input_required}
+ * — an agent is blocked on the user. Keyed {@code (host_id, workspace_id,
+ * item_id)}; see {@link AuthNotificationIntent} for {@code auth_required}'s
+ * sibling shape.
+ */
 public record NotificationIntent(
         String hostId,
         String workspaceId,
         String itemId,
         String workspaceName,
         String agentName,
-        String reason) {
+        String reason) implements RenderableNotification {
     public NotificationIntent {
         require(hostId, "hostId"); require(workspaceId, "workspaceId"); require(itemId, "itemId");
         require(workspaceName, "workspaceName"); require(agentName, "agentName"); require(reason, "reason");
     }
-    public String key() { return hostId + ":" + workspaceId + ":" + itemId; }
+    @Override public String key() { return hostId + ":" + workspaceId + ":" + itemId; }
     private static void require(String value, String name) {
         if (value == null || value.isBlank() || value.indexOf('\0') >= 0) throw new IllegalArgumentException(name);
     }

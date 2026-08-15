@@ -227,6 +227,37 @@ impl Grid {
         }
     }
 
+    /// Renders every visible row as plain text, one row per line, trailing
+    /// blank cells on each row trimmed and wide-glyph continuation
+    /// placeholder cells skipped (so a double-width CJK glyph contributes
+    /// one character, not two). This is the minimal accessible-text
+    /// equivalent of the GPU-rendered grid — Kotlin's
+    /// `TerminalSurfaceView` exposes it to `TalkBack` via a virtual
+    /// accessibility node (`docs/accessibility-device-report.md`'s item 1,
+    /// gap 2: "the Terminal surface has zero accessible content"), since a
+    /// screen reader has no other way to read a `SurfaceView`'s pixels.
+    /// Deliberately row-by-row plain text, not styled runs — accessibility
+    /// content, unlike the renderer's [`Cell`] runs, has no use for
+    /// color/bold/italic.
+    #[must_use]
+    pub fn visible_text(&self) -> String {
+        let mut lines: Vec<String> = Vec::with_capacity(usize::from(self.rows));
+        for row in 0..self.rows {
+            let mut line = String::new();
+            for cell in self.row(row) {
+                if cell.wide_continuation {
+                    continue;
+                }
+                line.push_str(if cell.text.is_empty() { " " } else { cell.text.as_str() });
+            }
+            while line.ends_with(' ') {
+                line.pop();
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
+
     /// Resizes in place, preserving the top-left overlapping region and
     /// re-marking everything dirty (a resize is always a full redraw, per
     /// `terminal-experience.md`'s "render only after damage ... resize").
@@ -278,6 +309,24 @@ mod tests {
         assert_eq!(grid.cell(0, 0).unwrap().text, "1");
         assert_eq!(grid.cell(0, 1).unwrap().text, "2");
         assert!(grid.cell(0, 2).unwrap().is_blank());
+    }
+
+    #[test]
+    fn visible_text_trims_trailing_blanks_and_joins_rows_with_newlines() {
+        let mut grid = Grid::new(5, 2);
+        grid.set_cell(0, 0, Cell { text: "h".into(), ..Cell::default() });
+        grid.set_cell(1, 0, Cell { text: "i".into(), ..Cell::default() });
+        grid.set_cell(0, 1, Cell { text: "!".into(), ..Cell::default() });
+        assert_eq!(grid.visible_text(), "hi\n!");
+    }
+
+    #[test]
+    fn visible_text_skips_wide_continuation_cells() {
+        let mut grid = Grid::new(4, 1);
+        grid.set_cell(0, 0, Cell { text: "你".into(), wide: true, ..Cell::default() });
+        grid.set_cell(1, 0, Cell { wide_continuation: true, ..Cell::default() });
+        grid.set_cell(2, 0, Cell { text: "x".into(), ..Cell::default() });
+        assert_eq!(grid.visible_text(), "你x");
     }
 
     #[test]

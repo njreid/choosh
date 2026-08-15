@@ -18,6 +18,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 
@@ -54,7 +56,20 @@ fun JjDiffScreen(
                 modifier = Modifier.weight(1f).testTag("diff-to-field"),
             )
         }
-        Button(onClick = onLoad, modifier = Modifier.padding(horizontal = 8.dp).testTag("diff-load-button")) { Text("Load diff") }
+        Button(
+            onClick = onLoad,
+            modifier = Modifier
+                .padding(horizontal = 8.dp)
+                .testTag("diff-load-button")
+                // `docs/accessibility-device-report.md`'s item 1, gap 1
+                // flagged this button by name ("the diff's
+                // OutlinedTextField-adjacent Load diff button pattern") —
+                // a context-specific label naming the actual revisions
+                // about to be loaded, not just "Load diff".
+                .semantics {
+                    contentDescription = "Load diff from ${state.from.ifBlank { "default @-" }} to ${state.to.ifBlank { "default @" }}"
+                },
+        ) { Text("Load diff") }
 
         when {
             state.isLoading -> Text("Loading diff…", modifier = Modifier.padding(16.dp))

@@ -10,9 +10,15 @@
 //! and `register-fcm-token` dispatch/routing (M2), the laptop-proxy-only
 //! `list-devhost-ssh-endpoints` read (M6), and the `devhost`-to-`devhost`
 //! `offload`-purpose tunnel capability (M7) — see `crate::ws::dispatch` for
-//! the full control-frame catalog this now serves.
+//! the full control-frame catalog this now serves. Also, per the M8
+//! threat-model review's named follow-ups: phone-gated device/phone-session
+//! revocation that closes an already-live connection immediately
+//! (`crate::ws::dispatch`'s `RevokeDevice`/`RevokePhoneSession` arms), a
+//! per-Identity control-frame rate limit (`crate::ws::RateLimiter`), and a
+//! connection-wide idle timeout (`AppState::connection_idle_timeout`).
 
 mod ca;
+mod fcm;
 #[cfg(test)]
 mod integration_tests;
 mod rng;
@@ -38,6 +44,17 @@ pub struct AppState {
     pub registry: Arc<state::Registry>,
     pub ca_key: ed25519_dalek::SigningKey,
     pub webauthn: WebauthnState,
+    /// See `state::CONNECTION_IDLE_TIMEOUT_SECONDS`. A plain field (not the
+    /// constant used directly) so a test can shrink it to something an
+    /// `#[tokio::test]` can actually wait out in real time, by mutating it
+    /// via `Arc::get_mut` before the state is cloned into `router`/spawned —
+    /// mirroring how `CHOOSH_RELAYD_STATE_DIR`/`build_state_in` already let
+    /// tests substitute an isolated directory without an env var.
+    pub connection_idle_timeout: std::time::Duration,
+    /// Real Firebase Cloud Messaging v1 dispatcher, or a logging-only
+    /// fallback — see `crate::fcm`'s module doc for this environment's
+    /// credential-availability finding.
+    pub fcm: fcm::FcmClient,
 }
 
 async fn healthz() -> &'static str {
@@ -75,6 +92,8 @@ pub fn build_state_in(dir: &Path) -> Arc<AppState> {
         registry: Arc::new(state::Registry::new()),
         ca_key,
         webauthn: webauthn::build(&rp_id, &rp_origin_str),
+        connection_idle_timeout: std::time::Duration::from_secs(state::CONNECTION_IDLE_TIMEOUT_SECONDS),
+        fcm: fcm::FcmClient::from_env(),
     })
 }
 

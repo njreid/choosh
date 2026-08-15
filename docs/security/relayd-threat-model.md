@@ -201,47 +201,64 @@ match the code exactly (no further drift found).
   reach the phone or another laptop-proxy's tunnels, list devhosts, or
   request enrollment tokens.
 
-**Revocation — real gap found, not fixed.** Both `authenticate_device`
+**Revocation — real gap found, since fixed as a follow-up to this review.**
+At the time of the original review, both `authenticate_device`
 (`ws.rs:173-175`) and `check_open_tunnel_permitted`
-(`ws.rs:527-533`, filtering `!device.revoked`) correctly *honor*
-`EnrolledDevice.revoked` wherever it's checked — a revoked device's next
-connection attempt does fail closed, exactly as auth-and-enrollment.md
-promises. But there is **no code path anywhere in `choosh-relayd` that ever
-sets `revoked = true`.** Grepping the crate for any write to that field, or
-any `ControlRequest`/HTTP route resembling a revoke operation, finds none —
-`EnrolledDevice::revoked` is initialized `false` at `handle_enroll`
-(`ws.rs:858`) and never mutated again. The same is true for phone passkey
-credential revocation (auth-and-enrollment.md's "a revoked phone passkey
-credential invalidates that credential's stored session token immediately")
-— there is no revoke endpoint for `phone_sessions` either.
+(`ws.rs:527-533`, filtering `!device.revoked`) correctly *honored*
+`EnrolledDevice.revoked` wherever it was checked — a revoked device's next
+connection attempt did fail closed, exactly as auth-and-enrollment.md
+promises — but no code path anywhere in `choosh-relayd` ever set
+`revoked = true`, and there was no revoke endpoint for `phone_sessions`
+either.
 
-This is **not a small, safe fix**: a real revoke path needs a
-passkey-gated, phone-only control frame or HTTP route (per
-auth-and-enrollment.md, "an operator-initiated revoke... itself
-passkey-gated"), and — since `Registry` has no disk persistence at all yet
-(`state.rs:1-7`'s crate doc already flags this as a known M0 gap) — a
-decision about whether revocation needs to survive a `relayd` restart before
-it's trustworthy as an incident-response tool. Implementing it well is a
-scoped follow-up, not a patch.
+**Fixed since.** Two phone-only control frames now exist:
+`ControlRequest::RevokeDevice { device_id }` and
+`ControlRequest::RevokePhoneSession { device_id }`
+(`rust/choosh-protocol/src/relay.rs`), dispatched by `ws.rs::dispatch`'s
+`handle_revoke_device`/`handle_revoke_phone_session`. Phone-only gating
+matches auth-and-enrollment.md's "operator-initiated revoke... itself
+passkey-gated" — `phone` is the only Identity class with a
+`WebAuthn`-authenticated human behind it. `RevokeDevice` sets
+`EnrolledDevice.revoked = true` (the checks above already honored this
+field, so no change was needed there); `RevokePhoneSession` removes every
+`phone_sessions` entry recorded against the target `device_id`. Critically,
+both go further than the registry-only half of the fix: `Registry` gained a
+`kill_switches: HashMap<String, oneshot::Sender<()>>` map
+(`state.rs`), populated alongside `connections` for every live connection;
+revoking fires and removes the target's kill switch, and
+`serve_authenticated_loop`'s `tokio::select!` gained a branch listening on
+its receiver that closes the socket immediately when fired. This means a
+revoke closes an **already-connected** device's or phone's live session
+right away, not just its next reconnect attempt — verified directly by
+`revoking_a_device_closes_its_live_connection_immediately` and
+`revoking_a_phone_session_closes_its_live_connection_immediately`
+(`integration_tests.rs`), both of which revoke a real, currently-connected
+WebSocket and assert it actually closes within a bounded wait, plus
+`a_revoked_devices_next_connection_attempt_fails_to_authenticate` for the
+already-covered "next connection" half. Non-phone callers and unknown
+targets are rejected with typed errors (`not_permitted`/`unknown_device`),
+covered by their own tests.
 
-**Verdict: Capability scoping is mitigated (and now correctly documented).
-Revocation is an accepted risk — named as an explicit follow-up, not a
-silent gap.**
+`Registry`'s lack of disk persistence (`state.rs`'s crate doc,
+[PLAN.md](../../PLAN.md)'s Known follow-ups) means this revoke only holds
+for one running `relayd` process's lifetime — accepted rather than solved,
+since a restart already invalidates every credential in the fleet, a
+strictly stronger reset than any specific revoke, so it doesn't weaken the
+guarantee, only bounds its scope.
+
+**Verdict: Mitigated.** Capability scoping (unchanged from the original
+review) and revocation (fixed since) are both now enforced in code, not
+just documented as intent.
 
 **Reasoning.** The capability checks are real, enforced in code, covered by
 tests (`laptop_proxy_may_only_open_ssh_purpose_tunnels`,
 `non_phone_identity_cannot_call_list_devhosts_or_request_enrollment_token`,
-`register_fcm_token_from_a_devhost_is_rejected`, others), and — after this
-review's fix — match the documented table. But "what can a stolen
-credential do" is only half the risk model; "how fast can you shut it off"
-is the other half, and today the honest answer is: **not via any exposed
-mechanism** — the only way to invalidate a compromised device credential
-right now is to restart `relayd` with a hand-edited state directory, which
-isn't a real operational path. This should be tracked as a named follow-up
-before this system is trusted with anything sensitive; M8's exit criterion
-("a documented mitigation or an accepted risk for each") is satisfied by
-this paragraph being explicit about it, not by pretending the gap doesn't
-exist.
+`register_fcm_token_from_a_devhost_is_rejected`, others), and match the
+documented table. "How fast can you shut a compromised credential off" was
+this case's other, previously-unmet half — it now has a real, tested answer:
+immediately, via a phone-authenticated revoke that reaches both the registry
+and any live connection, not just a `relayd` restart with a hand-edited
+state directory.
 
 ---
 
@@ -350,20 +367,35 @@ bandwidth against the single always-on instance the whole fleet depends on.
   connection closes. `cargo test -p choosh-relayd` passes (30/30) and
   `cargo clippy -p choosh-relayd --all-targets -- -D warnings` is clean
   with this change in place.
-- **Slow-loris / partial frames:** `FrameDecoder::feed` (`framing.rs:105-155`)
+- **Slow-loris / partial frames — real gap found, since fixed as a
+  follow-up to this review.** `FrameDecoder::feed` (`framing.rs:105-155`)
   is fully incremental — it accepts arbitrary byte fragments across
   multiple calls and only ever buffers up to `expected_payload` bytes for
   the frame currently in flight (bounded by the size checks above), so a
   connection that trickles bytes one at a time cannot grow `relayd`'s
-  per-connection buffer beyond one frame's worth. There is, however, no
-  *time* bound on how long a partial frame may sit open — a connection that
-  sends 3 of 4 header bytes and then never sends the 4th holds that
+  per-connection buffer beyond one frame's worth. There was, however, no
+  *time* bound on how long a partial frame could sit open — a connection
+  that sent 3 of 4 header bytes and then never sent the 4th held that
   allocation (small, since it's pre-header) indefinitely with no idle
   timeout at the framing layer. `TUNNEL_IDLE_TIMEOUT_SECONDS = 300`
   (`state.rs:97`) only bounds *tunnels with no data frames*, not raw
-  WebSocket connections stalled mid-frame — a connection that authenticates
-  and then sends nothing further (not even a truncated frame) is never
-  reaped. This is a real, unaddressed gap.
+  WebSocket connections stalled mid-frame — a connection that authenticated
+  and then sent nothing further (not even a truncated frame) was never
+  reaped. **Fixed since**: `AppState::connection_idle_timeout`
+  (`lib.rs`/`state.rs`'s `CONNECTION_IDLE_TIMEOUT_SECONDS`, 30 minutes in
+  production) is tracked per connection in `serve_authenticated_loop`,
+  reset on every *complete* frame (control or tunnel, not raw bytes — a
+  trickling slow-loris connection that never completes a frame does not
+  reset it), and enforced via a `tokio::select!` branch that closes the
+  socket once exceeded. Set well above the tunnel timeout deliberately:
+  this protocol has no periodic application-level heartbeat, so an
+  authenticated, idle-but-healthy devhost/laptop-proxy with no open tunnels
+  is an ordinary state, not itself suspicious. Covered by
+  `an_authenticated_connection_that_sends_nothing_further_is_eventually_closed`
+  (positive case, via a short test-only override of the timeout) and
+  `a_connection_that_keeps_sending_frames_is_not_reaped_as_idle` (negative
+  case, confirming the clock genuinely resets on activity rather than firing
+  unconditionally).
 - **Per-connection outbound backpressure:** `OUTBOUND_CHANNEL_CAPACITY = 256`
   (`state.rs:93`) bounds each connection's outbound queue; `forward_data`
   (`ws.rs:414-424`) uses non-blocking `try_send` and closes the tunnel
@@ -372,36 +404,57 @@ bandwidth against the single always-on instance the whole fleet depends on.
   `a_full_outbound_queue_closes_the_tunnel_instead_of_growing_unboundedly`.
   This bounds memory *per already-open tunnel* but nothing bounds the
   *number* of tunnels or connections in the first place (next point).
-- **Connection floods / request floods — real gap, not fixed.**
-  relay-protocol.md's "Errors and backpressure" section requires
+- **Request floods — real gap found, since fixed as a follow-up to this
+  review.** relay-protocol.md's "Errors and backpressure" section requires
   control-frame requests exceeding a per-Identity rate to close the
   connection ("rate limited per-Identity; exceeding the limit closes the
-  connection"). Grepping `choosh-relayd/src` for any rate-limiting,
-  connection-count cap, or per-identity request-rate tracking (`governor`,
-  `Semaphore`, `RateLimit`, or hand-rolled equivalents) finds **none**.
-  There is also no cap on total concurrent WebSocket connections at the
-  `axum` router level (`lib.rs:73-88`, `router`), and nothing prevents the
-  same authenticated Identity from opening unboundedly many `open-tunnel`
-  requests (each allocates a `Tunnel` entry and, per Case 4, an 8-byte ID —
-  cheap per-tunnel, but with no cap, an attacker holding one legitimate
-  device credential could still grow the `tunnels`/`connections` maps
-  without bound by looping `open-tunnel` against a real, online target).
+  connection"). At the time of the original review, grepping
+  `choosh-relayd/src` for any rate-limiting, connection-count cap, or
+  per-identity request-rate tracking (`governor`, `Semaphore`, `RateLimit`,
+  or hand-rolled equivalents) found none. **Fixed since**: `ws.rs`'s
+  `RateLimiter`, a per-connection token bucket (burst
+  `CONTROL_FRAME_RATE_LIMIT_BURST = 40`, refill
+  `CONTROL_FRAME_RATE_LIMIT_PER_SECOND = 20`/s — `state.rs`), is checked in
+  `handle_control_frame` before every dispatched request, including
+  `open-tunnel` (the most expensive request in the catalog: it allocates a
+  `Tunnel` registry entry and pushes a `tunnel-offered` frame to the
+  target). Exceeding it sends a typed `ControlResponse::Error { code:
+  "rate_limited", .. }` best-effort, then closes the connection — matching
+  relay-protocol.md's "MUST close the connection rather than silently
+  dropping requests" exactly, not just throttling silently. Connection-local
+  state suffices rather than a shared `Registry` structure, since
+  relay-protocol.md's Transport section already guarantees exactly one live
+  connection per Identity at a time, so per-connection state already is
+  per-Identity state. Verified against a real flood (more requests than the
+  burst allowance, sent back-to-back with no yielding delay so the bucket's
+  real-time refill cannot absorb it) by
+  `exceeding_the_control_frame_rate_limit_returns_a_typed_error_and_closes_the_connection`,
+  which asserts both that a typed `rate_limited` error is actually observed
+  (not silently dropped) and that the connection then genuinely closes; the
+  negative case (`a_moderate_burst_of_control_frames_is_never_rate_limited`)
+  guards against the bound being accidentally too tight for ordinary use.
+  There is still no cap on total concurrent WebSocket connections at the
+  `axum` router level (`lib.rs`, `router`) — the per-Identity rate limit
+  bounds how fast one already-authenticated Identity can issue requests, not
+  how many distinct connections the relay will accept in total; that remains
+  unaddressed and is a different, broader gap than the one this case
+  originally named.
 
-**Verdict: Frame-size and per-tunnel-backpressure vectors are mitigated
-(with one bug fixed this pass). Idle-partial-frame and connection/request-
-flood vectors are accepted risk, named as explicit follow-ups.**
+**Verdict: Frame-size, per-tunnel-backpressure, per-Identity request-rate,
+and idle-connection vectors are all mitigated (frame-size and
+per-tunnel-backpressure had one bug fixed during the original review; the
+rate-limit and idle-timeout gaps were fixed as a follow-up). A
+router-level cap on total concurrent connections remains unaddressed —
+narrower in scope than what this case originally covered, tracked
+separately.**
 
 **Reasoning.** The parts of this that are load-bearing for a genuinely
-malformed or oversized single frame are solid and now match spec exactly.
-The parts that require *rate* or *count* limiting across many
-frames/connections/tunnels are simply not implemented yet — this isn't a
-subtle bug to patch, it's unbuilt functionality (a rate limiter needs a
-design decision about the actual limits, not a two-line fix), so it's
-reported honestly as a gap rather than downplayed. Given `relayd` is
-explicitly called out in DESIGN.md §11 as now "load-bearing for the whole
-fleet," this and the Case 3 revocation gap are the two findings in this
-review most worth prioritizing before this system carries anything
-sensitive.
+malformed or oversized single frame, for one Identity's request rate, and
+for a stalled-mid-frame connection are now solid and match spec. What
+remains — a hard cap on total concurrent connections regardless of
+Identity — is a materially smaller, more specific gap than "no rate or
+count limiting at all," and is reasonable to track as its own follow-up
+rather than block this system's other uses on.
 
 ---
 
@@ -433,16 +486,71 @@ passing) and `cargo clippy -p choosh-relayd --all-targets -- -D warnings`
 
 ## Named follow-ups (not fixed in this pass — too large for a targeted fix)
 
-- **No working device or phone-passkey revocation mechanism.** `revoked`
-  is honored everywhere it's checked but nothing ever sets it. Needs a
-  passkey-gated revoke control frame/route, plus a decision on whether
-  `Registry`'s current lack of disk persistence blocks trusting revocation
-  as an incident-response tool.
-- **No connection-flood or per-Identity request-rate limiting**, despite
-  relay-protocol.md requiring it. Needs an actual rate-limiter design
-  (bucket sizes, what "closes the connection" means for a legitimate but
-  bursty devhost), not a quick patch.
-- **No idle timeout on a stalled mid-frame connection** (as opposed to a
-  stalled *tunnel*, which is covered). Low severity given the bounded
-  per-partial-frame buffer size, but still an unbounded-connection-count
-  vector combined with the point above.
+All three items originally listed here — device/phone-session revocation,
+per-Identity control-frame rate limiting, and the idle-connection timeout —
+have since been implemented as a follow-up to this review; see Cases 3 and 5
+above for the current (post-fix) state, and the "Summary of the
+revocation/rate-limit/idle-timeout follow-up" section below for what
+changed and how it was verified. One narrower gap surfaced during that
+follow-up remains open:
+
+- **No cap on total concurrent WebSocket connections at the `axum` router
+  level** (`lib.rs`, `router`). The per-Identity rate limit added since this
+  review bounds how fast one already-authenticated Identity can issue
+  requests, and per-tunnel/per-connection outbound backpressure (Cases 4-5)
+  bounds memory once connected — but nothing yet bounds how many distinct
+  connections `relayd` will accept in total, authenticated or not. Narrower
+  in scope than the three items originally named here (this system's own
+  design already bounds the realistic connection count in a single-tenant
+  deployment — one phone, a handful of devhosts/laptop-proxies — so this is
+  a defense-in-depth gap against a misbehaving or malicious client opening
+  many connections, not a gap in the core protocol guarantees).
+
+## Summary of the revocation/rate-limit/idle-timeout follow-up
+
+Landed after the original review, closing all three items this section
+previously named:
+
+1. **`rust/choosh-protocol/src/relay.rs`** — two new phone-only
+   `ControlRequest`/`ControlResponse` pairs, `RevokeDevice`/`RevokeDeviceOk`
+   and `RevokePhoneSession`/`RevokePhoneSessionOk`, plus a
+   `ControlRequest::request_id()` helper mirroring the existing
+   `ControlResponse::request_id()`.
+2. **`rust/choosh-relayd/src/state.rs`** — `Registry` gained
+   `kill_switches: HashMap<String, oneshot::Sender<()>>` (fires to force-close
+   an already-live connection), `CONNECTION_IDLE_TIMEOUT_SECONDS` (30
+   minutes), and `CONTROL_FRAME_RATE_LIMIT_BURST`/`_PER_SECOND` (40/20).
+3. **`rust/choosh-relayd/src/ws.rs`** — `dispatch` gained
+   `handle_revoke_device`/`handle_revoke_phone_session` (phone-only; set
+   `EnrolledDevice.revoked`/remove `phone_sessions` entries, then fire the
+   target's kill switch); `serve_authenticated_loop`'s `tokio::select!`
+   gained branches for the kill switch and an idle-timeout sleep (reset on
+   every completed frame, control or tunnel); `handle_control_frame` gained
+   a `RateLimiter` check ahead of `dispatch`, rejecting with a typed
+   `rate_limited` error and closing the connection once the per-connection
+   token bucket is empty.
+4. **`rust/choosh-relayd/src/lib.rs`** — `AppState` gained
+   `connection_idle_timeout` (a field, not a bare constant reference, so
+   tests can override it to something short and deterministic).
+5. **`docs/specs/relay-protocol.md`** and **`auth-and-enrollment.md`** —
+   both updated from "Not yet implemented" to describe the actual mechanism
+   now in place.
+
+Verified by `rust/choosh-relayd/src/integration_tests.rs`'s new tests —
+`revoking_a_device_closes_its_live_connection_immediately`,
+`a_revoked_devices_next_connection_attempt_fails_to_authenticate`,
+`revoke_device_is_rejected_from_a_non_phone_identity`,
+`revoking_an_unknown_device_id_returns_a_typed_error`,
+`revoking_a_phone_session_closes_its_live_connection_immediately`,
+`revoke_phone_session_is_rejected_from_a_non_phone_identity`,
+`revoking_an_unknown_phone_session_device_id_returns_a_typed_error`,
+`exceeding_the_control_frame_rate_limit_returns_a_typed_error_and_closes_the_connection`,
+`a_moderate_burst_of_control_frames_is_never_rate_limited`,
+`an_authenticated_connection_that_sends_nothing_further_is_eventually_closed`,
+and `a_connection_that_keeps_sending_frames_is_not_reaped_as_idle` — plus
+`rust/choosh-relayd/src/ws.rs`'s own unit tests for the `RateLimiter`'s pure
+boundary logic. `cargo test -p choosh-relayd -p choosh-protocol` passes (104
+tests, 0 failures, run repeatedly with no flakiness observed) and `cargo
+clippy -p choosh-relayd -p choosh-protocol --all-targets` is clean; `cargo
+check --workspace` confirms `choosh-hostd`/`choosh-android-transport`/
+`choosh-android-bridge` are unaffected by the additive `relay.rs` changes.

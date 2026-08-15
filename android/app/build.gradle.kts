@@ -132,6 +132,7 @@ dependencies {
     implementation(libs.credentials)
     implementation(libs.credentialsPlayServicesAuth)
     implementation(libs.securityCrypto)
+    implementation(libs.customview)
     implementation(libs.kotlinxCoroutinesAndroid)
     implementation(libs.kotlinxCoroutinesPlayServices)
     implementation(libs.kotlinxSerializationJson)

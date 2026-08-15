@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "source": {
+    "url": "https://github.com/njreid/zelland.git",
+    "release_tag": "v0.2.3",
+    "revision": "8bf9cf55911588451804a39526f8ae869da021b6",
+    "tree": "0960b9f788f1bb9da9b74d8e8f88f77274e24962",
+    "git_archive_sha256": "dc39a2d5da8c69ed9573bfd733df0ba13b0384cf4e6854d4537fe84e3e951bc1"
+  },
+  "ownership": {
+    "status": "granted",
+    "evidence": "../licenses/zelland-grant.md"
+  },
+  "integration": {
+    "status": "blocked",
+    "candidate_paths": [
+      "src-tauri/src/ghostty.rs",
+      "src-tauri/src/renderer/android.rs",
+      "src-tauri/src/renderer/mod.rs",
+      "src-tauri/src/terminal.rs"
+    ],
+    "blockers": [
+      "The pinned tree's libghostty-source gitlink (commit b10d4a0461f9d3d93c8512893f27ab2436d19793, itself pinning ghostty-org/ghostty at bebca84668947bfc92b9a30ed58712e1c34eee1d) has no .gitmodules entry mapping it to a fetchable URL at this revision, so the submodule contents cannot be resolved or independently audited from the pinned tree alone.",
+      "src-tauri/Cargo.toml at this revision depends on tauri/tauri-build 2.x plus the historical wgpu = \"23.0\" and glyphon = \"0.7\" pair, none resolved into Choosh's own Cargo graph or lockfile-audited here; adopting these four files unmodified would import an unresolved, Tauri-coupled dependency graph rather than the standalone renderer/JNI surface Choosh needs.",
+      "The renderer and JNI layers hardcode package-specific global state incompatible with verbatim adoption: src-tauri/src/renderer/android.rs exports JNI symbols named Java_com_njr_zelland_MainActivity_passSurfaceToRust/passSurfaceDestroyedToRust/passResizeToRust/getSelectionText/setSelectionHighlight, and src-tauri/src/renderer/mod.rs holds renderer state in global `static RENDERER: Lazy<Mutex<Option<Renderer>>>` and `static PENDING_SIZE: Lazy<Mutex<Option<(u32, u32)>>>` statics tied to that one Activity class, rather than session-scoped, package-neutral state."
+    ]
+  }
+}

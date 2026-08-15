@@ -9,7 +9,7 @@
 use choosh_protocol::relay::{IdentityClass, TUNNEL_ID_BYTES};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 #[derive(Clone, Debug)]
 pub struct EnrolledDevice {
@@ -96,6 +96,41 @@ pub const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 /// by `relayd`, per relay-protocol.md's tunnel lifecycle.
 pub const TUNNEL_IDLE_TIMEOUT_SECONDS: u64 = 300;
 
+/// An authenticated connection that completes no frame at all — control or
+/// tunnel — for this long is closed by `relayd`, mirroring
+/// [`TUNNEL_IDLE_TIMEOUT_SECONDS`]'s pattern but scoped to the whole
+/// connection rather than one tunnel. Covers relayd-threat-model.md Case 5's
+/// "stalled mid-frame" gap: previously a connection that authenticated and
+/// then sent nothing further (not even a truncated frame) was never reaped.
+/// Set well above `TUNNEL_IDLE_TIMEOUT_SECONDS` rather than reusing it
+/// outright: an authenticated devhost/laptop-proxy with no open tunnels and
+/// no agent activity right now is a normal, legitimate state (this protocol
+/// has no periodic application-level heartbeat), so this bound only needs to
+/// reclaim connections that are *never* going to do anything again, not
+/// penalize ordinary quiet periods.
+pub const CONNECTION_IDLE_TIMEOUT_SECONDS: u64 = 30 * 60;
+
+/// Per-Identity control-frame rate limit (a token bucket), per
+/// relay-protocol.md's "Errors and backpressure": control-frame requests
+/// arriving faster than `relayd` can process "MUST be rate limited
+/// per-Identity; exceeding the limit MUST close the connection". Applied to
+/// every dispatched control frame, including `open-tunnel` — the most
+/// expensive request in the catalog (allocates a `Tunnel` registry entry and
+/// pushes a `tunnel-offered` frame to the target).
+///
+/// Sized generously above any legitimate control-plane workload this
+/// codebase exercises today — `list-devhosts` polling, an occasional burst
+/// of `open-tunnel` calls, or a stream of `agent-event`s from a busy agent
+/// session are all well under one request per 50ms sustained — while still
+/// bounding a runaway client loop or flood to a small, fixed multiple of
+/// ordinary traffic before `relayd` disconnects it. A rejected request is
+/// cheap for `relayd` to reject (checked before any registry/tunnel work
+/// runs), so the cost of an occasional false-positive disconnect
+/// (reconnect + re-authenticate, per relay-protocol.md's backoff) is far
+/// lower than the cost of leaving this unbounded.
+pub const CONTROL_FRAME_RATE_LIMIT_BURST: u32 = 40;
+pub const CONTROL_FRAME_RATE_LIMIT_PER_SECOND: u32 = 20;
+
 #[derive(Default)]
 pub struct Registry {
     pub devices: RwLock<HashMap<String, EnrolledDevice>>,
@@ -111,6 +146,16 @@ pub struct Registry {
     /// `ServerPush` to an arbitrary other Identity possible from within a
     /// different connection's task.
     pub connections: RwLock<HashMap<String, OutboundSender>>,
+    /// `device_id -> kill switch` for every currently-authenticated
+    /// connection, alongside its entry in [`Self::connections`]. Firing this
+    /// (send, or just drop to close the channel) tells that connection's own
+    /// `serve_authenticated_loop` to stop serving and close the socket —
+    /// this is what makes an *already-connected* device's revocation take
+    /// effect immediately, rather than only on its next reconnect attempt.
+    /// A one-shot rather than reusing `connections`' `Vec<u8>` channel: a
+    /// kill is a control signal to the connection's own task, not a wire
+    /// message to relay to the client.
+    pub kill_switches: RwLock<HashMap<String, oneshot::Sender<()>>>,
     pub tunnels: RwLock<HashMap<[u8; TUNNEL_ID_BYTES], Tunnel>>,
     /// `phone device_id -> FCM registration token`, per relay-protocol.md's
     /// `register-fcm-token` ("at most one FCM token per phone Identity").
