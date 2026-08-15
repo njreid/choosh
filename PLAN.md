@@ -245,11 +245,23 @@ Not blocking, but real and worth tracking rather than leaving implicit:
   than a demonstrated production defect. Needs a follow-up check against
   the real, fully-launched app once `Screen.Connection` is reachable (e.g.
   via a real `relayd` deployment or a credential-provider-equipped device).
-- **SSO device-code detection** is verified against real `aws`/`gh` CLI
-  output; `az` is pattern-matched but not tested against a real binary;
-  `gcloud auth login --no-launch-browser`'s real flow is structurally
-  different (no short code printed) and the `gcp` detector arm is
-  documented scaffolding, not a working match (M7 SSO bridge).
+- **SSO device-code detection — fixed (follow-up).** `github`/`aws` are
+  verified against real CLI output. `az` is matched against `az login`'s
+  real device-code message, cross-checked as the RFC 8628 §3.3 device-flow
+  body text `az` (via MSAL) prints verbatim — not `az`-specific client text
+  whose exact wording could drift with an `az` release, but the
+  server-driven flow's own standard wording — still not captured from a
+  live `az` binary (unavailable in this environment: `az --version` ->
+  command not found), but its provenance is stronger than "pattern-matched
+  and untested." `gcp` has **no detector at all**, deliberately: an earlier
+  version of this module shipped a `detect_gcp` matching a hypothetical,
+  invented message rather than `gcloud auth login --no-launch-browser`'s
+  real, structurally different flow (no short code printed at all) —
+  concluded genuinely unrepresentable in the current event shape and
+  removed entirely, with negative tests proving no false positives.
+  `WireAuthProvider::Gcp` remains defined on the wire for a future,
+  differently-shaped detector; `auth_detect.rs`'s module doc comment
+  documents this reasoning in full.
 - **Claude Code's hook-config JSON schema (`hooks.rs`'s `install_claude_hooks`
   and the `emit`-payload-parsing heuristic in `extract_candidate_paths`) was
   never verified against a live payload** — this development environment's
