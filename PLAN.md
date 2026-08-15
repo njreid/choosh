@@ -41,27 +41,40 @@ tunnel, no client-side auth" posture.
 
 Not blocking, but real and worth tracking rather than leaving implicit:
 
-- **A real `relayd` deployment now exists, but only the `relayd` half of
-  end-to-end verification is done.** A temporary EC2 instance
-  (`i-01b9022a1d5d83ed0`, tagged `relayd-test`, `t3.micro`, us-east-1, own
-  minimal security group with no inbound rules — SSM Run Command needs
-  none) was provisioned and `just deploy relayd-test us-east-1` shipped a
-  real release build of `choosh-relayd` to it over the already-verified
-  SSM deploy path — the first real, non-`devhost`-stand-in use of that
-  path. Independently re-verified (a separate SSM Run Command, not the
-  deploy script's own health check): `systemctl is-active
-  choosh-relayd.service` → `active`, `GET /healthz` → `200 ok`. Still not
-  a phone → relay → devhost round trip: `choosh-relayd` binds loopback-only
-  (`127.0.0.1:7443`, per `deploy-relayd.sh`'s default) with no public
-  inbound rule, no TLS termination, and no DNS name — the Android app's
-  release default (`wss://relay.choosh.ai/connect`) needs all three plus a
-  matching WebAuthn RP ID before a real device could enroll against it.
-  Opening this instance to the public internet is a distinct, more
-  consequential decision (real inbound exposure, a real cert/DNS) than
-  provisioning the instance itself, and wasn't taken unilaterally. No
-  `choosh-hostd` has enrolled against this instance either. This instance
-  is temporary and should be terminated once its purpose is served —
-  not left running as an unmanaged, unmonitored resource.
+- **A real, publicly-reachable `relayd` deployment now exists over genuine
+  TLS/DNS, but no `choosh-hostd`/phone has enrolled against it yet.** An
+  earlier loopback-only test instance (`i-01b9022a1d5d83ed0`) proved the
+  deploy path itself and was terminated once that was confirmed. The
+  current instance (`i-0ea105f9e4b6f43b4`, tagged `relayd-njr`, `t3.micro`,
+  us-east-1, Elastic IP `54.174.208.193`, own security group open only on
+  80/443) is fronted by Caddy (a static binary, not a package — no AL2023
+  build existed) doing automatic HTTPS via Let's Encrypt for
+  **`njr.ship.stream`**, reverse-proxying to `choosh-relayd`'s loopback
+  bind. DNS: `ship.stream` (owned at Porkbun, confirmed unused/parked, no
+  prior records) is now delegated to a Route53 public hosted zone
+  (`Z01988063DBU2CEU8JUDG`) created in this account; an `njr.ship.stream A`
+  record points at the Elastic IP. `just deploy relayd-njr us-east-1` (now
+  with `CHOOSH_RELAYD_RP_ID`/`CHOOSH_RELAYD_RP_ORIGIN` support added to
+  `scripts/deploy-relayd.sh`/`deploy-relayd-remote.sh` — a real, permanent
+  addition to the deploy tooling, not a one-off hack, since it only adds an
+  `Environment=` line when the var is set, so every existing/default deploy
+  is unaffected) shipped `choosh-relayd` with `CHOOSH_RELAYD_RP_ID=njr.ship.stream`.
+  Independently verified: a real Let's Encrypt cert for `njr.ship.stream`
+  (confirmed via `openssl s_client`, not just "no cert error"), the
+  deployed unit's actual `Environment=` lines (via a separate SSM command,
+  not trusting the deploy script's own echo), and `GET
+  https://njr.ship.stream/healthz` → `200 ok` over the real public
+  internet from outside AWS.
+  **Still missing for a genuine phone round trip**: no `choosh-hostd` has
+  enrolled against this instance, and Android's *native* (non-browser)
+  WebAuthn ceremony needs `/.well-known/assetlinks.json` served from this
+  domain declaring the app's package name and signing-cert SHA-256
+  fingerprint (Digital Asset Links) — **this doesn't exist anywhere in the
+  repo**, a real, previously-undiscovered gap surfaced while pursuing this,
+  not yet closed.
+  This instance is a real, billed resource (Elastic IP, EC2, Route53 zone)
+  and should be terminated once its purpose is served, not left running
+  unmanaged.
 - **`relayd`'s registry (`devices`, `tokens`, `phone_sessions`, `fcm_tokens`)
   is in-memory only, with no disk persistence beyond the enrollment CA key
   itself** — `rust/choosh-relayd/src/state.rs`'s crate-level doc comment

@@ -33,6 +33,13 @@ region="${2:-us-east-1}"
 bucket="${3:-${CHOOSH_DEPLOY_BUCKET:-choosh-relayd-deploy-323509301014}}"
 bind_addr="${CHOOSH_RELAYD_BIND:-127.0.0.1:7443}"
 health_timeout_s="${CHOOSH_DEPLOY_HEALTH_TIMEOUT_S:-20}"
+# Both optional and empty by default: `choosh-relayd` itself already falls
+# back to `DEFAULT_RP_ID`/`https://<rp_id>` (rust/choosh-relayd/src/lib.rs)
+# when its own env vars are unset, so an empty substitution here (no
+# `Environment=` line written into the unit at all) preserves that
+# behavior exactly rather than this script needing its own second default.
+rp_id="${CHOOSH_RELAYD_RP_ID:-}"
+rp_origin="${CHOOSH_RELAYD_RP_ORIGIN:-}"
 cargo_target_dir="${CARGO_TARGET_DIR:?CARGO_TARGET_DIR must be set (see repo build instructions)}"
 
 log() { printf '[deploy] %s\n' "$*" >&2; }
@@ -80,6 +87,8 @@ sed \
   -e "s|CHOOSH_DEPLOY_EXPECTED_SHA256|$(sed_escape "$digest")|g" \
   -e "s|CHOOSH_DEPLOY_BIND_ADDR|$(sed_escape "$bind_addr")|g" \
   -e "s|CHOOSH_DEPLOY_HEALTH_TIMEOUT_S|$(sed_escape "$health_timeout_s")|g" \
+  -e "s|CHOOSH_DEPLOY_RP_ID|$(sed_escape "$rp_id")|g" \
+  -e "s|CHOOSH_DEPLOY_RP_ORIGIN|$(sed_escape "$rp_origin")|g" \
   "$root/scripts/deploy-relayd-remote.sh" > "$remote_script"
 
 b64=$(base64 -w0 "$remote_script")

@@ -25,6 +25,14 @@ HEALTH_URL="http://CHOOSH_DEPLOY_BIND_ADDR/healthz"
 PRESIGNED_URL="CHOOSH_DEPLOY_PRESIGNED_URL"
 EXPECTED_SHA256="CHOOSH_DEPLOY_EXPECTED_SHA256"
 HEALTH_TIMEOUT_S=CHOOSH_DEPLOY_HEALTH_TIMEOUT_S
+# Both empty by default (deploy-relayd.sh substitutes an empty string when
+# its own CHOOSH_RELAYD_RP_ID/CHOOSH_RELAYD_RP_ORIGIN env vars are unset) —
+# an empty value here means "write no Environment= line for it", which
+# preserves choosh-relayd's own DEFAULT_RP_ID/derived-origin fallback
+# (rust/choosh-relayd/src/lib.rs) rather than this script needing to know
+# what that default is.
+RP_ID="CHOOSH_DEPLOY_RP_ID"
+RP_ORIGIN="CHOOSH_DEPLOY_RP_ORIGIN"
 
 log() { printf '[deploy-relayd] %s\n' "$*"; }
 
@@ -43,6 +51,19 @@ fi
 chmod +x "$BIN_NEW"
 log "digest verified: $actual_sha256"
 
+# Built up separately (not inline in the heredoc below) so an empty
+# RP_ID/RP_ORIGIN contributes no Environment= line at all, rather than one
+# with an empty value — an explicit `Environment=CHOOSH_RELAYD_RP_ID=`
+# would override choosh-relayd's own DEFAULT_RP_ID fallback with an empty
+# string instead of leaving that fallback in effect.
+extra_env=""
+if [[ -n "$RP_ID" ]]; then
+  extra_env+=$'\n'"Environment=CHOOSH_RELAYD_RP_ID=$RP_ID"
+fi
+if [[ -n "$RP_ORIGIN" ]]; then
+  extra_env+=$'\n'"Environment=CHOOSH_RELAYD_RP_ORIGIN=$RP_ORIGIN"
+fi
+
 # Write/refresh the systemd unit idempotently. Root-run system-level unit:
 # SSM Run Command executes as root on this box by default and choosh-relayd
 # is the sole workload on this instance, so a dedicated unprivileged service
@@ -59,7 +80,7 @@ Type=simple
 ExecStart=$BIN
 WorkingDirectory=$INSTALL_DIR
 Environment=CHOOSH_RELAYD_BIND=$BIND_ADDR
-Environment=CHOOSH_RELAYD_STATE_DIR=$STATE_DIR
+Environment=CHOOSH_RELAYD_STATE_DIR=$STATE_DIR$extra_env
 Restart=on-failure
 RestartSec=2
 
