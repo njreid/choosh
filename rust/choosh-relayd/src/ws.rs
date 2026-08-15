@@ -569,6 +569,12 @@ async fn dispatch(
                 .collect();
             ControlResponse::ListDevhostsOk { request_id, devhosts }
         }
+        ControlRequest::ListDevhostSshEndpoints { request_id } => {
+            if authenticated.identity_class != IdentityClass::LaptopProxy {
+                return not_permitted(&request_id, "list-devhost-ssh-endpoints");
+            }
+            list_devhost_ssh_endpoints(state, request_id).await
+        }
         ControlRequest::OpenTunnel { request_id, target_device_id, purpose } => {
             if let Err(code) =
                 check_open_tunnel_permitted(state, authenticated, &target_device_id, &purpose).await
@@ -622,6 +628,29 @@ async fn dispatch(
             not_permitted(&request_id, "enroll")
         }
     }
+}
+
+/// The `list-devhost-ssh-endpoints` capability body, split out of
+/// [`dispatch`] purely to keep that function's line count reasonable —
+/// permission-checking stays in `dispatch` itself, alongside every other
+/// capability's own check, so this is only ever called after that's
+/// already passed. See `ControlRequest::ListDevhostSshEndpoints`'s doc
+/// comment for what this restricted read is and why it's `laptop-proxy`-only.
+async fn list_devhost_ssh_endpoints(state: &AppState, request_id: String) -> ControlResponse {
+    let devices = state.registry.devices.read().await;
+    let endpoints = devices
+        .iter()
+        .filter(|(_, device)| device.identity_class == IdentityClass::Devhost && !device.revoked)
+        .filter_map(|(device_id, device)| {
+            let host_key = device.host_ssh_public_key.as_ref()?;
+            Some(choosh_protocol::relay::DevhostSshEndpoint {
+                device_id: device_id.clone(),
+                alias: device.alias.clone(),
+                ssh_host_public_key: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, host_key),
+            })
+        })
+        .collect();
+    ControlResponse::ListDevhostSshEndpointsOk { request_id, endpoints }
 }
 
 /// Forwards `event` (sent by `from_device_id`, a devhost) to every currently
@@ -681,6 +710,14 @@ fn dispatch_fcm_push_stub(token: &str, from_device_id: &str, event: &WireAgentEv
         WireAgentEvent::AgentStatus { workspace_id, item_id, status } => {
             (workspace_id.as_str(), item_id.as_str(), format!("agent_status:{status:?}"))
         }
+        // Editor presence has no `item_id` (it's workspace-scoped, not
+        // item-scoped) and, per ssh-bridge-and-zed.md, is a live indicator
+        // only — it doesn't warrant waking an offline phone via FCM the
+        // way an actionable agent event does, but this stub logs it the
+        // same bounded way for observability rather than special-casing
+        // silence here.
+        WireAgentEvent::EditorAttached { workspace_id, editor } => (workspace_id.as_str(), "", format!("editor_attached:{editor:?}")),
+        WireAgentEvent::EditorDetached { workspace_id, editor } => (workspace_id.as_str(), "", format!("editor_detached:{editor:?}")),
     };
     tracing::info!(
         fcm_token_prefix = %token.get(..8).unwrap_or(token),
@@ -725,7 +762,7 @@ async fn handle_enroll(state: &AppState, request: ControlRequest, socket: &mut W
         alias,
         platform,
         account_label,
-        host_ssh_public_key: _,
+        host_ssh_public_key,
     } = request
     else {
         return;
@@ -750,6 +787,39 @@ async fn handle_enroll(state: &AppState, request: ControlRequest, socket: &mut W
         })
         .await;
     };
+
+    // auth-and-enrollment.md step 6: a devhost's loopback SSH host key is
+    // established as trusted at this exact moment, over this same
+    // authenticated exchange, never via a separate TOFU prompt. A devhost
+    // enrollment MUST carry one; a laptop-proxy (no SSH server of its own)
+    // MUST NOT.
+    let host_ssh_public_key_bytes = match (identity_class, host_ssh_public_key) {
+        (IdentityClass::Devhost, Some(encoded)) => {
+            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded) {
+                Ok(bytes) if bytes.len() == 32 => Some(bytes),
+                _ => {
+                    return respond(socket, ControlResponse::Error {
+                        request_id,
+                        code: "invalid_host_ssh_public_key".to_string(),
+                        message: "host_ssh_public_key is not a valid base64-encoded 32-byte Ed25519 public key".to_string(),
+                    })
+                    .await;
+                }
+            }
+        }
+        (IdentityClass::Devhost, None) => {
+            return respond(socket, ControlResponse::Error {
+                request_id,
+                code: "missing_host_ssh_public_key".to_string(),
+                message: "devhost enrollment MUST include the loopback SSH server's host public key".to_string(),
+            })
+            .await;
+        }
+        // laptop-proxy/phone: no SSH server of their own, so any presented
+        // value is simply ignored rather than validated or stored.
+        (_, _) => None,
+    };
+
     let device_id = format!("dev-{}", uuid::Uuid::new_v4());
     let certificate = ca::issue(&state.ca_key, &device_id, &public_key_bytes, now_unix());
     state.registry.devices.write().await.insert(
@@ -761,6 +831,7 @@ async fn handle_enroll(state: &AppState, request: ControlRequest, socket: &mut W
             platform,
             account_label,
             revoked: false,
+            host_ssh_public_key: host_ssh_public_key_bytes,
         },
     );
     respond(socket, ControlResponse::EnrollOk { request_id, device_id, certificate }).await;

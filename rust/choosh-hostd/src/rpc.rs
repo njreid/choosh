@@ -6,6 +6,7 @@
 //! machinery, the same split `choosh-relayd`'s enroll handling uses.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use choosh_protocol::host_rpc::{
     ChangeGraphNode, ChangedPath, DiffFileEntry, DiffHunk, DiffSegment, DiffSegmentKind, ItemStatus, ItemSummary, ItemType,
@@ -16,11 +17,18 @@ use tokio::sync::Mutex;
 use crate::agent_launch::agent_launch_argv;
 use crate::fs_ops::{self, FsError};
 use crate::jj_ops::{self, JjError};
+use crate::readiness;
 use crate::registry::{Registry, RegistryError};
 use crate::zellij_ops::{self, ZellijError};
 
 pub struct RpcContext {
-    pub registry: Mutex<Registry>,
+    /// `Arc`-wrapped (not a bare `Mutex<Registry>`) specifically so the
+    /// `WebService` readiness prober (`crate::readiness`) can hold an
+    /// owned, `'static` handle to it — a plain `&RpcContext` borrow, as
+    /// `dispatch` itself takes, isn't `'static` and can't be captured by a
+    /// `tokio::spawn`ed task that needs to keep running after `dispatch`
+    /// returns.
+    pub registry: Arc<Mutex<Registry>>,
     pub devhost_id: String,
     /// Root confinement boundary for every `workspace.create` destination
     /// (both a fresh clone and an adopted `existing_path`) — per
@@ -423,9 +431,27 @@ async fn handle_item_create(
         return zellij_error_response(request_id, &zellij_error);
     }
 
+    // `WebService` items start `starting` and get a real readiness prober
+    // (below); every other item type's Zellij tab already exists
+    // synchronously by this point, so `running` is immediately accurate
+    // for them, same as before this change — see `service-tunnels.md`'s
+    // Lifecycle section and `registry::Registry::register_item`'s doc
+    // comment.
+    let initial_status = if item_type == ItemType::WebService { ItemStatus::Starting } else { ItemStatus::Running };
+
+    let registry_handle = Arc::clone(&ctx.registry);
     let mut registry = ctx.registry.lock().await;
-    match registry.register_item(item_id.clone(), workspace_id.to_string(), item_type, name.clone(), name.clone(), agent, port) {
-        Ok(()) => RpcResponse::ItemCreateOk { request_id, item_id, item_type, name: name.clone(), tab_target: name },
+    match registry.register_item(item_id.clone(), workspace_id.to_string(), item_type, name.clone(), name.clone(), agent, port, initial_status)
+    {
+        Ok(()) => {
+            if item_type == ItemType::WebService {
+                // `port` is guaranteed `Some` here — checked above before
+                // any of this function's side effects began.
+                let port = port.expect("WebService port validated earlier in this function");
+                readiness::spawn(registry_handle, item_id.clone(), workspace_name, name.clone(), port);
+            }
+            RpcResponse::ItemCreateOk { request_id, item_id, item_type, name: name.clone(), tab_target: name }
+        }
         Err(RegistryError::ItemNameTaken(taken)) => {
             error(request_id, "conflict", format!("item name {taken:?} is already registered in this workspace"))
         }
@@ -724,7 +750,7 @@ mod tests {
         std::fs::create_dir_all(&workspaces_dir).unwrap();
         let registry_path = dir.path().join("registry.json");
         let ctx = RpcContext {
-            registry: Mutex::new(Registry::load(&registry_path).unwrap()),
+            registry: Arc::new(Mutex::new(Registry::load(&registry_path).unwrap())),
             devhost_id: "dev-1".to_string(),
             workspaces_dir,
         };
@@ -1308,5 +1334,120 @@ mod tests {
         );
 
         zellij_ops::kill_session(&name).await.ok();
+    }
+
+    /// A free-but-unused ephemeral port: binds to port 0 to let the OS
+    /// assign one, then immediately releases it so a caller can declare it
+    /// to `item.create` before anything is actually listening. Carries the
+    /// same small, accepted re-use race any "reserve a port, use it later"
+    /// pattern does.
+    fn reserve_ephemeral_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// `service-tunnels.md`'s Lifecycle + Readiness sections, end to end
+    /// through the real `item.create` dispatch path: a `WebService` item
+    /// is `starting` immediately after creation (never `running` before
+    /// its port is even checked), and transitions to `running` on its own,
+    /// within [`readiness::READINESS_TIMEOUT`], once something starts
+    /// listening on the declared port — no polling of the port by this
+    /// test other than observing the registry's own status field, which is
+    /// the real signal `item.list`/`ItemSummary::status` exposes to
+    /// callers.
+    #[tokio::test]
+    async fn web_service_item_becomes_running_once_its_port_starts_accepting_connections() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m5websvc-run").await;
+        let port = reserve_ephemeral_port();
+
+        let create_response = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r1".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::WebService,
+                name: "web".to_string(),
+                agent: None,
+                command: Some(vec!["cat".to_string()]),
+                port: Some(port),
+            },
+        )
+        .await;
+        let RpcResponse::ItemCreateOk { item_id, .. } = create_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected ItemCreateOk, got {create_response:?}");
+        };
+
+        // Immediately after creation, before anything is listening: must
+        // be `starting`, never `running` — `item.create` itself never
+        // blocks on readiness.
+        {
+            let registry = ctx.registry.lock().await;
+            assert_eq!(registry.find_item(&item_id).unwrap().status, ItemStatus::Starting);
+        }
+
+        // Now bring the port up for real.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let deadline = std::time::Instant::now() + readiness::READINESS_TIMEOUT + std::time::Duration::from_secs(2);
+        let mut observed = None;
+        while std::time::Instant::now() < deadline {
+            let status = ctx.registry.lock().await.find_item(&item_id).unwrap().status;
+            if status != ItemStatus::Starting {
+                observed = Some(status);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        zellij_ops::kill_session(&name).await.ok();
+        assert_eq!(observed, Some(ItemStatus::Running), "expected the item to become running within the readiness bound");
+    }
+
+    /// The other half of the same lifecycle: a port that never comes up at
+    /// all must transition to `failed`, not sit `starting` forever, and
+    /// must do so within the documented bound.
+    #[tokio::test]
+    async fn web_service_item_fails_if_its_port_never_comes_up_within_the_readiness_bound() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m5websvc-fail").await;
+        let port = reserve_ephemeral_port(); // reserved, then deliberately never listened on.
+
+        let create_response = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r1".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::WebService,
+                name: "web".to_string(),
+                agent: None,
+                command: Some(vec!["cat".to_string()]),
+                port: Some(port),
+            },
+        )
+        .await;
+        let RpcResponse::ItemCreateOk { item_id, .. } = create_response else {
+            zellij_ops::kill_session(&name).await.ok();
+            panic!("expected ItemCreateOk, got {create_response:?}");
+        };
+
+        let deadline = std::time::Instant::now() + readiness::READINESS_TIMEOUT + std::time::Duration::from_secs(2);
+        let mut observed = None;
+        while std::time::Instant::now() < deadline {
+            let status = ctx.registry.lock().await.find_item(&item_id).unwrap().status;
+            if status != ItemStatus::Starting {
+                observed = Some(status);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        zellij_ops::kill_session(&name).await.ok();
+        assert_eq!(observed, Some(ItemStatus::Failed), "expected the item to fail within the readiness bound when its port never comes up");
     }
 }

@@ -15,10 +15,15 @@ pub mod fs_ops;
 pub mod hooks;
 pub mod jj_ops;
 pub mod local_ipc;
+mod mise_ops;
+pub mod proxy;
 pub mod pty;
+mod readiness;
 pub mod registry;
 pub mod rpc;
 pub mod serve;
+mod ssh_keys;
+pub mod ssh_server;
 mod zellij_ops;
 
 use clap::{Parser, Subcommand};
@@ -54,6 +59,43 @@ pub enum Command {
         #[arg(long)]
         surface: String,
     },
+    /// `docs/specs/service-tunnels.md`'s "Explicit launch" CLI form. Thin
+    /// sugar over the exact same `item.create` RPC path `serve` drives on
+    /// Android's behalf (`rpc::handle_item_create`) — this does not
+    /// reimplement validation/launch, it just builds an `ItemCreate`
+    /// request and calls `rpc::dispatch` with it, for local/manual
+    /// devhost-side use with no phone or `relayd` connection required.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServiceCommand {
+    /// Registers and launches a `WebService` item in an already-registered
+    /// `--workspace` (by name, per `service-tunnels.md`'s pseudocode) —
+    /// this command deliberately does not also register a workspace, only
+    /// an item within one that already exists (via a prior
+    /// `workspace.create`, e.g. through `serve` + Android, or a devhost
+    /// operator's own prior use of this same registry file).
+    Run {
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        port: u16,
+        /// V1 supports only `http`, per `service-tunnels.md` ("HTTPS-to-host
+        /// support is deferred").
+        #[arg(long, default_value = "http")]
+        protocol: String,
+        /// Fixed argv after `--`, never a shell string — matches
+        /// `host-rpc.md`'s "Command construction" requirement for
+        /// `item.create`'s own `command` field.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -75,25 +117,105 @@ pub enum ProxyCommand {
 
 /// # Errors
 ///
-/// Returns an error if the requested subcommand fails. `proxy` variants are
-/// currently unimplemented scaffolding pending their own increment
-/// (`choosh-hostd proxy` is explicitly out of M0's scope — see
-/// `docs/milestones/M0-enrollment.md`'s non-goals).
+/// Returns an error if the requested subcommand fails — see
+/// [`serve::ServeError`] and [`proxy::ProxyError`] for the shapes of what
+/// can fail there.
 pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
 
     match cli.command {
         Command::Serve => serve::run().await.map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
         Command::Proxy { command } => match command {
-            ProxyCommand::Enroll { token: _ } => {
-                Err("choosh-hostd proxy enroll: not yet implemented".into())
-            }
-            ProxyCommand::Connect { host_id: _ } => {
-                Err("choosh-hostd proxy connect: not yet implemented".into())
-            }
-            ProxyCommand::Sync => Err("choosh-hostd proxy sync: not yet implemented".into()),
+            ProxyCommand::Enroll { token } => proxy::enroll(&token).await.map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
+            ProxyCommand::Connect { host_id } => Box::pin(proxy::connect(&host_id)).await.map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
+            ProxyCommand::Sync => proxy::sync().await.map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
         },
         Command::Emit { surface } => run_emit(&surface).await,
+        Command::Service { command: ServiceCommand::Run { workspace, name, port, protocol, command } } => {
+            run_service_run(&workspace, &name, port, &protocol, command).await
+        }
+    }
+}
+
+/// # Errors
+///
+/// Returns an error if `--protocol` isn't `"http"`, `--workspace` doesn't
+/// name an already-registered workspace, or the underlying `item.create`
+/// RPC itself returns an error (name collision, invalid command, etc.) —
+/// see `rpc::handle_item_create`.
+async fn run_service_run(
+    workspace: &str,
+    name: &str,
+    port: u16,
+    protocol: &str,
+    command: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if protocol != "http" {
+        return Err(format!(
+            "choosh-hostd service run: unsupported --protocol {protocol:?}; V1 supports only \"http\" per service-tunnels.md"
+        )
+        .into());
+    }
+
+    let device_id = serve::best_effort_device_id();
+    let ctx = serve::build_rpc_context(&device_id).map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+
+    let workspace_id = {
+        let registry = ctx.registry.lock().await;
+        registry
+            .find_workspace_by_name(workspace)
+            .map(|w| w.workspace_id.clone())
+            .ok_or_else(|| format!("workspace {workspace:?} is not registered on this devhost (register it first, e.g. via Android)"))?
+    };
+
+    let response = rpc::dispatch(
+        &ctx,
+        choosh_protocol::host_rpc::RpcRequest::ItemCreate {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            workspace_id,
+            item_type: choosh_protocol::host_rpc::ItemType::WebService,
+            name: name.to_string(),
+            agent: None,
+            command: Some(command),
+            port: Some(port),
+        },
+    )
+    .await;
+
+    let item_id = match response {
+        choosh_protocol::host_rpc::RpcResponse::ItemCreateOk { item_id, tab_target, .. } => {
+            println!("created WebService item {item_id} (tab {tab_target}), status: starting");
+            item_id
+        }
+        choosh_protocol::host_rpc::RpcResponse::Error { code, message, .. } => {
+            return Err(format!("item.create failed: {code}: {message}").into());
+        }
+        other => return Err(format!("item.create returned an unexpected response: {other:?}").into()),
+    };
+
+    // `item.create` (above) already spawned the real readiness prober
+    // (`readiness::spawn`, inside `rpc::handle_item_create`) as a detached
+    // task on this same process's runtime — it keeps running as long as
+    // this process's `main` hasn't returned yet, which is true for the
+    // rest of this function. Poll the registry to observe its outcome
+    // rather than launching a second, redundant probe.
+    let wait_bound = readiness::READINESS_TIMEOUT + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + wait_bound;
+    loop {
+        let status = { ctx.registry.lock().await.find_item(&item_id).map(|item| item.status) };
+        match status {
+            Some(choosh_protocol::host_rpc::ItemStatus::Starting) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Some(other) => {
+                println!("WebService {name} readiness: {other:?}");
+                return Ok(());
+            }
+            None => {
+                println!("WebService {name} readiness: item no longer registered");
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -173,5 +295,43 @@ mod tests {
                 command: ProxyCommand::Connect { host_id }
             } if host_id == "build-box"
         ));
+    }
+
+    #[test]
+    fn cli_parses_service_run_matching_service_tunnels_mds_pseudocode() {
+        let cli = Cli::parse_from([
+            "choosh-hostd",
+            "service",
+            "run",
+            "--workspace",
+            "app",
+            "--name",
+            "web",
+            "--port",
+            "3000",
+            "--protocol",
+            "http",
+            "--",
+            "npm",
+            "run",
+            "dev",
+        ]);
+        let Command::Service { command: ServiceCommand::Run { workspace, name, port, protocol, command } } = cli.command else {
+            panic!("expected Command::Service(Run), got {cli:?}");
+        };
+        assert_eq!(workspace, "app");
+        assert_eq!(name, "web");
+        assert_eq!(port, 3000);
+        assert_eq!(protocol, "http");
+        assert_eq!(command, vec!["npm".to_string(), "run".to_string(), "dev".to_string()]);
+    }
+
+    #[test]
+    fn cli_parses_service_run_with_default_protocol() {
+        let cli = Cli::parse_from(["choosh-hostd", "service", "run", "--workspace", "app", "--name", "web", "--port", "3000", "--", "cat"]);
+        let Command::Service { command: ServiceCommand::Run { protocol, .. } } = cli.command else {
+            panic!("expected Command::Service(Run), got {cli:?}");
+        };
+        assert_eq!(protocol, "http");
     }
 }

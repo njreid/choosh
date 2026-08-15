@@ -8,5 +8,5 @@ use choosh_hostd::Cli;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    choosh_hostd::run(Cli::parse()).await
+    Box::pin(choosh_hostd::run(Cli::parse())).await
 }

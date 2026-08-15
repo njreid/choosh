@@ -8,9 +8,12 @@ import ai.choosh.engine.FakeChooshEngine
 import ai.choosh.fleet.FleetDrawer
 import ai.choosh.fleet.FleetNavigationEvent
 import ai.choosh.fleet.FleetViewModel
+import ai.choosh.markdown.MarkdownFixtureDemoScreen
 import ai.choosh.sourceeditor.SourceEditorScreen
 import ai.choosh.sourceeditor.SourceEditorViewModel
 import ai.choosh.terminal.TerminalScreen
+import ai.choosh.webservice.WebServiceScreen
+import ai.choosh.webservice.WebServiceViewModel
 import ai.choosh.workspace.WorkspaceScreen
 import android.content.Context
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +25,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -80,6 +84,27 @@ private sealed interface Screen {
      * `item.list` wiring into the explorer itself, a later increment.
      */
     data class Terminal(val deviceId: String, val itemId: String) : Screen
+
+    /**
+     * `WebService` pinned-item demo, per `docs/specs/service-tunnels.md`.
+     * Reachable only from [Workspace]'s demo affordance, same "no real
+     * `item.list` entry point wired into the explorer yet" caveat as
+     * [Terminal] — `connectionHandle` is `null` here for the identical
+     * reason (see [Terminal]'s doc comment and this file's `buildEngine`
+     * comment), so this demonstrates the retrying-interstitial/failed
+     * states genuinely, not a live gateway/`WebView` load.
+     */
+    data class WebServiceDemo(val deviceId: String, val workspaceId: String) : Screen
+
+    /**
+     * The Markdown/Datastar `WebView` demo, per
+     * `docs/milestones/M5-web-and-markdown.md`. Unlike [WebServiceDemo],
+     * this one *does* render a real `WebView` loading real
+     * `choosh-web::markdown::render_markdown` output, via
+     * `MarkdownGatewayBridge`'s fixture-backed start (no relay connection
+     * needed) — see `MarkdownFixtureDemoScreen`'s doc comment.
+     */
+    data object MarkdownDemo : Screen
 }
 
 @Composable
@@ -133,6 +158,8 @@ fun ChooshApp(context: Context) {
                     // fixed item/path against the current workspace instead.
                     onOpenTerminal = { screen = Screen.Terminal(deviceId = current.deviceId, itemId = current.workspaceId) },
                     onOpenEditor = { path -> screen = Screen.SourceEditor(current.deviceId, current.workspaceId, path) },
+                    onOpenWebServiceDemo = { screen = Screen.WebServiceDemo(current.deviceId, current.workspaceId) },
+                    onOpenMarkdownDemo = { screen = Screen.MarkdownDemo },
                 )
 
                 is Screen.DevHostPlaceholder -> PlaceholderScreen(
@@ -166,6 +193,28 @@ fun ChooshApp(context: Context) {
                     connectionHandle = null,
                     onBack = { screen = Screen.Workspace(current.itemId, current.deviceId) },
                 )
+
+                is Screen.WebServiceDemo -> {
+                    val viewModel: WebServiceViewModel = viewModel(
+                        key = "web-service-demo:${current.deviceId}:${current.workspaceId}",
+                        factory = singleInstanceFactory {
+                            WebServiceViewModel(engine, current.deviceId, current.workspaceId, itemId = "item-web-1", connectionHandle = null)
+                        },
+                    )
+                    LaunchedEffect(viewModel) { viewModel.startPolling() }
+                    val state by viewModel.state.collectAsState()
+                    Column(Modifier.fillMaxSize()) {
+                        Button(onClick = { screen = Screen.Workspace(current.workspaceId, current.deviceId) }, modifier = Modifier.padding(8.dp)) {
+                            Text("Back")
+                        }
+                        WebServiceScreen(state, Modifier.weight(1f))
+                    }
+                }
+
+                is Screen.MarkdownDemo -> Column(Modifier.fillMaxSize()) {
+                    Button(onClick = { screen = Screen.Fleet }, modifier = Modifier.padding(8.dp)) { Text("Back") }
+                    MarkdownFixtureDemoScreen(Modifier.weight(1f))
+                }
             }
         }
     }

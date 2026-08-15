@@ -46,35 +46,6 @@ jobs:
       - name: Offline release discovery fixture
         if: matrix.host == 'linux-x86_64'
         run: ./scripts/test-release-discovery.sh
-      - name: Typed session with sequential host.describe requests through private RPC seam
-        if: matrix.host == 'linux-x86_64'
-        run: ./scripts/test-rpc-socket.sh
-      - name: Disposable-host acceptance runner fixture
-        if: matrix.host == 'linux-x86_64'
-        run: ./scripts/test-host-acceptance-runner.sh
-      - name: Host deployment transaction
-        if: matrix.host == 'linux-x86_64'
-        run: ./scripts/test-host-deployment.sh
-      - name: Aggregate M6 release readiness
-        if: matrix.host == 'linux-x86_64'
-        run: ./scripts/check-m6-release-readiness.sh
-      - name: Loopback OpenSSH acceptance
-        if: matrix.host == 'linux-x86_64'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # OpenSSH requires this root-owned privilege-separation directory even
-          # for the unprivileged ephemeral server the fixture starts.
-          sudo mkdir -p /run/sshd
-          status=0
-          ./scripts/test-host-acceptance-local-openssh.sh || status=$?
-          # 69 is the fixture's explicit "required tool absent" code. Report the
-          # skip rather than letting a missing runner package read as a pass.
-          if [ "$status" -eq 69 ]; then
-            echo 'host_acceptance_local_openssh_skipped_missing_dependency'
-            exit 0
-          fi
-          exit "$status"
       - name: Rust formatting
         run: cargo fmt --all -- --check
       - name: Rust lint

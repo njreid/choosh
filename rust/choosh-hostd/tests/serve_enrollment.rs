@@ -133,6 +133,33 @@ async fn relayd_rejecting_the_token_fails_closed_with_no_credential_written() {
 }
 
 #[tokio::test]
+async fn enrollment_request_carries_a_valid_ssh_host_public_key() {
+    // auth-and-enrollment.md step 6: devhost enrollment must include the
+    // loopback SSH server's host public key — captured here as the same
+    // value `ssh_keys::openssh_public_key_line` would format, proving
+    // `serve::enroll` actually derives and sends it rather than leaving
+    // the field `None` (its pre-M6 placeholder value).
+    let (listener, relay_url) = bind_fake_relayd().await;
+    let server = tokio::spawn(run_fake_relayd_enroll_once(listener, |request| match request {
+        ControlRequest::Enroll { request_id, host_ssh_public_key, .. } => {
+            let encoded = host_ssh_public_key.expect("devhost enrollment must carry a host_ssh_public_key");
+            let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded).expect("valid base64");
+            assert_eq!(raw.len(), 32, "expected a raw 32-byte Ed25519 public key");
+            ControlResponse::EnrollOk { request_id, device_id: "dev-ssh-key-test".to_string(), certificate: "fake-certificate-bytes".to_string() }
+        }
+        other => panic!("expected Enroll, got {other:?}"),
+    }));
+
+    let credential_dir = tempfile::tempdir().unwrap();
+    let config = ServeConfig::for_test(relay_url, credential_dir.path().join("device-credential.json"));
+    Box::pin(temp_env::async_with_vars([("CHOOSH_ENROLLMENT_TOKEN", Some("one-shot-token"))], serve::enroll(&config)))
+        .await
+        .expect("enrollment should succeed");
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn missing_enrollment_token_fails_fast_with_no_network_attempt() {
     // Deliberately point at a URL nothing is listening on: if `enroll`
     // tried to dial before checking the token, this would hang or error

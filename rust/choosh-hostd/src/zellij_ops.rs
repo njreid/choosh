@@ -48,6 +48,15 @@ use tokio::sync::Mutex;
 /// be suspicious if it stops being rare.
 static ZELLIJ_CLIENT_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// The port `zellij web` listens on when started with no explicit `--port`
+/// — confirmed against the real binary (`zellij web --help`: "defaults to
+/// 8082"), and also the only port `zellij web --status` itself checks
+/// (also confirmed empirically: `--status` takes no `--port` argument and
+/// always probes this fixed port). [`ensure_web_server_running`]
+/// deliberately never overrides it — using a different port would make
+/// `--status`'s own check meaningless for confirming "is it up".
+pub const ZELLIJ_WEB_DEFAULT_PORT: u16 = 8082;
+
 #[derive(Debug)]
 pub enum ZellijError {
     Spawn(std::io::Error),
@@ -56,6 +65,16 @@ pub enum ZellijError {
     /// relies on; `zellij attach --create-background`'s own exit status
     /// isn't inspected (see [`create_session`]'s doc comment for why).
     NotConfirmed,
+    /// [`list_tabs`] specifically: the `zellij action list-tabs` client
+    /// never exited within its bound. Confirmed by direct experiment
+    /// (`env ZELLIJ_SESSION_NAME=<a name nothing created> zellij action
+    /// list-tabs --json`, real binary, real timeout) that this is a real,
+    /// reachable case — targeting a session name that was never created at
+    /// all hangs the client indefinitely, unlike targeting a *real*
+    /// session for a tab that just isn't in it (which returns quickly,
+    /// successfully, with an empty/partial list) — so this is genuinely
+    /// distinct from "queried successfully and the tab isn't there".
+    Timeout,
 }
 
 impl std::fmt::Display for ZellijError {
@@ -63,6 +82,7 @@ impl std::fmt::Display for ZellijError {
         match self {
             Self::Spawn(error) => write!(f, "failed to spawn zellij: {error}"),
             Self::NotConfirmed => write!(f, "zellij session was not confirmed via list-sessions after creation"),
+            Self::Timeout => write!(f, "zellij client did not respond within the timeout"),
         }
     }
 }
@@ -212,24 +232,62 @@ pub async fn new_tab(session_name: &str, tab_name: &str, cwd: &Path, initial_com
 /// field, versus guessing at column alignment/whitespace in the table
 /// renderer's output.
 ///
+/// Bounded with the same 5s timeout [`wait_bounded`] uses elsewhere in this
+/// module, for the same class of reason but a distinct, specifically
+/// confirmed failure mode: unlike the `spawn`-then-`wait_bounded` commands
+/// elsewhere in this file (whose actual success signal is always a
+/// separate `list-sessions`/`list-tabs` poll, so a hung/killed spawned
+/// child there was never itself a problem), this function's result *is*
+/// the signal a caller needs — so a hang here can't just be shrugged off
+/// the same way; it has to surface as [`ZellijError::Timeout`] instead so
+/// callers ([`close_tab`], `readiness::run`) can tell "genuinely couldn't
+/// find out" apart from "asked, and there's nothing there".
+///
 /// # Errors
 ///
-/// Returns [`ZellijError::Spawn`] if `zellij` can't be spawned.
+/// Returns [`ZellijError::Spawn`] if `zellij` can't be spawned, or
+/// [`ZellijError::Timeout`] if it doesn't respond within 5s (confirmed by
+/// direct experiment: a `session_name` that was never created at all hangs
+/// the client indefinitely rather than failing fast — see
+/// [`ZellijError::Timeout`]'s own doc comment).
 pub async fn list_tabs(session_name: &str) -> Result<Vec<String>, ZellijError> {
-    let output = Command::new("zellij")
+    Ok(list_tabs_info(session_name).await?.into_iter().map(|t| t.name).collect())
+}
+
+/// The actual bounded `zellij action list-tabs --json` invocation, shared
+/// by [`list_tabs`] (names only) and [`close_tab`] (needs each tab's
+/// numeric `tab_id` too, to close by ID rather than by currently-focused
+/// tab — see [`close_tab`]'s own doc comment).
+async fn list_tabs_info(session_name: &str) -> Result<Vec<TabInfo>, ZellijError> {
+    let child = Command::new("zellij")
         .env("ZELLIJ_SESSION_NAME", session_name)
         .arg("action")
         .arg("list-tabs")
         .arg("--json")
         .stdin(Stdio::null())
-        .output()
-        .await
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // A timed-out `wait_with_output` future (below) drops the `Child`
+        // without ever cleanly `.wait()`-ing it — `kill_on_drop` is what
+        // actually reaps the hung process in that case rather than
+        // leaking it as an orphan; `wait_bounded`'s callers elsewhere in
+        // this file instead call `.kill()` explicitly after their own
+        // timeout because they still hold `child` at that point, but
+        // `wait_with_output(self)` below consumes it by value, so there's
+        // nothing left to call `.kill()` on if the timeout wins the race.
+        .kill_on_drop(true)
+        .spawn()
         .map_err(ZellijError::Spawn)?;
+
+    let output = match tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return Err(ZellijError::Spawn(error)),
+        Err(_elapsed) => return Err(ZellijError::Timeout),
+    };
     if !output.status.success() {
         return Ok(Vec::new());
     }
-    let tabs: Vec<TabInfo> = serde_json::from_slice(&output.stdout).unwrap_or_default();
-    Ok(tabs.into_iter().map(|t| t.name).collect())
+    Ok(serde_json::from_slice(&output.stdout).unwrap_or_default())
 }
 
 /// One entry from `zellij action list-tabs --json` — shared by [`list_tabs`]
@@ -278,16 +336,18 @@ pub async fn focus_tab(session_name: &str, tab_name: &str) -> Result<(), ZellijE
 ///
 /// Returns [`ZellijError::Spawn`] if `zellij` can't be spawned.
 pub async fn close_tab(session_name: &str, tab_name: &str) -> Result<(), ZellijError> {
-    let output = Command::new("zellij")
-        .env("ZELLIJ_SESSION_NAME", session_name)
-        .arg("action")
-        .arg("list-tabs")
-        .arg("--json")
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(ZellijError::Spawn)?;
-    let tabs: Vec<TabInfo> = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    // Reuses `list_tabs_info` rather than duplicating its own
+    // `list-tabs --json` invocation (an earlier version of this function
+    // did exactly that, with its own unbounded `.output()` call — the same
+    // real hang risk `list_tabs_info`'s bounded timeout now guards
+    // against; see `ZellijError::Timeout`'s doc comment). `rpc.rs`'s
+    // `handle_item_stop` already only treats `ZellijError::Spawn`
+    // specially and swallows every other `close_tab` error as best-effort
+    // (a stop request still records the item as stopped even if this part
+    // of it couldn't be confirmed in time), so surfacing `Timeout` here
+    // rather than the old code's silent-empty-list behavior is a strict
+    // improvement, not a behavior change callers need to handle specially.
+    let tabs = list_tabs_info(session_name).await?;
     let Some(tab) = tabs.iter().find(|t| t.name == tab_name) else {
         return Ok(());
     };
@@ -384,6 +444,95 @@ async fn wait_bounded(mut child: tokio::process::Child) {
     }
 }
 
+/// Ensures Zellij's own web-client server (`zellij web`) is running on
+/// [`ZELLIJ_WEB_DEFAULT_PORT`], starting it if it isn't, for
+/// `serve.rs`'s Zellij-web-client break-glass tunnel path
+/// (`docs/specs/service-tunnels.md`'s last section). Idempotent: a server
+/// already running is left alone and its port returned immediately.
+///
+/// Confirmed against the real binary rather than assumed: `zellij web` is
+/// a genuine, working HTTP+WebSocket terminal server (`zellij web
+/// --help`), not a stub — `--status`'s stdout text is the only reliable
+/// online/offline signal (its exit code is always `0` either way,
+/// confirmed by direct experiment), so this parses that text rather than
+/// trusting the exit status the way [`create_session`]/[`new_tab`] do
+/// against `list-sessions`/`list-tabs`. Starting an already-running server
+/// on the same port fails loudly (`zellij web --start`: "Address already
+/// in use", exit code 2) rather than being itself idempotent, which is
+/// exactly why this function checks `--status` first instead of always
+/// calling `--start`; the same race that [`create_session`] documents
+/// (two callers both seeing "not there yet" and both trying to create it)
+/// is handled the same way here too — a failed `--start` from losing that
+/// race is not itself treated as fatal, since the polling loop below still
+/// confirms the *actual* outcome via `--status` regardless of which
+/// caller's `--start` "won".
+///
+/// # Errors
+///
+/// Returns [`ZellijError::Spawn`] if `zellij` can't be spawned at all, or
+/// [`ZellijError::NotConfirmed`] if the server still isn't reported
+/// online after every retry.
+pub async fn ensure_web_server_running() -> Result<u16, ZellijError> {
+    if web_server_status_online().await? {
+        return Ok(ZELLIJ_WEB_DEFAULT_PORT);
+    }
+
+    {
+        let _guard = ZELLIJ_CLIENT_LOCK.lock().await;
+        let child = Command::new("zellij")
+            .arg("web")
+            .arg("--start")
+            .arg("-d")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(ZellijError::Spawn)?;
+        wait_bounded(child).await;
+    }
+
+    for _ in 0..20 {
+        if web_server_status_online().await? {
+            return Ok(ZELLIJ_WEB_DEFAULT_PORT);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(ZellijError::NotConfirmed)
+}
+
+async fn web_server_status_online() -> Result<bool, ZellijError> {
+    let output =
+        Command::new("zellij").arg("web").arg("--status").stdin(Stdio::null()).output().await.map_err(ZellijError::Spawn)?;
+    Ok(String::from_utf8_lossy(&output.stdout).contains("online"))
+}
+
+/// Stops Zellij's own web-client server. Idempotent — stopping an
+/// already-stopped (or never-started) server is not an error, matching
+/// [`kill_session`]'s posture. Used by this module's own tests to clean up
+/// after themselves; also available for any future graceful-shutdown path.
+///
+/// # Errors
+///
+/// Returns [`ZellijError::Spawn`] if `zellij` can't be spawned.
+///
+/// Only test-called today (`#[allow(dead_code)]` below, matching
+/// [`kill_session`]'s own precedent) — a production graceful-shutdown
+/// caller is a reasonable future addition, not part of this change's scope.
+#[allow(dead_code)]
+pub async fn stop_web_server() -> Result<(), ZellijError> {
+    let _guard = ZELLIJ_CLIENT_LOCK.lock().await;
+    let child = Command::new("zellij")
+        .arg("web")
+        .arg("--stop")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(ZellijError::Spawn)?;
+    wait_bounded(child).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +574,42 @@ mod tests {
         assert_eq!(count, 1, "creating an existing session must not duplicate it");
 
         kill_session(&name).await.unwrap();
+    }
+
+    /// Exercises the real `zellij web` server this environment ships —
+    /// confirmed present via `zellij web --help` (see `serve.rs`'s
+    /// break-glass tunnel doc comment for the fuller investigation this
+    /// backs). `zellij web` is a machine-wide singleton, not scoped per
+    /// test, so this restores whatever online/offline state it found
+    /// rather than unconditionally stopping it (a real daemon on this same
+    /// machine — or a concurrently running test — could legitimately want
+    /// it left running).
+    #[tokio::test]
+    async fn ensure_web_server_running_starts_a_real_reachable_server_and_is_idempotent() {
+        let was_online = web_server_status_online().await.unwrap();
+
+        let port = ensure_web_server_running().await.unwrap();
+        assert_eq!(port, ZELLIJ_WEB_DEFAULT_PORT);
+        assert!(web_server_status_online().await.unwrap());
+
+        // A real TCP connect confirms something is actually listening, not
+        // just that `--status` claims so.
+        tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("zellij web server should be reachable");
+
+        // Idempotent: calling again while already running must not error
+        // or report a different port.
+        let second = ensure_web_server_running().await.unwrap();
+        assert_eq!(second, port);
+
+        if !was_online {
+            stop_web_server().await.unwrap();
+            for _ in 0..20 {
+                if !web_server_status_online().await.unwrap() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("zellij web server still reported online after stop_web_server");
+        }
     }
 }

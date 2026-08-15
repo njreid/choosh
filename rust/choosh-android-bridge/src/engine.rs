@@ -3,8 +3,8 @@
 //! anywhere in this module. `lib.rs`'s `extern "system"` functions are thin
 //! marshaling wrappers around this.
 
-use choosh_android_transport::{CallError, PhoneConnection, PtyTunnelHandle};
-use choosh_protocol::host_rpc::{RpcRequest, RpcResponse};
+use choosh_android_transport::{CallError, PhoneConnection, PtyTunnelHandle, WebTunnelHandle};
+use choosh_protocol::host_rpc::{ByteRange, RpcRequest, RpcResponse};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -374,6 +374,93 @@ impl Engine {
             tracing::warn!(%error, "open_pty_tunnel failed");
             format!("open_pty_tunnel failed: {error}")
         })
+    }
+
+    /// Returns `item.list`'s items as a bare JSON array, backing the
+    /// `WebService`/Markdown pinned-item UI's status polling
+    /// (service-tunnels.md's "Lifecycle"/"Readiness" — a pinned item's
+    /// `starting`/`running`/`stopped`/`failed`/`unknown` status). Same
+    /// error-shape convention as `workspace_status` etc.
+    pub async fn item_list(&self, target_device_id: &str, workspace_id: &str) -> String {
+        let request = RpcRequest::ItemList { request_id: new_request_id(), workspace_id: workspace_id.to_string() };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::ItemListOk { items, .. }) => to_json(&items),
+            Ok(other) => unexpected_or_error_json("item.list", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// Opens a `"web:<item_id>"`-purpose tunnel for [`crate::web_gateway`]'s
+    /// loopback gateway — one call per accepted client connection, per
+    /// `open_web_tunnel`'s own doc comment on why that's the right
+    /// granularity.
+    ///
+    /// # Errors
+    ///
+    /// A message describing why: not connected yet, or the tunnel-open
+    /// call itself failed (see [`CallError`]).
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub async fn open_web_tunnel(&self, target_device_id: &str, item_id: &str) -> Result<WebTunnelHandle, String> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err("not connected: call nativeConnect first".to_string());
+        };
+        connection.open_web_tunnel(target_device_id, item_id).await.map_err(|error| {
+            tracing::warn!(%error, "open_web_tunnel failed");
+            format!("open_web_tunnel failed: {error}")
+        })
+    }
+
+    /// Fetches `path` (workspace-relative) at an optional byte range, for
+    /// [`crate::markdown_gateway`]'s `FileFetcher` — a lower-level sibling
+    /// of [`Self::open_document`]/[`Self::save_document`] that returns
+    /// decoded raw bytes plus `total_size` rather than a JSON string, since
+    /// the markdown gateway feeds the bytes straight into
+    /// `choosh_web::markdown::render_markdown` or an HTTP response body,
+    /// never into Kotlin/JNI.
+    ///
+    /// # Errors
+    ///
+    /// `Err("not_found: ...")`-prefixed message on a `hostd`-side
+    /// rejection (surfaced to the caller as a 404), or any other message on
+    /// a transport-level failure (surfaced as a 502) — see
+    /// `crate::markdown_gateway::FetchError`, which callers map this into.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub async fn read_workspace_file_range(
+        &self,
+        target_device_id: &str,
+        workspace_id: &str,
+        path: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<(Vec<u8>, u64), String> {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return Err("not connected: call nativeConnect first".to_string());
+        };
+        let request = RpcRequest::WorkspaceFileRead {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            path: path.to_string(),
+            revision: None,
+            range: range.map(|(offset, length)| ByteRange { offset, length }),
+        };
+        match connection.call_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceFileReadOk { content_base64, total_size, .. }) => {
+                use base64::Engine as _;
+                let content = base64::engine::general_purpose::STANDARD
+                    .decode(content_base64)
+                    .map_err(|error| format!("hostd returned invalid base64: {error}"))?;
+                Ok((content, total_size))
+            }
+            Ok(RpcResponse::Error { code, message, .. }) => Err(format!("{code}: {message}")),
+            Ok(other) => Err(format!("unexpected response to workspace.file.read: {other:?}")),
+            Err(error) => {
+                if matches!(error, CallError::Transport(_)) {
+                    *guard = None;
+                }
+                Err(format!("workspace.file.read failed: {error}"))
+            }
+        }
     }
 
     pub async fn close(&self) {

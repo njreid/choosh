@@ -96,6 +96,25 @@ pub enum ConnectionState {
     Offline,
 }
 
+/// One devhost's SSH-bridge endpoint, as returned by
+/// [`ControlRequest::ListDevhostSshEndpoints`] — a narrower sibling of
+/// [`DevHostPresence`] carrying only what `choosh-hostd proxy sync` needs
+/// (alias + SSH host key) rather than the fuller presence record
+/// `list-devhosts` exposes. See auth-and-enrollment.md's "Laptop-proxy
+/// enrollment" section: a `laptop-proxy` connection is permitted this
+/// restricted read even though it cannot call `list-devhosts` itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DevhostSshEndpoint {
+    pub device_id: String,
+    pub alias: String,
+    /// Base64-encoded raw 32-byte Ed25519 public key — the same encoding
+    /// [`ControlRequest::Enroll`]'s `public_key`/`host_ssh_public_key`
+    /// fields use, not an OpenSSH `ssh-ed25519 AAAA...` line. Converting to
+    /// the OpenSSH wire format for a `known_hosts` line is the caller's
+    /// job (`choosh-hostd proxy sync`), not this wire type's.
+    pub ssh_host_public_key: String,
+}
+
 /// Wire shape of `agent-events.md`'s normalized event set, as carried over
 /// the relay — a serde-friendly sibling of [`crate::agent_event`]'s
 /// deliberately dependency-free internal validation types, not a
@@ -127,6 +146,18 @@ pub enum WireAgentEvent {
         item_id: String,
         status: WireAgentStatus,
     },
+    /// A Zed session attached to this workspace through the loopback SSH
+    /// bridge (`ssh-bridge-and-zed.md`'s "Editor presence"). Carries no
+    /// file paths, command text, or session content — existence only.
+    EditorAttached {
+        workspace_id: String,
+        editor: WireEditor,
+    },
+    /// The SSH session behind a prior [`Self::EditorAttached`] closed.
+    EditorDetached {
+        workspace_id: String,
+        editor: WireEditor,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -147,6 +178,18 @@ pub enum WireAgentStatus {
     Waiting,
     Stopped,
     Failed,
+}
+
+/// Editor identity for [`WireAgentEvent::EditorAttached`]/
+/// [`WireAgentEvent::EditorDetached`], per `ssh-bridge-and-zed.md`'s
+/// "Editor presence" section. Only `zed` exists today (the SSH bridge's
+/// only editor integration), but this is its own type rather than a bare
+/// `String` so a second editor integration doesn't need a wire-format
+/// migration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireEditor {
+    Zed,
 }
 
 /// Client-to-relayd control-frame requests.
@@ -175,6 +218,15 @@ pub enum ControlRequest {
         identity_class: IdentityClass,
     },
     ListDevhosts {
+        request_id: String,
+    },
+    /// `laptop-proxy`-only restricted fleet read for `proxy sync`
+    /// (auth-and-enrollment.md's "Laptop-proxy enrollment"): alias + SSH
+    /// host key per devhost, nothing else `list-devhosts` exposes (no
+    /// platform, account label, or presence/connection state — `proxy
+    /// sync` doesn't need them and a laptop-proxy Identity isn't scoped to
+    /// read them).
+    ListDevhostSshEndpoints {
         request_id: String,
     },
     /// Opens a tunnel to `target_device_id`. `purpose` is an opaque tag the
@@ -222,6 +274,10 @@ pub enum ControlResponse {
         request_id: String,
         devhosts: Vec<DevHostPresence>,
     },
+    ListDevhostSshEndpointsOk {
+        request_id: String,
+        endpoints: Vec<DevhostSshEndpoint>,
+    },
     OpenTunnelOk {
         request_id: String,
         /// Lowercase hex encoding of the 8 raw tunnel-ID bytes carried in
@@ -253,6 +309,7 @@ impl ControlResponse {
             Self::EnrollOk { request_id, .. }
             | Self::RequestEnrollmentTokenOk { request_id, .. }
             | Self::ListDevhostsOk { request_id, .. }
+            | Self::ListDevhostSshEndpointsOk { request_id, .. }
             | Self::OpenTunnelOk { request_id, .. }
             | Self::AgentEventOk { request_id, .. }
             | Self::RegisterFcmTokenOk { request_id, .. }
@@ -517,6 +574,50 @@ mod tests {
             let decoded: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(decoded, event);
         }
+    }
+
+    #[test]
+    fn editor_attached_and_detached_events_round_trip_and_use_expected_wire_shape() {
+        for event in [
+            WireAgentEvent::EditorAttached { workspace_id: "ws-1".to_string(), editor: WireEditor::Zed },
+            WireAgentEvent::EditorDetached { workspace_id: "ws-1".to_string(), editor: WireEditor::Zed },
+        ] {
+            let json = serde_json::to_string(&event).expect("serialize");
+            assert!(json.contains("\"editor\":\"zed\""));
+            let decoded: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, event);
+        }
+        let attached_json = serde_json::to_string(&WireAgentEvent::EditorAttached {
+            workspace_id: "ws-1".to_string(),
+            editor: WireEditor::Zed,
+        })
+        .unwrap();
+        assert!(attached_json.contains("\"kind\":\"editor_attached\""));
+    }
+
+    #[test]
+    fn list_devhost_ssh_endpoints_request_round_trips_through_json() {
+        let request = ControlRequest::ListDevhostSshEndpoints { request_id: "id".to_string() };
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"type\":\"list-devhost-ssh-endpoints\""));
+        let decoded: ControlRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn list_devhost_ssh_endpoints_ok_round_trips_and_carries_request_id() {
+        let response = ControlResponse::ListDevhostSshEndpointsOk {
+            request_id: "id".to_string(),
+            endpoints: vec![DevhostSshEndpoint {
+                device_id: "dev-1".to_string(),
+                alias: "build-box".to_string(),
+                ssh_host_public_key: "cHVi".to_string(),
+            }],
+        };
+        assert_eq!(response.request_id(), "id");
+        let json = serde_json::to_string(&response).expect("serialize");
+        let decoded: ControlResponse = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, response);
     }
 
     #[test]

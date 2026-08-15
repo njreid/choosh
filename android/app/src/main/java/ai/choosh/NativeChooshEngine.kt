@@ -12,7 +12,10 @@ import ai.choosh.engine.DiffSegment
 import ai.choosh.engine.DiffSegmentKind
 import ai.choosh.engine.DocumentOpenResult
 import ai.choosh.engine.DocumentSaveResult
+import ai.choosh.engine.ItemSummary
+import ai.choosh.engine.ItemType
 import ai.choosh.engine.OperationLogEntry
+import ai.choosh.engine.WebServiceStatus
 import ai.choosh.engine.WebauthnResult
 import ai.choosh.engine.WorkspaceStatus
 import kotlinx.coroutines.Dispatchers
@@ -120,6 +123,14 @@ class NativeChooshEngine : ChooshEngine {
         decodeDocumentSaveResult(NativeBridge.nativeSaveDocument(handle, deviceId, workspaceId, path, baseRevision, contentBase64))
     }
 
+    override suspend fun itemList(deviceId: String, workspaceId: String): List<ItemSummary> = withContext(Dispatchers.IO) {
+        val raw = NativeBridge.nativeItemList(handle, deviceId, workspaceId)
+        decodeOrThrow(raw) { body -> json.decodeFromString<List<WireItemSummary>>(body).map { it.toDomain() } }
+    }
+
+    /** Exposes this instance's raw JNI connection handle to `WebGatewayBridge`/`MarkdownGatewayBridge`, mirroring [ai.choosh.terminal.TerminalSession.attachPty]'s existing `connectionHandle` pattern. */
+    val connectionHandle: Long get() = handle
+
     override fun close() = NativeBridge.nativeClose(handle)
 
     companion object {
@@ -174,6 +185,9 @@ private object NativeBridge {
         baseRevision: String,
         contentBase64: String,
     ): String
+
+    // M5 service-tunnels.md item listing.
+    @JvmStatic external fun nativeItemList(handle: Long, targetDeviceId: String, workspaceId: String): String
 }
 
 /**
@@ -382,6 +396,48 @@ private fun decodeDocumentOpenResult(raw: String): DocumentOpenResult {
         "offline" -> DocumentOpenResult.Offline(wire.message ?: "offline")
         else -> DocumentOpenResult.Rejected(wire.code ?: "unknown", wire.message ?: "native engine returned no message")
     }
+}
+
+// --- M5 service-tunnels.md item wire shapes ------------------------------
+
+private fun wireItemTypeToDomain(type: String): ItemType = when (type) {
+    "agent-terminal" -> ItemType.AGENT_TERMINAL
+    "shell" -> ItemType.SHELL
+    "web-service" -> ItemType.WEB_SERVICE
+    else -> ItemType.UNKNOWN
+}
+
+/**
+ * `choosh_protocol::host_rpc::ItemStatus` is `snake_case` on the wire
+ * (`running`/`stopped`, as of this pass — see [WebServiceStatus]'s doc
+ * comment on why every other value maps to [WebServiceStatus.UNKNOWN]
+ * rather than failing to decode).
+ */
+private fun wireItemStatusToDomain(status: String): WebServiceStatus = when (status) {
+    "starting" -> WebServiceStatus.STARTING
+    "running" -> WebServiceStatus.RUNNING
+    "stopped" -> WebServiceStatus.STOPPED
+    "failed" -> WebServiceStatus.FAILED
+    else -> WebServiceStatus.UNKNOWN
+}
+
+@Serializable
+private data class WireItemSummary(
+    val item_id: String,
+    val item_type: String,
+    val name: String,
+    val tab_target: String,
+    val status: String,
+    val port: Int? = null,
+) {
+    fun toDomain() = ItemSummary(
+        itemId = item_id,
+        itemType = wireItemTypeToDomain(item_type),
+        name = name,
+        tabTarget = tab_target,
+        status = wireItemStatusToDomain(status),
+        port = port,
+    )
 }
 
 private fun decodeDocumentSaveResult(raw: String): DocumentSaveResult {

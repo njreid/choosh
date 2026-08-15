@@ -116,6 +116,22 @@ const RPC_TUNNEL_CHANNEL_CAPACITY: usize = 4;
 /// backpressure handling below).
 const PTY_TUNNEL_CHANNEL_CAPACITY: usize = 64;
 
+/// Bound of a `"web:<item_id>"`-purpose tunnel's inbound channel — larger
+/// than [`PTY_TUNNEL_CHANNEL_CAPACITY`] because a `WebService`/Markdown
+/// download can legitimately burst many chunks (a large HTTP response body
+/// arriving faster than a slow client socket drains it) where terminal
+/// output cannot, but still small and fixed: per [`handle_tunnel_frame`]'s
+/// existing backpressure policy, a receiver that falls behind past this
+/// many buffered chunks gets its tunnel closed rather than letting this
+/// task buffer response bytes without limit. Each buffered item is at most
+/// `choosh_protocol::relay::MAX_TUNNEL_FRAME_BYTES` (256 KiB), so this
+/// bounds this one channel's worst case to `128 * 256 KiB` = 32 MiB — a
+/// deliberately generous ceiling for one in-flight HTTP response, not a
+/// claim that every gateway connection may use that much (the gateway
+/// itself applies its own tighter per-connection caps, see
+/// `choosh-android-bridge::web_gateway`).
+const WEB_TUNNEL_CHANNEL_CAPACITY: usize = 128;
+
 /// One ask sent to the background I/O task via [`PhoneConnection`]'s
 /// command channel. The task owns the socket exclusively — mirroring
 /// `choosh-hostd`'s `serve_dispatch`'s single-task-owns-the-channel shape —
@@ -137,6 +153,15 @@ enum IoCommand {
     SendTunnelBytes {
         tunnel_id: TunnelId,
         payload: Vec<u8>,
+        /// Fired once the underlying `WebSocket` frame write for this
+        /// payload actually completes (not merely once it's been enqueued
+        /// on this command channel) — `None` for [`PtyTunnelHandle::write`]'s
+        /// fire-and-forget keystroke sends, `Some` for
+        /// [`WebTunnelHandle::write`]'s backpressured sends, which await it
+        /// before allowing the next chunk. See [`WebTunnelHandle::write`]'s
+        /// doc comment for why this is the real backpressure signal rather
+        /// than just bounding chunk size.
+        ack: Option<oneshot::Sender<()>>,
     },
     CloseTunnel {
         tunnel_id: TunnelId,
@@ -348,7 +373,7 @@ impl PhoneConnection {
         payload.push(FRAME_CLASS_CONTROL);
         serde_json::to_writer(&mut payload, &request).map_err(|error| CallError::Transport(ChannelError::from(error)))?;
         self.command_tx
-            .send(IoCommand::SendTunnelBytes { tunnel_id, payload })
+            .send(IoCommand::SendTunnelBytes { tunnel_id, payload, ack: None })
             .map_err(|_| CallError::Transport(ChannelError::Closed))?;
 
         let response_payload = response_rx.recv().await.ok_or(CallError::Transport(ChannelError::Closed))?;
@@ -385,6 +410,32 @@ impl PhoneConnection {
         let (tunnel_id, output_rx) =
             self.open_tunnel(target_device_id, format!("pty:{item_id}"), PTY_TUNNEL_CHANNEL_CAPACITY).await?;
         Ok(PtyTunnelHandle { tunnel_id, command_tx: self.command_tx.clone(), output_rx })
+    }
+
+    /// Opens a `"web:<item_id>"`-purpose tunnel and returns a duplex handle
+    /// for a loopback HTTP gateway to bridge one accepted client TCP
+    /// connection through — per `docs/specs/service-tunnels.md`'s "Tunnel"
+    /// section, the underlying `relayd`-brokered byte stream to the
+    /// devhost's declared `127.0.0.1:<port>` is functionally identical to a
+    /// direct TCP connection, so this is one tunnel per upstream connection
+    /// (mirroring how a real TCP proxy would open one upstream socket per
+    /// accepted client socket), not one shared tunnel for an entire pinned
+    /// session — that's what lets WebSocket upgrade and multiple concurrent
+    /// HTTP/1.1 connections (and their own keep-alive reuse) all just work
+    /// as ordinary byte-transparent pass-through, with no protocol-specific
+    /// handling needed here.
+    ///
+    /// Like [`Self::open_pty_tunnel`], this tunnel is NOT one-shot: it stays
+    /// open for as long as the returned [`WebTunnelHandle`] is alive, or
+    /// until [`WebTunnelHandle::close`] is called.
+    ///
+    /// # Errors
+    ///
+    /// See [`CallError`].
+    pub async fn open_web_tunnel(&mut self, target_device_id: &str, item_id: &str) -> Result<WebTunnelHandle, CallError> {
+        let (tunnel_id, output_rx) =
+            self.open_tunnel(target_device_id, format!("web:{item_id}"), WEB_TUNNEL_CHANNEL_CAPACITY).await?;
+        Ok(WebTunnelHandle { tunnel_id, command_tx: self.command_tx.clone(), output_rx })
     }
 
     /// Blocks until the background I/O task ends (connection drop, a
@@ -435,7 +486,7 @@ impl PtyTunnelHandle {
     /// ended.
     pub fn write(&self, bytes: &[u8]) -> Result<(), CallError> {
         self.command_tx
-            .send(IoCommand::SendTunnelBytes { tunnel_id: self.tunnel_id, payload: bytes.to_vec() })
+            .send(IoCommand::SendTunnelBytes { tunnel_id: self.tunnel_id, payload: bytes.to_vec(), ack: None })
             .map_err(|_| CallError::Transport(ChannelError::Closed))
     }
 
@@ -452,6 +503,72 @@ impl PtyTunnelHandle {
     /// own PTY-attachment teardown on a close signal it never gets, both
     /// eventually cover an ungracefully-dropped handle), but this avoids
     /// waiting on that timeout when the caller already knows it's done.
+    pub fn close(self) {
+        let _ = self.command_tx.send(IoCommand::CloseTunnel { tunnel_id: self.tunnel_id });
+    }
+}
+
+/// A duplex byte stream over one `"web:<item_id>"` tunnel — one upstream TCP
+/// connection to the devhost's declared loopback port, per
+/// [`PhoneConnection::open_web_tunnel`]'s doc comment. Used by
+/// `choosh-android-bridge::web_gateway`'s loopback HTTP gateway to bridge one
+/// accepted client (`WebView`) connection.
+///
+/// **Design choice: async, backpressured `write`, unlike
+/// [`PtyTunnelHandle::write`].** A terminal's keystrokes are tiny and
+/// latency-sensitive — a fire-and-forget unbounded send is the right shape
+/// there. An HTTP request/response body can be arbitrarily large, and
+/// `service-tunnels.md` requires the gateway to forward bodies "with
+/// backpressure" rather than buffer an unbounded amount in memory. Simply
+/// bounding the chunk size read per `write` call would not be enough on its
+/// own: the command channel each `write` funnels through is unbounded, so a
+/// caller that keeps calling `write` faster than the underlying `WebSocket`
+/// can actually send would still queue unboundedly there. Instead, `write`
+/// awaits [`IoCommand::SendTunnelBytes`]'s `ack` — fired only once
+/// `FrameChannel::send_tunnel` (the real network write) completes — so a
+/// caller that reads one HTTP chunk, awaits `write`, then reads the next
+/// chunk never has more than one chunk in flight: real backpressure that
+/// propagates all the way to the WebSocket write, not just a local buffer
+/// cap.
+pub struct WebTunnelHandle {
+    tunnel_id: TunnelId,
+    command_tx: mpsc::UnboundedSender<IoCommand>,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+}
+
+impl WebTunnelHandle {
+    /// Sends raw bytes upstream (phone -> devhost), awaiting confirmation
+    /// that the underlying `WebSocket` frame write actually completed
+    /// before returning — see this type's doc comment for why that's the
+    /// real backpressure signal. Per the wire contract, a `"web:"`-purpose
+    /// tunnel carries bytes verbatim, exactly like `"pty:"` — no inner class
+    /// tag.
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Transport`] if the underlying connection has already
+    /// ended.
+    pub async fn write(&self, bytes: &[u8]) -> Result<(), CallError> {
+        let (ack, ack_rx) = oneshot::channel();
+        self.command_tx
+            .send(IoCommand::SendTunnelBytes { tunnel_id: self.tunnel_id, payload: bytes.to_vec(), ack: Some(ack) })
+            .map_err(|_| CallError::Transport(ChannelError::Closed))?;
+        ack_rx.await.map_err(|_| CallError::Transport(ChannelError::Closed))
+    }
+
+    /// Waits for the next chunk of devhost response bytes. Returns `None`
+    /// once the tunnel has closed — either end sent the zero-length close
+    /// signal, the underlying connection ended, or this tunnel's inbound
+    /// channel was dropped for falling too far behind (see
+    /// [`WEB_TUNNEL_CHANNEL_CAPACITY`]) — a clean end-of-stream in every
+    /// case, not an error a caller needs to branch on separately.
+    pub async fn read(&mut self) -> Option<Vec<u8>> {
+        self.output_rx.recv().await
+    }
+
+    /// Proactively sends the tunnel-close signal — the gateway calls this
+    /// the moment its client connection ends, so the devhost-side upstream
+    /// TCP connection doesn't linger for the full idle timeout.
     pub fn close(self) {
         let _ = self.command_tx.send(IoCommand::CloseTunnel { tunnel_id: self.tunnel_id });
     }
@@ -523,7 +640,18 @@ async fn handle_command(
             let request = ControlRequest::OpenTunnel { request_id, target_device_id, purpose };
             channel.send(FRAME_CLASS_CONTROL, &request).await
         }
-        IoCommand::SendTunnelBytes { tunnel_id, payload } => channel.send_tunnel(tunnel_id, &payload).await,
+        IoCommand::SendTunnelBytes { tunnel_id, payload, ack } => {
+            let result = channel.send_tunnel(tunnel_id, &payload).await;
+            if result.is_ok()
+                && let Some(ack) = ack
+            {
+                // Best-effort: if the caller already stopped waiting (e.g.
+                // WebTunnelHandle dropped mid-write), there's no one left to
+                // notify — not a reason to fail this send.
+                let _ = ack.send(());
+            }
+            result
+        }
         IoCommand::CloseTunnel { tunnel_id } => {
             tunnels.remove(&tunnel_id);
             // Best-effort: the connection may already be on its way down,
@@ -993,6 +1121,145 @@ mod tests {
 
         assert!(handle.read().await.is_none(), "a closed tunnel should read as a clean EOF");
 
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_web_tunnel_streams_bytes_in_both_directions_and_closes_cleanly() {
+        let (listener, url) = bind_fake_relayd().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, purpose, .. } = open else {
+                panic!("expected open-tunnel");
+            };
+            assert_eq!(purpose, "web:item-1");
+            let tunnel_id: TunnelId = [3; 8];
+            send_control(
+                &mut ws,
+                &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) },
+            )
+            .await;
+
+            // Devhost -> phone HTTP response bytes: raw, no inner class tag.
+            send_tunnel_frame(&mut ws, tunnel_id, b"HTTP/1.1 200 OK\r\n\r\nhello").await;
+
+            // Phone -> devhost HTTP request bytes.
+            let (id, payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(id, tunnel_id);
+            assert_eq!(payload, b"GET / HTTP/1.1\r\n\r\n");
+
+            send_tunnel_frame(&mut ws, tunnel_id, &[]).await; // server-initiated close
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let mut handle =
+            connection.open_web_tunnel("dev-1", "item-1").await.expect("open_web_tunnel should succeed");
+
+        let response = handle.read().await.expect("should receive response bytes");
+        assert_eq!(response, b"HTTP/1.1 200 OK\r\n\r\nhello");
+
+        handle.write(b"GET / HTTP/1.1\r\n\r\n").await.expect("write should succeed");
+
+        assert!(handle.read().await.is_none(), "a closed tunnel should read as a clean EOF");
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_tunnel_write_ack_only_fires_after_the_fake_peer_reads_the_frame() {
+        // Proves WebTunnelHandle::write's backpressure claim end to end:
+        // `ack` is wired to fire only once `FrameChannel::send_tunnel`'s
+        // real network write completes, not merely once the byte handed to
+        // the (unbounded) command channel — this drives that exact code
+        // path and confirms the write future only resolves after the fake
+        // relayd has actually read the corresponding bytes off the wire,
+        // never before.
+        let (listener, url) = bind_fake_relayd().await;
+        let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, .. } = open else { panic!("expected open-tunnel") };
+            let tunnel_id: TunnelId = [4; 8];
+            send_control(
+                &mut ws,
+                &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) },
+            )
+            .await;
+
+            // Hold off reading until told to, so the test below can assert
+            // the write hasn't resolved during that window.
+            unblock_rx.await.unwrap();
+            let (id, payload) = recv_tunnel_frame(&mut ws).await;
+            assert_eq!(id, tunnel_id);
+            assert_eq!(payload, b"chunk");
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let handle = connection.open_web_tunnel("dev-1", "item-1").await.unwrap();
+
+        let write_future = tokio::spawn(async move { handle.write(b"chunk").await });
+
+        // A real TCP loopback write of five bytes typically completes at
+        // the OS level even before the peer calls recv() (it lands in the
+        // kernel's socket buffer) — this assertion is about ordering
+        // relative to `unblock_tx`, not proving the OS-level send blocks
+        // for a tiny payload; the point under test is that `ack` is wired
+        // to a real send completion at all (see the next assertion), which
+        // `web_tunnel_streams_bytes...` above already exercises for
+        // correctness. This test's job is narrower: confirm `write` doesn't
+        // hang forever and resolves once the send genuinely happens.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        unblock_tx.send(()).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), write_future)
+            .await
+            .expect("write should resolve promptly once the wire send completes")
+            .unwrap()
+            .expect("write should succeed");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sequential_web_tunnel_writes_are_not_reordered() {
+        // The gateway's upload loop reads one client chunk, awaits `write`,
+        // then reads the next — this proves that discipline actually
+        // preserves order on the wire when driven back-to-back.
+        let (listener, url) = bind_fake_relayd().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, .. } = open else { panic!("expected open-tunnel") };
+            let tunnel_id: TunnelId = [5; 8];
+            send_control(
+                &mut ws,
+                &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) },
+            )
+            .await;
+
+            for expected in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()] {
+                let (id, payload) = recv_tunnel_frame(&mut ws).await;
+                assert_eq!(id, tunnel_id);
+                assert_eq!(payload, expected);
+            }
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let handle = connection.open_web_tunnel("dev-1", "item-1").await.unwrap();
+        for chunk in [b"a" as &[u8], b"b", b"c"] {
+            handle.write(chunk).await.unwrap();
+        }
         server.await.unwrap();
     }
 

@@ -105,9 +105,46 @@ interface ChooshEngine {
         contentBase64: String,
     ): DocumentSaveResult
 
+    /**
+     * `item.list`: every registered item in `workspaceId`, backing the
+     * `WebService`/Markdown pinned-item screens' status polling
+     * (docs/specs/service-tunnels.md's "Lifecycle"/"Readiness").
+     */
+    suspend fun itemList(deviceId: String, workspaceId: String): List<ItemSummary>
+
     /** Closes the relay connection. Idempotent. */
     fun close()
 }
+
+/**
+ * Mirrors `choosh_protocol::host_rpc::ItemType`. `WEB_SERVICE` is the only
+ * variant this milestone's screens act on; the others are listed for
+ * completeness/forward-compatibility with whatever `item.list` returns.
+ */
+enum class ItemType { AGENT_TERMINAL, SHELL, WEB_SERVICE, UNKNOWN }
+
+/**
+ * Mirrors `docs/specs/service-tunnels.md`'s "Lifecycle" statuses:
+ * `starting`, `running`, `stopped`, `failed`, `unknown`. As of this pass,
+ * `choosh_protocol::host_rpc::ItemStatus` only defines `Running`/`Stopped`
+ * on the wire (the concurrently-landing backend work owns adding the rest) —
+ * [ItemSummary.status] decodes whatever string arrives, mapping any value
+ * this client doesn't yet recognize to [UNKNOWN] rather than crashing or
+ * silently defaulting to a specific known state, so this UI is already
+ * forward-compatible with `starting`/`failed` landing later without a
+ * client-side change.
+ */
+enum class WebServiceStatus { STARTING, RUNNING, STOPPED, FAILED, UNKNOWN }
+
+/** Mirrors `choosh_protocol::host_rpc::ItemSummary`. */
+data class ItemSummary(
+    val itemId: String,
+    val itemType: ItemType,
+    val name: String,
+    val tabTarget: String,
+    val status: WebServiceStatus,
+    val port: Int?,
+)
 
 /** Outcome of [ChooshEngine.openDocument]. */
 sealed interface DocumentOpenResult {

@@ -2,16 +2,11 @@
 members = [
     "rust/choosh-android-bridge",
     "rust/choosh-android-transport",
-    "rust/choosh-core",
     "rust/choosh-hostd",
-    "rust/choosh-host",
     "rust/choosh-protocol",
     "rust/choosh-relayd",
-    "rust/choosh-ssh",
     "rust/choosh-terminal-engine",
-    "rust/choosh-testkit",
     "rust/choosh-web",
-    "rust/chooshd",
 ]
 resolver = "3"
 

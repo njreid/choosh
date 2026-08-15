@@ -237,6 +237,14 @@ impl Registry {
     /// Returns [`RegistryError::ItemNameTaken`] if `name` is already
     /// registered within `workspace_id`, per `host-rpc.md`'s "Unique within
     /// the workspace" requirement for `item.create`'s `name` field.
+    ///
+    /// `initial_status` is caller-supplied rather than hardcoded: per
+    /// `service-tunnels.md`'s Lifecycle section, a `WebService` item starts
+    /// `starting` (its readiness prober, `crate::readiness`, drives it to
+    /// `running`/`failed`/`unknown` from there), while `AgentTerminal`/
+    /// `Shell` items start `running` immediately — their Zellij tab already
+    /// exists synchronously by the time this call happens, so there's no
+    /// real `starting` window for them to be in.
     #[allow(clippy::too_many_arguments)]
     pub fn register_item(
         &mut self,
@@ -247,6 +255,7 @@ impl Registry {
         tab_target: String,
         agent: Option<AgentKind>,
         port: Option<u16>,
+        initial_status: ItemStatus,
     ) -> Result<(), RegistryError> {
         if self.find_item_by_name(&workspace_id, &name).is_some() {
             return Err(RegistryError::ItemNameTaken(name));
@@ -257,7 +266,7 @@ impl Registry {
             item_type,
             name,
             tab_target,
-            status: ItemStatus::Running,
+            status: initial_status,
             agent,
             port,
         });
@@ -269,17 +278,30 @@ impl Registry {
     ///
     /// # Errors
     ///
-    /// Returns [`RegistryError::Corrupt`] (repurposed as "not found" here —
-    /// there's no dedicated variant and adding one for a single call site
-    /// isn't worth it) if `item_id` isn't registered.
+    /// See [`Self::set_item_status`].
     pub fn mark_item_stopped(&mut self, item_id: &str) -> Result<(), RegistryError> {
+        self.set_item_status(item_id, ItemStatus::Stopped)
+    }
+
+    /// Sets `item_id`'s status directly — the general-purpose sibling of
+    /// [`Self::mark_item_stopped`], used by the `WebService` readiness
+    /// prober (`crate::readiness`) to drive `starting` -> `running`/
+    /// `failed`/`unknown` transitions per `service-tunnels.md`'s Lifecycle
+    /// section.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Corrupt`] (repurposed as "not found" here —
+    /// there's no dedicated variant and adding one for two call sites isn't
+    /// worth it) if `item_id` isn't registered.
+    pub fn set_item_status(&mut self, item_id: &str, status: ItemStatus) -> Result<(), RegistryError> {
         let item = self
             .state
             .items
             .iter_mut()
             .find(|i| i.item_id == item_id)
             .ok_or_else(|| RegistryError::Corrupt(format!("item {item_id:?} not found")))?;
-        item.status = ItemStatus::Stopped;
+        item.status = status;
         self.save()
     }
 }

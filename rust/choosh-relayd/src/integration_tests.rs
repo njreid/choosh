@@ -97,6 +97,17 @@ async fn enroll_devhost(server: &TestServer, key: &SigningKey) -> (String, Strin
 }
 
 async fn enroll_as(server: &TestServer, key: &SigningKey, identity_class: IdentityClass) -> (String, String) {
+    // Devhost enrollment MUST carry a loopback SSH host public key
+    // (auth-and-enrollment.md step 6) — a fresh, unrelated Ed25519 key
+    // stands in for a real SSH host key here, since these tests only
+    // exercise `relayd`'s storage/validation of the *shape*, not
+    // `choosh-hostd`'s actual host-key derivation (covered in
+    // `choosh-hostd`'s own tests).
+    let host_ssh_public_key = matches!(identity_class, IdentityClass::Devhost).then(|| {
+        let fake_host_key = SigningKey::generate(&mut crate::rng::os_rng());
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, fake_host_key.verifying_key().to_bytes())
+    });
+
     let mut ws = connect(server).await;
     recv_hello(&mut ws).await;
     let token = seed_enrollment_token(server, identity_class).await;
@@ -110,7 +121,7 @@ async fn enroll_as(server: &TestServer, key: &SigningKey, identity_class: Identi
                 &base64::engine::general_purpose::STANDARD,
                 key.verifying_key().to_bytes(),
             ),
-            host_ssh_public_key: None,
+            host_ssh_public_key,
             alias: Some("test-device".to_string()),
             platform: Some("linux".to_string()),
             account_label: None,
@@ -223,6 +234,7 @@ async fn enroll_token_is_single_use() {
     let server = spawn_server().await;
     let token = seed_enrollment_token(&server, IdentityClass::Devhost).await;
     let key = SigningKey::generate(&mut crate::rng::os_rng());
+    let host_key = SigningKey::generate(&mut crate::rng::os_rng());
 
     for expect_ok in [true, false] {
         let mut ws = connect(&server).await;
@@ -237,7 +249,10 @@ async fn enroll_token_is_single_use() {
                     &base64::engine::general_purpose::STANDARD,
                     key.verifying_key().to_bytes(),
                 ),
-                host_ssh_public_key: None,
+                host_ssh_public_key: Some(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    host_key.verifying_key().to_bytes(),
+                )),
                 alias: None,
                 platform: None,
                 account_label: None,
@@ -429,6 +444,7 @@ async fn phone_request_enrollment_token_round_trips_into_a_working_enrollment() 
     };
 
     let key = SigningKey::generate(&mut crate::rng::os_rng());
+    let host_key = SigningKey::generate(&mut crate::rng::os_rng());
     let mut ws = connect(&server).await;
     recv_hello(&mut ws).await;
     send_control(
@@ -441,7 +457,10 @@ async fn phone_request_enrollment_token_round_trips_into_a_working_enrollment() 
                 &base64::engine::general_purpose::STANDARD,
                 key.verifying_key().to_bytes(),
             ),
-            host_ssh_public_key: None,
+            host_ssh_public_key: Some(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                host_key.verifying_key().to_bytes(),
+            )),
             alias: None,
             platform: None,
             account_label: None,
@@ -528,6 +547,71 @@ async fn laptop_proxy_may_only_open_ssh_purpose_tunnels() {
     let (received_id, payload) = recv_tunnel_frame(&mut devhost).await;
     assert_eq!(received_id, tunnel_id);
     assert_eq!(payload, b"ssh bytes");
+}
+
+#[tokio::test]
+async fn laptop_proxy_can_list_devhost_ssh_endpoints_but_others_cannot() {
+    let server = spawn_server().await;
+    let (_devhost_ws, devhost_id) = authenticated_device(&server, IdentityClass::Devhost).await;
+    let (mut laptop, _laptop_id) = authenticated_device(&server, IdentityClass::LaptopProxy).await;
+
+    send_control(&mut laptop, &ControlRequest::ListDevhostSshEndpoints { request_id: "r".to_string() }).await;
+    let response: ControlResponse = recv_control(&mut laptop).await;
+    let ControlResponse::ListDevhostSshEndpointsOk { endpoints, .. } = response else {
+        panic!("expected ListDevhostSshEndpointsOk, got {response:?}");
+    };
+    assert_eq!(endpoints.len(), 1, "expected exactly the one enrolled devhost: {endpoints:?}");
+    assert_eq!(endpoints[0].device_id, devhost_id);
+    assert_eq!(endpoints[0].alias, "test-device");
+    assert!(!endpoints[0].ssh_host_public_key.is_empty());
+
+    // A devhost Identity is not scoped to this restricted read either —
+    // it's laptop-proxy-only, per auth-and-enrollment.md.
+    let (mut devhost2, _) = authenticated_device(&server, IdentityClass::Devhost).await;
+    send_control(&mut devhost2, &ControlRequest::ListDevhostSshEndpoints { request_id: "r2".to_string() }).await;
+    let response2: ControlResponse = recv_control(&mut devhost2).await;
+    assert!(
+        matches!(&response2, ControlResponse::Error { code, .. } if code == "not_permitted"),
+        "devhost calling list-devhost-ssh-endpoints must be rejected: {response2:?}"
+    );
+
+    // A phone Identity is not scoped to this either — it has its own,
+    // richer `list-devhosts` instead.
+    let mut phone = authenticated_phone(&server).await;
+    send_control(&mut phone, &ControlRequest::ListDevhostSshEndpoints { request_id: "r3".to_string() }).await;
+    let response3: ControlResponse = recv_control(&mut phone).await;
+    assert!(
+        matches!(&response3, ControlResponse::Error { code, .. } if code == "not_permitted"),
+        "phone calling list-devhost-ssh-endpoints must be rejected: {response3:?}"
+    );
+}
+
+#[tokio::test]
+async fn devhost_enrollment_without_host_ssh_public_key_is_rejected() {
+    let server = spawn_server().await;
+    let key = SigningKey::generate(&mut crate::rng::os_rng());
+    let mut ws = connect(&server).await;
+    recv_hello(&mut ws).await;
+    let token = seed_enrollment_token(&server, IdentityClass::Devhost).await;
+    send_control(
+        &mut ws,
+        &ControlRequest::Enroll {
+            request_id: "e".to_string(),
+            token,
+            identity_class: IdentityClass::Devhost,
+            public_key: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key.verifying_key().to_bytes()),
+            host_ssh_public_key: None,
+            alias: None,
+            platform: None,
+            account_label: None,
+        },
+    )
+    .await;
+    let response: ControlResponse = recv_control(&mut ws).await;
+    assert!(
+        matches!(&response, ControlResponse::Error { code, .. } if code == "missing_host_ssh_public_key"),
+        "devhost enrollment with no SSH host key must be rejected: {response:?}"
+    );
 }
 
 #[tokio::test]

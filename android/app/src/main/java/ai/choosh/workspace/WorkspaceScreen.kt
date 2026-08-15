@@ -7,11 +7,13 @@ import ai.choosh.jj.JjChangeGraphScreen
 import ai.choosh.jj.JjChangeGraphViewModel
 import ai.choosh.jj.JjDiffScreen
 import ai.choosh.jj.JjDiffViewModel
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Tab
@@ -58,6 +60,12 @@ fun WorkspaceScreen(
     // docs/specs/android-navigation.md).
     onOpenTerminal: (() -> Unit)? = null,
     onOpenEditor: ((path: String) -> Unit)? = null,
+    // Same "demo affordance, null renders no button" convention as
+    // onOpenTerminal/onOpenEditor above — the explorer doesn't yet surface
+    // real WebService pinned items or Markdown files to tap directly, per
+    // docs/specs/service-tunnels.md/M5-web-and-markdown.md.
+    onOpenWebServiceDemo: (() -> Unit)? = null,
+    onOpenMarkdownDemo: (() -> Unit)? = null,
 ) {
     var tab by remember { mutableIntStateOf(0) }
 
@@ -80,14 +88,24 @@ fun WorkspaceScreen(
                 modifier = Modifier.padding(start = 12.dp),
             )
         }
-        if (onOpenTerminal != null || onOpenEditor != null) {
-            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+        if (onOpenTerminal != null || onOpenEditor != null || onOpenWebServiceDemo != null || onOpenMarkdownDemo != null) {
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp)) {
                 if (onOpenTerminal != null) {
                     Button(onClick = onOpenTerminal) { Text("Open terminal") }
                 }
                 if (onOpenEditor != null) {
                     Button(onClick = { onOpenEditor("README.md") }, modifier = Modifier.padding(start = 8.dp)) {
                         Text("Open README.md in editor")
+                    }
+                }
+                if (onOpenWebServiceDemo != null) {
+                    Button(onClick = onOpenWebServiceDemo, modifier = Modifier.padding(start = 8.dp)) {
+                        Text("Open WebService demo")
+                    }
+                }
+                if (onOpenMarkdownDemo != null) {
+                    Button(onClick = onOpenMarkdownDemo, modifier = Modifier.padding(start = 8.dp)) {
+                        Text("Open Markdown demo")
                     }
                 }
             }

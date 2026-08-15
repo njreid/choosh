@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 9+ (API 28+) blocks cleartext (plain HTTP) traffic by default —
+  confirmed the hard way against a real device
+  (net::ERR_CLEARTEXT_NOT_PERMITTED loading a WebService/Markdown gateway
+  URL before this file existed). Both loopback gateways
+  (`ai.choosh.webservice`/`ai.choosh.markdown`, per
+  docs/specs/service-tunnels.md's "Tunnel" section) are deliberately plain
+  HTTP — TLS on a same-process loopback socket that never leaves the
+  device buys nothing and each ephemeral port would need its own
+  certificate — so cleartext must be explicitly allowed, but scoped
+  *only* to loopback: every other origin still uses the platform's default
+  (cleartext-blocked) config, matching this app's stated "only talks to
+  choosh-relayd and this device's own loopback gateways" network posture.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

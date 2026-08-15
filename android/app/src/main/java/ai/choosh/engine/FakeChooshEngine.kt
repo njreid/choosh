@@ -237,6 +237,42 @@ class FakeChooshEngine : ChooshEngine {
         doc.contentBase64 = base64Of(newContent)
     }
 
+    /**
+     * Cycles a fixture `WebService` item through `starting` -> `running` on
+     * successive calls (the first two calls return `starting`), so a
+     * ViewModel/screen polling this exercises the real "retrying
+     * interstitial until ready" path without a real backend. A second fixed
+     * `Shell` item (always `running`, no port) is included so `itemList`
+     * consumers see a realistic mixed-type result, matching this fake's
+     * existing style elsewhere (e.g. [FIXTURE_DEVHOSTS]'s mixed
+     * online/offline rows).
+     */
+    private var webServicePollCount = 0
+
+    override suspend fun itemList(deviceId: String, workspaceId: String): List<ItemSummary> {
+        delay(FAKE_LATENCY_MS)
+        webServicePollCount += 1
+        val webServiceStatus = if (webServicePollCount <= 2) WebServiceStatus.STARTING else WebServiceStatus.RUNNING
+        return listOf(
+            ItemSummary(
+                itemId = "item-web-1",
+                itemType = ItemType.WEB_SERVICE,
+                name = "web",
+                tabTarget = "tab-web-1",
+                status = webServiceStatus,
+                port = 3000,
+            ),
+            ItemSummary(
+                itemId = "item-shell-1",
+                itemType = ItemType.SHELL,
+                name = "shell",
+                tabTarget = "tab-shell-1",
+                status = WebServiceStatus.RUNNING,
+                port = null,
+            ),
+        )
+    }
+
     override fun close() {
         connected = false
     }

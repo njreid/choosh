@@ -19,6 +19,15 @@ pub struct EnrolledDevice {
     pub platform: Option<String>,
     pub account_label: Option<String>,
     pub revoked: bool,
+    /// Devhost-only: the loopback SSH server's host public key (raw
+    /// 32-byte Ed25519, same encoding as `public_key`), captured once at
+    /// enrollment per auth-and-enrollment.md step 6. `None` for
+    /// laptop-proxy/phone Identities, or for a devhost enrolled before
+    /// this field existed. `choosh-hostd proxy sync`'s
+    /// `list-devhost-ssh-endpoints` read (see `ws.rs::dispatch`) skips any
+    /// devhost with no key on record rather than emitting a `known_hosts`
+    /// line with nothing to verify against.
+    pub host_ssh_public_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]

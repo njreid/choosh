@@ -196,11 +196,22 @@ pub enum AgentKind {
     Opencode,
 }
 
+/// `docs/specs/service-tunnels.md`'s "Lifecycle" section: exactly these
+/// five statuses. `AgentTerminal`/`Shell` items only ever use `Running`/
+/// `Stopped` (registration is synchronous with the Zellij tab existing, so
+/// there's no meaningful `starting` window and no host-side readiness
+/// signal to probe for them) — `starting`/`failed`/`unknown` are real only
+/// for `WebService` items, driven by `choosh-hostd`'s readiness prober
+/// (`crate::readiness` in `choosh-hostd`) rather than by anything in this
+/// wire-types crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemStatus {
+    Starting,
     Running,
     Stopped,
+    Failed,
+    Unknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -477,6 +488,22 @@ mod tests {
         assert!(json.contains("\"type\":\"workspace-create\""));
         assert_eq!(serde_json::from_str::<RpcRequest>(&json).unwrap(), request);
         assert_eq!(request.request_id(), "id");
+    }
+
+    #[test]
+    fn item_status_lifecycle_variants_round_trip_with_snake_case_wire_names() {
+        let cases = [
+            (ItemStatus::Starting, "\"starting\""),
+            (ItemStatus::Running, "\"running\""),
+            (ItemStatus::Stopped, "\"stopped\""),
+            (ItemStatus::Failed, "\"failed\""),
+            (ItemStatus::Unknown, "\"unknown\""),
+        ];
+        for (status, wire) in cases {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, wire);
+            assert_eq!(serde_json::from_str::<ItemStatus>(&json).unwrap(), status);
+        }
     }
 
     #[test]
