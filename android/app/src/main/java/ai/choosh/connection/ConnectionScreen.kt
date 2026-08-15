@@ -66,14 +66,26 @@ fun ConnectionScreen(viewModel: ConnectionViewModel, onConnected: () -> Unit) {
                 CircularProgressIndicator()
                 Text("Waiting for passkey…", modifier = Modifier.padding(top = 8.dp))
             }
-            is ConnectionUiState.NeedsRegistration -> Button(
-                modifier = Modifier.testTag("register-passkey-button"),
-                onClick = {
-                    scope.launch {
-                        runRegistrationCeremony(context, viewModel)
-                    }
-                },
-            ) { Text("Set up with a passkey") }
+            is ConnectionUiState.NeedsRegistration -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Button(
+                    modifier = Modifier.testTag("register-passkey-button"),
+                    onClick = {
+                        scope.launch {
+                            runRegistrationCeremony(context, viewModel)
+                        }
+                    },
+                ) { Text("Set up with a passkey") }
+                // See ai.choosh.connection.DevPasskeyHooks's doc comment: this
+                // branch is unreachable in a release build (`devPasskeyAvailable`
+                // is a compile-time-fixed `false` there), not just hidden by a
+                // runtime check.
+                if (viewModel.devPasskeyAvailable) {
+                    Button(
+                        modifier = Modifier.testTag("dev-passkey-button").padding(top = 8.dp),
+                        onClick = viewModel::registerWithDevPasskey,
+                    ) { Text("Dev: register without a platform passkey") }
+                }
+            }
             is ConnectionUiState.Error -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
                     current.message,
@@ -81,6 +93,12 @@ fun ConnectionScreen(viewModel: ConnectionViewModel, onConnected: () -> Unit) {
                     modifier = Modifier.testTag("connection-error").padding(bottom = 16.dp),
                 )
                 Button(onClick = viewModel::retry) { Text("Try again") }
+                if (viewModel.devPasskeyAvailable) {
+                    Button(
+                        modifier = Modifier.testTag("dev-passkey-button").padding(top = 8.dp),
+                        onClick = viewModel::registerWithDevPasskey,
+                    ) { Text("Dev: register without a platform passkey") }
+                }
             }
             is ConnectionUiState.Connected -> Unit // handled by onConnected() above
         }

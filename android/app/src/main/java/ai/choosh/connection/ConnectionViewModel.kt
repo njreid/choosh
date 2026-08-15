@@ -74,6 +74,31 @@ class ConnectionViewModel(
         _state.value = ConnectionUiState.Error(message)
     }
 
+    /**
+     * Whether [registerWithDevPasskey] can do anything — see
+     * [DevPasskeyHooks]'s doc comment. Always `false` in a release build;
+     * [ConnectionScreen] uses this to decide whether to show that option
+     * at all, so a release build's UI never even offers it.
+     */
+    val devPasskeyAvailable: Boolean get() = DevPasskeyHooks.available
+
+    /**
+     * The [DevPasskeyHooks] equivalent of [ConnectionScreen]'s
+     * `runRegistrationCeremony` — self-contained here rather than split
+     * across the screen/view-model boundary the way the real ceremony is,
+     * since [DevPasskeyHooks.register] needs no `Activity` context.
+     */
+    fun registerWithDevPasskey() {
+        viewModelScope.launch {
+            val creationOptionsJson = beginRegistration()
+            val result = runCatching { DevPasskeyHooks.register(creationOptionsJson) }
+            result.fold(
+                onSuccess = ::finishRegistration,
+                onFailure = { failure -> onRegistrationCancelledOrFailed("Dev passkey registration failed: ${failure.message}") },
+            )
+        }
+    }
+
     fun retry() {
         _state.value = ConnectionUiState.NeedsRegistration
     }

@@ -7,7 +7,6 @@ import ai.choosh.connection.ConnectionScreen
 import ai.choosh.connection.ConnectionViewModel
 import ai.choosh.connection.SessionCredentialStore
 import ai.choosh.engine.ChooshEngine
-import ai.choosh.engine.FakeChooshEngine
 import ai.choosh.fleet.FleetDrawer
 import ai.choosh.fleet.FleetNavigationEvent
 import ai.choosh.fleet.FleetViewModel
@@ -47,15 +46,20 @@ import kotlinx.coroutines.tasks.await
 
 /**
  * Composition root. This is the single place that chooses [ChooshEngine]'s
- * implementation — swap [FakeChooshEngine] for `NativeChooshEngine()` here
- * once the native bridge (a sibling increment) is ready to be exercised for
- * real; nothing else in the app needs to change.
+ * implementation; nothing else in the app needs to change to swap it.
  */
-// NativeChooshEngine is real and verified (confirmed against the real
-// choosh-android-bridge .so on a real device — see NativeChooshEngine.kt's
-// NativeBridge doc comment) but needs a live choosh-relayd deployment to be
-// useful; FakeChooshEngine stays the default until one exists to point at.
-private fun buildEngine(): ChooshEngine = FakeChooshEngine()
+// A real choosh-relayd deployment now exists (PLAN.md's "Known follow-ups"
+// — a temporary EC2 test instance, fronted by real Let's Encrypt TLS/DNS),
+// so NativeChooshEngine — real and verified against the real
+// choosh-android-bridge .so on a real device, see NativeChooshEngine.kt's
+// NativeBridge doc comment — is now the real default, per this file's own
+// previously-stated intent ("once one exists to point at"). A build with
+// no reachable CHOOSH_RELAYD_URL configured (the release default,
+// wss://relay.choosh.ai/connect, has no live deployment yet) will show
+// real connection-failure states rather than FakeChooshEngine's polished
+// fixture demo — an accurate reflection of where the project actually is,
+// not a regression to paper over.
+private fun buildEngine(): ChooshEngine = NativeChooshEngine()
 
 /**
  * `null` on any failure (no Play Services, transient error, etc.) — a
@@ -233,11 +237,12 @@ fun ChooshApp(context: Context) {
                 is Screen.Terminal -> TerminalScreen(
                     deviceId = current.deviceId,
                     itemId = current.itemId,
-                    // No live relayd deployment exists yet (see NativeChooshEngine.kt's
-                    // doc comment) — FakeChooshEngine has no connection handle to hand
-                    // TerminalScreen, so real PTY attach isn't reachable from this
-                    // composition root today; the demo-output buttons still exercise
-                    // the real VT parser + renderer end to end.
+                    // Hardcoded null, not yet wired to `(engine as?
+                    // NativeChooshEngine)?.connectionHandle` — a real, tracked gap
+                    // (UX-friction audit finding #4/#12: this composition root's demo
+                    // buttons predate real item-pinning and haven't been rewired to it
+                    // yet), not a "no live relayd" limitation anymore. The demo-output
+                    // buttons still exercise the real VT parser + renderer end to end.
                     connectionHandle = null,
                     onBack = { screen = Screen.Workspace(current.itemId, current.deviceId) },
                 )

@@ -48,6 +48,27 @@ raw-window-handle = "0.6"
 ndk = { version = "0.9", features = ["nativewindow"] }
 ndk-sys = "0.6"
 
+# Debug-build-only software WebAuthn authenticator for devices with no
+# platform passkey provider (e.g. this project's own Genymotion test
+# instances, which have no Google Play Services) — see dev_passkey.rs's
+# module doc comment. Optional and feature-gated: never a dependency of a
+# release build, since buildRustAndroid only passes `--features
+# dev-passkey` for the debug Android variant. From the same upstream
+# project (kanidm/webauthn-rs) as the `webauthn-rs`/`webauthn-rs-core`
+# server-side crates `choosh-relayd` already depends on.
+[dependencies.webauthn-authenticator-rs]
+version = "0.6.1-dev"
+default-features = false
+features = ["softpasskey"]
+optional = true
+
+[dependencies.webauthn-rs-proto]
+version = "0.5.5"
+optional = true
+
+[features]
+dev-passkey = ["dep:webauthn-authenticator-rs", "dep:webauthn-rs-proto"]
+
 [dev-dependencies]
 tokio-tungstenite = "0.30.0"
 tokio = { version = "=1.53.0", features = ["macros", "rt-multi-thread"] }

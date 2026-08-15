@@ -163,8 +163,39 @@ val buildRustAndroid = tasks.register<Exec>("buildRustAndroid") {
     commandLine(rootProject.file("scripts/build-android-rust.sh").absolutePath)
 }
 
+// A second, debug-only build of the SAME crate with the `dev-passkey`
+// Cargo feature enabled (rust/choosh-android-bridge/src/dev_passkey.rs),
+// into `src/debug/jniLibs` rather than `src/main/jniLibs`. `buildRustAndroid`
+// above is shared by every build type (assembleDebug AND assembleRelease
+// both depend on it, and it always writes into `src/main/jniLibs`) — it
+// cannot be the thing that conditionally carries a debug-only feature, or
+// that feature would land in release too. Android's own source-set
+// precedence (`debug` overrides `main` for an identically-named/-pathed
+// file) is what actually keeps the dev-passkey-enabled `.so` out of a
+// release APK: `assembleRelease` never even looks at `src/debug/jniLibs`,
+// since the `debug` source set isn't part of the `release` variant at
+// all. `assembleDebug`/`testDebugUnitTest` still also depend on the plain
+// `buildRustAndroid` above (so `src/main/jniLibs` — the fallback — stays
+// current too); this does mean a debug build compiles the Rust bridge
+// twice, an acceptable, honest correctness-over-speed tradeoff rather than
+// a more tangled task graph.
+val buildRustAndroidDevPasskey = tasks.register<Exec>("buildRustAndroidDevPasskey") {
+    group = "build"
+    description = "Build and ABI-check the Rust bridge with the dev-passkey feature, for debug builds only."
+    workingDir(rootProject.projectDir)
+    environment("CHOOSH_ANDROID_RUST_FEATURES", "dev-passkey")
+    environment("CHOOSH_ANDROID_RUST_DEST", project.file("src/debug/jniLibs").absolutePath)
+    commandLine(rootProject.file("scripts/build-android-rust.sh").absolutePath)
+}
+
 tasks.matching { it.name == "testDebugUnitTest" }.configureEach {
     dependsOn(buildRustAndroid)
+}
+tasks.matching { it.name.startsWith("assembleDebug") || it.name == "testDebugUnitTest" }.configureEach {
+    dependsOn(buildRustAndroidDevPasskey)
+}
+tasks.matching { it.name.contains("JniLibFolders") || it.name.contains("NativeLibs") }.configureEach {
+    if (name.contains("Debug")) dependsOn(buildRustAndroidDevPasskey)
 }
 
 val checkNativeAbiPackaging = tasks.register("checkNativeAbiPackaging") {

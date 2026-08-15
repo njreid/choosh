@@ -41,37 +41,102 @@ tunnel, no client-side auth" posture.
 
 Not blocking, but real and worth tracking rather than leaving implicit:
 
-- **A real, publicly-reachable `relayd` deployment now exists over genuine
-  TLS/DNS, but no `choosh-hostd`/phone has enrolled against it yet.** An
-  earlier loopback-only test instance (`i-01b9022a1d5d83ed0`) proved the
-  deploy path itself and was terminated once that was confirmed. The
-  current instance (`i-0ea105f9e4b6f43b4`, tagged `relayd-njr`, `t3.micro`,
-  us-east-1, Elastic IP `54.174.208.193`, own security group open only on
-  80/443) is fronted by Caddy (a static binary, not a package — no AL2023
-  build existed) doing automatic HTTPS via Let's Encrypt for
+- **A real, publicly-reachable `relayd` deployment exists over genuine
+  TLS/DNS, and a real phone → relayd `WebAuthn` round trip has now been
+  verified end to end against it — the first genuine "phone" leg of the
+  "no live relayd deployment" gap is closed.** An earlier loopback-only
+  test instance (`i-01b9022a1d5d83ed0`) proved the deploy path itself and
+  was terminated once confirmed. The current instance
+  (`i-0ea105f9e4b6f43b4`, tagged `relayd-njr`, `t3.micro`, us-east-1,
+  Elastic IP `54.174.208.193`, own security group open only on 80/443) is
+  fronted by Caddy (a static binary, not a package — no AL2023 build
+  existed) doing automatic HTTPS via Let's Encrypt for
   **`njr.ship.stream`**, reverse-proxying to `choosh-relayd`'s loopback
   bind. DNS: `ship.stream` (owned at Porkbun, confirmed unused/parked, no
-  prior records) is now delegated to a Route53 public hosted zone
-  (`Z01988063DBU2CEU8JUDG`) created in this account; an `njr.ship.stream A`
-  record points at the Elastic IP. `just deploy relayd-njr us-east-1` (now
-  with `CHOOSH_RELAYD_RP_ID`/`CHOOSH_RELAYD_RP_ORIGIN` support added to
+  prior records) is delegated to a Route53 public hosted zone
+  (`Z01988063DBU2CEU8JUDG`); an `njr.ship.stream A` record points at the
+  Elastic IP. `just deploy relayd-njr us-east-1` (now with
+  `CHOOSH_RELAYD_RP_ID`/`CHOOSH_RELAYD_RP_ORIGIN` support added to
   `scripts/deploy-relayd.sh`/`deploy-relayd-remote.sh` — a real, permanent
-  addition to the deploy tooling, not a one-off hack, since it only adds an
-  `Environment=` line when the var is set, so every existing/default deploy
-  is unaffected) shipped `choosh-relayd` with `CHOOSH_RELAYD_RP_ID=njr.ship.stream`.
-  Independently verified: a real Let's Encrypt cert for `njr.ship.stream`
-  (confirmed via `openssl s_client`, not just "no cert error"), the
-  deployed unit's actual `Environment=` lines (via a separate SSM command,
-  not trusting the deploy script's own echo), and `GET
-  https://njr.ship.stream/healthz` → `200 ok` over the real public
-  internet from outside AWS.
-  **Still missing for a genuine phone round trip**: no `choosh-hostd` has
-  enrolled against this instance, and Android's *native* (non-browser)
-  WebAuthn ceremony needs `/.well-known/assetlinks.json` served from this
-  domain declaring the app's package name and signing-cert SHA-256
-  fingerprint (Digital Asset Links) — **this doesn't exist anywhere in the
-  repo**, a real, previously-undiscovered gap surfaced while pursuing this,
-  not yet closed.
+  addition to the deploy tooling, only adding an `Environment=` line when
+  the var is set, so every existing/default deploy is unaffected) shipped
+  `choosh-relayd` with `CHOOSH_RELAYD_RP_ID=njr.ship.stream`.
+
+  **Two real gaps were found and closed to make the phone round trip
+  possible at all:**
+  1. Android's native (non-browser) `WebAuthn` ceremony needs
+     `/.well-known/assetlinks.json` — didn't exist anywhere in the repo.
+     Now served by Caddy, declaring `ai.choosh`'s debug-keystore SHA-256
+     fingerprint.
+  2. The test device (a Genymotion instance with no Google Play Services)
+     has no platform credential provider at all —
+     `CredentialManager.createCredential` fails immediately with
+     `CreateCredentialNoCreateOptionException`, confirmed live via
+     `logcat`. A real, debug-build-only software `WebAuthn` authenticator
+     was built to unblock this without weakening `relayd`'s verification
+     in any way (per this project's standing "no ceremony bypass, not even
+     dev-gated" rule — the ceremony itself stays completely real, only the
+     OS's platform authenticator is replaced):
+     `rust/choosh-android-bridge/src/dev_passkey.rs`, built on
+     `webauthn-authenticator-rs`'s `softpasskey` backend (same upstream
+     project, `kanidm/webauthn-rs`, as the `webauthn-rs`/`webauthn-rs-core`
+     crates `relayd` already uses server-side) — generates a real,
+     fresh-per-ceremony P-256 keypair and performs the actual attestation
+     ceremony, which `relayd` verifies exactly as it would a hardware
+     passkey. Kept structurally out of release builds two ways: the Cargo
+     feature (`dev-passkey`) is only ever enabled by a new, separate
+     Gradle task (`buildRustAndroidDevPasskey`, building into
+     `src/debug/jniLibs` — verified via `nm -D` that the plain
+     `buildRustAndroid` output has zero trace of the symbol, and that the
+     final packaged **debug APK** genuinely contains the feature-enabled
+     `.so`, via AGP's real jniLibs debug-overrides-main precedence), and
+     the Kotlin call site (`ai.choosh.connection.DevPasskeyHooks`) is
+     gated on `BuildConfig.DEBUG` (an earlier attempt at Kotlin-level
+     source-set overriding was wrong and doesn't work for compiled
+     sources — Gradle's `debug`-overrides-`main` precedence is a
+     resource/jniLibs-merging mechanism only, not a compiled-source one; a
+     real, corrected finding from this pass, not merely assumed).
+
+  **A real, previously-undiscovered bug was found and fixed by this
+  test**: `NativeChooshEngine.kt`'s `WireWebauthnResult` assumed relayd's
+  `/webauthn/*/finish` response carried an `{"ok": bool, ...}` shape;
+  `relayd`'s actual response (`webauthn.rs::mint_session`) is
+  `{"session_credential": ..., "expires_at": ...}` on success and
+  `{"error": "..."}` on failure — no `ok` field at all. This had never
+  been exercised against a real `relayd` before (the app always used
+  `FakeChooshEngine`, matched to this same wrong assumption), and crashed
+  with a real `kotlinx.serialization.MissingFieldException` on the first
+  genuine successful registration. Fixed to match `relayd`'s real wire
+  shape.
+
+  **`ChooshApp.kt`'s `buildEngine()` now defaults to `NativeChooshEngine`**
+  (was hardcoded to `FakeChooshEngine`, with its own comment saying to
+  swap once a live relayd existed) — a deliberate, explicit decision, not
+  a side effect: a build with no reachable `CHOOSH_RELAYD_URL` (the
+  release default, `wss://relay.choosh.ai/connect`, has no live deployment
+  yet) now shows real connection-failure states instead of
+  `FakeChooshEngine`'s polished fixture demo — an accurate reflection of
+  where the project stands, not a regression.
+
+  **End-to-end verification, real evidence**: built a debug APK pointed at
+  `wss://njr.ship.stream/connect`/`https://njr.ship.stream`, installed on
+  the real Genymotion instance, tapped the dev-passkey button — real
+  ceremony reached real `relayd`, real session credential minted and
+  decoded correctly, real relay control connection established, real
+  `list-devhosts` returned the true (empty — no `choosh-hostd` enrolled
+  yet) result, rendered correctly as "No devhosts enrolled yet." with zero
+  crash. Independently confirmed server-side, not just client-side:
+  `POST https://njr.ship.stream/webauthn/login/start` returns a real
+  challenge with **two** real registered `allowCredentials` entries (one
+  per registration attempt made during this pass) — since `webauthn-rs`
+  only stores a passkey after successfully verifying its attestation, this
+  is authoritative, server-side proof the ceremony's cryptography was
+  genuinely correct end to end, not just "the client didn't crash."
+
+  **Still missing for a fully complete round trip**: no real
+  `choosh-hostd` has enrolled against this instance yet (needs a real
+  `request-enrollment-token` call from the app plus a real devhost dialing
+  in with that token — the natural next step, not attempted this pass).
   This instance is a real, billed resource (Elastic IP, EC2, Route53 zone)
   and should be terminated once its purpose is served, not left running
   unmanaged.

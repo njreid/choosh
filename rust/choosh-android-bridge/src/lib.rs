@@ -21,6 +21,8 @@ mod web_gateway;
 mod gateway_jni;
 #[cfg(target_os = "android")]
 mod terminal_jni;
+#[cfg(feature = "dev-passkey")]
+mod dev_passkey;
 
 use engine::Engine;
 use jni::objects::{JClass, JString};
@@ -415,6 +417,31 @@ fn native_agent_events_resume<'local>(
     JString::new(env, body)
 }
 
+/// Fulfills a `WebAuthn` registration ceremony in-process via
+/// [`dev_passkey::register`] instead of Android's platform Credential
+/// Manager — see that module's doc comment for the full "debug builds
+/// only, never weakens `relayd`'s verification" reasoning. Takes no engine
+/// handle: unlike every other native method here, this needs no live
+/// relay connection, just the relay's own HTTP origin (already known to
+/// Kotlin as `BuildConfig.CHOOSH_RELAYD_HTTP_URL`, passed straight
+/// through rather than plumbed through an `Engine`) and the creation
+/// options JSON `Engine::webauthn_register_start` already returned.
+// `origin`/`creation_options_json` stay `JString<'local>` by value to match
+// `native_method!`'s macro-generated wrapper — see `native_init`'s comment.
+#[cfg(feature = "dev-passkey")]
+#[allow(clippy::needless_pass_by_value)]
+fn native_dev_passkey_register<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    origin: JString<'local>,
+    creation_options_json: JString<'local>,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let origin = jstring_to_string(env, &origin)?;
+    let creation_options_json = jstring_to_string(env, &creation_options_json)?;
+    let body = dev_passkey::register(&origin, &creation_options_json).unwrap_or_else(|message| error_json(&message));
+    JString::new(env, body)
+}
+
 // `native_method!`'s non-raw mode always expects a `Result` return (it's
 // what gives every other native method here panic-safety and Java
 // exception translation for free) even though this particular method never
@@ -537,6 +564,12 @@ const _AGENT_EVENTS_RESUME: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",
     static extern fn NativeBridge::native_agent_events_resume(handle: jlong, target_device_id: JString, workspace_id: JString, after_sequence: jlong) -> JString,
     fn = native_agent_events_resume,
+};
+#[cfg(feature = "dev-passkey")]
+const _DEV_PASSKEY_REGISTER: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_dev_passkey_register(origin: JString, creation_options_json: JString) -> JString,
+    fn = native_dev_passkey_register,
 };
 
 #[cfg(test)]

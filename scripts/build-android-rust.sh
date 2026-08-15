@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
+# CHOOSH_ANDROID_RUST_FEATURES (optional): extra `choosh-android-bridge`
+# Cargo features to build with, e.g. "dev-passkey" — see that crate's
+# `dev_passkey.rs` module doc comment for why this must never be set for a
+# release build. CHOOSH_ANDROID_RUST_DEST (optional): where the built
+# `.so`s land, defaulting to `android/app/src/main/jniLibs` (packaged into
+# every build type). A caller building with CHOOSH_ANDROID_RUST_FEATURES
+# set MUST also point CHOOSH_ANDROID_RUST_DEST at `src/debug/jniLibs`
+# instead — AGP's own source-set precedence (debug overrides main for an
+# identically-named file) is what actually keeps a feature-enabled `.so`
+# out of a release APK, not anything in this script itself.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+rust_features="${CHOOSH_ANDROID_RUST_FEATURES:-}"
 sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 if [[ -z "$sdk" ]]; then
   echo 'android_rust_missing_sdk: set ANDROID_HOME or ANDROID_SDK_ROOT' >&2
@@ -62,10 +73,12 @@ build_one() {
   local cc_key="CC_${target//-/_}"
   local ar_key="AR_${target//-/_}"
   linker_key="${linker_key//-/_}"
+  local -a cargo_args=(build --manifest-path "$root/Cargo.toml" --locked --release --target "$target" -p choosh-android-bridge)
+  if [[ -n "$rust_features" ]]; then
+    cargo_args+=(--features "$rust_features")
+  fi
   env "$linker_key=$toolchain/$linker" "$cc_key=$toolchain/$linker" "$ar_key=$toolchain/llvm-ar" \
-    RUSTFLAGS="$build_rustflags" cargo build \
-    --manifest-path "$root/Cargo.toml" \
-    --locked --release --target "$target" -p choosh-android-bridge
+    RUSTFLAGS="$build_rustflags" cargo "${cargo_args[@]}"
   local library="$root/target/$target/release/libchoosh_android_bridge.so"
   # ai.choosh.NativeBridge's relay-protocol JNI surface (docs/specs/android-native-runtime.md);
   # replaces the pre-relay choosh_bridge_* C-ABI symbols this check used to require.
@@ -73,6 +86,13 @@ build_one() {
     Java_ai_choosh_NativeBridge_nativeListDevhosts__J Java_ai_choosh_NativeBridge_nativeClose__J; do
     nm -D --defined-only "$library" | awk '{print $3}' | grep -F -- "$symbol" >/dev/null
   done
+  # When a feature was explicitly requested, fail loudly if the symbol it's
+  # supposed to add didn't actually land — a silently-not-taken feature flag
+  # would otherwise look identical to a successful build.
+  if [[ "$rust_features" == *dev-passkey* ]]; then
+    nm -D --defined-only "$library" | awk '{print $3}' | grep -F -- Java_ai_choosh_NativeBridge_nativeDevPasskeyRegister >/dev/null \
+      || { echo "android_rust_dev_passkey_symbol_missing: dev-passkey feature was requested but its JNI symbol is absent from $library" >&2; exit 1; }
+  fi
   mkdir -p "$stage/$abi"
   cp -- "$library" "$stage/$abi/libchoosh_android_bridge.so"
 }
@@ -80,7 +100,7 @@ build_one() {
 build_one aarch64-linux-android arm64-v8a aarch64-linux-android26-clang
 build_one x86_64-linux-android x86_64 x86_64-linux-android26-clang
 
-destination="$root/android/app/src/main/jniLibs"
+destination="${CHOOSH_ANDROID_RUST_DEST:-$root/android/app/src/main/jniLibs}"
 mkdir -p "$destination/arm64-v8a" "$destination/x86_64"
 cp -- "$stage/arm64-v8a/libchoosh_android_bridge.so" "$destination/arm64-v8a/"
 cp -- "$stage/x86_64/libchoosh_android_bridge.so" "$destination/x86_64/"

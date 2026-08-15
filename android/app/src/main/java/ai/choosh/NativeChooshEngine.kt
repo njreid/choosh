@@ -227,7 +227,28 @@ private object NativeBridge {
     // `None`" convention; see `Engine::agent_events_resume`'s doc comment
     // on the Rust side for where this sentinel is translated back to `Option<u64>`.
     @JvmStatic external fun nativeAgentEventsResume(handle: Long, targetDeviceId: String, workspaceId: String, afterSequence: Long): String
+
+    // Gated by ai.choosh.connection.DevPasskeyHooks's `BuildConfig.DEBUG`
+    // check at the call site, but the real backstop is that the *release*
+    // `.so` doesn't contain this symbol at all: `buildRustAndroid`'s plain,
+    // unconditional build never passes Cargo's `dev-passkey` feature — only
+    // the separate `buildRustAndroidDevPasskey` task does (into
+    // `src/debug/jniLibs`, which — unlike Kotlin sources — genuinely does
+    // get AGP's debug-overrides-main treatment for a debug build). So even
+    // a `BuildConfig.DEBUG`-bypassing attempt to call this from a release
+    // build would fail with `UnsatisfiedLinkError`, not succeed.
+    @JvmStatic external fun nativeDevPasskeyRegister(origin: String, creationOptionsJson: String): String
 }
+
+/**
+ * The sole `src/main`-visible entry point into [NativeBridge]'s dev-only
+ * dev-passkey JNI method — [NativeBridge] itself is file-private, so this
+ * thin `internal` wrapper is what [ai.choosh.connection.DevPasskeyHooks]
+ * actually calls. See that file and `dev_passkey.rs`'s module doc comment
+ * for the full "why this exists, why it's safe" reasoning.
+ */
+internal fun nativeDevPasskeyRegister(origin: String, creationOptionsJson: String): String =
+    NativeBridge.nativeDevPasskeyRegister(origin, creationOptionsJson)
 
 /**
  * Every M3/M4 native method returns this module's shared `{"error": ...}`
@@ -273,20 +294,36 @@ private data class WireDevHostPresence(
     )
 }
 
+/**
+ * `Engine::webauthn_register_finish`/`webauthn_login_finish` are pure HTTP
+ * passthroughs (`Engine::post_passthrough`) — this is `relayd`'s own raw
+ * register/login "finish" response body verbatim, not a shape this crate
+ * invents. Success (`webauthn.rs::mint_session`):
+ * `{"session_credential": "...", "expires_at": <unix_seconds>}`. Failure —
+ * both a genuine `relayd`-side rejection (`{"error": "<message>"}`, from
+ * `webauthn.rs`'s own `Json(json!({ "error": err.to_string() }))`) and a
+ * transport-level failure this crate's own `error_json` produces
+ * (`{"error": "<message>"}`, e.g. "failed to reach relayd") — share the
+ * exact same one-field shape, so both are handled identically here. There
+ * is no `ok` field on the wire at all; an earlier version of this type
+ * assumed an `{"ok": bool, ...}` shape that was never actually exercised
+ * against a real `relayd` response until real live-relayd testing caught
+ * it (a real `kotlinx.serialization.MissingFieldException` crash on a
+ * genuine successful registration).
+ */
 @Serializable
 private data class WireWebauthnResult(
-    val ok: Boolean,
     val session_credential: String? = null,
-    val code: String? = null,
-    val message: String? = null,
+    val expires_at: Long? = null,
+    val error: String? = null,
 )
 
 private fun decodeWebauthnResult(raw: String): WebauthnResult {
     val wire = json.decodeFromString<WireWebauthnResult>(raw)
-    return if (wire.ok && wire.session_credential != null) {
+    return if (wire.session_credential != null) {
         WebauthnResult.Success(wire.session_credential)
     } else {
-        WebauthnResult.Failure(wire.code ?: "unknown", wire.message ?: "native engine returned no message")
+        WebauthnResult.Failure("relayd_error", wire.error ?: "native engine returned no message")
     }
 }
 
