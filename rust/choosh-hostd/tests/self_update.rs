@@ -302,7 +302,6 @@ async fn self_update_restart_does_not_disturb_a_real_zellij_session_or_its_proce
         tunnel_id,
         &RpcRequest::WorkspaceCreate {
             request_id: "req-1".to_string(),
-            devhost_id: "selftest-device".to_string(),
             workspace_name: "proj1".to_string(),
             project_source: ProjectSource::ExistingPath { existing_path: "proj1".to_string() },
             parent_workspace_id: None,

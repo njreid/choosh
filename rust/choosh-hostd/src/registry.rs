@@ -38,7 +38,6 @@ pub struct Project {
 pub struct Workspace {
     pub workspace_id: String,
     pub workspace_name: String,
-    pub devhost_id: String,
     pub project_id: String,
     pub root_path: PathBuf,
     pub created_at: String,
@@ -254,12 +253,10 @@ impl Registry {
     /// Returns [`RegistryError::WorkspaceNameTaken`] if `workspace_name` is
     /// already registered on this host, per `host-rpc.md`'s "reject
     /// collisions... rather than silently adopting it".
-    #[allow(clippy::too_many_arguments)] // registering a workspace genuinely needs all of these; a params struct would just move the count, not reduce it, for a single call site.
     pub fn register_workspace(
         &mut self,
         workspace_id: String,
         workspace_name: String,
-        devhost_id: String,
         project_id: String,
         project_name: String,
         root_path: PathBuf,
@@ -279,7 +276,6 @@ impl Registry {
         self.state.workspaces.push(Workspace {
             workspace_id,
             workspace_name,
-            devhost_id,
             project_id,
             root_path,
             created_at,
@@ -419,7 +415,6 @@ mod tests {
             .register_workspace(
                 "ws-1".to_string(),
                 "app".to_string(),
-                "dev-1".to_string(),
                 "proj-1".to_string(),
                 "app".to_string(),
                 PathBuf::from("/workspaces/app"),
@@ -442,7 +437,6 @@ mod tests {
             .register_workspace(
                 "ws-1".to_string(),
                 "app".to_string(),
-                "dev-1".to_string(),
                 "proj-1".to_string(),
                 "app".to_string(),
                 PathBuf::from("/workspaces/app"),
@@ -452,7 +446,6 @@ mod tests {
         let result = registry.register_workspace(
             "ws-2".to_string(),
             "app".to_string(),
-            "dev-1".to_string(),
             "proj-2".to_string(),
             "app-2".to_string(),
             PathBuf::from("/workspaces/app-2"),
@@ -476,7 +469,6 @@ mod tests {
             .register_workspace(
                 "ws-1".to_string(),
                 "app".to_string(),
-                "dev-1".to_string(),
                 "proj-1".to_string(),
                 "app".to_string(),
                 PathBuf::from("/workspaces/app"),
@@ -487,7 +479,6 @@ mod tests {
             .register_workspace(
                 "ws-2".to_string(),
                 "app-agent-b".to_string(),
-                "dev-1".to_string(),
                 "proj-1".to_string(),
                 "app".to_string(),
                 PathBuf::from("/workspaces/app-agent-b"),
@@ -506,7 +497,6 @@ mod tests {
             .register_workspace(
                 "ws-1".to_string(),
                 "app".to_string(),
-                "dev-1".to_string(),
                 "proj-1".to_string(),
                 "app".to_string(),
                 PathBuf::from("/workspaces/app"),
@@ -517,7 +507,6 @@ mod tests {
             .register_workspace(
                 "ws-2".to_string(),
                 "app-agent-b".to_string(),
-                "dev-1".to_string(),
                 "proj-1".to_string(),
                 "app".to_string(),
                 PathBuf::from("/workspaces/app-agent-b"),
@@ -542,7 +531,6 @@ mod tests {
             .register_workspace(
                 "ws-1".to_string(),
                 "app".to_string(),
-                "dev-1".to_string(),
                 "proj-1".to_string(),
                 "app".to_string(),
                 PathBuf::from("/workspaces/app"),
@@ -553,7 +541,6 @@ mod tests {
             .register_workspace(
                 "ws-2".to_string(),
                 "other".to_string(),
-                "dev-1".to_string(),
                 "proj-2".to_string(),
                 "other".to_string(),
                 PathBuf::from("/workspaces/other"),
@@ -579,7 +566,6 @@ mod tests {
             .register_workspace(
                 "ws-1".to_string(),
                 "app".to_string(),
-                "dev-1".to_string(),
                 "proj-1".to_string(),
                 "app".to_string(),
                 PathBuf::from("/workspaces/app"),

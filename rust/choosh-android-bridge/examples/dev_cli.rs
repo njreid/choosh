@@ -170,7 +170,6 @@ async fn create_workspace(args: &[String]) -> Result<(), String> {
     let mut connection = connect_from_session_file(ws_url, session_file).await?;
     let request = RpcRequest::WorkspaceCreate {
         request_id: "dev-cli-workspace-create".to_string(),
-        devhost_id: devhost_id.clone(),
         workspace_name: workspace_name.clone(),
         project_source: ProjectSource::CloneUrl { clone_url: clone_url.clone() },
         parent_workspace_id: None,

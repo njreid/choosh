@@ -179,7 +179,6 @@ async fn handle_create(
     match registry.register_workspace(
         workspace_id.clone(),
         workspace_name.clone(),
-        ctx.devhost_id.clone(),
         project_id.clone(),
         project_name,
         root_path,
@@ -281,7 +280,22 @@ async fn handle_list(ctx: &RpcContext, request_id: String) -> RpcResponse {
         .map(|w| WorkspaceSummary {
             workspace_id: w.workspace_id.clone(),
             workspace_name: w.workspace_name.clone(),
-            devhost_id: w.devhost_id.clone(),
+            // `ctx.devhost_id`, not a value stored on `w` at creation time:
+            // every workspace this registry lists belongs to this one
+            // process's own devhost, and `ctx.devhost_id` is this
+            // connection's current, relayd-assigned identity. A workspace
+            // never legitimately outlives the devhost's own enrollment, but
+            // relayd's registry is in-memory-only (a restart forgets every
+            // enrolled device, PLAN.md's documented accepted risk) — so a
+            // long-lived devhost process routinely re-enrolls under a new
+            // device_id over its lifetime. A value captured once at
+            // `workspace.create` time would go stale on every one of those
+            // re-enrollments, breaking every tunnel-based RPC a phone makes
+            // against that workspace with `not_permitted` (the phone would
+            // be targeting a `target_device_id` relayd no longer
+            // recognizes) — confirmed the hard way, driving a real
+            // multi-hunk `jj diff` through a real device.
+            devhost_id: ctx.devhost_id.clone(),
             project_id: w.project_id.clone(),
             created_at: w.created_at.clone(),
         })
@@ -1004,7 +1018,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "r1".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: name.clone(),
                 project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
                 parent_workspace_id: None,
@@ -1066,6 +1079,55 @@ mod tests {
         zellij_ops::kill_session(&name).await.ok();
     }
 
+    /// Regression test for a real, previously-shipped bug: `workspace.list`
+    /// used to echo back whatever `devhost_id` was current at
+    /// `workspace.create` time (stored on the `Workspace` record itself),
+    /// rather than this connection's own current `ctx.devhost_id` — so a
+    /// workspace created before a devhost's relayd re-enrollment (which
+    /// reassigns a new `device_id`; relayd's registry is in-memory-only per
+    /// PLAN.md's documented accepted risk, so any restart forces this) would
+    /// report a `devhost_id` no phone tunnel could actually reach, breaking
+    /// every RPC against it with `not_permitted` on the relay side. A real
+    /// devhost process never changes identity mid-connection, so the
+    /// correct value is always "whatever this `RpcContext` was built with",
+    /// never a value captured once and never revisited.
+    #[tokio::test]
+    async fn workspace_list_reports_this_connections_current_devhost_id_not_the_one_active_at_creation() {
+        let name = format!("app-{}", uuid::Uuid::new_v4());
+        let (_dir, ctx) = ctx_with_tempdir();
+        let existing = ctx.workspaces_dir.join(&name);
+        std::fs::create_dir_all(&existing).unwrap();
+        init_git_repo(&existing);
+
+        assert_eq!(ctx.devhost_id, "dev-1", "test assumes ctx_with_tempdir's fixed devhost_id");
+        let create_response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "r1".to_string(),
+                workspace_name: name.clone(),
+                project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
+                parent_workspace_id: None,
+            },
+        )
+        .await;
+        assert!(matches!(create_response, RpcResponse::WorkspaceCreateOk { .. }), "{create_response:?}");
+
+        // Simulates the same devhost reconnecting under a freshly
+        // relayd-assigned identity — same registry (a real re-enrollment
+        // never touches choosh-hostd's own on-disk workspace registry),
+        // different `devhost_id`.
+        let reenrolled_ctx = RpcContext { devhost_id: "dev-2-after-reenrollment".to_string(), ..ctx };
+        let list_response =
+            dispatch(&reenrolled_ctx, RpcRequest::WorkspaceList { request_id: "r2".to_string() }).await;
+        let RpcResponse::WorkspaceListOk { workspaces, .. } = list_response else {
+            panic!("expected WorkspaceListOk, got {list_response:?}");
+        };
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].devhost_id, "dev-2-after-reenrollment");
+
+        zellij_ops::kill_session(&name).await.ok();
+    }
+
     #[tokio::test]
     async fn duplicate_workspace_name_is_a_conflict() {
         let name = format!("app-{}", uuid::Uuid::new_v4());
@@ -1076,7 +1138,6 @@ mod tests {
 
         let request = || RpcRequest::WorkspaceCreate {
             request_id: "r".to_string(),
-            devhost_id: "dev-1".to_string(),
             workspace_name: name.clone(),
             project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
             parent_workspace_id: None,
@@ -1099,7 +1160,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "r1".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: name.clone(),
                 project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
                 parent_workspace_id: None,
@@ -1139,7 +1199,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "r1".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: name.clone(),
                 project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
                 parent_workspace_id: None,
@@ -1182,7 +1241,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "r1".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: name.clone(),
                 project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
                 parent_workspace_id: None,
@@ -1575,7 +1633,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "the-real-request-id".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: "escapetest".to_string(),
                 project_source: ProjectSource::ExistingPath { existing_path: "../../../etc".to_string() },
                 parent_workspace_id: None,
@@ -1600,7 +1657,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "r1".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: "agentws".to_string(),
                 project_source: ProjectSource::ExistingPath { existing_path: "agentws".to_string() },
                 parent_workspace_id: Some("ws-does-not-exist".to_string()),
@@ -2027,7 +2083,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "r1".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: name.clone(),
                 project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
                 parent_workspace_id: None,
@@ -2094,7 +2149,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "r1".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: name.clone(),
                 project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
                 parent_workspace_id: None,
@@ -2141,7 +2195,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "r1".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: name.clone(),
                 project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
                 parent_workspace_id: None,
@@ -2180,7 +2233,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "ra".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: name_a.clone(),
                 project_source: ProjectSource::ExistingPath { existing_path: name_a.clone() },
                 parent_workspace_id: None,
@@ -2191,7 +2243,6 @@ mod tests {
             &ctx,
             RpcRequest::WorkspaceCreate {
                 request_id: "rb".to_string(),
-                devhost_id: "dev-1".to_string(),
                 workspace_name: name_b.clone(),
                 project_source: ProjectSource::ExistingPath { existing_path: name_b.clone() },
                 parent_workspace_id: None,
@@ -2323,7 +2374,6 @@ mod tests {
             .register_workspace(
                 workspace_id_b.clone(),
                 format!("agent-b-{}", uuid::Uuid::new_v4()),
-                "dev-1".to_string(),
                 project_id.clone(),
                 "app".to_string(),
                 PathBuf::from(format!("/workspaces/{workspace_id_b}")),
@@ -2367,7 +2417,6 @@ mod tests {
             .register_workspace(
                 workspace_id_other_project.clone(),
                 format!("unrelated-{}", uuid::Uuid::new_v4()),
-                "dev-1".to_string(),
                 "proj-unrelated".to_string(),
                 "unrelated".to_string(),
                 PathBuf::from(format!("/workspaces/{workspace_id_other_project}")),

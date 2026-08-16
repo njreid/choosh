@@ -2214,7 +2214,6 @@ mod tunnel_tests {
             .register_workspace(
                 workspace_id.clone(),
                 session_name.to_string(),
-                "dev-1".to_string(),
                 "proj-1".to_string(),
                 "proj".to_string(),
                 dir.path().to_path_buf(),
@@ -2584,7 +2583,6 @@ mod tunnel_tests {
             .register_workspace(
                 "ws-target".to_string(),
                 "app".to_string(),
-                "dev-target".to_string(),
                 "proj-1".to_string(),
                 "app".to_string(),
                 target_repo.clone(),
@@ -2730,7 +2728,6 @@ mod tunnel_tests {
             .register_workspace(
                 "ws-target".to_string(),
                 "app".to_string(),
-                "dev-target".to_string(),
                 "proj-1".to_string(),
                 "app".to_string(),
                 repo_dir.path().to_path_buf(),

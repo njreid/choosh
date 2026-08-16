@@ -1,6 +1,6 @@
 {
   "type": "input_required",
-  "item_id": "22222222-2222-4222-8222-222222222222",
+  "item_id": "item-22222222-2222-4222-8222-222222222222",
   "occurred_at": "2026-01-02T03:04:05Z",
   "reason": "approval",
   "summary": "approval_required"

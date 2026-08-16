@@ -42,7 +42,6 @@ pub struct ByteRange {
 pub enum RpcRequest {
     WorkspaceCreate {
         request_id: String,
-        devhost_id: String,
         workspace_name: String,
         project_source: ProjectSource,
         parent_workspace_id: Option<String>,
@@ -525,7 +524,6 @@ mod tests {
     fn workspace_create_request_round_trips() {
         let request = RpcRequest::WorkspaceCreate {
             request_id: "id".to_string(),
-            devhost_id: "dev-1".to_string(),
             workspace_name: "app".to_string(),
             project_source: ProjectSource::ExistingPath { existing_path: "/workspaces/app".to_string() },
             parent_workspace_id: None,

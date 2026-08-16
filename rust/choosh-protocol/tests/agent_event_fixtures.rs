@@ -7,8 +7,8 @@ use choosh_protocol::agent_event::{
 };
 use serde_json::{Map, Value, json};
 
-const WORKSPACE: &str = "11111111-1111-4111-8111-111111111111";
-const ITEM: &str = "22222222-2222-4222-8222-222222222222";
+const WORKSPACE: &str = "ws-11111111-1111-4111-8111-111111111111";
+const ITEM: &str = "item-22222222-2222-4222-8222-222222222222";
 
 #[test]
 fn captured_vendor_fixtures_normalize_to_schema_shaped_redacted_goldens() {

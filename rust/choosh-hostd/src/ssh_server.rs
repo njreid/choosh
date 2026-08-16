@@ -841,7 +841,6 @@ mod session_tests {
             .register_workspace(
                 "ws-1".to_string(),
                 "solo".to_string(),
-                "dev-1".to_string(),
                 "proj-1".to_string(),
                 "solo-project".to_string(),
                 dir.path().join("solo"),
