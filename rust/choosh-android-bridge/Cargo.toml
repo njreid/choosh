@@ -69,6 +69,14 @@ optional = true
 [features]
 dev-passkey = ["dep:webauthn-authenticator-rs", "dep:webauthn-rs-proto"]
 
+# Ad-hoc dev/test tool, not shipped anywhere — see its own module doc
+# comment. Gated the same way dev_passkey.rs itself is: absent from a
+# normal `cargo build`/`cargo test` unless dev-passkey is explicitly
+# requested.
+[[example]]
+name = "dev_cli"
+required-features = ["dev-passkey"]
+
 [dev-dependencies]
 tokio-tungstenite = "0.30.0"
 tokio = { version = "=1.53.0", features = ["macros", "rt-multi-thread"] }

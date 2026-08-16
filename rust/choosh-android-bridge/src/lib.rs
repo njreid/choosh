@@ -21,8 +21,14 @@ mod web_gateway;
 mod gateway_jni;
 #[cfg(target_os = "android")]
 mod terminal_jni;
+// `pub` only so `examples/dev_cli.rs` (a separate compilation target) can
+// reach `dev_passkey::register` directly — every real call site inside
+// this crate's own `lib.rs`/`engine.rs` already had module-private access
+// before this, so this doesn't widen anything meaningful: the module is
+// still entirely absent unless `dev-passkey` is enabled, which is the
+// actual boundary that matters (see that module's own doc comment).
 #[cfg(feature = "dev-passkey")]
-mod dev_passkey;
+pub mod dev_passkey;
 
 use engine::Engine;
 use jni::objects::{JClass, JString};

@@ -114,21 +114,48 @@ log "detected OS=$OS ARCH=$ARCH"
 # --- Step 2: mise's own prerequisites (the ONLY OS-package-manager-aware step) ---
 install_mise_prereqs_linux() {
 	if command -v dnf >/dev/null 2>&1; then
-		run sudo dnf install -y gcc curl unzip
+		# Amazon Linux 2023's default AMI ships `curl-minimal` (a
+		# stripped-down, libcurl-compatible build) rather than the full
+		# `curl` package — a real, confirmed conflict: `dnf install -y curl`
+		# on a fresh AL2023 instance fails outright ("curl-minimal ...
+		# conflicts with curl provided by curl ..."), not because anything
+		# is missing but because dnf won't silently swap one for the other.
+		# `command -v curl` already succeeding means mise's own prerequisite
+		# (a working `curl` binary, whichever package provides it) is
+		# already met — installing the full `curl` package on top is
+		# neither necessary nor safe to attempt unconditionally.
+		pkgs="gcc unzip"
+		command -v curl >/dev/null 2>&1 || pkgs="$pkgs curl"
+		# `git` is not one of mise's own three prerequisites (gcc/curl/unzip)
+		# — it's here because `jj`'s colocated-git backend shells out to a
+		# real `git` binary for network operations (`jj git clone`), and a
+		# minimal base AMI genuinely may not have one at all: confirmed on a
+		# fresh Amazon Linux 2023 instance, `jj git clone` failed outright
+		# with "Could not execute the git process ... No such file or
+		# directory" — not a hypothetical, a real first-workspace-creation
+		# failure on a devhost that had otherwise bootstrapped correctly.
+		command -v git >/dev/null 2>&1 || pkgs="$pkgs git"
+		run sudo dnf install -y $pkgs
 	elif command -v apt-get >/dev/null 2>&1; then
 		run sudo apt-get update
-		run sudo apt-get install -y build-essential curl unzip
+		pkgs="build-essential unzip"
+		command -v curl >/dev/null 2>&1 || pkgs="$pkgs curl"
+		command -v git >/dev/null 2>&1 || pkgs="$pkgs git"
+		run sudo apt-get install -y $pkgs
 	else
 		fail "no supported package manager found (need dnf or apt-get)"
 	fi
 }
 
 install_mise_prereqs_macos() {
-	# Xcode Command Line Tools provide a C toolchain; curl and unzip ship
-	# with the OS. brew itself is not assumed to be present, and this
-	# script does not install brew — if a C toolchain is missing, direct
-	# the operator to `xcode-select --install` rather than silently
-	# reaching further than the three prerequisites mise needs.
+	# Xcode Command Line Tools provide a C toolchain and a real `git`
+	# binary (Apple's own CLT-provided build — the same one a stock macOS
+	# prompts to install the first time `git` is invoked at all); curl and
+	# unzip ship with the OS. brew itself is not assumed to be present, and
+	# this script does not install brew — if a C toolchain is missing,
+	# direct the operator to `xcode-select --install` rather than silently
+	# reaching further than the prerequisites mise (and jj's colocated-git
+	# backend) need.
 	if ! xcode-select -p >/dev/null 2>&1; then
 		fail "Xcode Command Line Tools are required (run: xcode-select --install) and were not found"
 	fi
@@ -139,6 +166,47 @@ case "$OS" in
 linux) install_mise_prereqs_linux ;;
 macos) install_mise_prereqs_macos ;;
 esac
+
+# --- Step 2.5: install mise itself -----------------------------------------
+#
+# toolchain-provisioning.md is explicit: provisioning happens "entirely via
+# mise, with no manual installation step on any devhost beyond the one-time
+# bootstrap in host-deployment.md" — this script IS that one-time bootstrap,
+# so it must be the thing that installs mise itself, not just mise's
+# prerequisites. A real, confirmed gap until now: a genuinely fresh devhost
+# (no mise/jj/zellij present at all) had no path to get any of them —
+# choosh-hostd's own host-tool-currency checks assume `mise` already
+# resolves via `$PATH` (rust/choosh-hostd/src/mise_ops.rs's
+# `mise_bin_from_env`) and fail closed (logged, not fatal) rather than
+# bootstrapping mise themselves, per that module's own documented scope.
+#
+# mise's official installer (https://mise.run) is itself OS/arch-generic —
+# installing mise this way, rather than via dnf/apt/brew, keeps faith with
+# this script's own stated rule ("the ONLY component ... allowed to know
+# about a specific OS package manager") since everything downstream of the
+# three prerequisites above is supposed to be mise's job, starting with
+# mise getting itself installed. Installed to `$INSTALL_PREFIX` (the same
+# directory choosh-hostd's own binary goes into, MISE_INSTALL_PATH) rather
+# than mise's own upstream default, and its absolute path is threaded into
+# the service unit as CHOOSH_HOSTD_MISE_BIN (see write_systemd_unit/
+# write_launchd_plist below) — a systemd/launchd unit's inherited PATH
+# does NOT reliably include `$INSTALL_PREFIX` (e.g. `~/.local/bin`) the
+# way an interactive login shell's would, so relying on bare `mise`
+# resolving via PATH inside the running service would silently fail even
+# with mise correctly installed at this exact path.
+install_mise() {
+	dest="$INSTALL_PREFIX/mise"
+	run mkdir -p "$INSTALL_PREFIX"
+	if [ "$DRY_RUN" = "1" ]; then
+		printf 'DRY-RUN: curl -fsSL https://mise.run | MISE_INSTALL_PATH=%s sh\n' "$dest" >&2
+	else
+		curl -fsSL https://mise.run | MISE_INSTALL_PATH="$dest" sh
+		"$dest" --version >/dev/null 2>&1 || fail "mise installation appears to have failed: $dest --version did not succeed"
+		log "mise installed at $dest ($("$dest" --version))"
+	fi
+}
+install_mise
+MISE_BIN="$INSTALL_PREFIX/mise"
 
 # --- Step 3: download and install the choosh-hostd binary ----------------
 install_hostd_binary() {
@@ -204,6 +272,7 @@ Restart=on-failure
 KillMode=process
 Environment=CHOOSH_ENROLLMENT_TOKEN=$TOKEN
 Environment=CHOOSH_RELAYD_URL=$CHOOSH_RELAYD_URL
+Environment=CHOOSH_HOSTD_MISE_BIN=$MISE_BIN
 
 [Install]
 WantedBy=default.target
@@ -252,6 +321,8 @@ write_launchd_plist() {
 		<string>$TOKEN</string>
 		<key>CHOOSH_RELAYD_URL</key>
 		<string>$CHOOSH_RELAYD_URL</string>
+		<key>CHOOSH_HOSTD_MISE_BIN</key>
+		<string>$MISE_BIN</string>
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>

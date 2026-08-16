@@ -292,8 +292,8 @@ mod tests {
 
     fn valid_input(surface: &'static str, payload: &'static [u8]) -> EmitInput<'static> {
         EmitInput {
-            workspace_id: "11111111-1111-1111-1111-111111111111",
-            item_id: "22222222-2222-2222-2222-222222222222",
+            workspace_id: "ws-11111111-1111-1111-1111-111111111111",
+            item_id: "item-22222222-2222-2222-2222-222222222222",
             root: "/workspaces/app",
             agent: AgentAdapter::Claude,
             surface,

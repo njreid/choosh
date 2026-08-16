@@ -13,7 +13,14 @@ choosh-protocol = { path = "../choosh-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "=1.0.150"
 tokio = { version = "=1.53.0", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "io-std", "fs", "process", "sync"] }
-tokio-tungstenite = "0.30.0"
+# `rustls-tls-webpki-roots`, matching choosh-android-transport's identical
+# dependency exactly: without it, this crate can dial a plaintext `ws://`
+# relayd (every existing test/deploy target so far) but not a real `wss://`
+# one — confirmed the hard way, deploying against a real TLS relayd for the
+# first time ever: `InvalidRelayUrl("...: URL error: TLS support not
+# compiled in")`. A real devhost could never have connected to any real,
+# TLS-terminated production relayd deployment before this.
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3.34"
 ed25519-dalek = { version = "=3.0.0-rc.1", features = ["rand_core"] }
 rand = "0.10.2"

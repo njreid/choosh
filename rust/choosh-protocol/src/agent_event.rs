@@ -304,10 +304,14 @@ fn validate_context(context: &AdapterContext<'_>) -> Result<(), ValidationError>
     if context.workspace_id.is_empty() || context.item_id.is_empty() || context.root.is_empty() {
         return Err(ValidationError::MissingContext);
     }
-    if !is_uuid(context.workspace_id) {
+    // Workspace/item IDs are never bare UUIDs in this system — they're
+    // always prefixed (`rust/choosh-hostd/src/rpc.rs`'s `format!("ws-{}",
+    // Uuid::new_v4())` / `format!("item-{}", Uuid::new_v4())`). Checking for
+    // a bare UUID here rejected every real ID this system ever generates.
+    if !is_prefixed_uuid(context.workspace_id, "ws-") {
         return Err(ValidationError::InvalidWorkspaceId);
     }
-    if !is_uuid(context.item_id) {
+    if !is_prefixed_uuid(context.item_id, "item-") {
         return Err(ValidationError::InvalidItemId);
     }
     if !context.root.starts_with('/')
@@ -317,6 +321,10 @@ fn validate_context(context: &AdapterContext<'_>) -> Result<(), ValidationError>
         return Err(ValidationError::InvalidRoot);
     }
     Ok(())
+}
+
+fn is_prefixed_uuid(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(is_uuid)
 }
 
 fn is_uuid(value: &str) -> bool {
@@ -401,8 +409,8 @@ fn validate_candidate_path(path: &str) -> Result<(), ValidationError> {
 mod tests {
     use super::*;
 
-    const WORKSPACE: &str = "11111111-1111-4111-8111-111111111111";
-    const ITEM: &str = "22222222-2222-4222-8222-222222222222";
+    const WORKSPACE: &str = "ws-11111111-1111-4111-8111-111111111111";
+    const ITEM: &str = "item-22222222-2222-4222-8222-222222222222";
     const TIME: &str = "2026-01-02T03:04:05Z";
 
     fn context(adapter: AgentAdapter) -> AdapterContext<'static> {
@@ -517,11 +525,23 @@ mod tests {
         );
 
         let uppercase = AdapterContext {
-            workspace_id: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+            workspace_id: "ws-AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
             ..context(AgentAdapter::Codex)
         };
         assert_eq!(
             normalize_codex(&uppercase, &hook("Stop")),
+            Err(ValidationError::InvalidWorkspaceId)
+        );
+
+        // The bug this guards against: a *bare* UUID with no `ws-` prefix is
+        // not a real workspace ID (see `validate_context`'s comment) — every
+        // real ID this system generates carries one.
+        let unprefixed = AdapterContext {
+            workspace_id: "11111111-1111-4111-8111-111111111111",
+            ..context(AgentAdapter::Codex)
+        };
+        assert_eq!(
+            normalize_codex(&unprefixed, &hook("Stop")),
             Err(ValidationError::InvalidWorkspaceId)
         );
     }
