@@ -76,6 +76,18 @@ class AgentEventSubscription(
      */
     private val onSnapshotRequired: suspend (deviceId: String, workspaceId: String) -> Unit,
     private val pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS,
+    /**
+     * `null` (the default) preserves this class's pre-existing behavior for
+     * every call site/test that doesn't pass one — the same "optional,
+     * additive live-signal consumer" convention
+     * [ai.choosh.fleet.FleetViewModel]'s own `attentionTracker` parameter
+     * already established. When supplied, every applied event (replayed or
+     * live) also feeds [AgentStatusTracker.apply], so the explorer's active
+     * agents section can read [AgentEvent.AgentStatusChanged]'s `busy`/
+     * `waiting`/`starting`/`failed` distinction — see that class's own doc
+     * comment for why `item.list` alone can't provide it.
+     */
+    private val statusTracker: AgentStatusTracker? = null,
 ) {
     /** `workspaceId -> deviceId` for every workspace [subscribe] has registered — re-resumed by [resubscribeAll]. */
     private val subscribedWorkspaces = mutableMapOf<String, String>()
@@ -126,7 +138,10 @@ class AgentEventSubscription(
                 // Oldest-first application, per agent-events.md — the same
                 // order the wire type itself documents and this app must
                 // preserve, not re-sort.
-                outcome.events.forEach { sequenced -> attentionTracker.apply(sequenced.event) }
+                outcome.events.forEach { sequenced ->
+                    attentionTracker.apply(sequenced.event)
+                    statusTracker?.apply(sequenced.event)
+                }
                 // Advances the cursor to `latestSequence` even when
                 // `events` is empty (already caught up) — per
                 // `AgentEventsResumeResponse::Replayed`'s own doc comment,
@@ -144,6 +159,7 @@ class AgentEventSubscription(
 
     private fun applyPush(push: AgentEventPush) {
         attentionTracker.apply(push.event)
+        statusTracker?.apply(push.event)
         val workspaceId = push.event.workspaceIdOrNull ?: return
         val sequence = push.sequence ?: return
         cursorStore.acknowledge(workspaceId, sequence)

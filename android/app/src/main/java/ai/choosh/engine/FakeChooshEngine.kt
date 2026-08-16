@@ -250,18 +250,33 @@ class FakeChooshEngine : ChooshEngine {
      * successive calls (the first two calls return `starting`), so a
      * ViewModel/screen polling this exercises the real "retrying
      * interstitial until ready" path without a real backend. A second fixed
-     * `Shell` item (always `running`, no port) is included so `itemList`
-     * consumers see a realistic mixed-type result, matching this fake's
-     * existing style elsewhere (e.g. [FIXTURE_DEVHOSTS]'s mixed
-     * online/offline rows).
+     * `Shell` item (always `running`, no port) and a third fixed
+     * `AgentTerminal` item are included so `itemList` consumers (the
+     * explorer's active-agents/dev-services sections in particular) see a
+     * realistic mixed-type result, matching this fake's existing style
+     * elsewhere (e.g. [FIXTURE_DEVHOSTS]'s mixed online/offline rows).
+     * [createdItems] holds every item [createItem] has actually registered,
+     * appended to this fixed set — so a caller that creates a new
+     * agent/service via this fake genuinely sees it on the next poll,
+     * mirroring [workspaceOpUndo]/[workspaceOpRestore]'s "real mutation, not
+     * a static stub" precedent.
      */
     private var webServicePollCount = 0
+    private val createdItems = mutableListOf<ItemSummary>()
 
     override suspend fun itemList(deviceId: String, workspaceId: String): List<ItemSummary> {
         delay(FAKE_LATENCY_MS)
         webServicePollCount += 1
         val webServiceStatus = if (webServicePollCount <= 2) WebServiceStatus.STARTING else WebServiceStatus.RUNNING
         return listOf(
+            ItemSummary(
+                itemId = "item-agent-1",
+                itemType = ItemType.AGENT_TERMINAL,
+                name = "agent-a",
+                tabTarget = "tab-agent-1",
+                status = WebServiceStatus.RUNNING,
+                port = null,
+            ),
             ItemSummary(
                 itemId = "item-web-1",
                 itemType = ItemType.WEB_SERVICE,
@@ -278,7 +293,95 @@ class FakeChooshEngine : ChooshEngine {
                 status = WebServiceStatus.RUNNING,
                 port = null,
             ),
-        )
+        ) + createdItems
+    }
+
+    /** Set by a test to exercise [ChooshEngine.createItem]'s [CreateItemResult.Failure] path without touching [connected]. */
+    var forceNextCreateItemFailure: String? = null
+
+    /**
+     * A real, minimal validation + mutation, mirroring `hostd`'s own
+     * `item.create` posture (host-rpc.md: rejects a duplicate name as
+     * `conflict`) rather than a no-op stub that always succeeds — the new
+     * item is genuinely appended to [createdItems] so a subsequent
+     * [itemList] reflects it, and its name is checked against every
+     * already-registered fixture/created item.
+     */
+    override suspend fun createItem(
+        deviceId: String,
+        workspaceId: String,
+        itemType: ItemType,
+        name: String,
+        agent: AgentKind?,
+        command: List<String>?,
+        port: Int?,
+    ): CreateItemResult {
+        delay(FAKE_LATENCY_MS)
+        forceNextCreateItemFailure?.let { message ->
+            forceNextCreateItemFailure = null
+            return CreateItemResult.Failure(message)
+        }
+        val existingNames = (listOf("agent-a", "web", "shell") + createdItems.map { it.name })
+        if (name in existingNames) {
+            return CreateItemResult.Failure("conflict: an item named '$name' already exists")
+        }
+        if (itemType == ItemType.AGENT_TERMINAL && agent == null) {
+            return CreateItemResult.Failure("invalid_argument: agent is required for AgentTerminal")
+        }
+        if (itemType == ItemType.WEB_SERVICE && (command.isNullOrEmpty() || port == null)) {
+            return CreateItemResult.Failure("invalid_argument: command and port are required for WebService")
+        }
+        val itemId = "item-created-${createdItems.size + 1}"
+        val tabTarget = "tab-created-${createdItems.size + 1}"
+        createdItems.add(ItemSummary(itemId = itemId, itemType = itemType, name = name, tabTarget = tabTarget, status = WebServiceStatus.RUNNING, port = port))
+        return CreateItemResult.Success(itemId = itemId, itemType = itemType, name = name, tabTarget = tabTarget)
+    }
+
+    /**
+     * Filtered to `deviceId`'s own workspaces, per [ChooshEngine.workspaceList]'s
+     * doc comment ("called once per devhost"), mirroring [projectList]'s
+     * identical scoping — sourced from the same [FleetFixtures.projectsFor]
+     * data [projectList] uses, so [ai.choosh.fleet.FleetViewModel]'s merge
+     * of both real RPCs produces the exact same `Project.workspaces` shape
+     * the pre-`workspace.list` fixture-only path used to hand it directly.
+     */
+    override suspend fun workspaceList(deviceId: String): List<WorkspaceSummary> {
+        delay(FAKE_LATENCY_MS)
+        check(connected) { "workspaceList() called before connect() succeeded" }
+        return FleetFixtures.projectsFor(FIXTURE_DEVHOSTS).flatMap { project ->
+            project.workspaces.filter { it.devHostId == deviceId }.map { workspace ->
+                WorkspaceSummary(
+                    workspaceId = workspace.workspaceId,
+                    workspaceName = workspace.name,
+                    devHostId = workspace.devHostId,
+                    projectId = project.projectId,
+                    createdAt = workspace.lastActiveAt,
+                )
+            }
+        }
+    }
+
+    /**
+     * A small, fixed two-level fixture tree (`README.md`/`app.kt`/`docs/`
+     * at the root, `docs/guide.md` one level down) — enough for
+     * [ai.choosh.explorer.ExplorerViewModel]'s drill-down/search paths to
+     * be genuinely exercisable without a real backend. Unknown
+     * `pathPrefix`es return an empty page rather than an error (a
+     * plausible `hostd` response for an as-yet-unpopulated directory, not a
+     * failure this fake needs to simulate separately).
+     */
+    override suspend fun workspaceTreeList(deviceId: String, workspaceId: String, pathPrefix: String, cursor: String?): WorkspaceTreeListResult {
+        delay(FAKE_LATENCY_MS)
+        val entries = when (pathPrefix) {
+            "" -> listOf(
+                TreeEntry("README.md", TreeEntryKind.FILE, conflicted = false),
+                TreeEntry("app.kt", TreeEntryKind.FILE, conflicted = false),
+                TreeEntry("docs", TreeEntryKind.DIRECTORY, conflicted = false),
+            )
+            "docs" -> listOf(TreeEntry("guide.md", TreeEntryKind.FILE, conflicted = false))
+            else -> emptyList()
+        }
+        return WorkspaceTreeListResult(entries = entries, nextCursor = null)
     }
 
     /**

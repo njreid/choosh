@@ -4,7 +4,7 @@
 //! marshaling wrappers around this.
 
 use choosh_android_transport::{AgentEventPush, CallError, PhoneConnection, PtyTunnelHandle, WebTunnelHandle};
-use choosh_protocol::host_rpc::{ByteRange, RpcRequest, RpcResponse};
+use choosh_protocol::host_rpc::{AgentKind, ByteRange, ItemType, RpcRequest, RpcResponse};
 use choosh_protocol::relay::AgentEventsResumeResponse;
 use serde::Serialize;
 use serde_json::json;
@@ -293,6 +293,53 @@ impl Engine {
         }
     }
 
+    /// Returns `workspace.list`'s `workspaces` array (`Vec<WorkspaceSummary>`)
+    /// as a bare JSON array — every registered Workspace on
+    /// `target_device_id`'s reachable set (`host-rpc.md`: "for the Android
+    /// fleet view, this is called once per devhost after list-devhosts").
+    /// Backs both the Fleet drawer's per-DevHost/per-Project workspace lists
+    /// and the `DevHost` screen replacing the old placeholder. Same
+    /// error-shape convention as `workspace_status`/`item_list`.
+    pub async fn workspace_list(&self, target_device_id: &str) -> String {
+        let request = RpcRequest::WorkspaceList { request_id: new_request_id() };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceListOk { workspaces, .. }) => to_json(&workspaces),
+            Ok(other) => unexpected_or_error_json("workspace.list", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// Returns `workspace.tree.list`'s one-level directory listing as
+    /// `{"entries": [...], "next_cursor": ...}` — the explorer's searchable
+    /// project-tree section (`android-navigation.md`'s Page model, section
+    /// 4). `path_prefix` empty means the workspace root; `revision`/`cursor`
+    /// empty mean "omitted", per this module's existing `none_if_empty`
+    /// convention (`revision: None` resolves to the live working copy per
+    /// jj-integration.md, `cursor: None` starts from the first page).
+    pub async fn workspace_tree_list(
+        &self,
+        target_device_id: &str,
+        workspace_id: &str,
+        path_prefix: &str,
+        revision: &str,
+        cursor: &str,
+    ) -> String {
+        let request = RpcRequest::WorkspaceTreeList {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            path_prefix: path_prefix.to_string(),
+            revision: none_if_empty(revision),
+            cursor: none_if_empty(cursor),
+        };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::WorkspaceTreeListOk { entries, next_cursor, .. }) => {
+                to_json(&json!({ "entries": entries, "next_cursor": next_cursor }))
+            }
+            Ok(other) => unexpected_or_error_json("workspace.tree.list", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
     /// Opens a document per editor-protocol.md's "Opening a document":
     /// `workspace.file.read { workspace_id, path }` (no `revision`/`range`
     /// — defaults to the live working copy `@`, whole file). Internally this
@@ -408,7 +455,15 @@ impl Engine {
     /// and `terminal_renderer.rs`'s module doc for why a host build
     /// legitimately never calls this despite it being real, tested (via
     /// this crate's Android-target build) production code.
-    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    ///
+    /// (`#[cfg_attr(not(target_os = "android"), allow(dead_code))]` lives on
+    /// [`Self::open_pty_tunnel`] itself, just below — it was previously
+    /// misplaced here, where it silently attached to [`Self::project_list`]
+    /// instead of this method, per Rust's "an attribute binds to the next
+    /// item" rule applying to the whole doc-comment/attribute run as one
+    /// unit; a host (non-Android) `cargo clippy` build surfaced the
+    /// resulting `dead_code` warning on this method once `project_list`
+    /// stopped being the only android-only-callsite method nearby.)
     /// Returns `project.list`'s `projects` array (`Vec<ProjectSummary>`) as
     /// a bare JSON array — the fleet drawer's Project-mode data source
     /// (`host-rpc.md`'s `project.list`). Each entry's `active` is computed
@@ -446,6 +501,7 @@ impl Engine {
         }
     }
 
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub async fn open_pty_tunnel(&self, target_device_id: &str, item_id: &str) -> Result<PtyTunnelHandle, String> {
         let mut guard = self.connection.lock().await;
         let Some(connection) = guard.as_mut() else {
@@ -467,6 +523,78 @@ impl Engine {
         match self.call_jj_rpc(target_device_id, request).await {
             Ok(RpcResponse::ItemListOk { items, .. }) => to_json(&items),
             Ok(other) => unexpected_or_error_json("item.list", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// `item.create` — registers a new `AgentTerminal`, `Shell`, or
+    /// `WebService` item in `workspace_id` and creates its Zellij tab
+    /// (`host-rpc.md`'s "Item RPCs"), backing the explorer's "active
+    /// agents"/"registered development services" sections' real
+    /// create-and-pin affordance (`android-navigation.md`'s Page model).
+    ///
+    /// `item_type` is one of `"agent-terminal"`/`"shell"`/`"web-service"` —
+    /// matching `ItemType`'s wire `kebab-case` tag exactly, the same string
+    /// [`NativeChooshEngine.kt`]'s Kotlin `ItemType` enum encodes to.
+    /// `agent` is `"codex"`/`"claude"`/`"opencode"` when `item_type ==
+    /// "agent-terminal"`, empty otherwise. `command_json` is a JSON array of
+    /// strings — fixed argv, never a shell string, per host-rpc.md's
+    /// "Command construction" — required (non-empty) when `item_type ==
+    /// "web-service"`, empty otherwise. `port <= 0` means "omitted" (`hostd`
+    /// itself requires it for `WebService`, rejecting its absence as
+    /// `invalid_argument`).
+    ///
+    /// Returns `{"item_id":...,"item_type":...,"name":...,"tab_target":...}`
+    /// on success, or this module's shared `{"error": ...}` shape on an
+    /// invalid `item_type`/`agent` string, malformed `command_json`, not
+    /// connected, a transport failure, or a `hostd`-side rejection
+    /// (`invalid_argument`, `conflict`, etc. — see host-rpc.md's error
+    /// model).
+    #[allow(clippy::too_many_arguments)] // matches the RPC's own field count, same posture as native_save_document
+    pub async fn item_create(
+        &self,
+        target_device_id: &str,
+        workspace_id: &str,
+        item_type: &str,
+        name: &str,
+        agent: &str,
+        command_json: &str,
+        port: i64,
+    ) -> String {
+        let Some(item_type) = parse_item_type(item_type) else {
+            return error_json(&format!("invalid item_type: {item_type}"));
+        };
+        let agent = if agent.is_empty() {
+            None
+        } else {
+            match parse_agent_kind(agent) {
+                Some(agent) => Some(agent),
+                None => return error_json(&format!("invalid agent: {agent}")),
+            }
+        };
+        let command = if command_json.is_empty() {
+            None
+        } else {
+            match serde_json::from_str::<Vec<String>>(command_json) {
+                Ok(command) => Some(command),
+                Err(error) => return error_json(&format!("invalid command_json: {error}")),
+            }
+        };
+        let port = u16::try_from(port).ok().filter(|value| *value > 0);
+        let request = RpcRequest::ItemCreate {
+            request_id: new_request_id(),
+            workspace_id: workspace_id.to_string(),
+            item_type,
+            name: name.to_string(),
+            agent,
+            command,
+            port,
+        };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::ItemCreateOk { item_id, item_type, name, tab_target, .. }) => {
+                to_json(&json!({ "item_id": item_id, "item_type": item_type, "name": name, "tab_target": tab_target }))
+            }
+            Ok(other) => unexpected_or_error_json("item.create", &other),
             Err(message) => error_json(&message),
         }
     }
@@ -803,6 +931,33 @@ fn none_if_empty(value: &str) -> Option<String> {
     if value.is_empty() { None } else { Some(value.to_string()) }
 }
 
+/// Parses `Engine::item_create`'s `item_type` string into `ItemType`'s wire
+/// `kebab-case` tag — the exact string [`NativeChooshEngine.kt`]'s Kotlin
+/// `ItemType` enum encodes to. `None` for anything else, including the
+/// non-creatable item types (`JjChangeGraph`, `SourceEditor`, etc. — per
+/// host-rpc.md, only `AgentTerminal`/`Shell`/`WebService` have an
+/// `item.create` call of their own, so `ItemType` itself has no variant for
+/// the rest).
+fn parse_item_type(value: &str) -> Option<ItemType> {
+    match value {
+        "agent-terminal" => Some(ItemType::AgentTerminal),
+        "shell" => Some(ItemType::Shell),
+        "web-service" => Some(ItemType::WebService),
+        _ => None,
+    }
+}
+
+/// Parses `Engine::item_create`'s `agent` string into `AgentKind`'s wire
+/// `lowercase` tag, per `agent-events.md`'s `CHOOSH_AGENT=codex|opencode|claude`.
+fn parse_agent_kind(value: &str) -> Option<AgentKind> {
+    match value {
+        "codex" => Some(AgentKind::Codex),
+        "claude" => Some(AgentKind::Claude),
+        "opencode" => Some(AgentKind::Opencode),
+        _ => None,
+    }
+}
+
 /// Clamps a Kotlin-supplied `Long` limit to a sane, positive `usize` —
 /// negative/zero/absurdly large inputs from the JNI boundary get a safe
 /// default rather than panicking on the `i64`->`usize` conversion.
@@ -955,6 +1110,49 @@ mod tests {
     #[tokio::test]
     async fn item_list_before_connect_is_a_typed_error() {
         assert_error_json_mentions_not_connected(&unconnected_engine().item_list("dev-1", "ws-1").await);
+    }
+
+    #[tokio::test]
+    async fn workspace_list_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().workspace_list("dev-1").await);
+    }
+
+    #[tokio::test]
+    async fn workspace_tree_list_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().workspace_tree_list("dev-1", "ws-1", "", "", "").await);
+    }
+
+    #[tokio::test]
+    async fn item_create_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(
+            &unconnected_engine().item_create("dev-1", "ws-1", "agent-terminal", "agent-a", "claude", "", 0).await,
+        );
+    }
+
+    /// [`Engine::item_create`]'s own client-side validation (never reaches
+    /// the RPC layer at all) — an invalid `item_type`/`agent` string is
+    /// reported the same shared `{"error": ...}` shape as every other
+    /// failure here, distinct from `hostd`'s own rejections which are only
+    /// reachable once connected.
+    #[tokio::test]
+    async fn item_create_rejects_an_invalid_item_type_before_touching_the_connection() {
+        let body = unconnected_engine().item_create("dev-1", "ws-1", "not-a-real-type", "x", "", "", 0).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("invalid item_type"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn item_create_rejects_an_invalid_agent_before_touching_the_connection() {
+        let body = unconnected_engine().item_create("dev-1", "ws-1", "agent-terminal", "x", "not-a-real-agent", "", 0).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("invalid agent"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn item_create_rejects_malformed_command_json_before_touching_the_connection() {
+        let body = unconnected_engine().item_create("dev-1", "ws-1", "web-service", "x", "", "not json", 3000).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("invalid command_json"), "{body}");
     }
 
     #[tokio::test]
@@ -1485,6 +1683,145 @@ mod tests {
         let body = engine.project_set_primary_workspace("dev-1", "proj-1", "ws-other-project").await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["error"], "invalid_argument: workspace_id does not belong to project_id", "{body}");
+    }
+
+    /// `workspace.list`'s happy path, round-tripped through a real (fake)
+    /// relayd/tunnel — the RPC the Fleet drawer's per-devhost workspace list
+    /// and the `DevHost` screen (replacing the old placeholder) both need.
+    #[tokio::test]
+    async fn workspace_list_round_trips_workspaces() {
+        use choosh_protocol::host_rpc::WorkspaceSummary;
+
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::WorkspaceList { request_id } = request else { panic!("expected workspace.list") };
+            RpcResponse::WorkspaceListOk {
+                request_id,
+                workspaces: vec![WorkspaceSummary {
+                    workspace_id: "ws-1".to_string(),
+                    workspace_name: "app".to_string(),
+                    devhost_id: "dev-1".to_string(),
+                    project_id: "proj-1".to_string(),
+                    created_at: "2026-08-01T00:00:00Z".to_string(),
+                }],
+            }
+        })
+        .await;
+
+        let body = engine.workspace_list("dev-1").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed[0]["workspace_id"], "ws-1");
+        assert_eq!(parsed[0]["project_id"], "proj-1");
+    }
+
+    /// `workspace.tree.list`'s happy path, proving the
+    /// `{"entries": [...], "next_cursor": ...}` wrapper shape this crate
+    /// adds around the raw RPC response (unlike every other `workspace_*`
+    /// method here, this one is not a bare array, since the explorer's
+    /// project-tree section needs `next_cursor` to page).
+    #[tokio::test]
+    async fn workspace_tree_list_round_trips_entries_and_cursor() {
+        use choosh_protocol::host_rpc::{TreeEntry, TreeEntryKind};
+
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::WorkspaceTreeList { request_id, workspace_id, path_prefix, revision, cursor } = request else {
+                panic!("expected workspace.tree.list")
+            };
+            assert_eq!(workspace_id, "ws-1");
+            assert_eq!(path_prefix, "src");
+            assert!(revision.is_none());
+            assert!(cursor.is_none());
+            RpcResponse::WorkspaceTreeListOk {
+                request_id,
+                entries: vec![
+                    TreeEntry { name: "main.rs".to_string(), kind: TreeEntryKind::File, conflicted: false },
+                    TreeEntry { name: "lib".to_string(), kind: TreeEntryKind::Directory, conflicted: false },
+                ],
+                next_cursor: Some("cursor-2".to_string()),
+            }
+        })
+        .await;
+
+        let body = engine.workspace_tree_list("dev-1", "ws-1", "src", "", "").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["entries"][0]["name"], "main.rs");
+        assert_eq!(parsed["entries"][1]["kind"], "directory");
+        assert_eq!(parsed["next_cursor"], "cursor-2");
+    }
+
+    /// `item.create`'s happy path for an `AgentTerminal` item, proving
+    /// `agent`/`command`/`port` marshal correctly and the response's four
+    /// fields survive.
+    #[tokio::test]
+    async fn item_create_round_trips_an_agent_terminal() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ItemCreate { request_id, workspace_id, item_type, name, agent, command, port } = request else {
+                panic!("expected item.create")
+            };
+            assert_eq!(workspace_id, "ws-1");
+            assert_eq!(item_type, ItemType::AgentTerminal);
+            assert_eq!(name, "agent-a");
+            assert_eq!(agent, Some(AgentKind::Claude));
+            assert_eq!(command, None);
+            assert_eq!(port, None);
+            RpcResponse::ItemCreateOk {
+                request_id,
+                item_id: "item-1".to_string(),
+                item_type: ItemType::AgentTerminal,
+                name: "agent-a".to_string(),
+                tab_target: "tab-1".to_string(),
+            }
+        })
+        .await;
+
+        let body = engine.item_create("dev-1", "ws-1", "agent-terminal", "agent-a", "claude", "", 0).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["item_id"], "item-1");
+        assert_eq!(parsed["tab_target"], "tab-1");
+    }
+
+    /// `item.create`'s happy path for a `WebService` item, proving
+    /// `command_json`/`port` marshal into the RPC's `command`/`port` fields.
+    #[tokio::test]
+    async fn item_create_round_trips_a_web_service() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ItemCreate { request_id, item_type, agent, command, port, .. } = request else {
+                panic!("expected item.create")
+            };
+            assert_eq!(item_type, ItemType::WebService);
+            assert_eq!(agent, None);
+            assert_eq!(command, Some(vec!["npm".to_string(), "run".to_string(), "dev".to_string()]));
+            assert_eq!(port, Some(3000));
+            RpcResponse::ItemCreateOk {
+                request_id,
+                item_id: "item-2".to_string(),
+                item_type: ItemType::WebService,
+                name: "web".to_string(),
+                tab_target: "tab-2".to_string(),
+            }
+        })
+        .await;
+
+        let body = engine
+            .item_create("dev-1", "ws-1", "web-service", "web", "", r#"["npm","run","dev"]"#, 3000)
+            .await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["item_id"], "item-2");
+    }
+
+    /// `hostd`'s `conflict` rejection (a duplicate item name, per
+    /// host-rpc.md) surfaces as this module's shared `{"error": ...}` shape,
+    /// same posture as `project_set_primary_workspace_reports_a_hostd_side_rejection`.
+    #[tokio::test]
+    async fn item_create_reports_a_hostd_side_rejection() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ItemCreate { request_id, .. } = request else { panic!("expected item.create") };
+            RpcResponse::Error { request_id, code: "conflict".to_string(), message: "an item named 'agent-a' already exists".to_string() }
+        })
+        .await;
+
+        let body = engine.item_create("dev-1", "ws-1", "agent-terminal", "agent-a", "claude", "", 0).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "conflict: an item named 'agent-a' already exists", "{body}");
     }
 
     /// Transport failure mid-call: the fake relayd disappears (drops the

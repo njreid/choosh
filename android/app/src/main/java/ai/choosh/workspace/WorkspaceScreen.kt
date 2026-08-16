@@ -1,6 +1,8 @@
 package ai.choosh.workspace
 
+import ai.choosh.agentevents.AgentStatusTracker
 import ai.choosh.engine.ChooshEngine
+import ai.choosh.explorer.ExplorerNavigationEvent
 import ai.choosh.explorer.ExplorerScreen
 import ai.choosh.explorer.ExplorerViewModel
 import ai.choosh.jj.JjChangeGraphScreen
@@ -10,7 +12,6 @@ import ai.choosh.jj.JjDiffViewModel
 import ai.choosh.singleInstanceFactory
 import ai.choosh.ui.WindowWidthSizeClass
 import ai.choosh.ui.rememberWindowWidthSizeClass
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -18,7 +19,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -56,25 +56,23 @@ fun WorkspaceScreen(
     deviceId: String,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
-    // Both default to `null` (and render no button) rather than a no-op
-    // lambda: `ChooshApp.kt`'s tests/previews that don't wire real
-    // `Terminal`/`SourceEditor` navigation shouldn't show a dead button.
-    // Demo affordances until the explorer surfaces real `AgentTerminal`/
-    // `SourceEditor` pinned items to tap directly (a later increment, per
-    // docs/specs/android-navigation.md).
-    onOpenTerminal: (() -> Unit)? = null,
-    onOpenEditor: ((path: String) -> Unit)? = null,
-    // Same "demo affordance, null renders no button" convention as
-    // onOpenTerminal/onOpenEditor above — the explorer doesn't yet surface
-    // real WebService pinned items or Markdown files to tap directly, per
-    // docs/specs/service-tunnels.md/M5-web-and-markdown.md.
-    onOpenWebServiceDemo: (() -> Unit)? = null,
-    onOpenMarkdownDemo: (() -> Unit)? = null,
+    statusTracker: AgentStatusTracker? = null,
+    // Real item-pinning entry points, per docs/specs/android-navigation.md:
+    // tapping an Explorer row for a real `AgentTerminal`/`WebService` item
+    // or a real tree file resolves (via [ExplorerViewModel]'s own
+    // `item.list`/`workspace.tree.list`-backed state) to exactly one of
+    // these — never a hardcoded demo item/path. All default to no-op so
+    // this composable stays usable without a full app-level navigation
+    // wired in (previews, tests).
+    onOpenAgentTerminal: (itemId: String) -> Unit = {},
+    onOpenWebService: (itemId: String) -> Unit = {},
+    onOpenSourceEditor: (path: String) -> Unit = {},
+    onOpenMarkdownPreview: (path: String) -> Unit = {},
 ) {
     var tab by remember { mutableIntStateOf(0) }
 
     val explorerViewModel: ExplorerViewModel = viewModel(
-        factory = singleInstanceFactory { ExplorerViewModel(engine, deviceId, workspaceId) },
+        factory = singleInstanceFactory { ExplorerViewModel(engine, deviceId, workspaceId, statusTracker) },
     )
     val diffViewModel: JjDiffViewModel = viewModel(
         factory = singleInstanceFactory { JjDiffViewModel(engine, deviceId, workspaceId) },
@@ -82,6 +80,17 @@ fun WorkspaceScreen(
     val graphViewModel: JjChangeGraphViewModel = viewModel(
         factory = singleInstanceFactory { JjChangeGraphViewModel(engine, deviceId, workspaceId) },
     )
+
+    /** Dispatches an [ExplorerNavigationEvent] (`null` for "handled locally", e.g. a tree directory drill-down) to this screen's own real navigation callbacks — the one place [ExplorerViewModel]'s real item.list/workspace.tree.list-backed taps become an app-level screen change. */
+    fun handleExplorerNavigation(event: ExplorerNavigationEvent?) {
+        when (event) {
+            is ExplorerNavigationEvent.OpenTerminal -> onOpenAgentTerminal(event.itemId)
+            is ExplorerNavigationEvent.OpenWebService -> onOpenWebService(event.itemId)
+            is ExplorerNavigationEvent.OpenSourceEditor -> onOpenSourceEditor(event.path)
+            is ExplorerNavigationEvent.OpenMarkdownPreview -> onOpenMarkdownPreview(event.path)
+            null -> Unit
+        }
+    }
 
     Column(modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -91,28 +100,6 @@ fun WorkspaceScreen(
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.padding(start = 12.dp),
             )
-        }
-        if (onOpenTerminal != null || onOpenEditor != null || onOpenWebServiceDemo != null || onOpenMarkdownDemo != null) {
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp)) {
-                if (onOpenTerminal != null) {
-                    Button(onClick = onOpenTerminal) { Text("Open terminal") }
-                }
-                if (onOpenEditor != null) {
-                    Button(onClick = { onOpenEditor("README.md") }, modifier = Modifier.padding(start = 8.dp)) {
-                        Text("Open README.md in editor")
-                    }
-                }
-                if (onOpenWebServiceDemo != null) {
-                    Button(onClick = onOpenWebServiceDemo, modifier = Modifier.padding(start = 8.dp)) {
-                        Text("Open WebService demo")
-                    }
-                }
-                if (onOpenMarkdownDemo != null) {
-                    Button(onClick = onOpenMarkdownDemo, modifier = Modifier.padding(start = 8.dp)) {
-                        Text("Open Markdown demo")
-                    }
-                }
-            }
         }
         // Adaptive layout, per `docs/accessibility-device-report.md`'s
         // item 3/4: at Compact/Medium widths, keep the existing
@@ -132,6 +119,14 @@ fun WorkspaceScreen(
                     state = explorerState,
                     onFileClick = { detailTab = WorkspaceTab.DIFF.ordinal },
                     onRefresh = explorerViewModel::refresh,
+                    onAgentClick = { row -> handleExplorerNavigation(explorerViewModel.onAgentTapped(row)) },
+                    onCreateAgent = explorerViewModel::createAgent,
+                    onServiceClick = { row -> handleExplorerNavigation(explorerViewModel.onServiceTapped(row)) },
+                    onCreateService = explorerViewModel::createService,
+                    onTreeEntryClick = { entry -> handleExplorerNavigation(explorerViewModel.onTreeEntryTapped(entry)) },
+                    onTreeSearchResultClick = { path -> handleExplorerNavigation(explorerViewModel.onTreeSearchResultTapped(path)) },
+                    onTreeSearchQueryChanged = explorerViewModel::onTreeSearchQueryChanged,
+                    onTreeNavigateUp = explorerViewModel::onTreeNavigateUp,
                     modifier = Modifier.width(360.dp).fillMaxHeight().testTag("workspace-master-pane"),
                 )
                 HorizontalDivider(modifier = Modifier.fillMaxHeight().width(1.dp))
@@ -184,6 +179,14 @@ fun WorkspaceScreen(
                         state = state,
                         onFileClick = { tab = WorkspaceTab.DIFF.ordinal },
                         onRefresh = explorerViewModel::refresh,
+                        onAgentClick = { row -> handleExplorerNavigation(explorerViewModel.onAgentTapped(row)) },
+                        onCreateAgent = explorerViewModel::createAgent,
+                        onServiceClick = { row -> handleExplorerNavigation(explorerViewModel.onServiceTapped(row)) },
+                        onCreateService = explorerViewModel::createService,
+                        onTreeEntryClick = { entry -> handleExplorerNavigation(explorerViewModel.onTreeEntryTapped(entry)) },
+                        onTreeSearchResultClick = { path -> handleExplorerNavigation(explorerViewModel.onTreeSearchResultTapped(path)) },
+                        onTreeSearchQueryChanged = explorerViewModel::onTreeSearchQueryChanged,
+                        onTreeNavigateUp = explorerViewModel::onTreeNavigateUp,
                         modifier = Modifier.weight(1f),
                     )
                 }

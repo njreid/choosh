@@ -108,9 +108,60 @@ interface ChooshEngine {
     /**
      * `item.list`: every registered item in `workspaceId`, backing the
      * `WebService`/Markdown pinned-item screens' status polling
-     * (docs/specs/service-tunnels.md's "Lifecycle"/"Readiness").
+     * (docs/specs/service-tunnels.md's "Lifecycle"/"Readiness") and the
+     * explorer's "active agents"/"registered development services"
+     * sections (docs/specs/android-navigation.md's Page model).
      */
     suspend fun itemList(deviceId: String, workspaceId: String): List<ItemSummary>
+
+    /**
+     * `item.create`: registers a new `AgentTerminal` or `WebService` item in
+     * `workspaceId` and creates its dedicated Zellij tab (host-rpc.md's
+     * "Item RPCs" — `Shell` items exist on the wire but this app has no UI
+     * entry point that creates one). `agent` is required (and only
+     * meaningful) when `itemType == AGENT_TERMINAL`; `command`/`port` are
+     * required (and only meaningful) when `itemType == WEB_SERVICE`, per
+     * host-rpc.md's per-`item_type` field table. `command` is a fixed argv
+     * — host-rpc.md's "Command construction": "User- or agent-supplied text
+     * ... MUST NOT be interpolated into a shell string" — callers building
+     * this from free-form user input MUST split it into separate argv
+     * entries themselves, never pass one shell-string element expecting
+     * `hostd` to parse it (a `["sh", "-c", "..."]` argv is a caller's
+     * explicit choice, per that section, not something this method infers).
+     */
+    suspend fun createItem(
+        deviceId: String,
+        workspaceId: String,
+        itemType: ItemType,
+        name: String,
+        agent: AgentKind? = null,
+        command: List<String>? = null,
+        port: Int? = null,
+    ): CreateItemResult
+
+    /**
+     * `workspace.list`: every registered Workspace on `deviceId`'s
+     * reachable set (host-rpc.md — "for the Android fleet view, this is
+     * called once per devhost after list-devhosts", the same per-devhost
+     * scoping [projectList] already documents). Backs the Fleet drawer's
+     * Project-mode expand-to-workspace-list affordance and the `DevHost`
+     * screen (replacing the old `DevHostPlaceholder`).
+     */
+    suspend fun workspaceList(deviceId: String): List<WorkspaceSummary>
+
+    /**
+     * `workspace.tree.list`: one directory level of `workspaceId`'s file
+     * tree — root-confined, cursor-paginated (host-rpc.md's Bounds: 500
+     * entries per page; "Directory traversal depth per tree.list call: one
+     * level; recursion is client-driven"). `pathPrefix` empty means the
+     * workspace root. Backs the explorer's searchable project-tree section
+     * (android-navigation.md's Page model, section 4) — search itself
+     * matches against paths already fetched into the client's own cache
+     * (android-navigation.md's "Search" section: "Explorer search matches
+     * cached/streamed root-confined paths ... Host-assisted content search
+     * is a later capability"), not a dedicated RPC this method would call.
+     */
+    suspend fun workspaceTreeList(deviceId: String, workspaceId: String, pathPrefix: String, cursor: String? = null): WorkspaceTreeListResult
 
     /**
      * `project.list`: every Project `deviceId` (a single devhost's own
@@ -285,6 +336,42 @@ data class ItemSummary(
     val status: WebServiceStatus,
     val port: Int?,
 )
+
+/**
+ * Mirrors `choosh_protocol::host_rpc::AgentKind`, matching
+ * `CHOOSH_AGENT=codex|opencode|claude` per agent-events.md's adapter
+ * contract. Required (and only meaningful) on [ChooshEngine.createItem]
+ * when `itemType == ItemType.AGENT_TERMINAL`.
+ */
+enum class AgentKind { CODEX, CLAUDE, OPENCODE }
+
+/** Outcome of [ChooshEngine.createItem] — a typed success/failure rather than a thrown exception, matching [DocumentSaveResult]/[DocumentOpenResult]'s existing "expected outcome, not an exceptional one" posture for a `hostd`-side RPC that can genuinely be rejected (`conflict` on a duplicate name, `invalid_argument` on a malformed field, etc.). */
+sealed interface CreateItemResult {
+    data class Success(val itemId: String, val itemType: ItemType, val name: String, val tabTarget: String) : CreateItemResult
+    data class Failure(val message: String) : CreateItemResult
+}
+
+/**
+ * Mirrors `choosh_protocol::host_rpc::WorkspaceSummary` exactly: `{
+ * workspace_id, workspace_name, devhost_id, project_id, created_at }` —
+ * `workspace.list`'s per-entry shape (host-rpc.md).
+ */
+data class WorkspaceSummary(
+    val workspaceId: String,
+    val workspaceName: String,
+    val devHostId: String,
+    val projectId: String,
+    val createdAt: String,
+)
+
+/** Mirrors `choosh_protocol::host_rpc::TreeEntryKind`. */
+enum class TreeEntryKind { FILE, DIRECTORY, UNKNOWN }
+
+/** Mirrors `choosh_protocol::host_rpc::TreeEntry`: `{ name, kind, conflicted }` — one entry in a `workspace.tree.list` page. `name` is a single path segment (the entry's own name within its parent directory), not a full path — callers join it with the `pathPrefix` they queried to get a full root-relative path. */
+data class TreeEntry(val name: String, val kind: TreeEntryKind, val conflicted: Boolean)
+
+/** `workspace.tree.list`'s `{entries, next_cursor}` result shape — one directory level per call, per host-rpc.md's Bounds ("Directory traversal depth per tree.list call: one level; recursion is client-driven"). `nextCursor` non-null means more entries remain at this same level; pass it back as [ChooshEngine.workspaceTreeList]'s `cursor` to fetch the next page. */
+data class WorkspaceTreeListResult(val entries: List<TreeEntry>, val nextCursor: String?)
 
 /** Outcome of [ChooshEngine.openDocument]. */
 sealed interface DocumentOpenResult {

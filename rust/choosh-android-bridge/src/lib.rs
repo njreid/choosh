@@ -293,6 +293,48 @@ fn native_workspace_status<'local>(
     JString::new(env, body)
 }
 
+// `target_device_id` stays `JString<'local>` by value to match
+// `native_method!`'s macro-generated wrapper — see `native_init`'s comment.
+#[allow(clippy::needless_pass_by_value)]
+fn native_workspace_list<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    target_device_id: JString<'local>,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let target_device_id = jstring_to_string(env, &target_device_id)?;
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| h.runtime.block_on(h.engine.workspace_list(&target_device_id)));
+    JString::new(env, body)
+}
+
+// `target_device_id`/`workspace_id`/`path_prefix`/`revision`/`cursor` all
+// stay `JString<'local>` by value to match `native_method!`'s
+// macro-generated wrapper — see `native_init`'s comment. Empty
+// `revision`/`cursor` means "omitted", per `Engine::workspace_tree_list`'s
+// `none_if_empty` convention; Kotlin passes `""` for `null`.
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)] // matches the RPC's own field count, same posture as native_save_document
+fn native_workspace_tree_list<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    target_device_id: JString<'local>,
+    workspace_id: JString<'local>,
+    path_prefix: JString<'local>,
+    revision: JString<'local>,
+    cursor: JString<'local>,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let target_device_id = jstring_to_string(env, &target_device_id)?;
+    let workspace_id = jstring_to_string(env, &workspace_id)?;
+    let path_prefix = jstring_to_string(env, &path_prefix)?;
+    let revision = jstring_to_string(env, &revision)?;
+    let cursor = jstring_to_string(env, &cursor)?;
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| {
+        h.runtime.block_on(h.engine.workspace_tree_list(&target_device_id, &workspace_id, &path_prefix, &revision, &cursor))
+    });
+    JString::new(env, body)
+}
+
 // `target_device_id`/`workspace_id`/`path` all stay `JString<'local>` by
 // value to match `native_method!`'s macro-generated wrapper — see
 // `native_init`'s comment.
@@ -349,6 +391,37 @@ fn native_item_list<'local>(
     let workspace_id = jstring_to_string(env, &workspace_id)?;
     let body = with_handle(handle, error_json("unknown engine handle"), |h| {
         h.runtime.block_on(h.engine.item_list(&target_device_id, &workspace_id))
+    });
+    JString::new(env, body)
+}
+
+// `target_device_id`/`workspace_id`/`item_type`/`name`/`agent`/`command_json`
+// all stay `JString<'local>` by value to match `native_method!`'s
+// macro-generated wrapper — see `native_init`'s comment. Empty
+// `agent`/`command_json` means "omitted"; `port <= 0` means "omitted" — see
+// `Engine::item_create`'s doc comment for the full field-by-field contract.
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)] // matches the RPC's own field count, same posture as native_save_document
+fn native_item_create<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    target_device_id: JString<'local>,
+    workspace_id: JString<'local>,
+    item_type: JString<'local>,
+    name: JString<'local>,
+    agent: JString<'local>,
+    command_json: JString<'local>,
+    port: jlong,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let target_device_id = jstring_to_string(env, &target_device_id)?;
+    let workspace_id = jstring_to_string(env, &workspace_id)?;
+    let item_type = jstring_to_string(env, &item_type)?;
+    let name = jstring_to_string(env, &name)?;
+    let agent = jstring_to_string(env, &agent)?;
+    let command_json = jstring_to_string(env, &command_json)?;
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| {
+        h.runtime.block_on(h.engine.item_create(&target_device_id, &workspace_id, &item_type, &name, &agent, &command_json, port))
     });
     JString::new(env, body)
 }
@@ -544,6 +617,21 @@ const _ITEM_LIST: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",
     static extern fn NativeBridge::native_item_list(handle: jlong, target_device_id: JString, workspace_id: JString) -> JString,
     fn = native_item_list,
+};
+const _ITEM_CREATE: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_item_create(handle: jlong, target_device_id: JString, workspace_id: JString, item_type: JString, name: JString, agent: JString, command_json: JString, port: jlong) -> JString,
+    fn = native_item_create,
+};
+const _WORKSPACE_LIST: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_workspace_list(handle: jlong, target_device_id: JString) -> JString,
+    fn = native_workspace_list,
+};
+const _WORKSPACE_TREE_LIST: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_workspace_tree_list(handle: jlong, target_device_id: JString, workspace_id: JString, path_prefix: JString, revision: JString, cursor: JString) -> JString,
+    fn = native_workspace_tree_list,
 };
 const _PROJECT_LIST: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",

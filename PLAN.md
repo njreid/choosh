@@ -421,6 +421,62 @@ Not blocking, but real and worth tracking rather than leaving implicit:
   from `FleetFixtures.workspacesFor`, since `workspace.list` itself isn't
   wired into `ChooshEngine` yet — a real, separate, tracked gap, not
   papered over.
+- **`workspace.list`/`workspace.tree.list`/`item.create` wired into
+  `ChooshEngine`, and the Explorer's four page-zero sections implemented
+  — closing the two gaps the entry above and `android-navigation.md`'s own
+  Page model left open.** `Engine::workspace_list`/`workspace_tree_list`/
+  `item_create` (Rust bridge, `rust/choosh-android-bridge/src/engine.rs`,
+  plus JNI exports in `lib.rs`) and `ChooshEngine.workspaceList`/
+  `workspaceTreeList`/`createItem` (`NativeChooshEngine`/`FakeChooshEngine`)
+  are real. `FleetViewModel.loadProjects` now sources `Project.workspaces`
+  from the real `workspace.list` RPC (merged per online devhost, joined by
+  `project_id`) instead of `FleetFixtures.workspacesFor` — the gap the
+  entry above named is closed. `ChooshApp.kt`'s old `Screen.DevHostPlaceholder`
+  ("Per-devhost workspace list lands with real workspace RPCs (M1)") is
+  retired, replaced by a real `Screen.DevHostWorkspaces` backed by
+  `DevHostWorkspacesViewModel`. The Fleet drawer's Project mode gained a
+  real expand-to-workspace-list chevron (`FleetDrawer.kt`'s
+  `project-expand-<id>` affordance) — previously Project rows had no way
+  to reach a non-primary Workspace at all (Recent mode was the only sort
+  mode that could).
+
+  `ExplorerScreen`/`ExplorerViewModel` now implement all four of
+  `android-navigation.md`'s Page model sections, not just changed files:
+  active agents and registered development services (`item.list`, split
+  by `ItemType`, each row resolving to a real `ExplorerNavigationEvent`
+  that opens the real `AgentTerminal`/`WebService` item — never a
+  hardcoded item id), and a searchable project tree (`workspace.tree.list`,
+  one directory level per call, client-side search over every level
+  fetched so far, per that section's own "host-assisted content search is
+  a later capability"). A new `AgentStatusTracker`
+  (`ai.choosh.agentevents`, process-wide like `AgentAttentionTracker`)
+  feeds the active-agents section a real `busy`/`waiting`/`starting`/
+  `failed` distinction from live `agent_status` events — `item.list` alone
+  can only ever report an `AgentTerminal` as `running`/`stopped`
+  (`ItemStatus`'s own doc comment). `WorkspaceScreen.kt`'s old fixed demo
+  buttons ("Open terminal", "Open README.md in editor", "Open WebService
+  demo", "Open Markdown demo") and the `ChooshApp.kt` demo screens they
+  routed to (`Screen.WebServiceDemo`, `Screen.MarkdownDemo`, and a
+  `Screen.Terminal` that reused `itemId = workspaceId`) are retired,
+  replaced by real `Screen.WebService`/`Screen.MarkdownPreview` and a
+  correctly-`itemId`-addressed `Screen.Terminal` — `TerminalScreen`'s own
+  "Demo output"/"Full redraw" buttons remain (they inject a canned ANSI
+  byte sequence to verify the VT renderer, independent of item-pinning,
+  and were never part of this gap). `item.create` also backs a real
+  "start a new agent/service" affordance in the Explorer (agent-kind
+  buttons; name/command/port fields), replacing the old demo buttons'
+  implicit "there's always exactly one workspace, one item named
+  `item-web-1`" assumption.
+
+  **Known gaps this pass did not close**: the explorer still opens a
+  pinned item as a full-screen navigation, not `android-navigation.md`'s
+  literal `[Explorer] [Pinned item] [Pinned item] ...` horizontally
+  swipeable pager with insertion-order pin persistence — that full pager
+  UX was never built at any point in this codebase and remains future
+  work, tracked here rather than silently assumed done by this pass.
+  `Workspace.lastActiveAt` is approximated from `WorkspaceSummary.created_at`
+  (the real RPC has no dedicated last-activity timestamp), so Recent sort
+  mode currently orders by registration time, not true last activity.
 - **`choosh-hostd` shells out to the `jj` CLI instead of using `jj-lib`'s
   programmatic API — partially migrated (Wave-2 follow-up).** `status`,
   `current_commit_id`/`commit_id_at`, and `log` now use real `jj-lib`

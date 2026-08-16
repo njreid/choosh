@@ -80,19 +80,19 @@ enum class SortMode { PROJECT, HOST, RECENT }
  * includes at least one attention-needing workspace and one devhost with
  * no active project, per the fork directive's UI-coverage requirement.
  *
- * As of `project.list`/`project.set_primary_workspace` landing
- * (docs/specs/host-rpc.md), a Project's own identity/`active` flag comes
- * from [ai.choosh.engine.ChooshEngine.projectList] (see [FleetViewModel]),
- * never from here directly — [FakeChooshEngine]'s own `projectList` still
- * leans on [projectsFor] to synthesize realistic `ProjectSummary` rows,
- * and [FleetViewModel] still leans on [workspacesFor] to fill in each
- * real Project's nested Workspace list, since `workspace.list` isn't
- * wired into [ai.choosh.engine.ChooshEngine] yet (a separate, tracked
- * gap — see PLAN.md's "Known follow-ups") — but no caller should reach
- * for [projectsFor] as a substitute for the real RPC anymore.
+ * As of `project.list`/`project.set_primary_workspace`/`workspace.list`
+ * landing (docs/specs/host-rpc.md), a Project's own identity/`active` flag
+ * and its nested Workspace list both come from
+ * [ai.choosh.engine.ChooshEngine.projectList]/
+ * [ai.choosh.engine.ChooshEngine.workspaceList] (see [FleetViewModel]'s
+ * `loadProjects`), never from here directly — this object now exists purely
+ * to give [FakeChooshEngine]'s own `projectList`/`workspaceList` a
+ * consistent, realistic fixture to serve (mirroring what a real `hostd`
+ * would return), not as a stand-in [FleetViewModel] itself reaches for
+ * anymore.
  */
 object FleetFixtures {
-    /** [Project.workspaces] fixture data for one already-known `projectId`, keyed the same way [projectsFor] is. */
+    /** [Project.workspaces] fixture data for one already-known `projectId`, keyed the same way [projectsFor] is — [FakeChooshEngine.workspaceList]'s own backing data. */
     fun workspacesFor(projectId: String, devHosts: List<DevHostPresence>): List<Workspace> =
         projectsFor(devHosts).firstOrNull { it.projectId == projectId }?.workspaces.orEmpty()
 
