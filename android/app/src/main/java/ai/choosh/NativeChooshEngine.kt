@@ -75,72 +75,72 @@ class NativeChooshEngine : ChooshEngine {
     private val handle: Long = NativeBridge.nativeInit(BuildConfig.CHOOSH_RELAYD_HTTP_URL, BuildConfig.CHOOSH_RELAYD_URL)
 
     override suspend fun webauthnRegisterStart(bootstrapSecret: String): String =
-        withContext(Dispatchers.IO) { NativeBridge.nativeWebauthnRegisterStart(handle, bootstrapSecret) }
+        ioCall { NativeBridge.nativeWebauthnRegisterStart(handle, bootstrapSecret) }
 
     override suspend fun webauthnRegisterFinish(credentialJson: String, correlationId: String): WebauthnResult =
-        withContext(Dispatchers.IO) {
+        ioCall {
             decodeWebauthnResult(NativeBridge.nativeWebauthnRegisterFinish(handle, credentialJson, correlationId))
         }
 
     override suspend fun webauthnLoginStart(): String =
-        withContext(Dispatchers.IO) { NativeBridge.nativeWebauthnLoginStart(handle) }
+        ioCall { NativeBridge.nativeWebauthnLoginStart(handle) }
 
     override suspend fun webauthnLoginFinish(credentialJson: String, correlationId: String): WebauthnResult =
-        withContext(Dispatchers.IO) {
+        ioCall {
             decodeWebauthnResult(NativeBridge.nativeWebauthnLoginFinish(handle, credentialJson, correlationId))
         }
 
     override suspend fun connect(sessionCredential: String): ConnectResult =
-        withContext(Dispatchers.IO) { decodeConnectResult(NativeBridge.nativeConnect(handle, sessionCredential)) }
+        ioCall { decodeConnectResult(NativeBridge.nativeConnect(handle, sessionCredential)) }
 
-    override suspend fun listDevhosts(): List<DevHostPresence> = withContext(Dispatchers.IO) {
+    override suspend fun listDevhosts(): List<DevHostPresence> = ioCall {
         json.decodeFromString<List<WireDevHostPresence>>(NativeBridge.nativeListDevhosts(handle)).map { it.toDomain() }
     }
 
     override suspend fun registerFcmToken(fcmToken: String): Boolean =
-        withContext(Dispatchers.IO) { NativeBridge.nativeRegisterFcmToken(handle, fcmToken) }
+        ioCall { NativeBridge.nativeRegisterFcmToken(handle, fcmToken) }
 
     override suspend fun requestEnrollmentToken(): EnrollmentTokenResult =
-        withContext(Dispatchers.IO) { decodeEnrollmentTokenResult(NativeBridge.nativeRequestEnrollmentToken(handle)) }
+        ioCall { decodeEnrollmentTokenResult(NativeBridge.nativeRequestEnrollmentToken(handle)) }
 
     override suspend fun workspaceDiff(deviceId: String, workspaceId: String, from: String?, to: String?): List<DiffFileEntry> =
-        withContext(Dispatchers.IO) {
+        ioCall {
             val raw = NativeBridge.nativeWorkspaceDiff(handle, deviceId, workspaceId, from.orEmpty(), to.orEmpty())
             decodeOrThrow(raw) { body -> json.decodeFromString<List<WireDiffFileEntry>>(body).map { it.toDomain() } }
         }
 
     override suspend fun workspaceLog(deviceId: String, workspaceId: String, revset: String?, limit: Int): List<ChangeGraphNode> =
-        withContext(Dispatchers.IO) {
+        ioCall {
             val raw = NativeBridge.nativeWorkspaceLog(handle, deviceId, workspaceId, revset.orEmpty(), limit.toLong())
             decodeOrThrow(raw) { body -> json.decodeFromString<List<WireChangeGraphNode>>(body).map { it.toDomain() } }
         }
 
     override suspend fun workspaceOpLog(deviceId: String, workspaceId: String, limit: Int): List<OperationLogEntry> =
-        withContext(Dispatchers.IO) {
+        ioCall {
             val raw = NativeBridge.nativeWorkspaceOpLog(handle, deviceId, workspaceId, limit.toLong())
             decodeOrThrow(raw) { body -> json.decodeFromString<List<WireOperationLogEntry>>(body).map { it.toDomain() } }
         }
 
     override suspend fun workspaceOpUndo(deviceId: String, workspaceId: String, opId: String): String =
-        withContext(Dispatchers.IO) {
+        ioCall {
             val raw = NativeBridge.nativeWorkspaceOpUndo(handle, deviceId, workspaceId, opId)
             decodeOrThrow(raw) { body -> json.decodeFromString<WireNewOpId>(body).new_op_id }
         }
 
     override suspend fun workspaceOpRestore(deviceId: String, workspaceId: String, opId: String): String =
-        withContext(Dispatchers.IO) {
+        ioCall {
             val raw = NativeBridge.nativeWorkspaceOpRestore(handle, deviceId, workspaceId, opId)
             decodeOrThrow(raw) { body -> json.decodeFromString<WireNewOpId>(body).new_op_id }
         }
 
     override suspend fun workspaceStatus(deviceId: String, workspaceId: String): WorkspaceStatus =
-        withContext(Dispatchers.IO) {
+        ioCall {
             val raw = NativeBridge.nativeWorkspaceStatus(handle, deviceId, workspaceId)
             decodeOrThrow(raw) { body -> json.decodeFromString<WireWorkspaceStatus>(body).toDomain() }
         }
 
     override suspend fun openDocument(deviceId: String, workspaceId: String, path: String): DocumentOpenResult =
-        withContext(Dispatchers.IO) {
+        ioCall {
             decodeDocumentOpenResult(NativeBridge.nativeOpenDocument(handle, deviceId, workspaceId, path))
         }
 
@@ -150,11 +150,11 @@ class NativeChooshEngine : ChooshEngine {
         path: String,
         baseRevision: String,
         contentBase64: String,
-    ): DocumentSaveResult = withContext(Dispatchers.IO) {
+    ): DocumentSaveResult = ioCall {
         decodeDocumentSaveResult(NativeBridge.nativeSaveDocument(handle, deviceId, workspaceId, path, baseRevision, contentBase64))
     }
 
-    override suspend fun itemList(deviceId: String, workspaceId: String): List<ItemSummary> = withContext(Dispatchers.IO) {
+    override suspend fun itemList(deviceId: String, workspaceId: String): List<ItemSummary> = ioCall {
         val raw = NativeBridge.nativeItemList(handle, deviceId, workspaceId)
         decodeOrThrow(raw) { body -> json.decodeFromString<List<WireItemSummary>>(body).map { it.toDomain() } }
     }
@@ -167,7 +167,7 @@ class NativeChooshEngine : ChooshEngine {
         agent: AgentKind?,
         command: List<String>?,
         port: Int?,
-    ): CreateItemResult = withContext(Dispatchers.IO) {
+    ): CreateItemResult = ioCall {
         val raw = NativeBridge.nativeItemCreate(
             handle,
             deviceId,
@@ -181,7 +181,7 @@ class NativeChooshEngine : ChooshEngine {
         decodeCreateItemResult(raw)
     }
 
-    override suspend fun workspaceList(deviceId: String): List<WorkspaceSummary> = withContext(Dispatchers.IO) {
+    override suspend fun workspaceList(deviceId: String): List<WorkspaceSummary> = ioCall {
         val raw = NativeBridge.nativeWorkspaceList(handle, deviceId)
         decodeOrThrow(raw) { body -> json.decodeFromString<List<WireWorkspaceSummary>>(body).map { it.toDomain() } }
     }
@@ -191,24 +191,24 @@ class NativeChooshEngine : ChooshEngine {
         workspaceId: String,
         pathPrefix: String,
         cursor: String?,
-    ): WorkspaceTreeListResult = withContext(Dispatchers.IO) {
+    ): WorkspaceTreeListResult = ioCall {
         val raw = NativeBridge.nativeWorkspaceTreeList(handle, deviceId, workspaceId, pathPrefix, "", cursor.orEmpty())
         decodeOrThrow(raw) { body -> json.decodeFromString<WireWorkspaceTreeListResult>(body).toDomain() }
     }
 
-    override suspend fun projectList(deviceId: String): List<ProjectSummary> = withContext(Dispatchers.IO) {
+    override suspend fun projectList(deviceId: String): List<ProjectSummary> = ioCall {
         val raw = NativeBridge.nativeProjectList(handle, deviceId)
         decodeOrThrow(raw) { body -> json.decodeFromString<List<WireProjectSummary>>(body).map { it.toDomain() } }
     }
 
     override suspend fun setPrimaryWorkspace(deviceId: String, projectId: String, workspaceId: String) {
-        withContext(Dispatchers.IO) {
+        ioCall {
             val raw = NativeBridge.nativeProjectSetPrimaryWorkspace(handle, deviceId, projectId, workspaceId)
             decodeOrThrow(raw) { /* {"ok":true} on success; decodeOrThrow already throws on the shared {"error":...} shape. */ }
         }
     }
 
-    override suspend fun resourceList(deviceId: String): List<Resource> = withContext(Dispatchers.IO) {
+    override suspend fun resourceList(deviceId: String): List<Resource> = ioCall {
         val raw = NativeBridge.nativeResourceList(handle, deviceId)
         decodeOrThrow(raw) { body -> json.decodeFromString<List<WireResource>>(body).map { it.toDomain() } }
     }
@@ -220,7 +220,7 @@ class NativeChooshEngine : ChooshEngine {
         pattern: ResourcePattern?,
         reauthCommand: String?,
         mobileProfile: MobileProfile,
-    ): ResourceProposeResult = withContext(Dispatchers.IO) {
+    ): ResourceProposeResult = ioCall {
         val raw = NativeBridge.nativeResourcePropose(
             handle,
             deviceId,
@@ -234,23 +234,23 @@ class NativeChooshEngine : ChooshEngine {
     }
 
     override suspend fun resourceConfirm(deviceId: String, resourceId: String, approve: Boolean): ResourceConfirmResult =
-        withContext(Dispatchers.IO) { decodeResourceConfirmResult(NativeBridge.nativeResourceConfirm(handle, deviceId, resourceId, approve)) }
+        ioCall { decodeResourceConfirmResult(NativeBridge.nativeResourceConfirm(handle, deviceId, resourceId, approve)) }
 
-    override suspend fun resourceReauthStart(deviceId: String, resourceId: String): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun resourceReauthStart(deviceId: String, resourceId: String): Boolean = ioCall {
         val raw = NativeBridge.nativeResourceReauthStart(handle, deviceId, resourceId)
         runCatching { decodeOrThrow(raw) { body -> json.decodeFromString<WireOk>(body).ok } }.getOrDefault(false)
     }
 
-    override suspend fun resourceReauthComplete(deviceId: String, resourceId: String, value: String): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun resourceReauthComplete(deviceId: String, resourceId: String, value: String): Boolean = ioCall {
         val raw = NativeBridge.nativeResourceReauthComplete(handle, deviceId, resourceId, value)
         runCatching { decodeOrThrow(raw) { body -> json.decodeFromString<WireVerified>(body).verified } }.getOrDefault(false)
     }
 
     override suspend fun pollAgentEvents(): List<AgentEventPush> =
-        withContext(Dispatchers.IO) { decodeAgentEventPushes(NativeBridge.nativePollAgentEvents(handle)) }
+        ioCall { decodeAgentEventPushes(NativeBridge.nativePollAgentEvents(handle)) }
 
     override suspend fun agentEventsResume(deviceId: String, workspaceId: String, afterSequence: Long?): AgentEventsResumeOutcome =
-        withContext(Dispatchers.IO) {
+        ioCall {
             val raw = NativeBridge.nativeAgentEventsResume(handle, deviceId, workspaceId, afterSequence ?: 0L)
             decodeOrThrow(raw) { body -> decodeAgentEventsResumeOutcome(body) }
         }
@@ -258,7 +258,7 @@ class NativeChooshEngine : ChooshEngine {
     /** Exposes this instance's raw JNI connection handle to `WebGatewayBridge`/`MarkdownGatewayBridge`, mirroring [ai.choosh.terminal.TerminalSession.attachPty]'s existing `connectionHandle` pattern. */
     val connectionHandle: Long get() = handle
 
-    override suspend fun close() = withContext(Dispatchers.IO) { NativeBridge.nativeClose(handle) }
+    override suspend fun close() = ioCall { NativeBridge.nativeClose(handle) }
 }
 
 /**
@@ -415,6 +415,41 @@ private fun <T> decodeOrThrow(raw: String, decode: (String) -> T): T {
     if (error != null) throw IllegalStateException(error.error)
     return decode(raw)
 }
+
+/**
+ * Degrades an unexpected failure from [block] — a genuine JNI-level
+ * `jni::errors::Error` on the Rust side, or (extremely unlikely, since
+ * `lib.rs`'s `native_method!` already catches and rethrows a Rust panic as
+ * a `RuntimeException` rather than letting it cross the JNI boundary as
+ * undefined behavior) a raw panic surfacing as a bare `RuntimeException` —
+ * into the exact same [IllegalStateException] shape [decodeOrThrow]'s
+ * `{"error": ...}` convention already produces for an ordinary
+ * application-level failure, which every caller of this class already
+ * knows to catch and handle. An [IllegalStateException] [block] itself
+ * throws (via [decodeOrThrow]) passes through completely unchanged — this
+ * only re-labels failure types callers don't already expect.
+ *
+ * Found during a dedicated JNI-boundary review: no call site here
+ * previously handled this at all, so an unexpected native-side failure
+ * would have propagated as an unrecognized exception type and crashed the
+ * app uncaught rather than degrading gracefully.
+ *
+ * `internal`, not `private`: unit-tested directly (the same "pure
+ * derivation, unit-tested directly" precedent as
+ * `ai.choosh.connection.describeCreateCredentialFailure`), since it needs
+ * no coroutine dispatcher or real native library to exercise.
+ */
+internal inline fun <T> wrapNativeFailure(block: () -> T): T =
+    try {
+        block()
+    } catch (failure: IllegalStateException) {
+        throw failure
+    } catch (failure: Exception) {
+        throw IllegalStateException("native call failed unexpectedly: ${failure.message}", failure)
+    }
+
+/** Every [NativeBridge] call in this file goes through this rather than a bare `withContext(Dispatchers.IO) { ... }` — see [wrapNativeFailure]'s doc comment for why. */
+private suspend fun <T> ioCall(block: () -> T): T = withContext(Dispatchers.IO) { wrapNativeFailure(block) }
 
 /**
  * Matches the wire shape `relayd`/`hostd` actually serialize
