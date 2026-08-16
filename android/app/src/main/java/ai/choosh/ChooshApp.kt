@@ -11,6 +11,7 @@ import ai.choosh.fleet.FleetDrawer
 import ai.choosh.fleet.FleetNavigationEvent
 import ai.choosh.fleet.FleetViewModel
 import ai.choosh.markdown.MarkdownFixtureDemoScreen
+import ai.choosh.nav.ScreenBackStack
 import ai.choosh.sourceeditor.SourceEditorScreen
 import ai.choosh.sourceeditor.SourceEditorViewModel
 import ai.choosh.terminal.TerminalScreen
@@ -18,11 +19,18 @@ import ai.choosh.webservice.WebServiceScreen
 import ai.choosh.webservice.WebServiceViewModel
 import ai.choosh.workspace.WorkspaceScreen
 import android.content.Context
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -31,7 +39,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -120,10 +127,24 @@ private sealed interface Screen {
 fun ChooshApp(context: Context) {
     val engine = remember { buildEngine() }
     val credentialStore = remember { SessionCredentialStore(context) }
-    // Plain `remember`, not `rememberSaveable`: `Screen` isn't `Parcelable`, and this
-    // navigation state is cheap to rebuild from `ConnectionViewModel`'s own stored-credential
-    // check on a configuration change anyway — not worth a custom Saver for this pass.
-    var screen by remember { mutableStateOf<Screen>(Screen.Connection) }
+    // A real back stack (UX-friction audit finding #2), not a single
+    // `remember { mutableStateOf(...) }` slot: `docs/specs/android-navigation.md`'s
+    // "Back behavior" section requires popping one level at a time
+    // (pinned page -> explorer -> workspace list -> fleet -> connection),
+    // which a single current-screen variable can't represent — there's
+    // nowhere to remember what came before. Plain `remember`, not
+    // `rememberSaveable`: `Screen` isn't `Parcelable`, and this navigation
+    // state is cheap to rebuild from `ConnectionViewModel`'s own
+    // stored-credential check on a configuration change anyway — not worth
+    // a custom Saver for this pass.
+    val backStack = remember { ScreenBackStack<Screen>(Screen.Connection) }
+    val screen = backStack.current
+    // System Back pops one level, per android-navigation.md's "Back
+    // behavior" — enabled only when there's somewhere to pop back to; at
+    // the root (`Connection`, with nothing pushed yet) this composable
+    // lets the platform's own default back handling apply (exit the app),
+    // same as any other single-Activity app's root screen.
+    BackHandler(enabled = backStack.canPop) { backStack.pop() }
 
     // docs/specs/agent-events.md's live subscription — one process-wide
     // instance, per AgentEventSubscription's own doc comment on why this
@@ -167,7 +188,7 @@ fun ChooshApp(context: Context) {
                             ConnectionViewModel(engine, credentialStore, fcmTokenProvider = ::fetchFcmToken)
                         },
                     )
-                    ConnectionScreen(viewModel = viewModel, onConnected = { screen = Screen.Fleet })
+                    ConnectionScreen(viewModel = viewModel, onConnected = { backStack.push(Screen.Fleet) })
                 }
 
                 is Screen.Fleet -> {
@@ -179,13 +200,15 @@ fun ChooshApp(context: Context) {
                         state = state,
                         onSortModeSelected = viewModel::setSortMode,
                         onProjectClick = { project ->
-                            screen = when (val event = viewModel.onProjectTapped(project)) {
-                                is FleetNavigationEvent.OpenWorkspace -> Screen.Workspace(event.workspaceId, event.deviceId)
-                                is FleetNavigationEvent.OpenDevHost -> Screen.DevHostPlaceholder(event.deviceId)
-                            }
+                            backStack.push(
+                                when (val event = viewModel.onProjectTapped(project)) {
+                                    is FleetNavigationEvent.OpenWorkspace -> Screen.Workspace(event.workspaceId, event.deviceId)
+                                    is FleetNavigationEvent.OpenDevHost -> Screen.DevHostPlaceholder(event.deviceId)
+                                },
+                            )
                         },
-                        onDevHostClick = { devHost -> screen = Screen.DevHostPlaceholder(devHost.deviceId) },
-                        onWorkspaceClick = { workspace -> screen = Screen.Workspace(workspace.workspaceId, workspace.devHostId) },
+                        onDevHostClick = { devHost -> backStack.push(Screen.DevHostPlaceholder(devHost.deviceId)) },
+                        onWorkspaceClick = { workspace -> backStack.push(Screen.Workspace(workspace.workspaceId, workspace.devHostId)) },
                     )
                 }
 
@@ -202,22 +225,22 @@ fun ChooshApp(context: Context) {
                         engine = engine,
                         workspaceId = current.workspaceId,
                         deviceId = current.deviceId,
-                        onBack = { screen = Screen.Fleet },
+                        onBack = { backStack.pop() },
                         // Demo entry points — the explorer doesn't yet surface real
                         // AgentTerminal/SourceEditor pinned items to tap directly
                         // (item.list wiring is a later increment), so these open a
                         // fixed item/path against the current workspace instead.
-                        onOpenTerminal = { screen = Screen.Terminal(deviceId = current.deviceId, itemId = current.workspaceId) },
-                        onOpenEditor = { path -> screen = Screen.SourceEditor(current.deviceId, current.workspaceId, path) },
-                        onOpenWebServiceDemo = { screen = Screen.WebServiceDemo(current.deviceId, current.workspaceId) },
-                        onOpenMarkdownDemo = { screen = Screen.MarkdownDemo },
+                        onOpenTerminal = { backStack.push(Screen.Terminal(deviceId = current.deviceId, itemId = current.workspaceId)) },
+                        onOpenEditor = { path -> backStack.push(Screen.SourceEditor(current.deviceId, current.workspaceId, path)) },
+                        onOpenWebServiceDemo = { backStack.push(Screen.WebServiceDemo(current.deviceId, current.workspaceId)) },
+                        onOpenMarkdownDemo = { backStack.push(Screen.MarkdownDemo) },
                     )
                 }
 
                 is Screen.DevHostPlaceholder -> PlaceholderScreen(
                     title = "DevHost ${current.deviceId}",
                     subtitle = "Per-devhost workspace list lands with real workspace RPCs (M1).",
-                    onBack = { screen = Screen.Fleet },
+                    onBack = { backStack.pop() },
                 )
 
                 is Screen.SourceEditor -> {
@@ -230,7 +253,7 @@ fun ChooshApp(context: Context) {
                     SourceEditorScreen(
                         viewModel = viewModel,
                         path = current.path,
-                        onBack = { screen = Screen.Workspace(current.workspaceId, current.deviceId) },
+                        onBack = { backStack.pop() },
                     )
                 }
 
@@ -244,7 +267,7 @@ fun ChooshApp(context: Context) {
                     // yet), not a "no live relayd" limitation anymore. The demo-output
                     // buttons still exercise the real VT parser + renderer end to end.
                     connectionHandle = null,
-                    onBack = { screen = Screen.Workspace(current.itemId, current.deviceId) },
+                    onBack = { backStack.pop() },
                 )
 
                 is Screen.WebServiceDemo -> {
@@ -257,18 +280,34 @@ fun ChooshApp(context: Context) {
                     LaunchedEffect(viewModel) { viewModel.startPolling() }
                     val state by viewModel.state.collectAsState()
                     Column(Modifier.fillMaxSize()) {
-                        Button(onClick = { screen = Screen.Workspace(current.workspaceId, current.deviceId) }, modifier = Modifier.padding(8.dp)) {
-                            Text("Back")
-                        }
+                        BackRow(onBack = { backStack.pop() })
                         WebServiceScreen(state, Modifier.weight(1f))
                     }
                 }
 
                 is Screen.MarkdownDemo -> Column(Modifier.fillMaxSize()) {
-                    Button(onClick = { screen = Screen.Fleet }, modifier = Modifier.padding(8.dp)) { Text("Back") }
+                    BackRow(onBack = { backStack.pop() })
                     MarkdownFixtureDemoScreen(Modifier.weight(1f))
                 }
             }
+        }
+    }
+}
+
+/**
+ * The standard top-left Back affordance (UX-friction audit finding #10):
+ * an `IconButton` + `ArrowBack`, matching [ai.choosh.sourceeditor.SourceEditorScreen]'s
+ * existing pattern — the one other screens previously diverged from (a
+ * top-left text `Button("Back")` in [ai.choosh.workspace.WorkspaceScreen]/here,
+ * a top-*right* text `Button("Back")` in [ai.choosh.terminal.TerminalScreen]).
+ * Used here for the two demo screens this composition root renders inline
+ * ([Screen.WebServiceDemo]/[Screen.MarkdownDemo]).
+ */
+@Composable
+private fun BackRow(onBack: () -> Unit) {
+    Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = onBack) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
         }
     }
 }

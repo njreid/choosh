@@ -19,8 +19,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
@@ -85,7 +89,12 @@ fun WorkspaceScreen(
 
     Column(modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Button(onClick = onBack) { Text("Back") }
+            // Top-left IconButton+ArrowBack, matching SourceEditorScreen's
+            // pattern (UX-friction audit finding #10: Back placement/style
+            // was previously inconsistent across screens).
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+            }
             Text(
                 "Workspace $workspaceId",
                 style = MaterialTheme.typography.titleMedium,
