@@ -262,17 +262,22 @@ impl AgentEventSpool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use choosh_protocol::relay::{WireAgentStatus, WireAuthProvider};
+    use choosh_protocol::relay::{WireAgentStatus, WireMobileProfile, WireResourcePattern};
 
     fn status_event(workspace_id: &str, status: WireAgentStatus) -> WireAgentEvent {
         WireAgentEvent::AgentStatus { workspace_id: workspace_id.to_string(), item_id: "item-1".to_string(), status }
     }
 
-    fn auth_required_event() -> WireAgentEvent {
-        WireAgentEvent::AuthRequired {
-            provider: WireAuthProvider::Github,
-            user_code: "WDJB-MJHT".to_string(),
-            verification_uri: "https://example.com/device".to_string(),
+    fn resource_reauth_required_event() -> WireAgentEvent {
+        WireAgentEvent::ResourceReauthRequired {
+            resource_id: "detected-github".to_string(),
+            display_name: "GitHub".to_string(),
+            resource_kind: "github".to_string(),
+            pattern: WireResourcePattern::A,
+            verification_uri: Some("https://example.com/device".to_string()),
+            user_code: Some("WDJB-MJHT".to_string()),
+            fetch_instructions: None,
+            mobile_profile: WireMobileProfile::Ask,
         }
     }
 
@@ -297,13 +302,13 @@ mod tests {
     }
 
     #[test]
-    fn auth_required_events_are_not_sequenced_or_recorded() {
+    fn resource_reauth_required_events_are_not_sequenced_or_recorded() {
         let spool = AgentEventSpool::new();
-        assert_eq!(spool.record(&auth_required_event()), None);
+        assert_eq!(spool.record(&resource_reauth_required_event()), None);
         // Confirm nothing was recorded under any key: a subsequent
         // workspace-scoped event still starts at sequence 1, proving the
-        // `AuthRequired` call above didn't silently consume a sequence
-        // number or create a phantom workspace entry.
+        // `ResourceReauthRequired` call above didn't silently consume a
+        // sequence number or create a phantom workspace entry.
         let sequence = spool.record(&status_event("ws-1", WireAgentStatus::Busy)).unwrap();
         assert_eq!(sequence, 1);
     }

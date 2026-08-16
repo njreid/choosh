@@ -234,6 +234,65 @@ interface ChooshEngine {
     suspend fun setPrimaryWorkspace(deviceId: String, projectId: String, workspaceId: String)
 
     /**
+     * `resource.list`, per docs/specs/resources-and-reauth.md: every
+     * confirmed, listed Resource on `deviceId` — a pending, unconfirmed
+     * proposal never appears here (see [resourcePropose]'s doc comment).
+     * Resources are devhost-scoped, not workspace-scoped, mirroring
+     * [workspaceList]/[projectList]'s existing per-devhost RPC shape.
+     */
+    suspend fun resourceList(deviceId: String): List<Resource>
+
+    /**
+     * `resource.propose`: declares a new Resource. Per the spec's
+     * confirmation-gate decision, this does NOT itself create a real,
+     * listed Resource — the returned [ResourceProposeResult.Success.resourceId]
+     * names a *pending* proposal, only promoted to a listed [Resource] by a
+     * later [resourceConfirm]. This is the human-initiated path (a form
+     * reachable from the Resources screen); an agent's own proposal instead
+     * reaches the phone as an [AgentEvent.InputRequired] with
+     * [InputReason.ELICITATION] — see that event's own doc comment for how
+     * this app currently resolves which pending resource_id it names.
+     *
+     * `pattern`/`reauthCommand` `null` means "omitted" — a non-reauth
+     * Resource (e.g. a second EC2 test host) per "Non-reauth Resources".
+     */
+    suspend fun resourcePropose(
+        deviceId: String,
+        displayName: String,
+        resourceKind: String,
+        pattern: ResourcePattern? = null,
+        reauthCommand: String? = null,
+        mobileProfile: MobileProfile = MobileProfile.ASK,
+    ): ResourceProposeResult
+
+    /**
+     * `resource.confirm`: the human's approve/reject answer to a pending
+     * [resourcePropose] proposal (whether declared directly through this
+     * app's own form, or via an agent's `input_required`/`Elicitation`
+     * round trip). [ResourceConfirmResult.Success.resource] is non-null
+     * only when `approve` resolved to a genuinely new, listed Resource;
+     * `approve = false` simply discards the proposal.
+     */
+    suspend fun resourceConfirm(deviceId: String, resourceId: String, approve: Boolean): ResourceConfirmResult
+
+    /**
+     * `resource.reauth_start`: proactively starts a Resource's re-auth as a
+     * `hostd`-managed subprocess. The actual url/code/instructions arrive
+     * later as an [AgentEvent.ResourceReauthRequired] push, never in this
+     * call's own response.
+     */
+    suspend fun resourceReauthStart(deviceId: String, resourceId: String): Boolean
+
+    /**
+     * `resource.reauth_complete`: hands back whatever value the phone's
+     * human obtained — a pasted code (patterns b/d) or a fetched secret
+     * (pattern c). Never valid for pattern a, which resolves on its own
+     * with nothing typed back. Returns whether `hostd` was able to verify
+     * the re-auth succeeded.
+     */
+    suspend fun resourceReauthComplete(deviceId: String, resourceId: String, value: String): Boolean
+
+    /**
      * Drains every live `agent-event` push (docs/specs/agent-events.md)
      * received on the persistent connection since the last call, oldest
      * first. Always succeeds — an empty list, never a thrown exception,
@@ -294,8 +353,41 @@ sealed interface AgentEvent {
     data class EditorAttached(val workspaceId: String) : AgentEvent
     data class EditorDetached(val workspaceId: String) : AgentEvent
 
-    /** Carries no `workspaceId`/`itemId` — see `WireAgentEvent::AuthRequired`'s own doc comment. */
+    /**
+     * Superseded by [ResourceReauthRequired] on the wire (`auth_required`'s
+     * `choosh_protocol::relay::WireAgentEvent` variant no longer exists —
+     * see that type's replacement doc comment) — kept only because
+     * `ai.choosh.notifications`' separate FCM best-effort path
+     * ([ai.choosh.notifications.AuthNotificationIntent]) still models the
+     * old `auth_required` FCM data payload shape, which is a distinct,
+     * still-real wire contract (`notifications.md`'s data payload, not
+     * `WireAgentEvent`) untouched by this pass. [NativeChooshEngine]'s live
+     * `WireAgentEvent` decoder no longer produces this case — a
+     * `"resource_reauth_required"` `kind` decodes to [ResourceReauthRequired]
+     * below instead.
+     */
     data class AuthRequired(val provider: String, val userCode: String, val verificationUri: String) : AgentEvent
+
+    /**
+     * `choosh_protocol::relay::WireAgentEvent::ResourceReauthRequired`,
+     * per docs/specs/resources-and-reauth.md — replaces [AuthRequired] on
+     * the live agent-event wire. Carries no `workspaceId`/`itemId`: a
+     * Resource is devhost-scoped, not attributable to a single workspace
+     * item, same as [AuthRequired] before it. `verificationUri`/`userCode`
+     * populated for patterns a/b(/d for the URI only); `fetchInstructions`
+     * populated for pattern c only — see [ResourcePattern]'s own doc
+     * comment for the full per-pattern field table.
+     */
+    data class ResourceReauthRequired(
+        val resourceId: String,
+        val displayName: String,
+        val resourceKind: String,
+        val pattern: ResourcePattern,
+        val verificationUri: String?,
+        val userCode: String?,
+        val fetchInstructions: String?,
+        val mobileProfile: MobileProfile,
+    ) : AgentEvent
 
     data object Unknown : AgentEvent
 }
@@ -314,7 +406,7 @@ val AgentEvent.workspaceIdOrNull: String?
         is AgentEvent.AgentStatusChanged -> workspaceId
         is AgentEvent.EditorAttached -> workspaceId
         is AgentEvent.EditorDetached -> workspaceId
-        is AgentEvent.AuthRequired, AgentEvent.Unknown -> null
+        is AgentEvent.AuthRequired, is AgentEvent.ResourceReauthRequired, AgentEvent.Unknown -> null
     }
 
 /** One live agent-event push, per [ChooshEngine.pollAgentEvents]. */
@@ -566,3 +658,68 @@ data class DevHostPresence(
 )
 
 enum class ConnectionState { ONLINE, OFFLINE }
+
+// --- docs/specs/resources-and-reauth.md domain types --------------------
+
+/**
+ * Mirrors `choosh_protocol::relay::WireResourcePattern` — the four
+ * structurally different re-auth interaction shapes that spec's "Provider
+ * survey" identifies:
+ * - **A** — self-polling device code: nothing typed back, `verificationUri`/
+ *   `userCode` shown, no submit field.
+ * - **B** — manual code paste-back: `verificationUri`/`userCode` shown, plus
+ *   a submit field (the value must reach the still-live blocked process).
+ * - **C** — static secret paste, no browser flow: `fetchInstructions` shown
+ *   instead of a URL/code, plus a submit field.
+ * - **D** — resume via a fresh command: `verificationUri` shown (no
+ *   `userCode`), plus a submit field.
+ *
+ * [UNKNOWN] is this app's forward-compatibility fallback, matching
+ * [WebServiceStatus]/[ItemType]'s existing "unrecognized value, don't
+ * crash" convention — `WireResourcePattern` itself has no such variant on
+ * the wire (it's a closed 4-value enum), so this only appears if a future
+ * wire change outpaces this client build.
+ */
+enum class ResourcePattern { A, B, C, D, UNKNOWN }
+
+/**
+ * Mirrors `choosh_protocol::relay::WireMobileProfile` — `resources-and-reauth.md`'s
+ * "Mobile profile targeting": which Android profile a Resource's re-auth
+ * should be attempted in. [ASK] means unknown/unspecified — the phone UI
+ * skips the profile label and copy defaults to "current profile," per that
+ * spec section.
+ */
+enum class MobileProfile { PERSONAL, WORK, ASK }
+
+/**
+ * Mirrors `choosh_protocol::host_rpc::WireResource` — one devhost-scoped,
+ * confirmed/listed Resource, per [ChooshEngine.resourceList]. `pattern ==
+ * null` is `resources-and-reauth.md`'s "Non-reauth Resources" case (e.g. a
+ * second EC2 test host) — the Resources screen shows "connection" for it,
+ * not a re-auth pattern label.
+ */
+data class Resource(
+    val resourceId: String,
+    val displayName: String,
+    val resourceKind: String,
+    val pattern: ResourcePattern?,
+    val mobileProfile: MobileProfile,
+    /** `"operator"` or `"agent:<id>"` — audit metadata only, per `WireResource.created_by`'s own doc comment; not a trust signal. */
+    val createdBy: String,
+    val lastUsedAt: String?,
+    val lastVerifiedAt: String?,
+)
+
+/** Outcome of [ChooshEngine.resourcePropose] — a typed success/failure, matching [CreateItemResult]'s existing "expected outcome, not an exception" posture for a `hostd`-side RPC that can genuinely be rejected. */
+sealed interface ResourceProposeResult {
+    /** `resourceId` names a *pending* proposal — not yet a real, listed [Resource] until [ChooshEngine.resourceConfirm] approves it. */
+    data class Success(val resourceId: String) : ResourceProposeResult
+    data class Failure(val message: String) : ResourceProposeResult
+}
+
+/** Outcome of [ChooshEngine.resourceConfirm]. */
+sealed interface ResourceConfirmResult {
+    /** [resource] is non-null only when `approve = true` resolved to a genuinely new, listed [Resource]. */
+    data class Success(val resource: Resource?) : ResourceConfirmResult
+    data class Failure(val message: String) : ResourceConfirmResult
+}

@@ -37,6 +37,9 @@ pub mod pty;
 mod readiness;
 pub mod registry;
 mod relay_client;
+mod resource_kinds;
+pub mod resource_reauth;
+pub mod resources;
 pub mod rpc;
 pub mod serve;
 mod ssh_keys;
@@ -237,7 +240,13 @@ async fn run_service_run(
     }
 
     let device_id = serve::best_effort_device_id();
-    let ctx = serve::build_rpc_context(&device_id).map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
+    // `service run` is a one-shot CLI invocation, not the resident `serve`
+    // daemon — see `dev_exec::run`'s identical reasoning for why a
+    // throwaway `agent_event_tx` (receiver immediately dropped) is
+    // sufficient here.
+    let (agent_event_tx, _agent_event_rx) = tokio::sync::mpsc::channel(1);
+    let ctx =
+        serve::build_rpc_context(&device_id, agent_event_tx).map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
 
     let workspace_id = {
         let registry = ctx.registry.lock().await;

@@ -5,7 +5,7 @@
 
 use choosh_android_transport::{AgentEventPush, CallError, ConnectError, PhoneConnection, PtyTunnelHandle, WebTunnelHandle};
 use choosh_protocol::host_rpc::{AgentKind, ByteRange, ItemType, RpcRequest, RpcResponse};
-use choosh_protocol::relay::AgentEventsResumeResponse;
+use choosh_protocol::relay::{AgentEventsResumeResponse, WireMobileProfile, WireResourcePattern};
 use serde::Serialize;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -568,6 +568,124 @@ impl Engine {
         }
     }
 
+    /// `docs/specs/resources-and-reauth.md`'s `resource.list` — every
+    /// confirmed, listed Resource on `target_device_id` (never a pending,
+    /// unconfirmed proposal — see `RpcRequest::ResourceList`'s own doc
+    /// comment). Returns `WireResource`'s array as a bare JSON array, same
+    /// convention as [`Self::project_list`]/[`Self::workspace_list`].
+    pub async fn resource_list(&self, target_device_id: &str) -> String {
+        let request = RpcRequest::ResourceList { request_id: new_request_id() };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::ResourceListOk { resources, .. }) => to_json(&resources),
+            Ok(other) => unexpected_or_error_json("resource.list", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// `resource.propose` — declares a new Resource. Per
+    /// `RpcRequest::ResourcePropose`'s own doc comment, this does NOT
+    /// itself create a real, listed Resource: the returned `resource_id`
+    /// names a *pending* proposal, only promoted to a listed Resource by a
+    /// later [`Self::resource_confirm`]. Used both by this app's own
+    /// "declare a Resource directly" form (skipping the agent-initiated
+    /// `input_required`/`Elicitation` round trip) and, indirectly, by
+    /// whatever `hostd`-side path an agent's own proposal takes — this
+    /// method itself has no opinion on which triggered it.
+    ///
+    /// `pattern`/`reauth_command` empty means "omitted" (`None`), matching
+    /// this module's existing `none_if_empty` convention. An unparseable
+    /// non-empty `pattern`/`mobile_profile` string is reported as this
+    /// module's shared `{"error": ...}` shape rather than silently
+    /// defaulting to some pattern/profile the caller didn't ask for.
+    /// Returns `{"resource_id": "..."}` on success.
+    pub async fn resource_propose(
+        &self,
+        target_device_id: &str,
+        display_name: &str,
+        resource_kind: &str,
+        pattern: &str,
+        reauth_command: &str,
+        mobile_profile: &str,
+    ) -> String {
+        let pattern = match none_if_empty(pattern) {
+            None => None,
+            Some(raw) => match parse_resource_pattern(&raw) {
+                Some(parsed) => Some(parsed),
+                None => return error_json(&format!("invalid pattern: {raw}")),
+            },
+        };
+        let Some(mobile_profile) = parse_mobile_profile(mobile_profile) else {
+            return error_json(&format!("invalid mobile_profile: {mobile_profile}"));
+        };
+        let request = RpcRequest::ResourcePropose {
+            request_id: new_request_id(),
+            display_name: display_name.to_string(),
+            resource_kind: resource_kind.to_string(),
+            pattern,
+            reauth_command: none_if_empty(reauth_command),
+            mobile_profile,
+        };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::ResourceProposeOk { resource_id, .. }) => json!({ "resource_id": resource_id }).to_string(),
+            Ok(other) => unexpected_or_error_json("resource.propose", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// `resource.confirm` — the human's approve/reject answer to a pending
+    /// [`Self::resource_propose`] (whether it originated from this app's own
+    /// form or an agent's `input_required`/`Elicitation` proposal). Returns
+    /// `{"resource": <WireResource-or-null>}` — non-null only when
+    /// `approve` resolved to a genuinely new, listed Resource
+    /// (`RpcResponse::ResourceConfirmOk`'s own doc comment); `approve:
+    /// false` simply discards the proposal, returning `{"resource": null}`.
+    pub async fn resource_confirm(&self, target_device_id: &str, resource_id: &str, approve: bool) -> String {
+        let request = RpcRequest::ResourceConfirm { request_id: new_request_id(), resource_id: resource_id.to_string(), approve };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::ResourceConfirmOk { resource, .. }) => json!({ "resource": resource }).to_string(),
+            Ok(other) => unexpected_or_error_json("resource.confirm", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// `resource.reauth_start` — proactively starts a Resource's re-auth as
+    /// a `hostd`-managed subprocess (patterns c/d always; a/b only when not
+    /// already detected mid-task in someone else's PTY). The actual
+    /// url/code/instructions arrive later as a
+    /// `WireAgentEvent::ResourceReauthRequired` push, never in this call's
+    /// own response (`RpcRequest::ResourceReauthStart`'s own doc comment).
+    /// Returns `{"ok":true}` on success, mirroring
+    /// [`Self::project_set_primary_workspace`]'s "small confirmation
+    /// payload" style.
+    pub async fn resource_reauth_start(&self, target_device_id: &str, resource_id: &str) -> String {
+        let request = RpcRequest::ResourceReauthStart { request_id: new_request_id(), resource_id: resource_id.to_string() };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::ResourceReauthStartOk { .. }) => json!({ "ok": true }).to_string(),
+            Ok(other) => unexpected_or_error_json("resource.reauth_start", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
+    /// `resource.reauth_complete` — hands back whatever value the phone's
+    /// human obtained: a pasted code (patterns b/d) or a fetched secret
+    /// (pattern c). Never valid for pattern a, which resolves on its own
+    /// with nothing typed back (`RpcRequest::ResourceReauthComplete`'s own
+    /// doc comment) — this method itself doesn't enforce that; a caller
+    /// sending it for pattern a is `hostd`'s rejection to make. Returns
+    /// `{"verified": bool}`.
+    pub async fn resource_reauth_complete(&self, target_device_id: &str, resource_id: &str, value: &str) -> String {
+        let request = RpcRequest::ResourceReauthComplete {
+            request_id: new_request_id(),
+            resource_id: resource_id.to_string(),
+            value: value.to_string(),
+        };
+        match self.call_jj_rpc(target_device_id, request).await {
+            Ok(RpcResponse::ResourceReauthCompleteOk { verified, .. }) => json!({ "verified": verified }).to_string(),
+            Ok(other) => unexpected_or_error_json("resource.reauth_complete", &other),
+            Err(message) => error_json(&message),
+        }
+    }
+
     /// Opens a `"pty:<item_id>"`-purpose tunnel for the terminal renderer.
     ///
     /// # Errors
@@ -1046,6 +1164,32 @@ fn parse_agent_kind(value: &str) -> Option<AgentKind> {
     }
 }
 
+/// Parses `Engine::resource_propose`'s `pattern` string into
+/// [`WireResourcePattern`]'s exact `lowercase` wire tag — the same string
+/// [`choosh_protocol::relay::WireResourcePattern`]'s `Serialize` impl
+/// produces, so this is the inverse of what a caller reading a
+/// `resource.list`/`resource_reauth_required` JSON payload already sees.
+fn parse_resource_pattern(value: &str) -> Option<WireResourcePattern> {
+    match value {
+        "a" => Some(WireResourcePattern::A),
+        "b" => Some(WireResourcePattern::B),
+        "c" => Some(WireResourcePattern::C),
+        "d" => Some(WireResourcePattern::D),
+        _ => None,
+    }
+}
+
+/// Parses `Engine::resource_propose`'s `mobile_profile` string into
+/// [`WireMobileProfile`]'s exact `snake_case` wire tag.
+fn parse_mobile_profile(value: &str) -> Option<WireMobileProfile> {
+    match value {
+        "personal" => Some(WireMobileProfile::Personal),
+        "work" => Some(WireMobileProfile::Work),
+        "ask" => Some(WireMobileProfile::Ask),
+        _ => None,
+    }
+}
+
 /// Clamps a Kotlin-supplied `Long` limit to a sane, positive `usize` —
 /// negative/zero/absurdly large inputs from the JNI boundary get a safe
 /// default rather than panicking on the `i64`->`usize` conversion.
@@ -1264,6 +1408,47 @@ mod tests {
     #[tokio::test]
     async fn project_set_primary_workspace_before_connect_is_a_typed_error() {
         assert_error_json_mentions_not_connected(&unconnected_engine().project_set_primary_workspace("dev-1", "proj-1", "ws-1").await);
+    }
+
+    #[tokio::test]
+    async fn resource_list_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().resource_list("dev-1").await);
+    }
+
+    #[tokio::test]
+    async fn resource_propose_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(
+            &unconnected_engine().resource_propose("dev-1", "Prod AWS SSO", "aws-sso", "a", "aws sso login", "work").await,
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_propose_rejects_an_invalid_pattern_before_touching_the_connection() {
+        let body = unconnected_engine().resource_propose("dev-1", "x", "custom", "not-a-real-pattern", "", "ask").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("invalid pattern"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn resource_propose_rejects_an_invalid_mobile_profile_before_touching_the_connection() {
+        let body = unconnected_engine().resource_propose("dev-1", "x", "custom", "", "", "not-a-real-profile").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("invalid mobile_profile"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn resource_confirm_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().resource_confirm("dev-1", "res-1", true).await);
+    }
+
+    #[tokio::test]
+    async fn resource_reauth_start_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().resource_reauth_start("dev-1", "res-1").await);
+    }
+
+    #[tokio::test]
+    async fn resource_reauth_complete_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().resource_reauth_complete("dev-1", "res-1", "123456").await);
     }
 
     #[tokio::test]
@@ -1929,6 +2114,187 @@ mod tests {
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed[0]["workspace_id"], "ws-1");
         assert_eq!(parsed[0]["project_id"], "proj-1");
+    }
+
+    /// `resource.list`'s happy path — a bare `WireResource` JSON array, same
+    /// "no wrapper object" convention as `project_list`/`workspace_list`.
+    #[tokio::test]
+    async fn resource_list_round_trips_resources() {
+        use choosh_protocol::host_rpc::WireResource;
+
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ResourceList { request_id } = request else { panic!("expected resource.list") };
+            RpcResponse::ResourceListOk {
+                request_id,
+                resources: vec![WireResource {
+                    resource_id: "res-1".to_string(),
+                    display_name: "Prod AWS SSO".to_string(),
+                    resource_kind: "aws-sso".to_string(),
+                    pattern: Some(WireResourcePattern::A),
+                    mobile_profile: WireMobileProfile::Work,
+                    created_by: "operator".to_string(),
+                    last_used_at: None,
+                    last_verified_at: Some("2026-08-01T00:00:00Z".to_string()),
+                }],
+            }
+        })
+        .await;
+
+        let body = engine.resource_list("dev-1").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed[0]["resource_id"], "res-1");
+        assert_eq!(parsed[0]["pattern"], "a");
+        assert_eq!(parsed[0]["mobile_profile"], "work");
+        assert!(parsed[0]["last_used_at"].is_null());
+    }
+
+    /// `resource.propose`'s happy path — proves `pattern`/`mobile_profile`
+    /// are parsed from Kotlin-facing `lowercase`/`snake_case` strings into the
+    /// exact wire enum variants, and that the *pending* `resource_id`
+    /// (never yet a listed Resource) comes back.
+    #[tokio::test]
+    async fn resource_propose_round_trips_a_pending_resource_id() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ResourcePropose { request_id, display_name, resource_kind, pattern, reauth_command, mobile_profile } = request
+            else {
+                panic!("expected resource.propose")
+            };
+            assert_eq!(display_name, "Prod AWS SSO");
+            assert_eq!(resource_kind, "aws-sso");
+            assert_eq!(pattern, Some(WireResourcePattern::A));
+            assert_eq!(reauth_command, Some("aws sso login --profile prod --no-browser".to_string()));
+            assert_eq!(mobile_profile, WireMobileProfile::Work);
+            RpcResponse::ResourceProposeOk { request_id, resource_id: "res-pending-1".to_string() }
+        })
+        .await;
+
+        let body = engine
+            .resource_propose("dev-1", "Prod AWS SSO", "aws-sso", "a", "aws sso login --profile prod --no-browser", "work")
+            .await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["resource_id"], "res-pending-1");
+    }
+
+    /// `pattern: ""`/`reauth_command: ""` (Kotlin's "omitted" convention,
+    /// per `none_if_empty`) round-trip as `None` on the wire, for a
+    /// non-reauth Resource (a second EC2 test host, per
+    /// resources-and-reauth.md's "Non-reauth Resources").
+    #[tokio::test]
+    async fn resource_propose_treats_empty_pattern_and_reauth_command_as_omitted() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ResourcePropose { request_id, pattern, reauth_command, .. } = request else { panic!("expected resource.propose") };
+            assert_eq!(pattern, None);
+            assert_eq!(reauth_command, None);
+            RpcResponse::ResourceProposeOk { request_id, resource_id: "res-pending-2".to_string() }
+        })
+        .await;
+
+        let body = engine.resource_propose("dev-1", "Test EC2 host", "custom", "", "", "ask").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["resource_id"], "res-pending-2");
+    }
+
+    /// `resource.confirm`'s `approve: true` path — the now-listed
+    /// `WireResource` comes back non-null.
+    #[tokio::test]
+    async fn resource_confirm_round_trips_the_newly_listed_resource_on_approve() {
+        use choosh_protocol::host_rpc::WireResource;
+
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ResourceConfirm { request_id, resource_id, approve } = request else { panic!("expected resource.confirm") };
+            assert_eq!(resource_id, "res-pending-1");
+            assert!(approve);
+            RpcResponse::ResourceConfirmOk {
+                request_id,
+                resource: Some(WireResource {
+                    resource_id: "res-pending-1".to_string(),
+                    display_name: "Prod AWS SSO".to_string(),
+                    resource_kind: "aws-sso".to_string(),
+                    pattern: Some(WireResourcePattern::A),
+                    mobile_profile: WireMobileProfile::Work,
+                    created_by: "operator".to_string(),
+                    last_used_at: None,
+                    last_verified_at: None,
+                }),
+            }
+        })
+        .await;
+
+        let body = engine.resource_confirm("dev-1", "res-pending-1", true).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["resource"]["resource_id"], "res-pending-1");
+    }
+
+    /// `resource.confirm`'s `approve: false` path — `resource: null`,
+    /// nothing was persisted, per `ResourceConfirmOk`'s own doc comment.
+    #[tokio::test]
+    async fn resource_confirm_round_trips_null_resource_on_reject() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ResourceConfirm { request_id, approve, .. } = request else { panic!("expected resource.confirm") };
+            assert!(!approve);
+            RpcResponse::ResourceConfirmOk { request_id, resource: None }
+        })
+        .await;
+
+        let body = engine.resource_confirm("dev-1", "res-pending-1", false).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["resource"].is_null(), "{body}");
+    }
+
+    /// `resource.reauth_start`'s happy path — a bare acknowledgement; the
+    /// real url/code arrives later as a `ResourceReauthRequired` agent-event
+    /// push, not in this response, per `ResourceReauthStartOk`'s own doc
+    /// comment.
+    #[tokio::test]
+    async fn resource_reauth_start_round_trips_ok() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ResourceReauthStart { request_id, resource_id } = request else { panic!("expected resource.reauth_start") };
+            assert_eq!(resource_id, "res-1");
+            RpcResponse::ResourceReauthStartOk { request_id }
+        })
+        .await;
+
+        let body = engine.resource_reauth_start("dev-1", "res-1").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["ok"], true);
+    }
+
+    /// `resource.reauth_complete`'s happy path — `verified` survives
+    /// untouched in both directions (true and false), the phone-supplied
+    /// `value` is forwarded verbatim.
+    #[tokio::test]
+    async fn resource_reauth_complete_round_trips_verified_true_and_false() {
+        for verified in [true, false] {
+            let engine = connect_and_serve_one_rpc(move |request| {
+                let RpcRequest::ResourceReauthComplete { request_id, resource_id, value } = request else {
+                    panic!("expected resource.reauth_complete")
+                };
+                assert_eq!(resource_id, "res-1");
+                assert_eq!(value, "123456");
+                RpcResponse::ResourceReauthCompleteOk { request_id, verified }
+            })
+            .await;
+
+            let body = engine.resource_reauth_complete("dev-1", "res-1", "123456").await;
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["verified"], verified, "{body}");
+        }
+    }
+
+    /// A `hostd`-side rejection surfaces as this module's shared
+    /// `{"error": "<code>: <message>"}` shape, same as every other RPC
+    /// method's `unexpected_or_error_json` fallback.
+    #[tokio::test]
+    async fn resource_confirm_reports_a_hostd_side_rejection() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ResourceConfirm { request_id, .. } = request else { panic!("expected resource.confirm") };
+            RpcResponse::Error { request_id, code: "not_found".to_string(), message: "no such pending proposal".to_string() }
+        })
+        .await;
+
+        let body = engine.resource_confirm("dev-1", "res-missing", true).await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "not_found: no such pending proposal", "{body}");
     }
 
     /// `workspace.tree.list`'s happy path, proving the

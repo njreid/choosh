@@ -515,6 +515,110 @@ fn native_agent_events_resume<'local>(
     JString::new(env, body)
 }
 
+// `target_device_id` stays `JString<'local>` by value to match
+// `native_method!`'s macro-generated wrapper — see `native_init`'s comment.
+#[allow(clippy::needless_pass_by_value)]
+fn native_resource_list<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    target_device_id: JString<'local>,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let target_device_id = jstring_to_string(env, &target_device_id)?;
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| h.runtime.block_on(h.engine.resource_list(&target_device_id)));
+    JString::new(env, body)
+}
+
+// `target_device_id`/`display_name`/`resource_kind`/`pattern`/`reauth_command`/
+// `mobile_profile` all stay `JString<'local>` by value to match
+// `native_method!`'s macro-generated wrapper — see `native_init`'s comment.
+// Empty `pattern`/`reauth_command` means "omitted", per
+// `Engine::resource_propose`'s `none_if_empty` convention.
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)] // matches the RPC's own field count, same posture as native_save_document
+fn native_resource_propose<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    target_device_id: JString<'local>,
+    display_name: JString<'local>,
+    resource_kind: JString<'local>,
+    pattern: JString<'local>,
+    reauth_command: JString<'local>,
+    mobile_profile: JString<'local>,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let target_device_id = jstring_to_string(env, &target_device_id)?;
+    let display_name = jstring_to_string(env, &display_name)?;
+    let resource_kind = jstring_to_string(env, &resource_kind)?;
+    let pattern = jstring_to_string(env, &pattern)?;
+    let reauth_command = jstring_to_string(env, &reauth_command)?;
+    let mobile_profile = jstring_to_string(env, &mobile_profile)?;
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| {
+        h.runtime.block_on(h.engine.resource_propose(&target_device_id, &display_name, &resource_kind, &pattern, &reauth_command, &mobile_profile))
+    });
+    JString::new(env, body)
+}
+
+// `target_device_id`/`resource_id` stay `JString<'local>` by value to match
+// `native_method!`'s macro-generated wrapper — see `native_init`'s comment.
+#[allow(clippy::needless_pass_by_value)]
+fn native_resource_confirm<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    target_device_id: JString<'local>,
+    resource_id: JString<'local>,
+    approve: jboolean,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let target_device_id = jstring_to_string(env, &target_device_id)?;
+    let resource_id = jstring_to_string(env, &resource_id)?;
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| {
+        h.runtime.block_on(h.engine.resource_confirm(&target_device_id, &resource_id, approve))
+    });
+    JString::new(env, body)
+}
+
+// `target_device_id`/`resource_id` stay `JString<'local>` by value to match
+// `native_method!`'s macro-generated wrapper — see `native_init`'s comment.
+#[allow(clippy::needless_pass_by_value)]
+fn native_resource_reauth_start<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    target_device_id: JString<'local>,
+    resource_id: JString<'local>,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let target_device_id = jstring_to_string(env, &target_device_id)?;
+    let resource_id = jstring_to_string(env, &resource_id)?;
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| {
+        h.runtime.block_on(h.engine.resource_reauth_start(&target_device_id, &resource_id))
+    });
+    JString::new(env, body)
+}
+
+// `target_device_id`/`resource_id`/`value` all stay `JString<'local>` by
+// value to match `native_method!`'s macro-generated wrapper — see
+// `native_init`'s comment. `value` is the phone-supplied secret/code — see
+// `Engine::resource_reauth_complete`'s doc comment on why this MUST never be
+// logged/persisted past this single call.
+#[allow(clippy::needless_pass_by_value)]
+fn native_resource_reauth_complete<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    target_device_id: JString<'local>,
+    resource_id: JString<'local>,
+    value: JString<'local>,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let target_device_id = jstring_to_string(env, &target_device_id)?;
+    let resource_id = jstring_to_string(env, &resource_id)?;
+    let value = jstring_to_string(env, &value)?;
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| {
+        h.runtime.block_on(h.engine.resource_reauth_complete(&target_device_id, &resource_id, &value))
+    });
+    JString::new(env, body)
+}
+
 /// Fulfills a `WebAuthn` registration ceremony in-process via
 /// [`dev_passkey::register`] instead of Android's platform Credential
 /// Manager — see that module's doc comment for the full "debug builds
@@ -682,6 +786,31 @@ const _AGENT_EVENTS_RESUME: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",
     static extern fn NativeBridge::native_agent_events_resume(handle: jlong, target_device_id: JString, workspace_id: JString, after_sequence: jlong) -> JString,
     fn = native_agent_events_resume,
+};
+const _RESOURCE_LIST: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_resource_list(handle: jlong, target_device_id: JString) -> JString,
+    fn = native_resource_list,
+};
+const _RESOURCE_PROPOSE: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_resource_propose(handle: jlong, target_device_id: JString, display_name: JString, resource_kind: JString, pattern: JString, reauth_command: JString, mobile_profile: JString) -> JString,
+    fn = native_resource_propose,
+};
+const _RESOURCE_CONFIRM: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_resource_confirm(handle: jlong, target_device_id: JString, resource_id: JString, approve: jboolean) -> JString,
+    fn = native_resource_confirm,
+};
+const _RESOURCE_REAUTH_START: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_resource_reauth_start(handle: jlong, target_device_id: JString, resource_id: JString) -> JString,
+    fn = native_resource_reauth_start,
+};
+const _RESOURCE_REAUTH_COMPLETE: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_resource_reauth_complete(handle: jlong, target_device_id: JString, resource_id: JString, value: JString) -> JString,
+    fn = native_resource_reauth_complete,
 };
 #[cfg(feature = "dev-passkey")]
 const _DEV_PASSKEY_REGISTER: jni::NativeMethod = native_method! {

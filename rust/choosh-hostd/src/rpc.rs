@@ -16,6 +16,7 @@ use choosh_protocol::host_rpc::{
     MAX_FILE_READ_RANGE_BYTES, MAX_TREE_LIST_PAGE, OperationLogEntry, ProjectSource, ProjectSummary, RpcRequest, RpcResponse,
     WorkspaceSummary,
 };
+use choosh_protocol::relay::{WireAgentEvent, WireInputReason, WireMobileProfile, WireResourcePattern};
 use tokio::sync::Mutex;
 
 use crate::agent_launch::agent_launch_argv;
@@ -24,6 +25,8 @@ use crate::jj_ops::{self, JjError};
 use crate::mise_ops::{self, MiseError};
 use crate::readiness;
 use crate::registry::{Registry, RegistryError};
+use crate::resource_reauth::{ReauthError, ReauthProcesses};
+use crate::resources::{ResourceRegistry, ResourceRegistryError};
 use crate::zellij_ops::{self, ZellijError};
 
 pub struct RpcContext {
@@ -53,6 +56,22 @@ pub struct RpcContext {
     /// `SshBridgeConfig::mise_host_tools_dir` (host-managed tools) uses, per
     /// toolchain-provisioning.md's tier-isolation requirement.
     pub mise_project_tools_dir: PathBuf,
+    /// `docs/specs/resources-and-reauth.md`'s `Resource` registry —
+    /// `Arc`-wrapped for the same reason `registry` is: `serve.rs`'s
+    /// `open_pty_tunnel` pty-reading task also needs a handle to it (to
+    /// attribute a passive pattern-a detection to a registered Resource),
+    /// outliving any single RPC dispatch call.
+    pub resources: Arc<Mutex<ResourceRegistry>>,
+    /// `resource.propose`'s `input_required`/`Elicitation` round trip (see
+    /// `handle_resource_propose`'s doc comment) needs to push a
+    /// `WireAgentEvent` the same way `hooks.rs`/`local_ipc.rs`/`ssh_server.rs`
+    /// already do — this is the same channel `serve.rs::run` wires every
+    /// one of those into, just also handed to `RpcContext` so `rpc::dispatch`
+    /// can be a producer too. Cloning a `Sender` is cheap (an `Arc` internally).
+    pub agent_event_tx: tokio::sync::mpsc::Sender<WireAgentEvent>,
+    /// In-flight pattern-b/d managed subprocesses for `resource.reauth_start`/
+    /// `resource.reauth_complete` — see `resource_reauth.rs`.
+    pub reauth_processes: ReauthProcesses,
 }
 
 /// # Panics
@@ -97,6 +116,15 @@ pub async fn dispatch(ctx: &RpcContext, request: RpcRequest) -> RpcResponse {
         RpcRequest::ProjectList { .. } => handle_project_list(ctx, request_id).await,
         RpcRequest::ProjectSetPrimaryWorkspace { project_id, workspace_id, .. } => {
             handle_project_set_primary_workspace(ctx, request_id, &project_id, &workspace_id).await
+        }
+        RpcRequest::ResourceList { .. } => handle_resource_list(ctx, request_id).await,
+        RpcRequest::ResourcePropose { display_name, resource_kind, pattern, reauth_command, mobile_profile, .. } => {
+            handle_resource_propose(ctx, request_id, display_name, resource_kind, pattern, reauth_command, mobile_profile).await
+        }
+        RpcRequest::ResourceConfirm { resource_id, approve, .. } => handle_resource_confirm(ctx, request_id, &resource_id, approve).await,
+        RpcRequest::ResourceReauthStart { resource_id, .. } => handle_resource_reauth_start(ctx, request_id, &resource_id).await,
+        RpcRequest::ResourceReauthComplete { resource_id, value, .. } => {
+            handle_resource_reauth_complete(ctx, request_id, &resource_id, &value).await
         }
     }
 }
@@ -330,6 +358,14 @@ async fn create_agent_workspace(
 /// performs for every other root-confined path in this crate; see that
 /// function's own doc comment and `confine_rejects_a_symlink_escaping_the_root`
 /// for the same guarantee proven against it directly).
+// `RpcResponse`'s own largest variant (`ResourceConfirmOk`'s inlined
+// `Option<WireResource>`, per `resources-and-reauth.md`) grew this enum
+// past clippy's default `result_large_err` threshold — `RpcResponse` is a
+// `choosh-protocol` wire type this crate doesn't own and every other
+// `Result<_, RpcResponse>`-returning helper in this module already shares
+// the same shape, so boxing it here alone wouldn't be consistent with the
+// rest of the module and isn't this function's call to make.
+#[allow(clippy::result_large_err)]
 fn confine_workspaces_dir(ctx: &RpcContext, existing_path: &str) -> Result<PathBuf, RpcResponse> {
     if existing_path.starts_with('/') || existing_path.split('/').any(|s| s == "..") {
         // An absolute path is meaningful here (unlike fs_ops::confine's
@@ -585,6 +621,145 @@ async fn handle_project_set_primary_workspace(
         Err(RegistryError::WorkspaceNotInProject { .. }) => {
             error(request_id, "invalid_argument", "workspace_id does not belong to project_id")
         }
+        Err(other) => error(request_id, "internal", other.to_string()),
+    }
+}
+
+async fn handle_resource_list(ctx: &RpcContext, request_id: String) -> RpcResponse {
+    let resources = ctx.resources.lock().await;
+    RpcResponse::ResourceListOk { request_id, resources: resources.list().iter().map(crate::resources::Resource::to_wire).collect() }
+}
+
+/// `docs/specs/resources-and-reauth.md`'s "Agent-declared resources"
+/// mechanism: `resource.propose` stores a [`crate::resources::PendingProposal`]
+/// (never a real, listed Resource — see `ResourceRegistry::propose`'s own
+/// doc comment) and surfaces it to the human as a
+/// `WireAgentEvent::InputRequired { reason: Elicitation, .. }`, reusing the
+/// same "ask a human a question" mechanism `hooks.rs`/`local_ipc.rs` already
+/// drive from a running agent's own hook events, per the spec's explicit
+/// choice to reuse that mechanism rather than invent a second one.
+///
+/// **Design call this task's brief flagged as unresolved, made explicit
+/// here**: `InputRequired` is normally workspace/item-scoped (every other
+/// producer of it — `hooks.rs::to_wire_event`, `local_ipc.rs` — has a real
+/// `workspace_id`/`item_id` from the agent hook that triggered it), but a
+/// Resource is devhost-scoped, not attached to any single workspace or
+/// item (`WireAgentEvent::ResourceReauthRequired` itself carries neither,
+/// for the same reason). There is no existing mechanism in this codebase
+/// for a devhost-scoped elicitation, and adding one (a new
+/// `WireAgentEvent` variant, or making `workspace_id`/`item_id` optional on
+/// `InputRequired`) would be a `choosh-protocol` wire-format change, out of
+/// scope for this crate-only task. Rather than block on that, this uses a
+/// fixed, documented sentinel `workspace_id` (`RESOURCE_PROPOSAL_WORKSPACE_ID`,
+/// below — not a real, registered Workspace; real ones are always minted as
+/// `format!("ws-{}", Uuid::new_v4())`, per `handle_create`, so this literal
+/// can never collide with one) and an `item_id` that embeds the proposal id
+/// (`format!("resource-proposal:{proposal_id}")`) so a phone client can
+/// still recognize and route this specific elicitation without needing a
+/// real item to exist. This does mean a `resource.propose` event is
+/// sequenced/spooled under this one shared pseudo-workspace bucket
+/// (`agent_event_spool.rs`'s per-workspace spool, keyed by
+/// `WireAgentEvent::workspace_id()`) rather than under no workspace at all
+/// the way `ResourceReauthRequired` is — an acceptable, narrow consequence
+/// of reusing `InputRequired` as-is rather than changing its wire shape.
+#[allow(clippy::too_many_arguments)]
+async fn handle_resource_propose(
+    ctx: &RpcContext,
+    request_id: String,
+    display_name: String,
+    resource_kind: String,
+    pattern: Option<WireResourcePattern>,
+    reauth_command: Option<String>,
+    mobile_profile: WireMobileProfile,
+) -> RpcResponse {
+    // `RpcRequest::ResourcePropose` carries no agent/operator identity on
+    // the wire at all (see `host_rpc.rs`'s field list) — and in this
+    // codebase's current architecture, an agent never calls an `RpcRequest`
+    // directly in the first place; it only ever reaches `choosh-hostd`
+    // through `local_ipc.rs`'s structured hook-event path
+    // (`hooks.rs::AgentEventKind`), which has no `resource.propose`
+    // equivalent. So every `resource.propose` that reaches this dispatch
+    // arrives over a `rpc`-purpose tunnel, which per `host-rpc.md`'s
+    // capability-scope rules is the human operator's own phone/laptop-proxy
+    // client — `created_by: "operator"` here is therefore not a guess, it's
+    // the only value this call site could honestly attribute, until a real
+    // agent-to-hostd RPC identity path exists (out of scope here).
+    const CREATED_BY: &str = "operator";
+    let proposal_id = {
+        let mut resources = ctx.resources.lock().await;
+        match resources.propose(display_name, resource_kind, pattern, reauth_command, mobile_profile, CREATED_BY.to_string()) {
+            Ok(id) => id,
+            Err(ResourceRegistryError::UnknownKind(kind)) => {
+                return error(request_id, "invalid_argument", format!("{kind:?} is not a built-in resource kind and is not \"custom\""));
+            }
+            Err(ResourceRegistryError::CustomPatternDUnsupported) => {
+                return error(request_id, "invalid_argument", ResourceRegistryError::CustomPatternDUnsupported.to_string());
+            }
+            Err(other) => return error(request_id, "internal", other.to_string()),
+        }
+    };
+    let event = WireAgentEvent::InputRequired {
+        workspace_id: RESOURCE_PROPOSAL_WORKSPACE_ID.to_string(),
+        item_id: format!("resource-proposal:{proposal_id}"),
+        reason: WireInputReason::Elicitation,
+    };
+    let _ = ctx.agent_event_tx.send(event).await;
+    RpcResponse::ResourceProposeOk { request_id, resource_id: proposal_id }
+}
+
+/// The sentinel `workspace_id` `handle_resource_propose`'s `InputRequired`
+/// event uses — see that function's doc comment. Never a real, registered
+/// Workspace: real ones are always `format!("ws-{}", Uuid::new_v4())`.
+const RESOURCE_PROPOSAL_WORKSPACE_ID: &str = "devhost";
+
+async fn handle_resource_confirm(ctx: &RpcContext, request_id: String, proposal_id: &str, approve: bool) -> RpcResponse {
+    let mut resources = ctx.resources.lock().await;
+    match resources.confirm(proposal_id, approve) {
+        Ok(resource) => RpcResponse::ResourceConfirmOk { request_id, resource: resource.as_ref().map(crate::resources::Resource::to_wire) },
+        Err(ResourceRegistryError::ProposalNotFound(_)) => error(request_id, "not_found", "resource_id is not a pending proposal"),
+        Err(other) => error(request_id, "internal", other.to_string()),
+    }
+}
+
+async fn handle_resource_reauth_start(ctx: &RpcContext, request_id: String, resource_id: &str) -> RpcResponse {
+    let resource = {
+        let resources = ctx.resources.lock().await;
+        let Some(resource) = resources.get(resource_id) else {
+            return error(request_id, "not_found", "resource_id is not a registered resource");
+        };
+        resource.clone()
+    };
+    match ctx.reauth_processes.start(&resource, ctx.agent_event_tx.clone()).await {
+        Ok(()) => RpcResponse::ResourceReauthStartOk { request_id },
+        Err(ReauthError::NotApplicable) => {
+            error(request_id, "invalid_argument", "this resource's pattern does not support resource.reauth_start (pattern a is only ever passively detected; a non-reauth resource has no pattern at all)")
+        }
+        Err(ReauthError::MissingCommand) => error(request_id, "invalid_argument", "this resource has no command configured for its pattern"),
+        Err(other) => error(request_id, "internal", other.to_string()),
+    }
+}
+
+async fn handle_resource_reauth_complete(ctx: &RpcContext, request_id: String, resource_id: &str, value: &str) -> RpcResponse {
+    let resource = {
+        let resources = ctx.resources.lock().await;
+        let Some(resource) = resources.get(resource_id) else {
+            return error(request_id, "not_found", "resource_id is not a registered resource");
+        };
+        resource.clone()
+    };
+    match ctx.reauth_processes.complete(&resource, value).await {
+        Ok(verified) => {
+            if verified {
+                let mut resources = ctx.resources.lock().await;
+                resources.mark_verified(resource_id, now_rfc3339());
+            }
+            RpcResponse::ResourceReauthCompleteOk { request_id, verified }
+        }
+        Err(ReauthError::NotApplicable) => {
+            error(request_id, "invalid_argument", "this resource's pattern does not support resource.reauth_complete")
+        }
+        Err(ReauthError::NoActiveReauth) => error(request_id, "conflict", "no in-progress reauth for this resource; call resource.reauth_start first"),
+        Err(ReauthError::MissingCommand) => error(request_id, "invalid_argument", "this resource has no command configured for its pattern"),
         Err(other) => error(request_id, "internal", other.to_string()),
     }
 }
@@ -1117,6 +1292,9 @@ mod tests {
             // passing on cargo-culted mocked behavior.
             mise_bin: "/nonexistent/choosh-hostd-tests-must-not-invoke-mise".to_string(),
             mise_project_tools_dir: dir.path().join("mise-project-tools"),
+            resources: Arc::new(Mutex::new(crate::resources::ResourceRegistry::load(&dir.path().join("resources.json")).unwrap())),
+            agent_event_tx: tokio::sync::mpsc::channel(16).0,
+            reauth_processes: crate::resource_reauth::ReauthProcesses::new(),
         };
         (dir, ctx)
     }
@@ -2716,5 +2894,141 @@ mod tests {
         .await;
         zellij_ops::kill_session(&name).await.ok();
         assert!(matches!(&not_found_response, RpcResponse::Error { code, .. } if code == "not_found"), "expected not_found, got {not_found_response:?}");
+    }
+
+    // --- `docs/specs/resources-and-reauth.md`'s RPC surface, end to end through `dispatch` ---
+
+    /// The full life cycle through real `dispatch` calls (not just
+    /// `resources.rs`'s own unit tests against `ResourceRegistry` directly):
+    /// `resource.propose` emits a real `InputRequired`/`Elicitation` event
+    /// and leaves `resource.list` empty; `resource.confirm` makes it real
+    /// and listed; `resource.reauth_start`/`resource.reauth_complete` for a
+    /// pattern-c resource round-trip through a real `sh` subprocess and
+    /// update `last_verified_at`.
+    #[tokio::test]
+    async fn resource_propose_confirm_list_and_reauth_round_trip_through_dispatch() {
+        let (_dir, ctx) = ctx_with_tempdir();
+        // `ctx_with_tempdir`'s own `agent_event_tx` has its receiver
+        // immediately dropped (most of this module's tests never touch
+        // Resources at all) — this test needs a live receiver to observe
+        // the events `resource.propose`/`resource.reauth_start` push.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ctx = RpcContext { agent_event_tx: tx, ..ctx };
+
+        let list_before = dispatch(&ctx, RpcRequest::ResourceList { request_id: "r0".to_string() }).await;
+        assert!(matches!(&list_before, RpcResponse::ResourceListOk { resources, .. } if resources.is_empty()));
+
+        let propose = dispatch(
+            &ctx,
+            RpcRequest::ResourcePropose {
+                request_id: "r1".to_string(),
+                display_name: "Twilio".to_string(),
+                resource_kind: "custom".to_string(),
+                pattern: Some(WireResourcePattern::C),
+                reauth_command: Some("read -r v; exit 0".to_string()),
+                mobile_profile: WireMobileProfile::Ask,
+            },
+        )
+        .await;
+        let RpcResponse::ResourceProposeOk { resource_id: proposal_id, .. } = propose else {
+            panic!("expected ResourceProposeOk, got {propose:?}")
+        };
+
+        let event = rx.try_recv().expect("resource.propose must emit an InputRequired event");
+        let WireAgentEvent::InputRequired { workspace_id, item_id, reason } = event else {
+            panic!("expected InputRequired, got {event:?}")
+        };
+        assert_eq!(workspace_id, "devhost");
+        assert_eq!(item_id, format!("resource-proposal:{proposal_id}"));
+        assert_eq!(reason, WireInputReason::Elicitation);
+
+        let list_still_empty = dispatch(&ctx, RpcRequest::ResourceList { request_id: "r2".to_string() }).await;
+        assert!(
+            matches!(&list_still_empty, RpcResponse::ResourceListOk { resources, .. } if resources.is_empty()),
+            "an unconfirmed proposal must never appear in resource.list"
+        );
+
+        let confirm = dispatch(&ctx, RpcRequest::ResourceConfirm { request_id: "r3".to_string(), resource_id: proposal_id.clone(), approve: true }).await;
+        let RpcResponse::ResourceConfirmOk { resource: Some(resource), .. } = confirm else {
+            panic!("expected ResourceConfirmOk with a resource, got {confirm:?}")
+        };
+        assert_eq!(resource.display_name, "Twilio");
+        assert_eq!(resource.last_verified_at, None);
+
+        let list_after = dispatch(&ctx, RpcRequest::ResourceList { request_id: "r4".to_string() }).await;
+        let RpcResponse::ResourceListOk { resources, .. } = list_after else { panic!("expected ResourceListOk") };
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].resource_id, resource.resource_id);
+
+        let start = dispatch(&ctx, RpcRequest::ResourceReauthStart { request_id: "r5".to_string(), resource_id: resource.resource_id.clone() }).await;
+        assert!(matches!(start, RpcResponse::ResourceReauthStartOk { .. }), "expected ResourceReauthStartOk, got {start:?}");
+        let reauth_event = rx.try_recv().expect("pattern c must emit ResourceReauthRequired immediately, synchronously with reauth_start");
+        assert!(matches!(reauth_event, WireAgentEvent::ResourceReauthRequired { .. }), "expected ResourceReauthRequired, got {reauth_event:?}");
+
+        let complete = dispatch(
+            &ctx,
+            RpcRequest::ResourceReauthComplete { request_id: "r6".to_string(), resource_id: resource.resource_id.clone(), value: "the-secret".to_string() },
+        )
+        .await;
+        let RpcResponse::ResourceReauthCompleteOk { verified, .. } = complete else { panic!("expected ResourceReauthCompleteOk, got {complete:?}") };
+        assert!(verified, "the real `sh -c \"read -r v; exit 0\"` subprocess must exit 0 once fed a value");
+
+        let list_final = dispatch(&ctx, RpcRequest::ResourceList { request_id: "r7".to_string() }).await;
+        let RpcResponse::ResourceListOk { resources, .. } = list_final else { panic!("expected ResourceListOk") };
+        assert!(resources[0].last_verified_at.is_some(), "a verified resource.reauth_complete must update last_verified_at");
+        assert!(resources[0].last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn resource_confirm_of_an_unknown_proposal_is_not_found() {
+        let (_dir, ctx) = ctx_with_tempdir();
+        let response = dispatch(&ctx, RpcRequest::ResourceConfirm { request_id: "r1".to_string(), resource_id: "resprop-does-not-exist".to_string(), approve: true }).await;
+        assert!(matches!(&response, RpcResponse::Error { code, .. } if code == "not_found"), "expected not_found, got {response:?}");
+    }
+
+    #[tokio::test]
+    async fn resource_propose_of_an_unknown_kind_is_invalid_argument() {
+        let (_dir, ctx) = ctx_with_tempdir();
+        let response = dispatch(
+            &ctx,
+            RpcRequest::ResourcePropose {
+                request_id: "r1".to_string(),
+                display_name: "X".to_string(),
+                resource_kind: "not-a-real-kind".to_string(),
+                pattern: None,
+                reauth_command: None,
+                mobile_profile: WireMobileProfile::Ask,
+            },
+        )
+        .await;
+        assert!(matches!(&response, RpcResponse::Error { code, .. } if code == "invalid_argument"), "expected invalid_argument, got {response:?}");
+    }
+
+    /// Pattern a is only ever passively detected (this task's own build-time
+    /// simplification) — `resource.reauth_start` against a pattern-a
+    /// resource (e.g. a confirmed `github` Resource) must be rejected, not
+    /// silently accepted.
+    #[tokio::test]
+    async fn resource_reauth_start_rejects_a_pattern_a_resource() {
+        let (_dir, ctx) = ctx_with_tempdir();
+        let propose = dispatch(
+            &ctx,
+            RpcRequest::ResourcePropose {
+                request_id: "r1".to_string(),
+                display_name: "GH".to_string(),
+                resource_kind: "github".to_string(),
+                pattern: None,
+                reauth_command: None,
+                mobile_profile: WireMobileProfile::Ask,
+            },
+        )
+        .await;
+        let RpcResponse::ResourceProposeOk { resource_id: proposal_id, .. } = propose else { panic!("expected ResourceProposeOk") };
+        let confirm = dispatch(&ctx, RpcRequest::ResourceConfirm { request_id: "r2".to_string(), resource_id: proposal_id, approve: true }).await;
+        let RpcResponse::ResourceConfirmOk { resource: Some(resource), .. } = confirm else { panic!("expected ResourceConfirmOk with a resource") };
+        assert_eq!(resource.pattern, Some(WireResourcePattern::A));
+
+        let start = dispatch(&ctx, RpcRequest::ResourceReauthStart { request_id: "r3".to_string(), resource_id: resource.resource_id }).await;
+        assert!(matches!(&start, RpcResponse::Error { code, .. } if code == "invalid_argument"), "expected invalid_argument, got {start:?}");
     }
 }

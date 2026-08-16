@@ -492,6 +492,137 @@ class FakeChooshEngine : ChooshEngine {
         projectPrimaryOverrides[projectId] = workspaceId
     }
 
+    // --- docs/specs/resources-and-reauth.md fakes ---------------------------
+
+    /**
+     * Confirmed, listed Resources — seeded with one fixture per built-in
+     * reauth pattern (a/b/c/d) plus one non-reauth Resource (`pattern =
+     * null`), so [ai.choosh.resources.ResourcesScreen]/its ViewModel are
+     * exercisable against every row shape without a real backend.
+     */
+    private val resources = mutableListOf(
+        Resource(
+            resourceId = "res-aws-sso",
+            displayName = "Prod AWS SSO",
+            resourceKind = "aws-sso",
+            pattern = ResourcePattern.A,
+            mobileProfile = MobileProfile.WORK,
+            createdBy = "operator",
+            lastUsedAt = "2026-08-15T09:00:00Z",
+            lastVerifiedAt = "2026-08-15T09:00:05Z",
+        ),
+        Resource(
+            resourceId = "res-gcloud",
+            displayName = "Personal gcloud",
+            resourceKind = "gcloud",
+            pattern = ResourcePattern.B,
+            mobileProfile = MobileProfile.PERSONAL,
+            createdBy = "operator",
+            lastUsedAt = null,
+            lastVerifiedAt = null,
+        ),
+        Resource(
+            resourceId = "res-twilio",
+            displayName = "Twilio",
+            resourceKind = "custom",
+            pattern = ResourcePattern.C,
+            mobileProfile = MobileProfile.ASK,
+            createdBy = "agent:codex-1",
+            lastUsedAt = "2026-08-10T12:00:00Z",
+            lastVerifiedAt = "2026-08-10T12:00:30Z",
+        ),
+        Resource(
+            resourceId = "res-firebase",
+            displayName = "Firebase",
+            resourceKind = "firebase",
+            pattern = ResourcePattern.D,
+            mobileProfile = MobileProfile.ASK,
+            createdBy = "operator",
+            lastUsedAt = null,
+            lastVerifiedAt = null,
+        ),
+        Resource(
+            resourceId = "res-test-host",
+            displayName = "Second EC2 test host",
+            resourceKind = "custom",
+            pattern = null,
+            mobileProfile = MobileProfile.ASK,
+            createdBy = "operator",
+            lastUsedAt = "2026-08-14T00:00:00Z",
+            lastVerifiedAt = null,
+        ),
+    )
+
+    /** Pending, unconfirmed proposals awaiting [resourceConfirm] — never returned by [resourceList] until approved, mirroring `RpcRequest::ResourcePropose`'s own doc comment. */
+    private val pendingResourceProposals = mutableMapOf<String, Resource>()
+    private var resourceProposalCounter = 0
+
+    /** Set by a test to exercise [ResourceProposeResult.Failure]/[ResourceConfirmResult.Failure] without touching [connected]. */
+    var simulateResourceRpcFailure: String? = null
+
+    override suspend fun resourceList(deviceId: String): List<Resource> {
+        delay(FAKE_LATENCY_MS)
+        check(connected) { "resourceList() called before connect() succeeded" }
+        return resources.toList()
+    }
+
+    override suspend fun resourcePropose(
+        deviceId: String,
+        displayName: String,
+        resourceKind: String,
+        pattern: ResourcePattern?,
+        reauthCommand: String?,
+        mobileProfile: MobileProfile,
+    ): ResourceProposeResult {
+        delay(FAKE_LATENCY_MS)
+        simulateResourceRpcFailure?.let { message ->
+            simulateResourceRpcFailure = null
+            return ResourceProposeResult.Failure(message)
+        }
+        resourceProposalCounter += 1
+        val resourceId = "res-pending-$resourceProposalCounter"
+        pendingResourceProposals[resourceId] = Resource(
+            resourceId = resourceId,
+            displayName = displayName,
+            resourceKind = resourceKind,
+            pattern = pattern,
+            mobileProfile = mobileProfile,
+            createdBy = "operator",
+            lastUsedAt = null,
+            lastVerifiedAt = null,
+        )
+        return ResourceProposeResult.Success(resourceId = resourceId)
+    }
+
+    override suspend fun resourceConfirm(deviceId: String, resourceId: String, approve: Boolean): ResourceConfirmResult {
+        delay(FAKE_LATENCY_MS)
+        simulateResourceRpcFailure?.let { message ->
+            simulateResourceRpcFailure = null
+            return ResourceConfirmResult.Failure(message)
+        }
+        val proposal = pendingResourceProposals.remove(resourceId) ?: return ResourceConfirmResult.Failure("not_found: no such pending proposal")
+        if (!approve) return ResourceConfirmResult.Success(resource = null)
+        resources.add(proposal)
+        return ResourceConfirmResult.Success(resource = proposal)
+    }
+
+    /** Set by a test to exercise the `verified = false` path of [resourceReauthComplete] without touching [connected]. */
+    var simulateResourceReauthVerifiedFailure: Boolean = false
+
+    override suspend fun resourceReauthStart(deviceId: String, resourceId: String): Boolean {
+        delay(FAKE_LATENCY_MS)
+        return connected
+    }
+
+    override suspend fun resourceReauthComplete(deviceId: String, resourceId: String, value: String): Boolean {
+        delay(FAKE_LATENCY_MS)
+        if (simulateResourceReauthVerifiedFailure) {
+            simulateResourceReauthVerifiedFailure = false
+            return false
+        }
+        return connected && value.isNotEmpty()
+    }
+
     // --- docs/specs/agent-events.md fakes -----------------------------------
 
     /** Test/demo-injected live pushes, drained (in order) by [pollAgentEvents] — never populated on its own. */

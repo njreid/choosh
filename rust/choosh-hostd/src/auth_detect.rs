@@ -30,9 +30,9 @@
 //! `gcloud` device-login flows do not print anything this module's
 //! `(provider, user_code, verification_uri)` shape could ever hold, so a
 //! matcher here would necessarily be unverifiable scaffolding pretending to
-//! be a working detector. `WireAuthProvider::Gcp` remains a valid wire enum
-//! variant (owned by `choosh-protocol`, not this module) — it is simply
-//! never produced by this detector today.
+//! be a working detector. `"gcloud"` remains a valid built-in `resource_kind`
+//! (`resource_kinds.rs`, pattern b) — it is simply never a `DetectedProvider`
+//! this module's own detectors produce.
 //!
 //! **Extraction, not capture.** Every `detect_*` function returns only the
 //! three named fields, each independently bounds- and shape-checked before
@@ -44,7 +44,49 @@
 //! provider's real output puts anything else on that line. See this
 //! module's `no_leakage` test for a concrete adversarial case.
 
-use choosh_protocol::relay::{WireAgentEvent, WireAuthProvider};
+/// Which of this module's three real detectors matched — mirrors the
+/// `resource_kind` strings `resource_kinds.rs`'s built-in kind table uses
+/// (`"github"`, `"aws-sso"`, `"azure"`), kept as a small closed enum here
+/// (rather than a bare `&str`) so [`AuthCodeDetector::feed`]'s own
+/// `already_fired` re-emission suppression can cheaply `Eq`/`Hash` on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum DetectedProvider {
+    Github,
+    AwsSso,
+    Azure,
+}
+
+impl DetectedProvider {
+    /// The `resource_kind` string `resources.rs`'s built-in-kind lookup and
+    /// `WireAgentEvent::ResourceReauthRequired::resource_kind` use for this
+    /// provider.
+    #[must_use]
+    pub fn resource_kind(self) -> &'static str {
+        match self {
+            Self::Github => "github",
+            Self::AwsSso => "aws-sso",
+            Self::Azure => "azure",
+        }
+    }
+}
+
+/// One complete, validated pattern-a device-code prompt this module found
+/// in a pty's output stream. Deliberately **not** a `WireAgentEvent`: this
+/// module has no notion of Resources, registered or otherwise (see this
+/// module's own top-level doc comment — it is a pure text scanner and
+/// always has been). Turning this into the wire event
+/// `docs/specs/resources-and-reauth.md` defines — looking up a matching
+/// registered Resource for `resource_id`/`display_name`/`mobile_profile`,
+/// or synthesizing a transient one if none is registered yet — is
+/// `resources.rs`'s job (see its `event_for_pattern_a_detection`), not this
+/// one's. Kept as its own named type, not a bare tuple, so that boundary is
+/// explicit at every call site.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetectedPrompt {
+    pub provider: DetectedProvider,
+    pub user_code: String,
+    pub verification_uri: String,
+}
 
 /// Upper bound on how much recently-seen terminal text this detector keeps
 /// around across [`AuthCodeDetector::feed`] calls. Bounds memory for a
@@ -71,7 +113,7 @@ pub struct AuthCodeDetector {
     /// re-emit on every subsequent read — this suppresses that re-emission
     /// for the *same* code. A genuinely new login attempt (a different
     /// code) is still reported.
-    already_fired: Option<(WireAuthProvider, String)>,
+    already_fired: Option<(DetectedProvider, String)>,
 }
 
 impl Default for AuthCodeDetector {
@@ -91,7 +133,7 @@ impl AuthCodeDetector {
     /// `(provider, user_code)` pair; `None` otherwise — including while a
     /// real prompt is only partially buffered (see this module's tests for
     /// the partial-output cases this is required not to fire on).
-    pub fn feed(&mut self, bytes: &[u8]) -> Option<WireAgentEvent> {
+    pub fn feed(&mut self, bytes: &[u8]) -> Option<DetectedPrompt> {
         // Lossy is correct here: a chunk boundary can legitimately split a
         // multi-byte UTF-8 codepoint, which `from_utf8_lossy` turns into a
         // replacement character for *this* feed call rather than an error —
@@ -116,7 +158,7 @@ impl AuthCodeDetector {
             return None;
         }
         self.already_fired = Some((provider, user_code.clone()));
-        Some(WireAgentEvent::AuthRequired { provider, user_code, verification_uri })
+        Some(DetectedPrompt { provider, user_code, verification_uri })
     }
 }
 
@@ -131,7 +173,12 @@ impl AuthCodeDetector {
 /// isn't a recognized CSI/OSC shape (a bare `ESC` followed by one other
 /// character is dropped as a simple two-byte escape) rather than
 /// attempting to be a complete terminal emulator.
-fn strip_ansi_and_normalize(input: &str) -> String {
+///
+/// `pub(crate)`, not private: `resource_reauth.rs`'s managed-subprocess
+/// output scanning (patterns b/d, per `docs/specs/resources-and-reauth.md`)
+/// reuses this exact helper rather than re-implementing ANSI stripping a
+/// second time — see that module's own doc comment.
+pub(crate) fn strip_ansi_and_normalize(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -224,7 +271,12 @@ fn first_nonblank_line_token(text: &str, from: usize) -> Option<&str> {
 /// The first `https://` URL in `text`, terminated by whitespace (i.e. not
 /// yet-incomplete), bounded to a sane length so a pathological stream
 /// can't make this scan (or a downstream consumer) do unbounded work.
-fn first_https_url(text: &str) -> Option<&str> {
+///
+/// `pub(crate)`, not private: `resource_reauth.rs`'s pattern-b/d
+/// verification-URL extraction reuses this exact helper — same
+/// bounds-checking discipline, one implementation. See
+/// [`strip_ansi_and_normalize`]'s doc comment for the same reasoning.
+pub(crate) fn first_https_url(text: &str) -> Option<&str> {
     let start = text.find("https://")?;
     https_url_at(text, start)
 }
@@ -276,7 +328,7 @@ fn https_url_at(text: &str, start: usize) -> Option<&str> {
 /// captured shapes (and a GitHub Enterprise `--hostname`, which changes the
 /// URL's host but not this structure) without needing to special-case tty
 /// vs. non-tty.
-fn detect_github(text: &str) -> Option<(WireAuthProvider, String, String)> {
+fn detect_github(text: &str) -> Option<(DetectedProvider, String, String)> {
     const MARKER: &str = "First copy your one-time code:";
     // The *last* occurrence: a long-lived buffer can accumulate more than
     // one completed prompt (a retried login), and the current one is
@@ -292,7 +344,7 @@ fn detect_github(text: &str) -> Option<(WireAuthProvider, String, String)> {
     if !uri.contains("/login/device") {
         return None;
     }
-    Some((WireAuthProvider::Github, code.to_string(), uri.to_string()))
+    Some((DetectedProvider::Github, code.to_string(), uri.to_string()))
 }
 
 /// **Verified against the real, installed `aws` CLI's source** (`aws-cli
@@ -351,7 +403,7 @@ fn detect_github(text: &str) -> Option<(WireAuthProvider, String, String)> {
 /// `verificationUriComplete`, which appears later and is not what this
 /// extracts — as the first `https://` URL appearing anywhere before that
 /// anchor.
-fn detect_aws(text: &str) -> Option<(WireAuthProvider, String, String)> {
+fn detect_aws(text: &str) -> Option<(DetectedProvider, String, String)> {
     const MARKER: &str = "Then enter the code:";
     let marker_pos = text.rfind(MARKER)?;
     let code = first_nonblank_line_token(text, marker_pos + MARKER.len())?;
@@ -359,7 +411,7 @@ fn detect_aws(text: &str) -> Option<(WireAuthProvider, String, String)> {
         return None;
     }
     let uri = last_https_url(&text[..marker_pos])?;
-    Some((WireAuthProvider::Aws, code.to_string(), uri.to_string()))
+    Some((DetectedProvider::AwsSso, code.to_string(), uri.to_string()))
 }
 
 /// **Still not verified against a real `az` binary, as of a second pass
@@ -396,7 +448,7 @@ fn detect_aws(text: &str) -> Option<(WireAuthProvider, String, String)> {
 /// Unlike the other three providers, both fields sit on one line — the URL
 /// is the token right after "use a web browser to open the page ", the
 /// code is the token right after the subsequent "enter the code ".
-fn detect_azure(text: &str) -> Option<(WireAuthProvider, String, String)> {
+fn detect_azure(text: &str) -> Option<(DetectedProvider, String, String)> {
     const URL_MARKER: &str = "use a web browser to open the page ";
     const CODE_MARKER: &str = "enter the code ";
     let url_marker_pos = text.rfind(URL_MARKER)?;
@@ -410,7 +462,7 @@ fn detect_azure(text: &str) -> Option<(WireAuthProvider, String, String)> {
     if !looks_like_device_code(code) {
         return None;
     }
-    Some((WireAuthProvider::Azure, code.to_string(), uri.to_string()))
+    Some((DetectedProvider::Azure, code.to_string(), uri.to_string()))
 }
 
 // **There is deliberately no `detect_gcp` function.** An earlier version of
@@ -460,8 +512,9 @@ fn detect_azure(text: &str) -> Option<(WireAuthProvider, String, String)> {
 // tests below, which assert exactly that non-match against realistic,
 // research-based reconstructions of both flows), this module ships no `gcp`
 // matcher and [`AuthCodeDetector::feed`]'s dispatch chain has no `gcp` arm.
-// `WireAuthProvider::Gcp` remains defined in `choosh-protocol` — this module
-// just never constructs one.
+// `"gcloud"` remains a valid built-in `resource_kind` (`resource_kinds.rs`,
+// pattern b, per `docs/specs/resources-and-reauth.md`'s survey) — it is
+// simply never something this module's own text scanner detects.
 
 #[cfg(test)]
 mod tests {
@@ -520,7 +573,7 @@ mod tests {
     /// pieces, returning the first `Some` result (if any) — used to prove
     /// detection survives an arbitrary chunk boundary, including one that
     /// lands mid-marker or mid-code.
-    fn feed_in_chunks_of(bytes: &[u8], chunk_size: usize) -> Option<WireAgentEvent> {
+    fn feed_in_chunks_of(bytes: &[u8], chunk_size: usize) -> Option<DetectedPrompt> {
         let mut detector = AuthCodeDetector::new();
         for chunk in bytes.chunks(chunk_size.max(1)) {
             if let Some(event) = detector.feed(chunk) {
@@ -536,8 +589,8 @@ mod tests {
         let event = detector.feed(GH_PIPED_REAL.as_bytes()).expect("must detect the real gh device-code prompt");
         assert_eq!(
             event,
-            WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Github,
+            DetectedPrompt {
+                provider: DetectedProvider::Github,
                 user_code: "F1FE-DF1C".to_string(),
                 verification_uri: "https://github.com/login/device".to_string(),
             }
@@ -550,8 +603,8 @@ mod tests {
         let event = detector.feed(GH_PTY_REAL_RAW).expect("must detect through real ANSI escape sequences");
         assert_eq!(
             event,
-            WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Github,
+            DetectedPrompt {
+                provider: DetectedProvider::Github,
                 user_code: "21F9-D986".to_string(),
                 verification_uri: "https://github.com/login/device".to_string(),
             }
@@ -564,8 +617,8 @@ mod tests {
             let event = feed_in_chunks_of(GH_PIPED_REAL.as_bytes(), chunk_size);
             assert_eq!(
                 event,
-                Some(WireAgentEvent::AuthRequired {
-                    provider: WireAuthProvider::Github,
+                Some(DetectedPrompt {
+                    provider: DetectedProvider::Github,
                     user_code: "F1FE-DF1C".to_string(),
                     verification_uri: "https://github.com/login/device".to_string(),
                 }),
@@ -585,8 +638,8 @@ mod tests {
         let event = detector.feed(text.as_bytes()).expect("must detect the aws PrintOnlyHandler prompt");
         assert_eq!(
             event,
-            WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Aws,
+            DetectedPrompt {
+                provider: DetectedProvider::AwsSso,
                 user_code: "ABCD-WXYZ".to_string(),
                 verification_uri: "https://device.sso.us-east-1.amazonaws.com/".to_string(),
             }
@@ -600,8 +653,8 @@ mod tests {
         let event = detector.feed(text.as_bytes()).unwrap();
         assert_eq!(
             event,
-            WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Aws,
+            DetectedPrompt {
+                provider: DetectedProvider::AwsSso,
                 user_code: "QRST-1234".to_string(),
                 verification_uri: "https://device.sso.us-east-1.amazonaws.com/".to_string(),
             }
@@ -621,8 +674,8 @@ mod tests {
         let event = detector.feed(text.as_bytes()).unwrap();
         assert_eq!(
             event,
-            WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Azure,
+            DetectedPrompt {
+                provider: DetectedProvider::Azure,
                 user_code: "BQFQAAT9V".to_string(),
                 verification_uri: "https://microsoft.com/devicelogin".to_string(),
             }
@@ -703,8 +756,8 @@ mod tests {
         let event = detector.feed(b"Open this URL to continue in your web browser: https://github.com/login/device\n").unwrap();
         assert_eq!(
             event,
-            WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Github,
+            DetectedPrompt {
+                provider: DetectedProvider::Github,
                 user_code: "F1FE-DF1C".to_string(),
                 verification_uri: "https://github.com/login/device".to_string(),
             }
@@ -722,8 +775,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             event,
-            WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Github,
+            DetectedPrompt {
+                provider: DetectedProvider::Github,
                 user_code: "F1FE-DF1C".to_string(),
                 verification_uri: "https://github.com/login/device".to_string(),
             }
@@ -750,8 +803,8 @@ mod tests {
         let event = detector.feed(second_login.as_bytes()).unwrap();
         assert_eq!(
             event,
-            WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Github,
+            DetectedPrompt {
+                provider: DetectedProvider::Github,
                 user_code: "9999-ZZZZ".to_string(),
                 verification_uri: "https://github.com/login/device".to_string(),
             }
@@ -770,17 +823,28 @@ mod tests {
         );
         let mut detector = AuthCodeDetector::new();
         let event = detector.feed(poisoned.as_bytes()).expect("the real prompt embedded in the poisoned stream must still be found");
-        let WireAgentEvent::AuthRequired { provider, user_code, verification_uri } = &event else {
-            panic!("expected AuthRequired, got {event:?}");
-        };
-        assert_eq!(*provider, WireAuthProvider::Github);
+        let DetectedPrompt { provider, user_code, verification_uri } = &event;
+        assert_eq!(*provider, DetectedProvider::Github);
         assert_eq!(user_code, "F1FE-DF1C");
         assert_eq!(verification_uri, "https://github.com/login/device");
 
-        // Belt and braces: serialize the event exactly as it would go over
-        // the wire and confirm the fake secrets are nowhere in it at all —
+        // Belt and braces: build the real wire event this `DetectedPrompt`
+        // would end up in (`resources.rs::event_for_pattern_a_detection`'s
+        // job in production — reconstructed inline here so this module's
+        // own tests don't need a dependency on `resources.rs`) and confirm
+        // the fake secrets are nowhere in its serialized or Debug form —
         // not truncated into a field, not appended, nothing.
-        let json = serde_json::to_string(&event).unwrap();
+        let wire_event = choosh_protocol::relay::WireAgentEvent::ResourceReauthRequired {
+            resource_id: "detected-github".to_string(),
+            display_name: "GitHub".to_string(),
+            resource_kind: "github".to_string(),
+            pattern: choosh_protocol::relay::WireResourcePattern::A,
+            verification_uri: Some(verification_uri.clone()),
+            user_code: Some(user_code.clone()),
+            fetch_instructions: None,
+            mobile_profile: choosh_protocol::relay::WireMobileProfile::Ask,
+        };
+        let json = serde_json::to_string(&wire_event).unwrap();
         assert!(!json.contains("AWS_SECRET_ACCESS_KEY"));
         assert!(!json.contains("wJalrFAKESECRETKEYEXAMPLEbPxRfiCYEXAMPLEKEY"));
         assert!(!json.contains("GH_TOKEN"));
@@ -788,7 +852,7 @@ mod tests {
         assert!(!json.contains("noise"));
         // And the Debug representation too, in case a future change logs
         // the event directly rather than its serialized form.
-        let debug = format!("{event:?}");
+        let debug = format!("{wire_event:?}");
         assert!(!debug.contains("AWS_SECRET_ACCESS_KEY"));
         assert!(!debug.contains("GH_TOKEN"));
     }

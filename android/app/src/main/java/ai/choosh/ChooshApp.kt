@@ -17,6 +17,10 @@ import ai.choosh.markdown.MarkdownScreen
 import ai.choosh.markdown.MarkdownViewModel
 import ai.choosh.nav.ScreenBackStack
 import ai.choosh.notifications.NotificationDeepLinkTarget
+import ai.choosh.resources.ResourceEventOverlay
+import ai.choosh.resources.ResourceEventTracker
+import ai.choosh.resources.ResourcesScreen
+import ai.choosh.resources.ResourcesViewModel
 import ai.choosh.sourceeditor.SourceEditorScreen
 import ai.choosh.sourceeditor.SourceEditorViewModel
 import ai.choosh.terminal.TerminalScreen
@@ -103,6 +107,15 @@ private sealed interface Screen {
      * screen").
      */
     data class DevHostWorkspaces(val deviceId: String) : Screen
+
+    /**
+     * docs/specs/resources-and-reauth.md's Resources list, devhost-scoped
+     * (Resources don't move between devhosts, per that spec's "The Resource
+     * entity"). Reached from [DevHostWorkspaces]'s own "Resources" button
+     * (see [DevHostWorkspacesScreen]'s doc comment on why there, not a
+     * separate fleet-drawer entry point).
+     */
+    data class Resources(val deviceId: String) : Screen
 
     /**
      * The `SourceEditor` pinned item (docs/specs/android-navigation.md's
@@ -266,6 +279,12 @@ fun ChooshApp(
     // `starting`/`failed` distinction, which `item.list` alone cannot
     // provide.
     val statusTracker = remember { AgentStatusTracker() }
+    // docs/specs/resources-and-reauth.md's resource-event surface — feeds
+    // ResourceEventOverlay below, rendered once at the bottom of this
+    // composable so a ResourceReauthRequired/pending-proposal dialog can
+    // appear regardless of which Screen is currently on top (Resources are
+    // devhost-scoped, not tied to any one screen).
+    val resourceEventTracker = remember { ResourceEventTracker() }
     // `onSnapshotRequired` calls the real `workspace.status` RPC per
     // agent-events.md: "the client refreshes full workspace/item state via
     // workspace.status/workspace.list". Its result isn't routed into a
@@ -284,6 +303,7 @@ fun ChooshApp(
             attentionTracker = attentionTracker,
             onSnapshotRequired = { deviceId, workspaceId -> runCatching { engine.workspaceStatus(deviceId, workspaceId) } },
             statusTracker = statusTracker,
+            resourceEventTracker = resourceEventTracker,
         )
     }
     val agentEventPollScope = rememberCoroutineScope()
@@ -430,6 +450,23 @@ fun ChooshApp(
                         onWorkspaceClick = { workspace -> backStack.push(fleetViewModel.onWorkspaceTapped(workspace).toScreen()) },
                         onRefresh = viewModel::refresh,
                         onBack = { backStack.pop() },
+                        onResourcesClick = { backStack.push(Screen.Resources(current.deviceId)) },
+                    )
+                }
+
+                is Screen.Resources -> {
+                    val viewModel: ResourcesViewModel = viewModel(
+                        key = "resources:${current.deviceId}",
+                        factory = singleInstanceFactory { ResourcesViewModel(engine, current.deviceId) },
+                    )
+                    val state by viewModel.state.collectAsState()
+                    ResourcesScreen(
+                        deviceId = current.deviceId,
+                        state = state,
+                        onRefresh = viewModel::refresh,
+                        onBack = { backStack.pop() },
+                        onPropose = viewModel::propose,
+                        onConfirmSelfProposal = viewModel::confirmSelfProposal,
                     )
                 }
 
@@ -498,6 +535,12 @@ fun ChooshApp(
                     }
                 }
             }
+
+            // Rendered last (drawn on top, via AlertDialog's own dialog
+            // window) so a ResourceReauthRequired/pending-proposal prompt is
+            // visible over whatever Screen above happens to be showing —
+            // see ResourceEventOverlay's own doc comment.
+            ResourceEventOverlay(engine, resourceEventTracker)
         }
     }
 }

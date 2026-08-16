@@ -34,6 +34,11 @@ fun DevHostWorkspacesScreen(
     onWorkspaceClick: (WorkspaceSummary) -> Unit,
     onRefresh: () -> Unit,
     onBack: () -> Unit,
+    // `null` (the default) preserves every existing call site/preview/test
+    // exactly as before — the fixture-era placeholder tests that construct
+    // this screen directly (rather than through ChooshApp's real navigation)
+    // have no Resources screen to route to.
+    onResourcesClick: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Column(modifier.fillMaxSize()) {
@@ -42,7 +47,15 @@ fun DevHostWorkspacesScreen(
                 Button(onClick = onBack) { Text("Back") }
                 Text("DevHost $deviceId", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(start = 12.dp))
             }
-            TextButton(onClick = onRefresh, modifier = Modifier.testTag("devhost-workspaces-refresh-button")) { Text("Refresh") }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // docs/specs/resources-and-reauth.md's Resources screen —
+                // devhost-scoped, same as this screen's own workspace list,
+                // so it's reached from here rather than a separate
+                // fleet-drawer entry point (see ResourcesScreen's own doc
+                // comment).
+                TextButton(onClick = onResourcesClick, modifier = Modifier.testTag("devhost-resources-button")) { Text("Resources") }
+                TextButton(onClick = onRefresh, modifier = Modifier.testTag("devhost-workspaces-refresh-button")) { Text("Refresh") }
+            }
         }
 
         when {

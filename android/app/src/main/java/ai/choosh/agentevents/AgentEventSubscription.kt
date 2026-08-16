@@ -4,6 +4,7 @@ import ai.choosh.engine.AgentEventPush
 import ai.choosh.engine.AgentEventsResumeOutcome
 import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.workspaceIdOrNull
+import ai.choosh.resources.ResourceEventTracker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -88,6 +89,16 @@ class AgentEventSubscription(
      * comment for why `item.list` alone can't provide it.
      */
     private val statusTracker: AgentStatusTracker? = null,
+    /**
+     * `null` (the default) preserves this class's pre-existing behavior for
+     * every call site/test that doesn't pass one, matching [statusTracker]'s
+     * own "optional, additive live-signal consumer" convention. When
+     * supplied, every applied event (replayed or live) also feeds
+     * [ResourceEventTracker.apply] — the phone UI's source of
+     * `ResourceReauthRequired` prompts and pending agent-proposed-Resource
+     * confirmations, per docs/specs/resources-and-reauth.md.
+     */
+    private val resourceEventTracker: ResourceEventTracker? = null,
 ) {
     /** `workspaceId -> deviceId` for every workspace [subscribe] has registered — re-resumed by [resubscribeAll]. */
     private val subscribedWorkspaces = mutableMapOf<String, String>()
@@ -141,6 +152,7 @@ class AgentEventSubscription(
                 outcome.events.forEach { sequenced ->
                     attentionTracker.apply(sequenced.event)
                     statusTracker?.apply(sequenced.event)
+                    resourceEventTracker?.apply(deviceId, sequenced.event)
                 }
                 // Advances the cursor to `latestSequence` even when
                 // `events` is empty (already caught up) — per
@@ -160,6 +172,7 @@ class AgentEventSubscription(
     private fun applyPush(push: AgentEventPush) {
         attentionTracker.apply(push.event)
         statusTracker?.apply(push.event)
+        resourceEventTracker?.apply(push.fromDeviceId, push.event)
         val workspaceId = push.event.workspaceIdOrNull ?: return
         val sequence = push.sequence ?: return
         cursorStore.acknowledge(workspaceId, sequence)

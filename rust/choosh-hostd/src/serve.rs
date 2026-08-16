@@ -123,8 +123,6 @@ pub async fn run() -> Result<(), ServeError> {
         None => enroll(&config).await?,
     };
 
-    let rpc_context = build_rpc_context(&credential.device_id)?;
-
     // The local IPC listener and its channel live for the whole `serve`
     // process lifetime, not per-connection: an `emit` invocation while
     // `serve` is between relayd connections (a reconnect backoff window)
@@ -133,7 +131,16 @@ pub async fn run() -> Result<(), ServeError> {
     // hook events during an extended outage backpressures onto `emit`
     // (which fails closed and exits non-zero) rather than growing memory
     // without limit.
+    //
+    // Created before `build_rpc_context` (not after, as it originally was):
+    // `RpcContext::agent_event_tx` (`resource.propose`'s `input_required`
+    // event, `resource_reauth.rs`'s `ResourceReauthRequired` events) needs
+    // a clone of this same sender, per the "one producer alongside
+    // `local_ipc`/the SSH bridge/`open_pty_tunnel`'s auth detector" posture
+    // every other producer into this channel already documents on itself.
     let (agent_event_tx, agent_event_rx) = tokio::sync::mpsc::channel(256);
+
+    let rpc_context = build_rpc_context(&credential.device_id, agent_event_tx.clone())?;
 
     // `agent-events.md`'s "Delivery and replay" per-workspace spool +
     // sequencer (`crate::agent_event_spool`'s module doc comment covers the
@@ -207,7 +214,7 @@ pub async fn run() -> Result<(), ServeError> {
         Err(error) => tracing::warn!(%error, "failed to determine this binary's own path (std::env::current_exe()); Claude Code agent hooks will not be installed"),
     }
 
-    // `open_pty_tunnel`'s auth_required detector (agent-events.md,
+    // `open_pty_tunnel`'s pattern-a resource_reauth_required detector (agent-events.md,
     // auth_detect.rs) needs its own sender into this exact same channel —
     // it's a producer alongside `local_ipc` and the SSH bridge below, not a
     // second, parallel event path. Cloned here (before `ssh_bridge_config`
@@ -336,7 +343,7 @@ const HOST_TOOL_RECHECK_INTERVAL: Duration = Duration::from_hours(6);
 /// identity (see `rpc::handle_create`'s use of `ctx.devhost_id`: only
 /// `workspace.create`, registering a *new* workspace, ever reads it, and
 /// `service run` only ever targets an already-registered `--workspace`).
-pub(crate) fn build_rpc_context(device_id: &str) -> Result<RpcContext, ServeError> {
+pub(crate) fn build_rpc_context(device_id: &str, agent_event_tx: tokio::sync::mpsc::Sender<WireAgentEvent>) -> Result<RpcContext, ServeError> {
     let workspaces_dir = match std::env::var("CHOOSH_HOSTD_WORKSPACES_DIR") {
         Ok(path) => PathBuf::from(path),
         Err(_) => directories::ProjectDirs::from("ai", "choosh", "hostd")
@@ -352,12 +359,22 @@ pub(crate) fn build_rpc_context(device_id: &str) -> Result<RpcContext, ServeErro
     };
     let registry = crate::registry::Registry::load(&registry_path)
         .map_err(|e| ServeError::Credential(CredentialError::Io(io_error(e))))?;
+    let resources_path = match std::env::var("CHOOSH_HOSTD_RESOURCES_PATH") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => crate::resources::ResourceRegistry::default_path()
+            .map_err(|e| ServeError::Credential(CredentialError::Io(io_error(e))))?,
+    };
+    let resources = crate::resources::ResourceRegistry::load(&resources_path)
+        .map_err(|e| ServeError::Credential(CredentialError::Io(io_error(e))))?;
     Ok(RpcContext {
         registry: std::sync::Arc::new(tokio::sync::Mutex::new(registry)),
         devhost_id: device_id.to_string(),
         workspaces_dir,
         mise_bin: crate::mise_ops::mise_bin_from_env(),
         mise_project_tools_dir: mise_project_tools_dir()?,
+        resources: std::sync::Arc::new(tokio::sync::Mutex::new(resources)),
+        agent_event_tx,
+        reauth_processes: crate::resource_reauth::ReauthProcesses::new(),
     })
 }
 
@@ -1244,6 +1261,9 @@ fn clone_rpc_context(context: &RpcContext) -> RpcContext {
         workspaces_dir: context.workspaces_dir.clone(),
         mise_bin: context.mise_bin.clone(),
         mise_project_tools_dir: context.mise_project_tools_dir.clone(),
+        resources: context.resources.clone(),
+        agent_event_tx: context.agent_event_tx.clone(),
+        reauth_processes: context.reauth_processes.clone(),
     }
 }
 
@@ -1553,12 +1573,13 @@ fn spawn_offload_process(
 /// `tunnel_id` — the write half is returned for [`serve_dispatch`]'s main
 /// loop to route phone-originated input into.
 ///
-/// **`auth_required` detection lives here.** This is the one place
+/// **Pattern-a `resource_reauth_required` detection lives here.** This is the one place
 /// `choosh-hostd` reads a real, unbuffered stream of an interactive
 /// terminal's output — exactly what an `aws sso login`/`gcloud auth
 /// login`/`az login`/`gh auth login` invocation inside an `AgentTerminal`/
 /// `Shell` item's Zellij tab produces (per `agent-events.md`'s
-/// `auth_required`, `docs/milestones/M7-fleet-and-provisioning.md`'s
+/// `resource_reauth_required` (which superseded the original `auth_required`),
+/// `docs/milestones/M7-fleet-and-provisioning.md`'s
 /// "SSO/cloud-CLI device-code bridge", and `auth_detect.rs`'s own doc
 /// comment for exactly which four providers and how each was verified). A
 /// fresh [`crate::auth_detect::AuthCodeDetector`] is created per pty
@@ -1611,6 +1632,7 @@ async fn open_pty_tunnel(
 
     let session = PtySession::attach(&session_name, &tab_name).await.map_err(|error| error.to_string())?;
     let (mut read_half, write_half) = session.split();
+    let resources = rpc_context.resources.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         let mut auth_detector = crate::auth_detect::AuthCodeDetector::new();
@@ -1618,10 +1640,22 @@ async fn open_pty_tunnel(
             match read_half.read(&mut buf).await {
                 Ok(0) | Err(_) => return, // EOF (client exited) or a read error — either way, nothing left to forward.
                 Ok(n) => {
-                    if let Some(event) = auth_detector.feed(&buf[..n])
-                        && agent_event_tx.send(event).await.is_err()
-                    {
-                        tracing::warn!("failed to forward a detected auth_required event; the connection's event channel is gone");
+                    if let Some(detection) = auth_detector.feed(&buf[..n]) {
+                        // `auth_detect.rs` only ever hands back the raw,
+                        // bounds-checked `(provider, user_code,
+                        // verification_uri)` extraction (see its own doc
+                        // comment) — `resources.rs::event_for_pattern_a_detection`
+                        // is what turns that into the real
+                        // `ResourceReauthRequired` wire event, attributing it
+                        // to a real registered Resource if one matches, or
+                        // synthesizing a transient one otherwise.
+                        let event = {
+                            let resources = resources.lock().await;
+                            crate::resources::event_for_pattern_a_detection(&resources, &detection)
+                        };
+                        if agent_event_tx.send(event).await.is_err() {
+                            tracing::warn!("failed to forward a detected resource_reauth_required event; the connection's event channel is gone");
+                        }
                     }
                     if output_tx.send(TunnelOutput { tunnel_id, bytes: buf[..n].to_vec() }).await.is_err() {
                         return; // serve_dispatch's loop has ended; nothing left to forward to.
@@ -1789,7 +1823,7 @@ mod tunnel_tests {
     use choosh_protocol::host_rpc::{ItemStatus, ItemType};
     use choosh_protocol::relay::{
         FRAME_CLASS_CONTROL as CTRL, FRAME_CLASS_TUNNEL as TUNNEL, MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES, WireAgentStatus,
-        WireAuthProvider, encode_tunnel_id_hex,
+        WireMobileProfile, WireResourcePattern, encode_tunnel_id_hex,
     };
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -1844,6 +1878,9 @@ mod tunnel_tests {
             workspaces_dir: dir.path().to_path_buf(),
             mise_bin: "mise-not-used-in-this-test".to_string(),
             mise_project_tools_dir: dir.path().join("mise-project-tools"),
+            resources: std::sync::Arc::new(tokio::sync::Mutex::new(crate::resources::ResourceRegistry::load(&dir.path().join("resources.json")).unwrap())),
+            agent_event_tx: tokio::sync::mpsc::channel(16).0,
+            reauth_processes: crate::resource_reauth::ReauthProcesses::new(),
         };
         (dir, ctx, item_id)
     }
@@ -1993,6 +2030,9 @@ mod tunnel_tests {
             workspaces_dir: dir.path().to_path_buf(),
             mise_bin: "mise-not-used-in-this-test".to_string(),
             mise_project_tools_dir: dir.path().join("mise-project-tools"),
+            resources: std::sync::Arc::new(tokio::sync::Mutex::new(crate::resources::ResourceRegistry::load(&dir.path().join("resources.json")).unwrap())),
+            agent_event_tx: tokio::sync::mpsc::channel(16).0,
+            reauth_processes: crate::resource_reauth::ReauthProcesses::new(),
         };
         let (listener, relay_url) = bind_fake_relayd().await;
         let (agent_tx, mut agent_event_rx) = tokio::sync::mpsc::channel(1);
@@ -2060,6 +2100,9 @@ mod tunnel_tests {
             workspaces_dir: dir.to_path_buf(),
             mise_bin: "mise-not-used-in-this-test".to_string(),
             mise_project_tools_dir: dir.join("mise-project-tools"),
+            resources: std::sync::Arc::new(tokio::sync::Mutex::new(crate::resources::ResourceRegistry::load(&dir.join("resources.json")).unwrap())),
+            agent_event_tx: tokio::sync::mpsc::channel(16).0,
+            reauth_processes: crate::resource_reauth::ReauthProcesses::new(),
         }
     }
 
@@ -2441,6 +2484,9 @@ mod tunnel_tests {
             workspaces_dir: dir.path().to_path_buf(),
             mise_bin: "mise-not-used-in-this-test".to_string(),
             mise_project_tools_dir: dir.path().join("mise-project-tools"),
+            resources: std::sync::Arc::new(tokio::sync::Mutex::new(crate::resources::ResourceRegistry::load(&dir.path().join("resources.json")).unwrap())),
+            agent_event_tx: tokio::sync::mpsc::channel(16).0,
+            reauth_processes: crate::resource_reauth::ReauthProcesses::new(),
         };
         (dir, ctx, item_id)
     }
@@ -2449,7 +2495,7 @@ mod tunnel_tests {
     /// a fresh Zellij session/tab, a real `pty:<item_id>` tunnel attach
     /// through it, and an assertion that the resulting bytes really produce
     /// a real `ControlRequest::AgentEvent` control frame carrying
-    /// `WireAgentEvent::AuthRequired` with the exact `agent-events.md` wire
+    /// `WireAgentEvent::ResourceReauthRequired` with the exact `agent-events.md` wire
     /// shape. Returns `Err` with a diagnostic string instead of panicking
     /// directly, so the caller can retry against the pre-existing Zellij
     /// flake documented on the outer test.
@@ -2529,7 +2575,7 @@ mod tunnel_tests {
             loop {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(format!(
-                        "timed out waiting for the auth_required control frame; pty output seen so far: {:?}",
+                        "timed out waiting for the resource_reauth_required control frame; pty output seen so far: {:?}",
                         String::from_utf8_lossy(&debug_collected)
                     ));
                 }
@@ -2545,12 +2591,27 @@ mod tunnel_tests {
                     let Ok(ControlRequest::AgentEvent { event, .. }) = serde_json::from_slice::<ControlRequest>(body) else {
                         continue; // some other control push (e.g. tunnel-offered) racing on the same connection.
                     };
-                    let WireAgentEvent::AuthRequired { provider, user_code, verification_uri } = event else {
-                        return Err(format!("expected an AuthRequired agent-event, got {event:?}"));
+                    let WireAgentEvent::ResourceReauthRequired {
+                        resource_id, resource_kind, pattern, verification_uri, user_code, mobile_profile, ..
+                    } = event
+                    else {
+                        return Err(format!("expected a ResourceReauthRequired agent-event, got {event:?}"));
                     };
-                    if provider != WireAuthProvider::Github || user_code != "TEST-1234" || verification_uri != "https://github.com/login/device" {
+                    // No Resource was ever registered for this test — the
+                    // detection must synthesize a transient one, exactly as
+                    // `resources.rs::event_for_pattern_a_detection`'s own
+                    // doc comment requires ("detection must keep working
+                    // even before the operator has explicitly registered
+                    // anything").
+                    if resource_id != "detected-github"
+                        || resource_kind != "github"
+                        || pattern != WireResourcePattern::A
+                        || user_code.as_deref() != Some("TEST-1234")
+                        || verification_uri.as_deref() != Some("https://github.com/login/device")
+                        || mobile_profile != WireMobileProfile::Ask
+                    {
                         return Err(format!(
-                            "unexpected AuthRequired fields: provider={provider:?} user_code={user_code:?} verification_uri={verification_uri:?}; raw pty bytes so far: {:?}",
+                            "unexpected ResourceReauthRequired fields: resource_id={resource_id:?} resource_kind={resource_kind:?} pattern={pattern:?} user_code={user_code:?} verification_uri={verification_uri:?} mobile_profile={mobile_profile:?}; raw pty bytes so far: {:?}",
                             String::from_utf8_lossy(&debug_collected)
                         ));
                     }
@@ -2572,7 +2633,7 @@ mod tunnel_tests {
     /// through the real `pty:<item_id>` tunnel path
     /// (`open_pty_tunnel`/`auth_detect.rs`), really produces a real
     /// `ControlRequest::AgentEvent` control frame carrying
-    /// `WireAgentEvent::AuthRequired` with the exact `agent-events.md` wire
+    /// `WireAgentEvent::ResourceReauthRequired` with the exact `agent-events.md` wire
     /// shape — mirroring how `ssh_purpose_tunnel_bridges_to_the_real_loopback_ssh_server`
     /// above and `ssh_server.rs`'s own editor-presence tests already prove
     /// their respective events the same way. The shell command itself
@@ -2613,7 +2674,7 @@ mod tunnel_tests {
             match attempt_real_device_code_prompt_produces_auth_required(Duration::from_secs(8)).await {
                 Ok(()) => return,
                 Err(error) => {
-                    tracing::warn!(attempt, %error, "auth_required pty integration attempt failed; retrying against the documented pre-existing Zellij flake");
+                    tracing::warn!(attempt, %error, "resource_reauth_required pty integration attempt failed; retrying against the documented pre-existing Zellij flake");
                     last_error = error;
                 }
             }
@@ -2797,6 +2858,9 @@ mod tunnel_tests {
             workspaces_dir: target_workspaces_dir.path().to_path_buf(),
             mise_bin: "mise-not-used-in-this-test".to_string(),
             mise_project_tools_dir: target_workspaces_dir.path().join("mise-project-tools"),
+            resources: std::sync::Arc::new(tokio::sync::Mutex::new(crate::resources::ResourceRegistry::load(&target_workspaces_dir.path().join("resources.json")).unwrap())),
+            agent_event_tx: tokio::sync::mpsc::channel(16).0,
+            reauth_processes: crate::resource_reauth::ReauthProcesses::new(),
         };
 
         let (listener, relay_url) = bind_fake_relayd().await;
@@ -2881,6 +2945,9 @@ mod tunnel_tests {
             workspaces_dir: dir.path().to_path_buf(),
             mise_bin: "mise-not-used-in-this-test".to_string(),
             mise_project_tools_dir: dir.path().join("mise-project-tools"),
+            resources: std::sync::Arc::new(tokio::sync::Mutex::new(crate::resources::ResourceRegistry::load(&dir.path().join("resources.json")).unwrap())),
+            agent_event_tx: tokio::sync::mpsc::channel(16).0,
+            reauth_processes: crate::resource_reauth::ReauthProcesses::new(),
         };
 
         let (listener, relay_url) = bind_fake_relayd().await;
@@ -2942,6 +3009,9 @@ mod tunnel_tests {
             workspaces_dir: target_workspaces_dir.path().to_path_buf(),
             mise_bin: "mise-not-used-in-this-test".to_string(),
             mise_project_tools_dir: target_workspaces_dir.path().join("mise-project-tools"),
+            resources: std::sync::Arc::new(tokio::sync::Mutex::new(crate::resources::ResourceRegistry::load(&target_workspaces_dir.path().join("resources.json")).unwrap())),
+            agent_event_tx: tokio::sync::mpsc::channel(16).0,
+            reauth_processes: crate::resource_reauth::ReauthProcesses::new(),
         };
 
         let (listener, relay_url) = bind_fake_relayd().await;

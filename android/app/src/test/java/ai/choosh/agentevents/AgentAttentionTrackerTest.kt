@@ -3,6 +3,9 @@ package ai.choosh.agentevents
 import ai.choosh.engine.AgentEvent
 import ai.choosh.engine.AgentRunStatus
 import ai.choosh.engine.InputReason
+import ai.choosh.engine.MobileProfile
+import ai.choosh.engine.ResourcePattern
+import ai.choosh.resources.RESOURCE_PROPOSAL_WORKSPACE_ID
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -43,7 +46,30 @@ class AgentAttentionTrackerTest {
         tracker.apply(AgentEvent.EditorAttached("ws-1"))
         tracker.apply(AgentEvent.EditorDetached("ws-1"))
         tracker.apply(AgentEvent.AuthRequired("aws", "WDJB-MJHT", "https://example.com/device"))
+        tracker.apply(
+            AgentEvent.ResourceReauthRequired(
+                resourceId = "res-1",
+                displayName = "Prod AWS SSO",
+                resourceKind = "aws-sso",
+                pattern = ResourcePattern.A,
+                verificationUri = "https://example.com/device",
+                userCode = "WDJB-MJHT",
+                fetchInstructions = null,
+                mobileProfile = MobileProfile.WORK,
+            ),
+        )
         tracker.apply(AgentEvent.Unknown)
+        assertTrue(tracker.needsAttention.value.isEmpty())
+    }
+
+    @Test
+    fun `an input_required sentinel-workspace resource proposal never pollutes the real attention set`() {
+        // See ai.choosh.resources.RESOURCE_PROPOSAL_WORKSPACE_ID's own doc
+        // comment: this sentinel names an agent-proposed-Resource
+        // confirmation, not a real workspace — ai.choosh.resources.ResourceEventTracker
+        // is the real consumer of this shape.
+        val tracker = AgentAttentionTracker()
+        tracker.apply(AgentEvent.InputRequired(RESOURCE_PROPOSAL_WORKSPACE_ID, "res-1", InputReason.ELICITATION))
         assertTrue(tracker.needsAttention.value.isEmpty())
     }
 

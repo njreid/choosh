@@ -23,8 +23,13 @@ import ai.choosh.engine.EnrollmentTokenResult
 import ai.choosh.engine.InputReason
 import ai.choosh.engine.ItemSummary
 import ai.choosh.engine.ItemType
+import ai.choosh.engine.MobileProfile
 import ai.choosh.engine.OperationLogEntry
 import ai.choosh.engine.ProjectSummary
+import ai.choosh.engine.Resource
+import ai.choosh.engine.ResourceConfirmResult
+import ai.choosh.engine.ResourcePattern
+import ai.choosh.engine.ResourceProposeResult
 import ai.choosh.engine.SequencedAgentEvent
 import ai.choosh.engine.TreeEntry
 import ai.choosh.engine.TreeEntryKind
@@ -41,6 +46,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonContentPolymorphicSerializer
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -198,6 +204,44 @@ class NativeChooshEngine : ChooshEngine {
         }
     }
 
+    override suspend fun resourceList(deviceId: String): List<Resource> = withContext(Dispatchers.IO) {
+        val raw = NativeBridge.nativeResourceList(handle, deviceId)
+        decodeOrThrow(raw) { body -> json.decodeFromString<List<WireResource>>(body).map { it.toDomain() } }
+    }
+
+    override suspend fun resourcePropose(
+        deviceId: String,
+        displayName: String,
+        resourceKind: String,
+        pattern: ResourcePattern?,
+        reauthCommand: String?,
+        mobileProfile: MobileProfile,
+    ): ResourceProposeResult = withContext(Dispatchers.IO) {
+        val raw = NativeBridge.nativeResourcePropose(
+            handle,
+            deviceId,
+            displayName,
+            resourceKind,
+            pattern?.let { wireResourcePatternFromDomain(it) }.orEmpty(),
+            reauthCommand.orEmpty(),
+            wireMobileProfileFromDomain(mobileProfile),
+        )
+        decodeResourceProposeResult(raw)
+    }
+
+    override suspend fun resourceConfirm(deviceId: String, resourceId: String, approve: Boolean): ResourceConfirmResult =
+        withContext(Dispatchers.IO) { decodeResourceConfirmResult(NativeBridge.nativeResourceConfirm(handle, deviceId, resourceId, approve)) }
+
+    override suspend fun resourceReauthStart(deviceId: String, resourceId: String): Boolean = withContext(Dispatchers.IO) {
+        val raw = NativeBridge.nativeResourceReauthStart(handle, deviceId, resourceId)
+        runCatching { decodeOrThrow(raw) { body -> json.decodeFromString<WireOk>(body).ok } }.getOrDefault(false)
+    }
+
+    override suspend fun resourceReauthComplete(deviceId: String, resourceId: String, value: String): Boolean = withContext(Dispatchers.IO) {
+        val raw = NativeBridge.nativeResourceReauthComplete(handle, deviceId, resourceId, value)
+        runCatching { decodeOrThrow(raw) { body -> json.decodeFromString<WireVerified>(body).verified } }.getOrDefault(false)
+    }
+
     override suspend fun pollAgentEvents(): List<AgentEventPush> =
         withContext(Dispatchers.IO) { decodeAgentEventPushes(NativeBridge.nativePollAgentEvents(handle)) }
 
@@ -307,6 +351,24 @@ private object NativeBridge {
     // `None`" convention; see `Engine::agent_events_resume`'s doc comment
     // on the Rust side for where this sentinel is translated back to `Option<u64>`.
     @JvmStatic external fun nativeAgentEventsResume(handle: Long, targetDeviceId: String, workspaceId: String, afterSequence: Long): String
+
+    // docs/specs/resources-and-reauth.md's resource.* RPCs. `pattern`/
+    // `reauthCommand` empty means "omitted" — mirrors this file's existing
+    // `from`/`to`/`revset` empty-string-means-null convention.
+    @JvmStatic external fun nativeResourceList(handle: Long, targetDeviceId: String): String
+
+    @JvmStatic external fun nativeResourcePropose(
+        handle: Long,
+        targetDeviceId: String,
+        displayName: String,
+        resourceKind: String,
+        pattern: String,
+        reauthCommand: String,
+        mobileProfile: String,
+    ): String
+    @JvmStatic external fun nativeResourceConfirm(handle: Long, targetDeviceId: String, resourceId: String, approve: Boolean): String
+    @JvmStatic external fun nativeResourceReauthStart(handle: Long, targetDeviceId: String, resourceId: String): String
+    @JvmStatic external fun nativeResourceReauthComplete(handle: Long, targetDeviceId: String, resourceId: String, value: String): String
 
     // Gated by ai.choosh.connection.DevPasskeyHooks's `BuildConfig.DEBUG`
     // check at the call site, but the real backstop is that the *release*
@@ -738,6 +800,92 @@ private data class WireProjectSummary(
     fun toDomain() = ProjectSummary(projectId = project_id, name = name, primaryWorkspaceId = primary_workspace_id, active = active)
 }
 
+// --- docs/specs/resources-and-reauth.md wire shapes ---------------------
+
+private fun wireResourcePatternToDomain(pattern: String): ResourcePattern = when (pattern) {
+    "a" -> ResourcePattern.A
+    "b" -> ResourcePattern.B
+    "c" -> ResourcePattern.C
+    "d" -> ResourcePattern.D
+    else -> ResourcePattern.UNKNOWN
+}
+
+/** The reverse of [wireResourcePatternToDomain] — [ChooshEngine.resourcePropose]'s `pattern` argument, encoded to `WireResourcePattern`'s exact `lowercase` wire tag. [ResourcePattern.UNKNOWN] has no wire representation (this client never constructs it itself); mapped to `"a"` only so this stays total, never a caller-visible "valid" choice. */
+private fun wireResourcePatternFromDomain(pattern: ResourcePattern): String = when (pattern) {
+    ResourcePattern.A, ResourcePattern.UNKNOWN -> "a"
+    ResourcePattern.B -> "b"
+    ResourcePattern.C -> "c"
+    ResourcePattern.D -> "d"
+}
+
+private fun wireMobileProfileToDomain(profile: String): MobileProfile = when (profile) {
+    "personal" -> MobileProfile.PERSONAL
+    "work" -> MobileProfile.WORK
+    else -> MobileProfile.ASK
+}
+
+private fun wireMobileProfileFromDomain(profile: MobileProfile): String = when (profile) {
+    MobileProfile.PERSONAL -> "personal"
+    MobileProfile.WORK -> "work"
+    MobileProfile.ASK -> "ask"
+}
+
+/** Mirrors `choosh_protocol::host_rpc::WireResource` field-for-field. */
+@Serializable
+private data class WireResource(
+    val resource_id: String,
+    val display_name: String,
+    val resource_kind: String,
+    val pattern: String? = null,
+    val mobile_profile: String,
+    val created_by: String,
+    val last_used_at: String? = null,
+    val last_verified_at: String? = null,
+) {
+    fun toDomain() = Resource(
+        resourceId = resource_id,
+        displayName = display_name,
+        resourceKind = resource_kind,
+        pattern = pattern?.let { wireResourcePatternToDomain(it) },
+        mobileProfile = wireMobileProfileToDomain(mobile_profile),
+        createdBy = created_by,
+        lastUsedAt = last_used_at,
+        lastVerifiedAt = last_verified_at,
+    )
+}
+
+/** `Engine::resource_propose`'s success shape: `{"resource_id": "..."}`. Decoded via [decodeOrThrow] first, same "shared `{"error": ...}` shape on any failure" convention [decodeCreateItemResult] already uses. */
+@Serializable
+private data class WireResourceId(val resource_id: String)
+
+/** `internal`, not `private` — see [decodeEnrollmentTokenResult]'s identical precedent — so a plain JVM unit test can exercise this decode logic without the real native `.so`. */
+internal fun decodeResourceProposeResult(raw: String): ResourceProposeResult = runCatching {
+    decodeOrThrow(raw) { body -> json.decodeFromString<WireResourceId>(body) }
+}.fold(
+    onSuccess = { wire -> ResourceProposeResult.Success(resourceId = wire.resource_id) },
+    onFailure = { failure -> ResourceProposeResult.Failure(failure.message ?: "resource.propose failed") },
+)
+
+/** `Engine::resource_confirm`'s success shape: `{"resource": <WireResource-or-null>}`. */
+@Serializable
+private data class WireResourceConfirmResult(val resource: WireResource? = null)
+
+/** `internal`, not `private` — same rationale as [decodeResourceProposeResult]. */
+internal fun decodeResourceConfirmResult(raw: String): ResourceConfirmResult = runCatching {
+    decodeOrThrow(raw) { body -> json.decodeFromString<WireResourceConfirmResult>(body) }
+}.fold(
+    onSuccess = { wire -> ResourceConfirmResult.Success(resource = wire.resource?.toDomain()) },
+    onFailure = { failure -> ResourceConfirmResult.Failure(failure.message ?: "resource.confirm failed") },
+)
+
+/** `Engine::resource_reauth_start`'s success shape: `{"ok": true}`. */
+@Serializable
+private data class WireOk(val ok: Boolean)
+
+/** `Engine::resource_reauth_complete`'s success shape: `{"verified": bool}`. */
+@Serializable
+private data class WireVerified(val verified: Boolean)
+
 private fun decodeDocumentSaveResult(raw: String): DocumentSaveResult {
     val wire = json.decodeFromString<WireDocumentResult>(raw)
     return when (wire.type) {
@@ -790,9 +938,11 @@ private fun wireAgentRunStatusToDomain(status: String): AgentRunStatus = when (s
  * every other native-engine response — since a partially-decodable live
  * push is still far more useful surfaced than dropped outright.
  */
-private fun decodeWireAgentEvent(element: JsonElement): AgentEvent {
+/** `internal`, not `private` — same rationale as [decodeResourceProposeResult]: lets a plain JVM unit test exercise every `kind`'s decode logic (including [AgentEvent.ResourceReauthRequired]'s nullable-per-pattern fields) directly. */
+internal fun decodeWireAgentEvent(element: JsonElement): AgentEvent {
     val obj = element.jsonObject
     fun field(name: String): String = obj[name]?.jsonPrimitive?.content.orEmpty()
+    fun fieldOrNull(name: String): String? = obj[name]?.jsonPrimitive?.contentOrNull
     return when (field("kind")) {
         "input_required" -> AgentEvent.InputRequired(
             workspaceId = field("workspace_id"),
@@ -816,6 +966,24 @@ private fun decodeWireAgentEvent(element: JsonElement): AgentEvent {
             provider = field("provider"),
             userCode = field("user_code"),
             verificationUri = field("verification_uri"),
+        )
+        // Supersedes "auth_required" on the wire — see
+        // `WireAgentEvent::ResourceReauthRequired`'s own doc comment and
+        // `AgentEvent.AuthRequired`'s. `verification_uri`/`user_code`/
+        // `fetch_instructions` are genuinely nullable per-pattern fields
+        // (`fieldOrNull`, not `field`) — unlike every other event's plain
+        // required strings, a missing/explicit-null value here is real wire
+        // state (e.g. pattern c has no `verification_uri`), not a decode
+        // failure to paper over with `""`.
+        "resource_reauth_required" -> AgentEvent.ResourceReauthRequired(
+            resourceId = field("resource_id"),
+            displayName = field("display_name"),
+            resourceKind = field("resource_kind"),
+            pattern = wireResourcePatternToDomain(field("pattern")),
+            verificationUri = fieldOrNull("verification_uri"),
+            userCode = fieldOrNull("user_code"),
+            fetchInstructions = fieldOrNull("fetch_instructions"),
+            mobileProfile = wireMobileProfileToDomain(field("mobile_profile")),
         )
         else -> AgentEvent.Unknown
     }

@@ -2,6 +2,7 @@ package ai.choosh.agentevents
 
 import ai.choosh.engine.AgentEvent
 import ai.choosh.engine.AgentRunStatus
+import ai.choosh.resources.RESOURCE_PROPOSAL_WORKSPACE_ID
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -38,13 +39,19 @@ class AgentAttentionTracker {
 
     fun apply(event: AgentEvent) {
         when (event) {
-            is AgentEvent.InputRequired -> add(event.workspaceId)
+            // The `RESOURCE_PROPOSAL_WORKSPACE_ID` sentinel (see that
+            // constant's own doc comment) never names a real workspace —
+            // it must not appear in a real, listed workspace's attention
+            // set. `ai.choosh.resources.ResourceEventTracker` is the real
+            // consumer of this shape of `InputRequired`.
+            is AgentEvent.InputRequired -> if (event.workspaceId != RESOURCE_PROPOSAL_WORKSPACE_ID) add(event.workspaceId)
             is AgentEvent.TurnCompleted -> remove(event.workspaceId)
             is AgentEvent.AgentStatusChanged -> if (event.status == AgentRunStatus.BUSY) remove(event.workspaceId)
             is AgentEvent.FilesChanged,
             is AgentEvent.EditorAttached,
             is AgentEvent.EditorDetached,
             is AgentEvent.AuthRequired,
+            is AgentEvent.ResourceReauthRequired,
             AgentEvent.Unknown,
             -> Unit
         }

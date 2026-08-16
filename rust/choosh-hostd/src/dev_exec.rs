@@ -174,7 +174,13 @@ impl From<RelayClientError> for DevExecError {
 pub async fn run(host_id: &str, workspace_name: &str, argv: Vec<String>) -> Result<i32, DevExecError> {
     let credential = credential::load(&credential::default_path()?)?.ok_or(DevExecError::NotEnrolled)?;
 
-    let ctx = crate::serve::build_rpc_context(&credential.device_id)
+    // `dev-exec` is a one-shot CLI command, not the resident `serve`
+    // daemon — it never runs long enough for a Resource re-auth to matter,
+    // so a throwaway channel (receiver immediately dropped) is all
+    // `RpcContext::agent_event_tx` needs here; nothing this command path
+    // does ever sends on it.
+    let (agent_event_tx, _agent_event_rx) = tokio::sync::mpsc::channel(1);
+    let ctx = crate::serve::build_rpc_context(&credential.device_id, agent_event_tx)
         .map_err(|error| DevExecError::Io(std::io::Error::other(error.to_string())))?;
     let root_path = {
         let registry = ctx.registry.lock().await;
