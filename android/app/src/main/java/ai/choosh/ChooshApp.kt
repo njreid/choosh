@@ -54,6 +54,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.google.firebase.messaging.FirebaseMessaging
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
 /**
@@ -72,6 +75,49 @@ import kotlinx.coroutines.tasks.await
 // fixture demo — an accurate reflection of where the project actually is,
 // not a regression to paper over.
 private fun buildEngine(): ChooshEngine = NativeChooshEngine()
+
+/**
+ * Hosts the single [ChooshEngine] instance for as long as [MainActivity]'s
+ * `ViewModelStore` lives, via a [ViewModel] specifically *because*
+ * [ViewModel]s survive configuration changes (rotation, multi-window
+ * resize, etc.) while [ChooshApp]'s composition does not.
+ *
+ * **Real, live bug this fixes** (found during a dedicated JNI-boundary
+ * review): [engine] used to be a plain `remember { buildEngine() }` inside
+ * [ChooshApp] itself. Every configuration change recomposes from scratch,
+ * so every rotation called [buildEngine] again — minting a brand-new
+ * `nativeInit` handle (its own multi-threaded Tokio runtime and a fresh
+ * live relayd WebSocket connection) — while the *previous* handle was
+ * simply abandoned: nothing anywhere in the app ever called
+ * [ChooshEngine.close] (confirmed via a full-tree grep turning up zero
+ * call sites). Repeated rotations leaked one Tokio runtime and one
+ * abandoned live connection each, unboundedly, for the rest of the
+ * process's life. Hoisting [engine] into a [ViewModel] means
+ * configuration changes reuse the same instance instead of recreating it;
+ * [onCleared] — called only when this Activity is genuinely finishing, not
+ * on a configuration change — is now the one real place [close] is
+ * exercised.
+ */
+class EngineHolderViewModel(buildEngine: () -> ChooshEngine = ::buildEngine) : ViewModel() {
+    val engine: ChooshEngine = buildEngine()
+
+    /**
+     * `onCleared()` is not a suspend function, and `viewModelScope` is
+     * already being cancelled by the time it runs — a coroutine launched
+     * on it here would not be guaranteed to run to completion. [GlobalScope]
+     * is used deliberately here, as the narrow, correct exception to this
+     * codebase's usual "always scope coroutines to something with a
+     * lifecycle" discipline: this genuinely is the end of [engine]'s
+     * lifecycle, with nothing left to scope its final cleanup to.
+     */
+    // `public`, not the inherited `protected`: widened deliberately so
+    // ChooshAppTest can call this directly to verify the fix without
+    // needing a real ViewModelStore teardown to trigger it.
+    @Suppress("OPT_IN_USAGE")
+    public override fun onCleared() {
+        GlobalScope.launch(Dispatchers.IO) { engine.close() }
+    }
+}
 
 /**
  * `null` on any failure (no Play Services, transient error, etc.) — a
@@ -204,7 +250,10 @@ fun ChooshApp(
     // wherever the user went next.
     onDeepLinkConsumed: () -> Unit = {},
 ) {
-    val engine = remember { buildEngine() }
+    // See EngineHolderViewModel's doc comment: hoisted into a ViewModel, not
+    // `remember { buildEngine() }`, specifically so a configuration change
+    // reuses this instance instead of leaking a fresh native handle.
+    val engine = viewModel<EngineHolderViewModel>(factory = singleInstanceFactory { EngineHolderViewModel() }).engine
     val credentialStore = remember { RealSessionCredentialStore(context) }
     // A real back stack (UX-friction audit finding #2), not a single
     // `remember { mutableStateOf(...) }` slot: `docs/specs/android-navigation.md`'s

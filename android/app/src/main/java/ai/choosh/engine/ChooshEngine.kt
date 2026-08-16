@@ -332,7 +332,7 @@ interface ChooshEngine {
     suspend fun agentEventsResume(deviceId: String, workspaceId: String, afterSequence: Long?): AgentEventsResumeOutcome
 
     /** Closes the relay connection. Idempotent. */
-    fun close()
+    suspend fun close()
 }
 
 // --- docs/specs/agent-events.md domain types --------------------------

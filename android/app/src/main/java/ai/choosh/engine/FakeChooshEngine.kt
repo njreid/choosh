@@ -664,7 +664,7 @@ class FakeChooshEngine : ChooshEngine {
         return AgentEventsResumeOutcome.Replayed(events = replay, latestSequence = history.maxOfOrNull { it.sequence } ?: after)
     }
 
-    override fun close() {
+    override suspend fun close() {
         connected = false
     }
 

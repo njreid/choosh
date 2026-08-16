@@ -258,7 +258,7 @@ class NativeChooshEngine : ChooshEngine {
     /** Exposes this instance's raw JNI connection handle to `WebGatewayBridge`/`MarkdownGatewayBridge`, mirroring [ai.choosh.terminal.TerminalSession.attachPty]'s existing `connectionHandle` pattern. */
     val connectionHandle: Long get() = handle
 
-    override fun close() = NativeBridge.nativeClose(handle)
+    override suspend fun close() = withContext(Dispatchers.IO) { NativeBridge.nativeClose(handle) }
 }
 
 /**
