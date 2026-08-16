@@ -9,6 +9,7 @@ import ai.choosh.engine.ChangeGraphNode
 import ai.choosh.engine.ChangeKind
 import ai.choosh.engine.ChangedPath
 import ai.choosh.engine.ChooshEngine
+import ai.choosh.engine.ConnectResult
 import ai.choosh.engine.ConnectionState
 import ai.choosh.engine.CreateItemResult
 import ai.choosh.engine.DevHostPresence
@@ -79,8 +80,8 @@ class NativeChooshEngine : ChooshEngine {
     override suspend fun webauthnLoginFinish(credentialJson: String): WebauthnResult =
         withContext(Dispatchers.IO) { decodeWebauthnResult(NativeBridge.nativeWebauthnLoginFinish(handle, credentialJson)) }
 
-    override suspend fun connect(sessionCredential: String): Boolean =
-        withContext(Dispatchers.IO) { NativeBridge.nativeConnect(handle, sessionCredential) }
+    override suspend fun connect(sessionCredential: String): ConnectResult =
+        withContext(Dispatchers.IO) { decodeConnectResult(NativeBridge.nativeConnect(handle, sessionCredential)) }
 
     override suspend fun listDevhosts(): List<DevHostPresence> = withContext(Dispatchers.IO) {
         json.decodeFromString<List<WireDevHostPresence>>(NativeBridge.nativeListDevhosts(handle)).map { it.toDomain() }
@@ -232,7 +233,7 @@ private object NativeBridge {
     @JvmStatic external fun nativeWebauthnRegisterFinish(handle: Long, credentialJson: String): String
     @JvmStatic external fun nativeWebauthnLoginStart(handle: Long): String
     @JvmStatic external fun nativeWebauthnLoginFinish(handle: Long, credentialJson: String): String
-    @JvmStatic external fun nativeConnect(handle: Long, sessionCredential: String): Boolean
+    @JvmStatic external fun nativeConnect(handle: Long, sessionCredential: String): String
     @JvmStatic external fun nativeListDevhosts(handle: Long): String
     @JvmStatic external fun nativeRegisterFcmToken(handle: Long, fcmToken: String): Boolean
     @JvmStatic external fun nativeRequestEnrollmentToken(handle: Long): String
@@ -393,6 +394,27 @@ private data class WireWebauthnResult(
     val expires_at: Long? = null,
     val error: String? = null,
 )
+
+/**
+ * Mirrors `choosh-android-bridge::engine::connect_result_json`'s shape:
+ * `{"outcome":"ok"}`, `{"outcome":"rejected","message":"..."}`, or
+ * `{"outcome":"transport","message":"..."}`. Also covers `native_connect`'s
+ * own `"unknown engine handle"` fallback (this file's shared [WireError]
+ * shape, `{"error":"..."}`, `outcome` absent) — treated as a transport
+ * failure below, never a rejection: an uninitialized native engine says
+ * nothing about whether `sessionCredential` itself is still valid.
+ */
+@Serializable
+private data class WireConnectResult(val outcome: String? = null, val message: String? = null, val error: String? = null)
+
+private fun decodeConnectResult(raw: String): ConnectResult {
+    val wire = runCatching { json.decodeFromString<WireConnectResult>(raw) }.getOrNull()
+    return when (wire?.outcome) {
+        "ok" -> ConnectResult.Connected
+        "rejected" -> ConnectResult.Rejected(wire.message ?: "relayd rejected this session credential")
+        else -> ConnectResult.TransportFailure(wire?.message ?: wire?.error ?: "failed to reach relayd")
+    }
+}
 
 private fun decodeWebauthnResult(raw: String): WebauthnResult {
     val wire = json.decodeFromString<WireWebauthnResult>(raw)

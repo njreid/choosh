@@ -1,5 +1,6 @@
 package ai.choosh.terminal
 
+import ai.choosh.BuildConfig
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -49,7 +50,16 @@ import java.nio.charset.StandardCharsets
  * connection, which this composable does not fabricate.
  */
 @Composable
-fun TerminalScreen(deviceId: String, itemId: String, connectionHandle: Long?, onBack: () -> Unit) {
+fun TerminalScreen(
+    deviceId: String,
+    itemId: String,
+    connectionHandle: Long?,
+    onBack: () -> Unit,
+    // UX-friction audit finding #11: the real item/workspace name — see ChooshApp.kt's
+    // Screen.Terminal doc comment for where this comes from today. `null` falls back to the
+    // old "$itemId@$deviceId" title, unchanged from before this param existed.
+    itemName: String? = null,
+) {
     val session = remember { TerminalSession() }
 
     DisposableEffect(deviceId, itemId) {
@@ -72,20 +82,31 @@ fun TerminalScreen(deviceId: String, itemId: String, connectionHandle: Long?, on
             IconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
-            Text("Terminal: $itemId@$deviceId", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            Text(terminalScreenTitle(deviceId, itemId, itemName), style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
         }
 
         // A demo/verification affordance: injects a canned, real ANSI byte
         // sequence directly into the VT parser without needing a live PTY
         // tunnel — the same code path the on-device rendering verification
-        // in this increment's evidence used. Kept visible (not just a test
-        // hook) since it's also a reasonable way to prove the surface is
-        // alive before a real relay deployment exists to attach to. Placed
-        // above the surface (not below it) so it never competes with the
-        // system gesture-nav area at the bottom of the screen.
-        Row(modifier = Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-            Button(onClick = { session.testInject(demoPromptAndListing()) }) { Text("Demo output") }
-            Button(onClick = { session.testInject(demoFullScreenRedraw()) }) { Text("Full redraw") }
+        // in this increment's evidence used, and also a reasonable way to
+        // prove the surface is alive before a real relay deployment exists
+        // to attach to. Placed above the surface (not below it) so it never
+        // competes with the system gesture-nav area at the bottom of the
+        // screen.
+        //
+        // UX-friction audit finding #12: these buttons used to ship
+        // unconditionally, including in a release build, where a real user
+        // on a real session would see two buttons that inject fake terminal
+        // output for no reason they could ever discover. Gated behind
+        // `BuildConfig.DEBUG` — the same idiom `ai.choosh.connection.DevPasskeyHooks`
+        // already uses for its own debug-only affordance — so this is gone
+        // from release builds but still available for development/on-device
+        // verification, exactly as before within a debug build.
+        if (BuildConfig.DEBUG) {
+            Row(modifier = Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                Button(onClick = { session.testInject(demoPromptAndListing()) }) { Text("Demo output") }
+                Button(onClick = { session.testInject(demoFullScreenRedraw()) }) { Text("Full redraw") }
+            }
         }
 
         AndroidView(
@@ -110,6 +131,15 @@ fun TerminalScreen(deviceId: String, itemId: String, connectionHandle: Long?, on
         ExtraKeysBar(session)
     }
 }
+
+/**
+ * Pure derivation, unit-tested directly — same "keep UI-label logic as a
+ * plain function" precedent as `ai.choosh.workspace.workspaceScreenTitle`.
+ * UX-friction audit finding #11: prefers the real [itemName] over the raw
+ * `$itemId@$deviceId` pairing whenever it's genuinely available.
+ */
+internal fun terminalScreenTitle(deviceId: String, itemId: String, itemName: String?): String =
+    "Terminal: ${itemName ?: "$itemId@$deviceId"}"
 
 /**
  * The native Compose extra-keys bar `terminal-experience.md`'s "Extra-keys

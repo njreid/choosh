@@ -21,6 +21,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
@@ -29,12 +33,50 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 
 /**
+ * One pending destructive action awaiting the user's confirmation — see
+ * [JjChangeGraphScreen]'s own doc comment on why this exists at all
+ * (UX-friction audit finding #9). `internal`, not `private`: [confirmedAction]
+ * below is unit-tested directly from `JjConfirmedActionTest`, the same
+ * "pure derivation, unit-tested directly" precedent
+ * `ai.choosh.workspace.workspaceScreenTitle`/`deriveWebServiceUiState` use
+ * elsewhere in this codebase for logic that would otherwise only be
+ * reachable through a full Compose UI test.
+ */
+internal sealed interface PendingOpConfirmation {
+    data object UndoMostRecent : PendingOpConfirmation
+    data class Restore(val opId: String, val description: String) : PendingOpConfirmation
+}
+
+/**
+ * What confirming [pending] actually does — the one place
+ * [JjChangeGraphScreen]'s confirm button's `onClick` and a JVM unit test can
+ * both exercise the exact same logic (a `remember`-backed Composable's
+ * `onClick` body itself has no such seam).
+ */
+internal fun confirmedAction(pending: PendingOpConfirmation, onUndoMostRecent: () -> Unit, onRestore: (String) -> Unit): () -> Unit =
+    when (pending) {
+        is PendingOpConfirmation.UndoMostRecent -> onUndoMostRecent
+        is PendingOpConfirmation.Restore -> ({ onRestore(pending.opId) })
+    }
+
+/**
  * The `JjChangeGraph` item: an interactive DAG view over `workspace.log`,
  * tap-to-inspect a change (a local selection dialog — every field it shows
  * came from the already-fetched node), and one-tap `undo`/`op restore`
  * against `workspace.op.*`. Node positions come from [layoutChangeGraph],
  * a client-side *layout* only — the node/edge data itself is never
  * computed here, per M3's exit criterion.
+ *
+ * UX-friction audit finding #9: [onUndoMostRecent]/[onRestore] rewrite repo
+ * history (a real `jj op undo`/`op restore` against the working copy) — an
+ * earlier version of this screen fired them the instant "Undo last op" or a
+ * row's "Restore" was tapped, with no confirmation step at all, indistinguishable
+ * from every other single-tap navigation action in this app. A
+ * [PendingOpConfirmation] held as local UI state plus one [AlertDialog] —
+ * the same `AlertDialog` mechanism [ChangeDetailDialog] below already uses,
+ * the precedent this fix matches — is the minimal fix: tapping either button
+ * now only stages the action; [onUndoMostRecent]/[onRestore] themselves are
+ * only ever invoked from the dialog's own confirm button.
  */
 @Composable
 fun JjChangeGraphScreen(
@@ -45,11 +87,13 @@ fun JjChangeGraphScreen(
     onRestore: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var pendingConfirmation by remember { mutableStateOf<PendingOpConfirmation?>(null) }
+
     Column(modifier) {
         Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             Text("Change graph", style = MaterialTheme.typography.titleMedium)
             TextButton(
-                onClick = onUndoMostRecent,
+                onClick = { pendingConfirmation = PendingOpConfirmation.UndoMostRecent },
                 enabled = state.operations.isNotEmpty(),
                 modifier = Modifier.testTag("undo-most-recent-button"),
             ) { Text("Undo last op") }
@@ -62,7 +106,11 @@ fun JjChangeGraphScreen(
                 color = MaterialTheme.colorScheme.error,
                 modifier = Modifier.padding(16.dp).testTag("change-graph-error"),
             )
-            else -> ChangeGraphAndOperations(state, onNodeTap, onRestore)
+            else -> ChangeGraphAndOperations(
+                state = state,
+                onNodeTap = onNodeTap,
+                onRequestRestore = { op -> pendingConfirmation = PendingOpConfirmation.Restore(op.opId, op.description) },
+            )
         }
     }
 
@@ -70,10 +118,47 @@ fun JjChangeGraphScreen(
     if (selected != null) {
         ChangeDetailDialog(selected, onDismissSelection)
     }
+
+    when (val pending = pendingConfirmation) {
+        null -> Unit
+        is PendingOpConfirmation.UndoMostRecent -> OpConfirmationDialog(
+            title = "Undo this operation?",
+            text = "This reverses the most recently listed operation in this workspace.",
+            testTag = "undo-confirm-dialog",
+            onConfirm = {
+                pendingConfirmation = null
+                confirmedAction(pending, onUndoMostRecent, onRestore)()
+            },
+            onCancel = { pendingConfirmation = null },
+        )
+        is PendingOpConfirmation.Restore -> OpConfirmationDialog(
+            title = "Restore to this operation?",
+            text = "This resets the working copy to \"${pending.description}\".",
+            testTag = "restore-confirm-dialog",
+            onConfirm = {
+                pendingConfirmation = null
+                confirmedAction(pending, onUndoMostRecent, onRestore)()
+            },
+            onCancel = { pendingConfirmation = null },
+        )
+    }
+}
+
+/** Shared Cancel/Confirm shape for [PendingOpConfirmation.UndoMostRecent]/[PendingOpConfirmation.Restore] — see [JjChangeGraphScreen]'s doc comment. */
+@Composable
+private fun OpConfirmationDialog(title: String, text: String, testTag: String, onConfirm: () -> Unit, onCancel: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        modifier = Modifier.testTag(testTag),
+        title = { Text(title) },
+        text = { Text(text) },
+        confirmButton = { TextButton(onClick = onConfirm, modifier = Modifier.testTag("$testTag-confirm")) { Text("Confirm") } },
+        dismissButton = { TextButton(onClick = onCancel, modifier = Modifier.testTag("$testTag-cancel")) { Text("Cancel") } },
+    )
 }
 
 @Composable
-private fun ChangeGraphAndOperations(state: JjChangeGraphUiState, onNodeTap: (String) -> Unit, onRestore: (String) -> Unit) {
+private fun ChangeGraphAndOperations(state: JjChangeGraphUiState, onNodeTap: (String) -> Unit, onRequestRestore: (OperationLogEntry) -> Unit) {
     val positions = layoutChangeGraph(state.nodes).associateBy { it.changeId }
     val rows = state.nodes.groupBy { positions[it.changeId]?.row ?: 0 }.toSortedMap()
 
@@ -94,7 +179,7 @@ private fun ChangeGraphAndOperations(state: JjChangeGraphUiState, onNodeTap: (St
         item(key = "operations-header") {
             Text("Operations", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(16.dp, 24.dp, 16.dp, 8.dp))
         }
-        items(state.operations, key = { it.opId }) { op -> OperationRow(op, onRestore = { onRestore(op.opId) }) }
+        items(state.operations, key = { it.opId }) { op -> OperationRow(op, onRestore = { onRequestRestore(op) }) }
     }
 }
 

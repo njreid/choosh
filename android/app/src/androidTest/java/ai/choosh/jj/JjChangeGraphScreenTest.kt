@@ -8,6 +8,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.test.assertDoesNotExist
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -15,6 +16,8 @@ import androidx.compose.ui.test.performClick
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import java.io.FileOutputStream
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Rule
 import org.junit.Test
 
@@ -133,5 +136,59 @@ class JjChangeGraphScreenTest {
 
         composeTestRule.onNodeWithTag("operation-row-op-3").assertExists()
         composeTestRule.onNodeWithTag("restore-button-op-3").assertExists()
+    }
+
+    /** UX-friction audit finding #9: tapping "Undo last op" must stage a confirmation, never fire the real action by itself. */
+    @Test
+    fun undoRequiresConfirmationBeforeFiringAndCancelDismissesWithoutFiring() {
+        var undoCalls = 0
+        composeTestRule.setContent {
+            JjChangeGraphScreen(
+                state = JjChangeGraphUiState(nodes = conflictedMergeNodes(), operations = operations(), isLoading = false),
+                onNodeTap = {},
+                onDismissSelection = {},
+                onUndoMostRecent = { undoCalls += 1 },
+                onRestore = {},
+            )
+        }
+
+        composeTestRule.onNodeWithTag("undo-most-recent-button").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals("the trigger button alone must not fire the real undo", 0, undoCalls)
+        composeTestRule.onNodeWithTag("undo-confirm-dialog").assertExists()
+
+        composeTestRule.onNodeWithTag("undo-confirm-dialog-cancel").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals("Cancel must dismiss without firing", 0, undoCalls)
+        composeTestRule.onNodeWithTag("undo-confirm-dialog").assertDoesNotExist()
+
+        composeTestRule.onNodeWithTag("undo-most-recent-button").performClick()
+        composeTestRule.onNodeWithTag("undo-confirm-dialog-confirm").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals("Confirm must fire exactly once", 1, undoCalls)
+    }
+
+    /** UX-friction audit finding #9's Restore counterpart, plus confirming the exact opId is threaded through. */
+    @Test
+    fun restoreRequiresConfirmationAndFiresWithTheCorrectOpId() {
+        var restoredOpId: String? = null
+        composeTestRule.setContent {
+            JjChangeGraphScreen(
+                state = JjChangeGraphUiState(nodes = conflictedMergeNodes(), operations = operations(), isLoading = false),
+                onNodeTap = {},
+                onDismissSelection = {},
+                onUndoMostRecent = {},
+                onRestore = { restoredOpId = it },
+            )
+        }
+
+        composeTestRule.onNodeWithTag("restore-button-op-3").performClick()
+        composeTestRule.waitForIdle()
+        assertNull("the trigger button alone must not fire the real restore", restoredOpId)
+        composeTestRule.onNodeWithTag("restore-confirm-dialog").assertExists()
+
+        composeTestRule.onNodeWithTag("restore-confirm-dialog-confirm").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals("op-3", restoredOpId)
     }
 }

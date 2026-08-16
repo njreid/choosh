@@ -28,8 +28,23 @@ interface ChooshEngine {
     /** Finishes login with the Credential Manager response JSON; returns a [WebauthnResult]. */
     suspend fun webauthnLoginFinish(credentialJson: String): WebauthnResult
 
-    /** Opens the persistent relay connection using a stored session credential. */
-    suspend fun connect(sessionCredential: String): Boolean
+    /**
+     * Opens the persistent relay connection using a stored session
+     * credential. Returns a [ConnectResult] — never a bare `Boolean` — so
+     * callers ([ai.choosh.connection.ConnectionViewModel.connectWith] in
+     * particular) can distinguish a genuine relayd-side rejection of
+     * `sessionCredential` (revoked/expired: [ConnectResult.Rejected], which
+     * MUST force a fresh `WebAuthn` ceremony) from a plain connectivity
+     * failure ([ConnectResult.TransportFailure], which MUST NOT: the
+     * credential itself may still be perfectly valid, only unreachable
+     * right now). An earlier version of this method returned `Boolean`,
+     * which collapsed both cases into the same `false` and forced every
+     * transient network failure to silently wipe the stored credential
+     * (UX-friction audit finding #5) — see [NativeChooshEngine]'s doc
+     * comment on [Engine::connect]'s Rust-side counterpart for the wire
+     * shape this decodes.
+     */
+    suspend fun connect(sessionCredential: String): ConnectResult
 
     /** Lists every devhost visible to this authenticated connection. */
     suspend fun listDevhosts(): List<DevHostPresence>
@@ -498,6 +513,32 @@ sealed interface EnrollmentTokenResult {
     data class Success(val token: String, val expiresAt: String) : EnrollmentTokenResult
 
     data class Failure(val message: String) : EnrollmentTokenResult
+}
+
+/**
+ * Outcome of [ChooshEngine.connect]. Two distinct failure shapes on
+ * purpose — see that method's doc comment for the full "why" — a caller
+ * MUST NOT treat [Rejected] and [TransportFailure] the same way.
+ */
+sealed interface ConnectResult {
+    /** The relay connection is open. */
+    data object Connected : ConnectResult
+
+    /**
+     * relayd itself rejected `sessionCredential` (revoked, expired, or
+     * otherwise no longer valid) — the caller MUST treat the stored
+     * credential as dead and require a fresh `WebAuthn` ceremony before
+     * connecting again.
+     */
+    data class Rejected(val message: String) : ConnectResult
+
+    /**
+     * A transport-level failure (relayd unreachable, a dial/timeout error,
+     * or an unexpected protocol frame) — NOT evidence that the credential
+     * itself is invalid. The caller MUST keep the stored credential and
+     * let the user retry.
+     */
+    data class TransportFailure(val message: String) : ConnectResult
 }
 
 /** Mirrors `choosh_protocol::relay::DevHostPresence` exactly (see relay-protocol.md). */

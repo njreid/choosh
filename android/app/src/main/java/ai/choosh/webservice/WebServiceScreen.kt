@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -19,17 +20,20 @@ import androidx.compose.ui.unit.dp
  * "WebView isolation" and "Readiness" sections. `state` drives what's
  * shown: [WebServiceUiState.Starting] is the retrying interstitial,
  * [WebServiceUiState.Ready] mounts the isolated `WebView`,
- * [WebServiceUiState.Stopped]/[WebServiceUiState.Failed] show a plain
- * status message (no `WebView` in either case — nothing to load).
+ * [WebServiceUiState.Stopped] shows a plain status message (no `WebView` —
+ * nothing to load), and [WebServiceUiState.Failed] shows the same plus a
+ * real retry action (UX-friction audit finding #7 — this used to be a dead
+ * end with no way back to [WebServiceUiState.Ready] short of navigating
+ * away and back) wired to [ai.choosh.webservice.WebServiceViewModel.retry].
  */
 @Composable
-fun WebServiceScreen(state: WebServiceUiState, modifier: Modifier = Modifier) {
+fun WebServiceScreen(state: WebServiceUiState, modifier: Modifier = Modifier, onRetry: () -> Unit = {}) {
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         when (state) {
             is WebServiceUiState.Starting -> RetryingInterstitial()
             is WebServiceUiState.Ready -> IsolatedWebServiceWebView(state.url, state.cookieHeader, Modifier.fillMaxSize())
             is WebServiceUiState.Stopped -> StatusMessage("This service isn't running.")
-            is WebServiceUiState.Failed -> StatusMessage(state.message)
+            is WebServiceUiState.Failed -> FailedStatus(state.message, onRetry)
         }
     }
 }
@@ -45,6 +49,14 @@ private fun RetryingInterstitial() {
 @Composable
 private fun StatusMessage(message: String) {
     Text(message, modifier = Modifier.testTag("web-service-status").padding(24.dp), style = MaterialTheme.typography.bodyMedium)
+}
+
+@Composable
+private fun FailedStatus(message: String, onRetry: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        StatusMessage(message)
+        Button(onClick = onRetry, modifier = Modifier.testTag("web-service-retry-button")) { Text("Retry") }
+    }
 }
 
 /**

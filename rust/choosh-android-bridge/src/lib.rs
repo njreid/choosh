@@ -150,10 +150,12 @@ fn native_connect<'local>(
     _class: JClass<'local>,
     handle: jlong,
     session_credential: JString<'local>,
-) -> Result<jboolean, jni::errors::Error> {
+) -> Result<JString<'local>, jni::errors::Error> {
     let session_credential = jstring_to_string(env, &session_credential)?;
-    let connected = with_handle(handle, false, |h| h.runtime.block_on(h.engine.connect(&session_credential)));
-    Ok(jboolean::from(connected))
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| {
+        h.runtime.block_on(h.engine.connect(&session_credential))
+    });
+    JString::new(env, body)
 }
 
 fn native_list_devhosts<'local>(env: &mut Env<'local>, _class: JClass<'local>, handle: jlong) -> Result<JString<'local>, jni::errors::Error> {
@@ -560,7 +562,7 @@ const _LOGIN_FINISH: jni::NativeMethod = native_method! {
 };
 const _CONNECT: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",
-    static extern fn NativeBridge::native_connect(handle: jlong, session_credential: JString) -> jboolean,
+    static extern fn NativeBridge::native_connect(handle: jlong, session_credential: JString) -> JString,
     fn = native_connect,
 };
 const _LIST_DEVHOSTS: jni::NativeMethod = native_method! {

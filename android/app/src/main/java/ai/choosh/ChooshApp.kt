@@ -6,7 +6,7 @@ import ai.choosh.agentevents.AgentEventSubscription
 import ai.choosh.agentevents.AgentStatusTracker
 import ai.choosh.connection.ConnectionScreen
 import ai.choosh.connection.ConnectionViewModel
-import ai.choosh.connection.SessionCredentialStore
+import ai.choosh.connection.RealSessionCredentialStore
 import ai.choosh.engine.ChooshEngine
 import ai.choosh.fleet.DevHostWorkspacesScreen
 import ai.choosh.fleet.DevHostWorkspacesViewModel
@@ -80,7 +80,17 @@ private suspend fun fetchFcmToken(): String? = runCatching { FirebaseMessaging.g
 private sealed interface Screen {
     data object Connection : Screen
     data object Fleet : Screen
-    data class Workspace(val workspaceId: String, val deviceId: String) : Screen
+    /**
+     * `workspaceName` is [ai.choosh.fleet.Workspace.name] — carried through
+     * from wherever this screen was navigated to from (see
+     * [ai.choosh.fleet.FleetNavigationEvent.OpenWorkspace]'s own doc
+     * comment), so [ai.choosh.workspace.WorkspaceScreen] can title itself
+     * with the real name instead of the raw [workspaceId] (UX-friction
+     * audit finding #11). `null` only where genuinely unavailable at the
+     * navigating call site — [ai.choosh.workspace.WorkspaceScreen] falls
+     * back to [workspaceId] in that case, never a crash or a fabricated name.
+     */
+    data class Workspace(val workspaceId: String, val deviceId: String, val workspaceName: String? = null) : Screen
 
     /**
      * The real per-devhost Workspace list (docs/specs/android-navigation.md's
@@ -116,8 +126,15 @@ private sealed interface Screen {
      * for [onBack] to return to the right Workspace — it plays no role in
      * [TerminalScreen]'s own PTY-attach logic, which is
      * `(deviceId, itemId)`-addressed per `terminal-experience.md`.
+     *
+     * `itemName`: same "thread the real name through instead of showing a
+     * raw id" fix as [Workspace.workspaceName] (UX-friction audit finding
+     * #11) — there is no real named `AgentTerminal` item to source this
+     * from yet, so this is the current [Workspace]'s own name, the closest
+     * genuinely-available name today. `null` falls back to [itemId]/
+     * [deviceId], unchanged from before this field existed.
      */
-    data class Terminal(val deviceId: String, val itemId: String, val workspaceId: String) : Screen
+    data class Terminal(val deviceId: String, val itemId: String, val workspaceId: String, val itemName: String? = null) : Screen
 
     /**
      * The real `WebService` pinned item, per `docs/specs/service-tunnels.md`.
@@ -157,7 +174,7 @@ fun ChooshApp(
     onDeepLinkConsumed: () -> Unit = {},
 ) {
     val engine = remember { buildEngine() }
-    val credentialStore = remember { SessionCredentialStore(context) }
+    val credentialStore = remember { RealSessionCredentialStore(context) }
     // A real back stack (UX-friction audit finding #2), not a single
     // `remember { mutableStateOf(...) }` slot: `docs/specs/android-navigation.md`'s
     // "Back behavior" section requires popping one level at a time
@@ -299,13 +316,13 @@ fun ChooshApp(
                         onProjectClick = { project ->
                             backStack.push(
                                 when (val event = viewModel.onProjectTapped(project)) {
-                                    is FleetNavigationEvent.OpenWorkspace -> Screen.Workspace(event.workspaceId, event.deviceId)
+                                    is FleetNavigationEvent.OpenWorkspace -> Screen.Workspace(event.workspaceId, event.deviceId, event.workspaceName)
                                     is FleetNavigationEvent.OpenDevHost -> Screen.DevHostWorkspaces(event.deviceId)
                                 },
                             )
                         },
                         onDevHostClick = { devHost -> backStack.push(Screen.DevHostWorkspaces(devHost.deviceId)) },
-                        onWorkspaceClick = { workspace -> backStack.push(Screen.Workspace(workspace.workspaceId, workspace.devHostId)) },
+                        onWorkspaceClick = { workspace -> backStack.push(Screen.Workspace(workspace.workspaceId, workspace.devHostId, workspace.name)) },
                         onRequestEnrollmentToken = viewModel::requestEnrollmentToken,
                         onDismissEnrollmentToken = viewModel::dismissEnrollmentToken,
                     )
@@ -323,6 +340,7 @@ fun ChooshApp(
                     WorkspaceScreen(
                         engine = engine,
                         workspaceId = current.workspaceId,
+                        workspaceName = current.workspaceName,
                         deviceId = current.deviceId,
                         onBack = { backStack.pop() },
                         statusTracker = statusTracker,
@@ -332,7 +350,9 @@ fun ChooshApp(
                         // hardcoded demo item (see WorkspaceScreen.kt's own
                         // doc comment on why the old fixed demo buttons are
                         // gone).
-                        onOpenAgentTerminal = { itemId -> backStack.push(Screen.Terminal(current.deviceId, itemId, current.workspaceId)) },
+                        onOpenAgentTerminal = { itemId ->
+                            backStack.push(Screen.Terminal(current.deviceId, itemId, current.workspaceId, itemName = current.workspaceName))
+                        },
                         onOpenWebService = { itemId -> backStack.push(Screen.WebService(current.deviceId, current.workspaceId, itemId)) },
                         onOpenSourceEditor = { path -> backStack.push(Screen.SourceEditor(current.deviceId, current.workspaceId, path)) },
                         onOpenMarkdownPreview = { path -> backStack.push(Screen.MarkdownPreview(current.deviceId, current.workspaceId, path)) },
@@ -371,6 +391,7 @@ fun ChooshApp(
                 is Screen.Terminal -> TerminalScreen(
                     deviceId = current.deviceId,
                     itemId = current.itemId,
+                    itemName = current.itemName,
                     // Real connection handle, per this file's `buildEngine`
                     // comment (`NativeChooshEngine` is the real default now)
                     // — `null` only when running against `FakeChooshEngine`
@@ -399,7 +420,7 @@ fun ChooshApp(
                     val state by viewModel.state.collectAsState()
                     Column(Modifier.fillMaxSize()) {
                         BackRow(onBack = { backStack.pop() })
-                        WebServiceScreen(state, Modifier.weight(1f))
+                        WebServiceScreen(state, Modifier.weight(1f), onRetry = viewModel::retry)
                     }
                 }
 

@@ -21,7 +21,11 @@ import androidx.compose.ui.unit.dp
 import androidx.credentials.CreatePublicKeyCredentialRequest
 import androidx.credentials.CredentialManager
 import androidx.credentials.CreateCredentialResponse
+import androidx.credentials.exceptions.CreateCredentialCancellationException
 import androidx.credentials.exceptions.CreateCredentialException
+import androidx.credentials.exceptions.CreateCredentialInterruptedException
+import androidx.credentials.exceptions.CreateCredentialNoCreateOptionException
+import androidx.credentials.exceptions.CreateCredentialProviderConfigurationException
 import kotlinx.coroutines.launch
 
 /**
@@ -121,7 +125,39 @@ private suspend fun runRegistrationCeremony(context: android.content.Context, vi
             viewModel.onRegistrationCancelledOrFailed("Credential Manager returned an unexpected response type")
         }
     } catch (failure: CreateCredentialException) {
-        Log.w("ConnectionScreen", "passkey registration ceremony failed", failure)
-        viewModel.onRegistrationCancelledOrFailed(failure.errorMessage?.toString() ?: "Passkey registration was cancelled")
+        // The raw platform errorMessage still goes to Logcat (real diagnostic value for
+        // debugging a real device) — describeCreateCredentialFailure below is what the user
+        // actually sees, per UX-friction audit finding #6: the raw platform string
+        // ("No create options available.") was shown to the user verbatim, telling them
+        // nothing about what actually went wrong or what to do about it.
+        Log.w("ConnectionScreen", "passkey registration ceremony failed: ${failure.errorMessage}", failure)
+        viewModel.onRegistrationCancelledOrFailed(describeCreateCredentialFailure(failure))
     }
+}
+
+/**
+ * App-authored replacements for [CreateCredentialException]'s raw platform
+ * [CreateCredentialException.errorMessage] — UX-friction audit finding #6.
+ * Deliberately doesn't fabricate false certainty beyond what each typed
+ * exception actually tells us: [CreateCredentialNoCreateOptionException]
+ * specifically means no credential provider was available to even offer a
+ * creation option (this project's own Genymotion test instances hit this —
+ * see [DevPasskeyHooks]'s doc comment — no Google Play Services means no
+ * platform passkey provider at all), so that's named directly rather than
+ * left as an opaque platform string; every other case gets a plain,
+ * honest description of what its own type actually represents, never a
+ * guess about the underlying cause a type this generic can't actually tell
+ * us. `internal` (not `private`): unit-tested directly in
+ * `ConnectionScreenMessagesTest`, the same "pure derivation, unit-tested
+ * directly" precedent as `ai.choosh.webservice.deriveWebServiceUiState`.
+ */
+internal fun describeCreateCredentialFailure(failure: CreateCredentialException): String = when (failure) {
+    is CreateCredentialCancellationException -> "Passkey setup was cancelled."
+    is CreateCredentialNoCreateOptionException ->
+        "No passkey provider is available on this device — this usually means there's no " +
+            "credential provider (e.g. Google Play Services) configured here, so a passkey can't " +
+            "be created."
+    is CreateCredentialProviderConfigurationException -> "This device's passkey provider isn't configured correctly."
+    is CreateCredentialInterruptedException -> "Passkey setup was interrupted before it could finish. Please try again."
+    else -> "Passkey setup couldn't be completed on this device."
 }
