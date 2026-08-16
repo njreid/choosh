@@ -1,6 +1,7 @@
 package ai.choosh.engine
 
 import ai.choosh.fleet.FleetFixtures
+import java.time.Instant
 import java.util.Base64
 import kotlinx.coroutines.delay
 
@@ -76,6 +77,21 @@ class FakeChooshEngine : ChooshEngine {
     override suspend fun registerFcmToken(fcmToken: String): Boolean {
         delay(FAKE_LATENCY_MS)
         return connected
+    }
+
+    /** Set by a test to exercise [EnrollmentTokenResult.Failure] without touching [connected]. */
+    var simulateEnrollmentTokenFailure: Boolean = false
+    private var enrollmentTokenCounter = 0
+
+    override suspend fun requestEnrollmentToken(): EnrollmentTokenResult {
+        delay(FAKE_LATENCY_MS)
+        if (!connected) return EnrollmentTokenResult.Failure("not connected: call connect first")
+        if (simulateEnrollmentTokenFailure) return EnrollmentTokenResult.Failure("fake request-enrollment-token failure")
+        enrollmentTokenCounter += 1
+        return EnrollmentTokenResult.Success(
+            token = "fake-enroll-tok-$enrollmentTokenCounter",
+            expiresAt = Instant.now().plusSeconds(FAKE_ENROLLMENT_TOKEN_LIFETIME_SECONDS).toString(),
+        )
     }
 
     /**
@@ -379,6 +395,9 @@ class FakeChooshEngine : ChooshEngine {
 
     companion object {
         private const val FAKE_LATENCY_MS = 120L
+
+        /** Matches auth-and-enrollment.md's real 15-minute enrollment-token lifetime. */
+        private const val FAKE_ENROLLMENT_TOKEN_LIFETIME_SECONDS = 15L * 60
         const val FIXTURE_DEVICE_ID = "dev-mbp-home"
         const val FIXTURE_WORKSPACE_ID = "ws-choosh-app"
 

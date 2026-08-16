@@ -186,6 +186,8 @@ fun ChooshApp(context: Context) {
                         },
                         onDevHostClick = { devHost -> screen = Screen.DevHostPlaceholder(devHost.deviceId) },
                         onWorkspaceClick = { workspace -> screen = Screen.Workspace(workspace.workspaceId, workspace.devHostId) },
+                        onRequestEnrollmentToken = viewModel::requestEnrollmentToken,
+                        onDismissEnrollmentToken = viewModel::dismissEnrollmentToken,
                     )
                 }
 
