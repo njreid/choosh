@@ -4,25 +4,31 @@ import ai.choosh.engine.FakeChooshEngine
 import ai.choosh.explorer.ExplorerScreen
 import ai.choosh.explorer.ExplorerViewModel
 import ai.choosh.fleet.FleetDrawer
+import ai.choosh.fleet.FleetNavigationEvent
 import ai.choosh.fleet.FleetViewModel
 import ai.choosh.jj.JjChangeGraphScreen
 import ai.choosh.jj.JjChangeGraphViewModel
 import ai.choosh.jj.JjDiffScreen
 import ai.choosh.jj.JjDiffViewModel
 import ai.choosh.markdown.MarkdownFixtureDemoScreen
+import ai.choosh.nav.ScreenBackStack
 import ai.choosh.terminal.TerminalScreen
 import ai.choosh.webservice.WebServiceScreen
 import ai.choosh.webservice.WebServiceViewModel
 import ai.choosh.workspace.WorkspaceScreen
 import android.util.Log
+import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.test.espresso.Espresso
 import org.junit.Rule
 import org.junit.Test
 
@@ -309,5 +315,180 @@ class DeviceVerificationHarnessTest {
         composeTestRule.waitForIdle()
         Log.i("DeviceHarness", "ready-markdown")
         Thread.sleep(45000)
+    }
+
+    /**
+     * Real on-device evidence for the UX-friction audit's finding #2 fix
+     * (a real back stack, `ai.choosh.nav.ScreenBackStack`, replacing
+     * `ChooshApp.kt`'s previous single `remember { mutableStateOf(...) }`
+     * current-screen variable — see that class's doc comment): drives the
+     * exact same [ScreenBackStack] class wired to a real
+     * `androidx.activity.compose.BackHandler`, the same way [ChooshApp]
+     * wires it, three real production screens deep — [FleetDrawer] ->
+     * [WorkspaceScreen] -> [TerminalScreen] — using [FakeChooshEngine]'s
+     * fixture data instead of [ai.choosh.NativeChooshEngine] for the same
+     * Credential-Manager-unreachable reason the rest of this harness
+     * exists (see this class's own doc comment): `ChooshApp` itself can
+     * reach [ai.choosh.fleet.FleetDrawer] on this device via the real
+     * dev-passkey ceremony against a real `relayd` (PLAN.md's "End-to-end
+     * verification, real evidence"), but that real fleet has zero enrolled
+     * devhosts, so there is no real Workspace to drill into three levels
+     * deep through `ChooshApp` itself — [FakeChooshEngine]'s fixture
+     * Project (`proj-choosh`, primary workspace `ws-choosh-app` on
+     * `dev-mbp-home`, matching [FakeChooshEngine.FIXTURE_WORKSPACE_ID]/
+     * [FakeChooshEngine.FIXTURE_DEVICE_ID]) gives this a real, populated
+     * three-level chain to actually pop back through.
+     *
+     * Logs a distinctive marker at each depth reached, then holds, so an
+     * external `adb shell input keyevent KEYCODE_BACK` / `adb shell
+     * screencap` poll can capture each level and confirm hardware Back
+     * pops exactly one level per press: terminal -> workspace -> fleet.
+     */
+    @Test
+    fun backStackPopsThroughFleetWorkspaceTerminal() {
+        val engine = FakeChooshEngine()
+        kotlinx.coroutines.runBlocking { engine.connect("device-harness-test") }
+        val fleetViewModel = FleetViewModel(engine)
+
+        composeTestRule.setContent {
+            val backStack = remember { ScreenBackStack("fleet") }
+            BackHandler(enabled = backStack.canPop) { backStack.pop() }
+            when (backStack.current) {
+                "fleet" -> {
+                    val state by fleetViewModel.state.collectAsState()
+                    FleetDrawer(
+                        state = state,
+                        onSortModeSelected = fleetViewModel::setSortMode,
+                        onProjectClick = { project ->
+                            val event = fleetViewModel.onProjectTapped(project)
+                            if (event is FleetNavigationEvent.OpenWorkspace) backStack.push("workspace")
+                        },
+                        onDevHostClick = {},
+                        onWorkspaceClick = {},
+                    )
+                }
+                "workspace" -> WorkspaceScreen(
+                    engine = engine,
+                    workspaceId = FakeChooshEngine.FIXTURE_WORKSPACE_ID,
+                    deviceId = FakeChooshEngine.FIXTURE_DEVICE_ID,
+                    onBack = { backStack.pop() },
+                    onOpenTerminal = { backStack.push("terminal") },
+                )
+                "terminal" -> TerminalScreen(
+                    deviceId = FakeChooshEngine.FIXTURE_DEVICE_ID,
+                    itemId = FakeChooshEngine.FIXTURE_WORKSPACE_ID,
+                    connectionHandle = null,
+                    onBack = { backStack.pop() },
+                )
+                else -> error("unreachable screen: ${backStack.current}")
+            }
+        }
+
+        composeTestRule.waitUntil(timeoutMillis = 5_000) {
+            composeTestRule.onAllNodesWithTag("fleet-row-list").fetchSemanticsNodes().isNotEmpty()
+        }
+        composeTestRule.waitForIdle()
+        Log.i("DeviceHarness", "navdepth-ready-fleet")
+        Thread.sleep(10_000)
+
+        composeTestRule.onNodeWithTag("fleet-row-project:proj-choosh").performClick()
+        composeTestRule.waitForIdle()
+        Log.i("DeviceHarness", "navdepth-ready-workspace")
+        Thread.sleep(10_000)
+
+        composeTestRule.onNodeWithText("Open terminal").performClick()
+        composeTestRule.waitForIdle()
+        // Held long — this is the window an external `adb shell input keyevent
+        // KEYCODE_BACK` / `adb shell screencap` poll actually drives Back
+        // presses from, all the way back down through workspace -> fleet, so
+        // it needs to comfortably outlast that external polling's own
+        // round-trip latency, not just a fixed render-settle pause like the
+        // rest of this harness's holds.
+        Log.i("DeviceHarness", "navdepth-ready-terminal")
+        Thread.sleep(300_000)
+    }
+
+    /**
+     * Deterministic (no external-adb-timing race) confirmation that the
+     * real back stack pops one level per Back press, Fleet -> Workspace ->
+     * Terminal then Back twice — the exact scenario this task's
+     * verification asked for — via Espresso's `pressBack()`, which routes
+     * through the real `OnBackPressedDispatcher` inside this test process
+     * rather than an external `adb shell input keyevent`. Added after
+     * external `adb shell input keyevent KEYCODE_BACK` against
+     * [backStackPopsThroughFleetWorkspaceTerminal]'s held Terminal screen
+     * did not visibly navigate (confirmed via `adb shell screencap`: the
+     * same Terminal screen, unchanged, after two separate keyevent
+     * attempts) — the same "did `adb shell input keyevent`/`input tap` not
+     * reach the composable, or is this a real logic defect" ambiguity
+     * [graphDialogDismissesViaComposeClick] exists to resolve for the
+     * dialog-dismiss case, applied here to `BackHandler`.
+     */
+    @Test
+    fun backStackPopsTwiceViaEspressoPressBack() {
+        val engine = FakeChooshEngine()
+        kotlinx.coroutines.runBlocking { engine.connect("device-harness-test") }
+        val fleetViewModel = FleetViewModel(engine)
+
+        composeTestRule.setContent {
+            val backStack = remember { ScreenBackStack("fleet") }
+            BackHandler(enabled = backStack.canPop) { backStack.pop() }
+            when (backStack.current) {
+                "fleet" -> {
+                    val state by fleetViewModel.state.collectAsState()
+                    FleetDrawer(
+                        state = state,
+                        onSortModeSelected = fleetViewModel::setSortMode,
+                        onProjectClick = { project ->
+                            val event = fleetViewModel.onProjectTapped(project)
+                            if (event is FleetNavigationEvent.OpenWorkspace) backStack.push("workspace")
+                        },
+                        onDevHostClick = {},
+                        onWorkspaceClick = {},
+                    )
+                }
+                "workspace" -> WorkspaceScreen(
+                    engine = engine,
+                    workspaceId = FakeChooshEngine.FIXTURE_WORKSPACE_ID,
+                    deviceId = FakeChooshEngine.FIXTURE_DEVICE_ID,
+                    onBack = { backStack.pop() },
+                    onOpenTerminal = { backStack.push("terminal") },
+                )
+                "terminal" -> TerminalScreen(
+                    deviceId = FakeChooshEngine.FIXTURE_DEVICE_ID,
+                    itemId = FakeChooshEngine.FIXTURE_WORKSPACE_ID,
+                    connectionHandle = null,
+                    onBack = { backStack.pop() },
+                )
+                else -> error("unreachable screen: ${backStack.current}")
+            }
+        }
+
+        // Drive down: fleet -> workspace -> terminal.
+        composeTestRule.waitUntil(timeoutMillis = 5_000) {
+            composeTestRule.onAllNodesWithTag("fleet-row-list").fetchSemanticsNodes().isNotEmpty()
+        }
+        composeTestRule.onNodeWithTag("fleet-row-project:proj-choosh").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Open terminal").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Terminal: ${FakeChooshEngine.FIXTURE_WORKSPACE_ID}@${FakeChooshEngine.FIXTURE_DEVICE_ID}").assertExists()
+        Log.i("DeviceHarness", "espresso-back-at-terminal")
+
+        // First Back: terminal -> workspace (the explorer), per
+        // android-navigation.md's "a pinned page ... returns to the
+        // explorer" — not all the way back to fleet.
+        Espresso.pressBack()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("Workspace ${FakeChooshEngine.FIXTURE_WORKSPACE_ID}").assertExists()
+        Log.i("DeviceHarness", "espresso-back-at-workspace")
+
+        // Second Back: workspace (the explorer) -> fleet (the workspace
+        // list), per android-navigation.md's "From the explorer, back
+        // returns to the Workspace list."
+        Espresso.pressBack()
+        composeTestRule.waitForIdle()
+        composeTestRule.onAllNodesWithTag("fleet-row-list").assertCountEquals(1)
+        Log.i("DeviceHarness", "espresso-back-at-fleet")
     }
 }
