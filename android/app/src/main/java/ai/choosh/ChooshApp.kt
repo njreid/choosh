@@ -3,14 +3,18 @@ package ai.choosh
 import ai.choosh.agentevents.AgentAttentionTracker
 import ai.choosh.agentevents.AgentEventCursorStore
 import ai.choosh.agentevents.AgentEventSubscription
+import ai.choosh.agentevents.AgentStatusTracker
 import ai.choosh.connection.ConnectionScreen
 import ai.choosh.connection.ConnectionViewModel
 import ai.choosh.connection.SessionCredentialStore
 import ai.choosh.engine.ChooshEngine
+import ai.choosh.fleet.DevHostWorkspacesScreen
+import ai.choosh.fleet.DevHostWorkspacesViewModel
 import ai.choosh.fleet.FleetDrawer
 import ai.choosh.fleet.FleetNavigationEvent
 import ai.choosh.fleet.FleetViewModel
-import ai.choosh.markdown.MarkdownFixtureDemoScreen
+import ai.choosh.markdown.MarkdownScreen
+import ai.choosh.markdown.MarkdownViewModel
 import ai.choosh.nav.ScreenBackStack
 import ai.choosh.sourceeditor.SourceEditorScreen
 import ai.choosh.sourceeditor.SourceEditorViewModel
@@ -20,7 +24,6 @@ import ai.choosh.webservice.WebServiceViewModel
 import ai.choosh.workspace.WorkspaceScreen
 import android.content.Context
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -28,12 +31,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -41,7 +42,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -80,7 +80,18 @@ private sealed interface Screen {
     data object Connection : Screen
     data object Fleet : Screen
     data class Workspace(val workspaceId: String, val deviceId: String) : Screen
-    data class DevHostPlaceholder(val deviceId: String) : Screen
+
+    /**
+     * The real per-devhost Workspace list (docs/specs/android-navigation.md's
+     * "Workspace entry": `Fleet drawer -> Workspace list -> Workspace`),
+     * backed by `workspace.list` via [DevHostWorkspacesViewModel]. Replaces
+     * the old `DevHostPlaceholder` literal placeholder screen — the
+     * UX-friction audit's finding #3 ("Fleet drawer can't actually reach
+     * most workspaces... Host mode renders `DevHostRow`s only, and tapping
+     * one routes to `Screen.DevHostPlaceholder`... a literal placeholder
+     * screen").
+     */
+    data class DevHostWorkspaces(val deviceId: String) : Screen
 
     /**
      * The `SourceEditor` pinned item (docs/specs/android-navigation.md's
@@ -88,39 +99,44 @@ private sealed interface Screen {
      * needed alongside `workspaceId` because
      * `PhoneConnection::call_rpc`/`Engine.openDocument`/`saveDocument` are
      * always devhost-targeted — there is no workspace-scoped connection to
-     * resolve it from implicitly.
+     * resolve it from implicitly. Reachable from the Explorer's searchable
+     * project tree (a non-Markdown file) or its own real demo affordance
+     * inside [ai.choosh.workspace.WorkspaceScreen].
      */
     data class SourceEditor(val deviceId: String, val workspaceId: String, val path: String) : Screen
 
     /**
      * The `AgentTerminal` pinned-item page, per
-     * `docs/specs/android-navigation.md`'s pinned-kinds table. Reachable
-     * today only from [Workspace]'s demo affordance — a real entry point
-     * (tapping an actual `AgentTerminal` item in the explorer) lands with
-     * `item.list` wiring into the explorer itself, a later increment.
+     * `docs/specs/android-navigation.md`'s pinned-kinds table. `itemId` is
+     * now a real `item.list`/`item.create` id (never a hardcoded/reused
+     * `workspaceId`, as an earlier pass did) — reachable by tapping a real
+     * row in the Explorer's "active agents" section. `workspaceId` is
+     * carried alongside purely for [onBack] to return to the right
+     * Workspace — it plays no role in [TerminalScreen]'s own PTY-attach
+     * logic, which is `(deviceId, itemId)`-addressed per
+     * `terminal-experience.md`.
      */
-    data class Terminal(val deviceId: String, val itemId: String) : Screen
+    data class Terminal(val deviceId: String, val itemId: String, val workspaceId: String) : Screen
 
     /**
-     * `WebService` pinned-item demo, per `docs/specs/service-tunnels.md`.
-     * Reachable only from [Workspace]'s demo affordance, same "no real
-     * `item.list` entry point wired into the explorer yet" caveat as
-     * [Terminal] — `connectionHandle` is `null` here for the identical
-     * reason (see [Terminal]'s doc comment and this file's `buildEngine`
-     * comment), so this demonstrates the retrying-interstitial/failed
-     * states genuinely, not a live gateway/`WebView` load.
+     * The real `WebService` pinned item, per `docs/specs/service-tunnels.md`.
+     * `itemId` is a real `item.list`/`item.create` id, reached by tapping a
+     * real row in the Explorer's "registered development services"
+     * section — replaces the old `WebServiceDemo` screen, which always
+     * polled a hardcoded `"item-web-1"` regardless of what the tapped
+     * workspace actually had registered.
      */
-    data class WebServiceDemo(val deviceId: String, val workspaceId: String) : Screen
+    data class WebService(val deviceId: String, val workspaceId: String, val itemId: String) : Screen
 
     /**
-     * The Markdown/Datastar `WebView` demo, per
-     * `docs/milestones/M5-web-and-markdown.md`. Unlike [WebServiceDemo],
-     * this one *does* render a real `WebView` loading real
-     * `choosh-web::markdown::render_markdown` output, via
-     * `MarkdownGatewayBridge`'s fixture-backed start (no relay connection
-     * needed) — see `MarkdownFixtureDemoScreen`'s doc comment.
+     * The `MarkdownPreview` pinned item, per
+     * `docs/specs/android-navigation.md`'s pinned-kinds table /
+     * `docs/milestones/M5-web-and-markdown.md`. `path` is a real
+     * `workspace.tree.list`-discovered `.md`/`.markdown` file, reached by
+     * tapping it in the Explorer's searchable project tree — replaces the
+     * old fixture-only `MarkdownDemo` screen.
      */
-    data object MarkdownDemo : Screen
+    data class MarkdownPreview(val deviceId: String, val workspaceId: String, val path: String) : Screen
 }
 
 @Composable
@@ -154,12 +170,15 @@ fun ChooshApp(context: Context) {
     // `startPolling`.
     val cursorStore = remember { AgentEventCursorStore() }
     val attentionTracker = remember { AgentAttentionTracker() }
+    // The per-item `AgentRunStatus` companion to `attentionTracker`'s
+    // workspace-level flag (see AgentStatusTracker's own doc comment) —
+    // feeds the explorer's "active agents" section's real `busy`/`waiting`/
+    // `starting`/`failed` distinction, which `item.list` alone cannot
+    // provide.
+    val statusTracker = remember { AgentStatusTracker() }
     // `onSnapshotRequired` calls the real `workspace.status` RPC per
     // agent-events.md: "the client refreshes full workspace/item state via
-    // workspace.status/workspace.list" (`workspace.list` itself isn't
-    // wired into [ChooshEngine] yet — a separate, tracked gap; see
-    // FleetViewModel's own doc comment — so `workspace.status` is the real
-    // refresh available to wire to). Its result isn't routed into a
+    // workspace.status/workspace.list". Its result isn't routed into a
     // specific screen's visible state here: [WorkspaceScreen] constructs
     // its own [ai.choosh.explorer.ExplorerViewModel] internally rather than
     // the composition root holding a reference to it, so there's no
@@ -174,6 +193,7 @@ fun ChooshApp(context: Context) {
             cursorStore = cursorStore,
             attentionTracker = attentionTracker,
             onSnapshotRequired = { deviceId, workspaceId -> runCatching { engine.workspaceStatus(deviceId, workspaceId) } },
+            statusTracker = statusTracker,
         )
     }
     val agentEventPollScope = rememberCoroutineScope()
@@ -203,11 +223,11 @@ fun ChooshApp(context: Context) {
                             backStack.push(
                                 when (val event = viewModel.onProjectTapped(project)) {
                                     is FleetNavigationEvent.OpenWorkspace -> Screen.Workspace(event.workspaceId, event.deviceId)
-                                    is FleetNavigationEvent.OpenDevHost -> Screen.DevHostPlaceholder(event.deviceId)
+                                    is FleetNavigationEvent.OpenDevHost -> Screen.DevHostWorkspaces(event.deviceId)
                                 },
                             )
                         },
-                        onDevHostClick = { devHost -> backStack.push(Screen.DevHostPlaceholder(devHost.deviceId)) },
+                        onDevHostClick = { devHost -> backStack.push(Screen.DevHostWorkspaces(devHost.deviceId)) },
                         onWorkspaceClick = { workspace -> backStack.push(Screen.Workspace(workspace.workspaceId, workspace.devHostId)) },
                     )
                 }
@@ -226,22 +246,34 @@ fun ChooshApp(context: Context) {
                         workspaceId = current.workspaceId,
                         deviceId = current.deviceId,
                         onBack = { backStack.pop() },
-                        // Demo entry points — the explorer doesn't yet surface real
-                        // AgentTerminal/SourceEditor pinned items to tap directly
-                        // (item.list wiring is a later increment), so these open a
-                        // fixed item/path against the current workspace instead.
-                        onOpenTerminal = { backStack.push(Screen.Terminal(deviceId = current.deviceId, itemId = current.workspaceId)) },
-                        onOpenEditor = { path -> backStack.push(Screen.SourceEditor(current.deviceId, current.workspaceId, path)) },
-                        onOpenWebServiceDemo = { backStack.push(Screen.WebServiceDemo(current.deviceId, current.workspaceId)) },
-                        onOpenMarkdownDemo = { backStack.push(Screen.MarkdownDemo) },
+                        statusTracker = statusTracker,
+                        // Real item-pinning entry points — every one of these
+                        // is a real `item.list`/`item.create`/`workspace.tree.list`
+                        // id/path resolved by ExplorerViewModel, never a
+                        // hardcoded demo item (see WorkspaceScreen.kt's own
+                        // doc comment on why the old fixed demo buttons are
+                        // gone).
+                        onOpenAgentTerminal = { itemId -> backStack.push(Screen.Terminal(current.deviceId, itemId, current.workspaceId)) },
+                        onOpenWebService = { itemId -> backStack.push(Screen.WebService(current.deviceId, current.workspaceId, itemId)) },
+                        onOpenSourceEditor = { path -> backStack.push(Screen.SourceEditor(current.deviceId, current.workspaceId, path)) },
+                        onOpenMarkdownPreview = { path -> backStack.push(Screen.MarkdownPreview(current.deviceId, current.workspaceId, path)) },
                     )
                 }
 
-                is Screen.DevHostPlaceholder -> PlaceholderScreen(
-                    title = "DevHost ${current.deviceId}",
-                    subtitle = "Per-devhost workspace list lands with real workspace RPCs (M1).",
-                    onBack = { backStack.pop() },
-                )
+                is Screen.DevHostWorkspaces -> {
+                    val viewModel: DevHostWorkspacesViewModel = viewModel(
+                        key = "devhost-workspaces:${current.deviceId}",
+                        factory = singleInstanceFactory { DevHostWorkspacesViewModel(engine, current.deviceId) },
+                    )
+                    val state by viewModel.state.collectAsState()
+                    DevHostWorkspacesScreen(
+                        deviceId = current.deviceId,
+                        state = state,
+                        onWorkspaceClick = { workspace -> backStack.push(Screen.Workspace(workspace.workspaceId, workspace.devHostId)) },
+                        onRefresh = viewModel::refresh,
+                        onBack = { backStack.pop() },
+                    )
+                }
 
                 is Screen.SourceEditor -> {
                     val viewModel: SourceEditorViewModel = viewModel(
@@ -260,21 +292,28 @@ fun ChooshApp(context: Context) {
                 is Screen.Terminal -> TerminalScreen(
                     deviceId = current.deviceId,
                     itemId = current.itemId,
-                    // Hardcoded null, not yet wired to `(engine as?
-                    // NativeChooshEngine)?.connectionHandle` — a real, tracked gap
-                    // (UX-friction audit finding #4/#12: this composition root's demo
-                    // buttons predate real item-pinning and haven't been rewired to it
-                    // yet), not a "no live relayd" limitation anymore. The demo-output
-                    // buttons still exercise the real VT parser + renderer end to end.
-                    connectionHandle = null,
+                    // Real connection handle, per this file's `buildEngine`
+                    // comment (`NativeChooshEngine` is the real default now)
+                    // — `null` only when running against `FakeChooshEngine`
+                    // (no real relay connection to attach a PTY tunnel
+                    // through), in which case the extra-keys bar's demo
+                    // output buttons remain the only way to see anything
+                    // render, exactly as documented on that button.
+                    connectionHandle = (engine as? NativeChooshEngine)?.connectionHandle,
                     onBack = { backStack.pop() },
                 )
 
-                is Screen.WebServiceDemo -> {
+                is Screen.WebService -> {
                     val viewModel: WebServiceViewModel = viewModel(
-                        key = "web-service-demo:${current.deviceId}:${current.workspaceId}",
+                        key = "web-service:${current.deviceId}:${current.workspaceId}:${current.itemId}",
                         factory = singleInstanceFactory {
-                            WebServiceViewModel(engine, current.deviceId, current.workspaceId, itemId = "item-web-1", connectionHandle = null)
+                            WebServiceViewModel(
+                                engine,
+                                current.deviceId,
+                                current.workspaceId,
+                                itemId = current.itemId,
+                                connectionHandle = (engine as? NativeChooshEngine)?.connectionHandle,
+                            )
                         },
                     )
                     LaunchedEffect(viewModel) { viewModel.startPolling() }
@@ -285,9 +324,22 @@ fun ChooshApp(context: Context) {
                     }
                 }
 
-                is Screen.MarkdownDemo -> Column(Modifier.fillMaxSize()) {
-                    BackRow(onBack = { backStack.pop() })
-                    MarkdownFixtureDemoScreen(Modifier.weight(1f))
+                is Screen.MarkdownPreview -> {
+                    val viewModel: MarkdownViewModel = viewModel(
+                        key = "markdown-preview:${current.deviceId}:${current.workspaceId}:${current.path}",
+                        factory = singleInstanceFactory {
+                            MarkdownViewModel(current.deviceId, current.workspaceId, current.path, (engine as? NativeChooshEngine)?.connectionHandle)
+                        },
+                    )
+                    // Explicitly stops this document's local gateway when the
+                    // screen leaves composition — MarkdownViewModel.onClose's
+                    // own doc comment is exactly this "screen teardown" case.
+                    DisposableEffect(viewModel) { onDispose { viewModel.onClose() } }
+                    val state by viewModel.state.collectAsState()
+                    Column(Modifier.fillMaxSize()) {
+                        BackRow(onBack = { backStack.pop() })
+                        MarkdownScreen(state, Modifier.weight(1f))
+                    }
                 }
             }
         }
@@ -300,8 +352,8 @@ fun ChooshApp(context: Context) {
  * existing pattern — the one other screens previously diverged from (a
  * top-left text `Button("Back")` in [ai.choosh.workspace.WorkspaceScreen]/here,
  * a top-*right* text `Button("Back")` in [ai.choosh.terminal.TerminalScreen]).
- * Used here for the two demo screens this composition root renders inline
- * ([Screen.WebServiceDemo]/[Screen.MarkdownDemo]).
+ * Used here for the screens this composition root renders inline
+ * ([Screen.WebService]/[Screen.MarkdownPreview]).
  */
 @Composable
 private fun BackRow(onBack: () -> Unit) {
@@ -309,19 +361,6 @@ private fun BackRow(onBack: () -> Unit) {
         IconButton(onClick = onBack) {
             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
         }
-    }
-}
-
-@Composable
-private fun PlaceholderScreen(title: String, subtitle: String, onBack: () -> Unit) {
-    Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Text(title, style = MaterialTheme.typography.headlineSmall)
-        Text(subtitle, modifier = Modifier.padding(top = 8.dp, bottom = 24.dp))
-        Button(onClick = onBack) { Text("Back to fleet") }
     }
 }
 

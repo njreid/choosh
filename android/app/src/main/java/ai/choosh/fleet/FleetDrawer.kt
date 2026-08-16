@@ -22,12 +22,18 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccessTime
 import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -154,6 +160,19 @@ private fun FleetRowView(
     onDevHostClick: (DevHostPresence) -> Unit,
     onWorkspaceClick: (Workspace) -> Unit,
 ) {
+    // Project-mode's real expand-to-workspace-list affordance
+    // (docs/specs/android-navigation.md: "Tapping a Project row opens its
+    // designated primary Workspace directly, skipping an intermediate
+    // Workspace list" — that's [onProjectClick]'s job, unchanged; this is
+    // the *separate* chevron affordance the UX-friction audit's finding #3
+    // flagged as entirely missing: "Project mode renders one row per
+    // Project with no expand affordance"). Local, per-row Compose state —
+    // resets if this row scrolls out of the `LazyColumn`/`LazyVerticalGrid`
+    // far enough to be discarded and recomposed later; a real
+    // ViewModel-level "which projects are expanded" set is a further
+    // increment this pass didn't need for the affordance to exist at all.
+    var expanded by remember(row.id) { mutableStateOf(false) }
+
     val (label, sublabel, onClick) = when (row) {
         is FleetRow.ProjectRow -> Triple(
             row.project.name,
@@ -171,44 +190,92 @@ private fun FleetRowView(
         ) { onWorkspaceClick(row.workspace) }
     }
 
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .testTag("fleet-row-${row.id}")
+                // `docs/accessibility-device-report.md`'s item 1, gap 1: "by
+                // identical code pattern" to `ExplorerScreen`'s
+                // `ChangedFileRow`, this row's clickable node otherwise carries
+                // an empty accessible label while the real name/sublabel text
+                // sits on non-focusable sibling `Text` children. A real,
+                // context-specific label naming the row's actual name and
+                // sublabel — confirmed via a real on-device `uiautomator dump`
+                // that plain `Modifier.semantics(mergeDescendants = true) {}`
+                // did not surface the children's text in the exposed
+                // `AccessibilityNodeInfo` on this device/Compose version (see
+                // `ExplorerScreen.kt`'s identical finding), so this uses the
+                // explicit `contentDescription` form instead — the same
+                // mechanism already confirmed working for this file's own
+                // `SortModeIcon`/`AttentionDot`.
+                .semantics {
+                    contentDescription = buildString {
+                        append("$label, $sublabel")
+                        if (row.needsAttention) append(", needs attention")
+                    }
+                }
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column {
+                Text(label, style = MaterialTheme.typography.bodyLarge)
+                Text(sublabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (row.needsAttention) {
+                    AttentionDot()
+                }
+                if (row is FleetRow.DevHostRow && row.devHost.connectionState == ConnectionState.OFFLINE) {
+                    Text("offline", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (row is FleetRow.ProjectRow && row.project.workspaces.isNotEmpty()) {
+                    IconButton(
+                        onClick = { expanded = !expanded },
+                        modifier = Modifier
+                            .testTag("project-expand-${row.project.projectId}")
+                            .semantics { contentDescription = if (expanded) "Collapse ${row.project.name}" else "Expand ${row.project.name}" },
+                    ) {
+                        Icon(
+                            imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                            contentDescription = null,
+                        )
+                    }
+                }
+            }
+        }
+
+        if (row is FleetRow.ProjectRow && expanded) {
+            Column(Modifier.testTag("project-workspaces-${row.project.projectId}")) {
+                row.project.workspaces.forEach { workspace -> NestedWorkspaceRow(workspace, onClick = { onWorkspaceClick(workspace) }) }
+            }
+        }
+    }
+}
+
+/** One indented Workspace row under an expanded [FleetRow.ProjectRow] — the Fleet drawer's Project-mode expand-to-workspace-list affordance (UX-friction audit finding #3). Tapping it opens that Workspace directly, same [Workspace] shape/behavior [FleetRow.WorkspaceRow]'s Recent-mode row already uses. */
+@Composable
+private fun NestedWorkspaceRow(workspace: Workspace, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .testTag("fleet-row-${row.id}")
-            // `docs/accessibility-device-report.md`'s item 1, gap 1: "by
-            // identical code pattern" to `ExplorerScreen`'s
-            // `ChangedFileRow`, this row's clickable node otherwise carries
-            // an empty accessible label while the real name/sublabel text
-            // sits on non-focusable sibling `Text` children. A real,
-            // context-specific label naming the row's actual name and
-            // sublabel — confirmed via a real on-device `uiautomator dump`
-            // that plain `Modifier.semantics(mergeDescendants = true) {}`
-            // did not surface the children's text in the exposed
-            // `AccessibilityNodeInfo` on this device/Compose version (see
-            // `ExplorerScreen.kt`'s identical finding), so this uses the
-            // explicit `contentDescription` form instead — the same
-            // mechanism already confirmed working for this file's own
-            // `SortModeIcon`/`AttentionDot`.
+            .testTag("project-workspace-row-${workspace.workspaceId}")
             .semantics {
                 contentDescription = buildString {
-                    append("$label, $sublabel")
-                    if (row.needsAttention) append(", needs attention")
+                    append(workspace.name)
+                    if (workspace.needsAttention) append(", needs attention")
                 }
             }
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            .padding(start = 32.dp, end = 16.dp, top = 8.dp, bottom = 8.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column {
-            Text(label, style = MaterialTheme.typography.bodyLarge)
-            Text(sublabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        if (row.needsAttention) {
+        Text(workspace.name, style = MaterialTheme.typography.bodyMedium)
+        if (workspace.needsAttention) {
             AttentionDot()
-        }
-        if (row is FleetRow.DevHostRow && row.devHost.connectionState == ConnectionState.OFFLINE) {
-            Text("offline", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }

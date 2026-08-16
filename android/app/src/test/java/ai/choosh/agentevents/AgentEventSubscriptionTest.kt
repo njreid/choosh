@@ -2,6 +2,7 @@ package ai.choosh.agentevents
 
 import ai.choosh.engine.AgentEvent
 import ai.choosh.engine.AgentEventPush
+import ai.choosh.engine.AgentRunStatus
 import ai.choosh.engine.FakeChooshEngine
 import ai.choosh.engine.InputReason
 import ai.choosh.engine.SequencedAgentEvent
@@ -197,5 +198,54 @@ class AgentEventSubscriptionTest {
         subscription.resubscribeAll() // must not touch ws-1 anymore
 
         assertEquals("unsubscribe must stop resubscribeAll from touching this workspace's cursor", 1L, cursorStore.lastAcknowledged("ws-1"))
+    }
+
+    // --- optional AgentStatusTracker wiring ---------------------------------
+    //
+    // [AgentStatusTracker] is the explorer's active-agents section's only
+    // source of a real `busy`/`waiting`/`starting`/`failed` distinction
+    // (see that class's own doc comment) — these tests prove
+    // [AgentEventSubscription] actually feeds it, both for a live push and
+    // a replayed batch, and that omitting it (the pre-existing default)
+    // stays safe.
+
+    @Test
+    fun `pollOnce feeds a live agent_status push into the optional status tracker`() = runTest {
+        val engine = FakeChooshEngine()
+        val statusTracker = AgentStatusTracker()
+        val subscription = AgentEventSubscription(engine, AgentEventCursorStore(), AgentAttentionTracker(), { _, _ -> }, statusTracker = statusTracker)
+
+        engine.enqueueAgentEvent(AgentEventPush("dev-1", AgentEvent.AgentStatusChanged("ws-1", "item-1", AgentRunStatus.BUSY), sequence = 1L))
+        subscription.pollOnce()
+
+        assertEquals(AgentRunStatus.BUSY, statusTracker.statusByItemId.value["item-1"])
+    }
+
+    @Test
+    fun `a replayed batch also feeds the optional status tracker, in order`() = runTest {
+        val engine = FakeChooshEngine()
+        val statusTracker = AgentStatusTracker()
+        engine.setAgentEventHistory(
+            "ws-1",
+            listOf(
+                SequencedAgentEvent(1, AgentEvent.AgentStatusChanged("ws-1", "item-1", AgentRunStatus.STARTING)),
+                SequencedAgentEvent(2, AgentEvent.AgentStatusChanged("ws-1", "item-1", AgentRunStatus.WAITING)),
+            ),
+        )
+        val subscription = AgentEventSubscription(engine, AgentEventCursorStore(), AgentAttentionTracker(), { _, _ -> }, statusTracker = statusTracker)
+
+        subscription.subscribe("dev-1", "ws-1")
+
+        assertEquals("the later (sequence 2) status must win, proving oldest-first application", AgentRunStatus.WAITING, statusTracker.statusByItemId.value["item-1"])
+    }
+
+    @Test
+    fun `a null status tracker (the pre-existing default) is safely ignored`() = runTest {
+        val engine = FakeChooshEngine()
+        val subscription = AgentEventSubscription(engine, AgentEventCursorStore(), AgentAttentionTracker(), { _, _ -> })
+
+        engine.enqueueAgentEvent(AgentEventPush("dev-1", AgentEvent.AgentStatusChanged("ws-1", "item-1", AgentRunStatus.BUSY), sequence = 1L))
+
+        subscription.pollOnce() // must not throw with no status tracker supplied
     }
 }

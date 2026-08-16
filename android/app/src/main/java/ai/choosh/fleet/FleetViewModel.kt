@@ -5,6 +5,7 @@ import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.ConnectionState
 import ai.choosh.engine.DevHostPresence
 import ai.choosh.engine.ProjectSummary
+import ai.choosh.engine.WorkspaceSummary
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -119,38 +120,50 @@ class FleetViewModel(
     }
 
     /**
-     * `project.list`, called once per *online* devhost — mirroring
-     * host-rpc.md's `workspace.list` precedent ("called once per devhost
-     * after list-devhosts"), since `project.list` is itself an RPC scoped
-     * to a single devhost's tunnel despite host-rpc.md's own prose
-     * describing its result as "every Project the requesting Identity can
-     * reach, across every devhost". An offline devhost is skipped
-     * outright (no live tunnel to call over, per `list-devhosts`'
-     * `connectionState`); a thrown failure from an *online* devhost's call
-     * propagates to [refresh]'s `runCatching`, surfacing as this
-     * ViewModel's normal error state rather than silently dropping that
-     * devhost's Projects.
+     * `project.list` and `workspace.list`, each called once per *online*
+     * devhost — per host-rpc.md's `workspace.list` precedent ("called once
+     * per devhost after list-devhosts"), which `project.list`'s own doc
+     * comment says it mirrors despite host-rpc.md's prose describing
+     * `project.list`'s result as "every Project the requesting Identity can
+     * reach, across every devhost" (both are, in fact, single-devhost-tunnel
+     * RPCs). An offline devhost is skipped outright for both calls (no live
+     * tunnel to call over, per `list-devhosts`' `connectionState`); a thrown
+     * failure from either call on an *online* devhost propagates to
+     * [refresh]'s `runCatching`, surfacing as this ViewModel's normal error
+     * state rather than silently dropping that devhost's Projects/Workspaces.
      *
      * Merge rule when the same `projectId` is reported by more than one
      * devhost (a Project with Workspaces spread across hosts): `active`
      * is OR'd together (active anywhere counts as active for the
      * Project as a whole) and the first-seen devhost's `name`/
      * `primaryWorkspaceId` wins — a deliberate, documented simplification
-     * host-rpc.md doesn't itself pin down.
+     * host-rpc.md doesn't itself pin down. Each [WorkspaceSummary] is
+     * grouped into its own `project_id`'s [Project.workspaces] list,
+     * regardless of which devhost's call returned it — `workspace.list`'s
+     * `WorkspaceSummary.projectId` is the join key, the same one
+     * `project.list`'s `ProjectSummary.projectId` uses.
      *
-     * Each merged [ProjectSummary]'s nested [Project.workspaces] still
-     * comes from [FleetFixtures.workspacesFor] rather than a real
-     * per-project RPC — `workspace.list` isn't wired into [ChooshEngine]
-     * yet, a separate, tracked gap (PLAN.md's "Known follow-ups"), not
-     * something this pass silently papers over.
+     * [Workspace.needsAttention] starts `false` for every real Workspace —
+     * `workspace.list` carries no such field (per host-rpc.md, that's a
+     * live `agent-events.md` signal, not a registry fact); [recompute]
+     * unions in [attentionTracker]'s live set afterward, same as before this
+     * pass. [Workspace.lastActiveAt] is `WorkspaceSummary.createdAt` — the
+     * real RPC has no dedicated "last active" timestamp, and `created_at` is
+     * the closest available proxy; Recent sort mode is therefore ordered by
+     * registration time until a real activity timestamp exists on the wire,
+     * a known, deliberate approximation.
      */
     private suspend fun loadProjects(devHosts: List<DevHostPresence>): List<Project> {
         val summaries = linkedMapOf<String, ProjectSummary>()
+        val workspacesByProject = mutableMapOf<String, MutableList<Workspace>>()
         for (host in devHosts) {
             if (host.connectionState != ConnectionState.ONLINE) continue
             for (summary in engine.projectList(host.deviceId)) {
                 val existing = summaries[summary.projectId]
                 summaries[summary.projectId] = if (existing == null) summary else existing.copy(active = existing.active || summary.active)
+            }
+            for (workspace in engine.workspaceList(host.deviceId)) {
+                workspacesByProject.getOrPut(workspace.projectId) { mutableListOf() }.add(workspace.toFleetWorkspace())
             }
         }
         return summaries.values.map { summary ->
@@ -158,7 +171,7 @@ class FleetViewModel(
                 projectId = summary.projectId,
                 name = summary.name,
                 primaryWorkspaceId = summary.primaryWorkspaceId.orEmpty(),
-                workspaces = FleetFixtures.workspacesFor(summary.projectId, devHosts),
+                workspaces = workspacesByProject[summary.projectId].orEmpty(),
                 active = summary.active,
             )
         }
@@ -231,3 +244,7 @@ class FleetViewModel(
             }
     }
 }
+
+/** `workspace.list`'s per-entry shape, adapted into this package's own [Workspace] — see [FleetViewModel.loadProjects]'s doc comment for [Workspace.needsAttention]/[Workspace.lastActiveAt]'s approximations. */
+private fun WorkspaceSummary.toFleetWorkspace(): Workspace =
+    Workspace(workspaceId = workspaceId, name = workspaceName, devHostId = devHostId, needsAttention = false, lastActiveAt = createdAt)

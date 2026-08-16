@@ -1,6 +1,8 @@
 package ai.choosh.fleet
 
+import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.FakeChooshEngine
+import ai.choosh.engine.WorkspaceSummary
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
@@ -9,6 +11,11 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
+
+/** [ChooshEngine] wrapper that always fails `workspace.list`, delegating everything else to [FakeChooshEngine] — exercises [FleetViewModel]'s `workspace.list`-sourced path's failure state distinctly from a `project.list` failure. */
+private class FailingWorkspaceListChooshEngine(private val delegate: ChooshEngine = FakeChooshEngine()) : ChooshEngine by delegate {
+    override suspend fun workspaceList(deviceId: String): List<WorkspaceSummary> = error("simulated workspace.list failure")
+}
 
 /**
  * [FleetViewModel] state-flow behavior against [FakeChooshEngine] — the
@@ -130,6 +137,32 @@ class FleetViewModelTest {
         val updated = viewModel.state.value.rows.filterIsInstance<FleetRow.ProjectRow>().single { it.project.projectId == "proj-choosh" }
         assertEquals("ws-choosh-agent-b", updated.project.primaryWorkspaceId)
         assertEquals(null, viewModel.state.value.error)
+    }
+
+    // --- workspace.list-sourced Project.workspaces (real RPC, not FleetFixtures) ---
+
+    @Test
+    fun `a Project's nested workspaces come from the real workspace_list RPC, not fixture data directly`() = runTest(mainDispatcherRule.dispatcher) {
+        val engine = FakeChooshEngine()
+        engine.connect("fake-session-credential")
+        val viewModel = FleetViewModel(engine)
+        advanceUntilIdle()
+
+        val project = viewModel.state.value.rows.filterIsInstance<FleetRow.ProjectRow>().single { it.project.projectId == "proj-choosh" }.project
+        assertEquals(setOf("ws-choosh-app", "ws-choosh-agent-b"), project.workspaces.map { it.workspaceId }.toSet())
+    }
+
+    @Test
+    fun `a workspace_list failure on an online devhost surfaces as an error state, not a crash`() = runTest(mainDispatcherRule.dispatcher) {
+        val engine = FailingWorkspaceListChooshEngine()
+        engine.connect("fake-session-credential")
+        val viewModel = FleetViewModel(engine)
+        advanceUntilIdle()
+
+        val state = viewModel.state.value
+        assertTrue(!state.isLoading)
+        assertNotNull("a failed workspace.list must populate an error message, not throw", state.error)
+        assertTrue("a failed refresh must not leave stale rows", state.rows.isEmpty())
     }
 
     @Test

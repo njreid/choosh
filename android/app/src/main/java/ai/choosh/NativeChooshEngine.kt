@@ -3,12 +3,14 @@ package ai.choosh
 import ai.choosh.engine.AgentEvent
 import ai.choosh.engine.AgentEventPush
 import ai.choosh.engine.AgentEventsResumeOutcome
+import ai.choosh.engine.AgentKind
 import ai.choosh.engine.AgentRunStatus
 import ai.choosh.engine.ChangeGraphNode
 import ai.choosh.engine.ChangeKind
 import ai.choosh.engine.ChangedPath
 import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.ConnectionState
+import ai.choosh.engine.CreateItemResult
 import ai.choosh.engine.DevHostPresence
 import ai.choosh.engine.DiffFileEntry
 import ai.choosh.engine.DiffHunk
@@ -22,13 +24,18 @@ import ai.choosh.engine.ItemType
 import ai.choosh.engine.OperationLogEntry
 import ai.choosh.engine.ProjectSummary
 import ai.choosh.engine.SequencedAgentEvent
+import ai.choosh.engine.TreeEntry
+import ai.choosh.engine.TreeEntryKind
 import ai.choosh.engine.WebServiceStatus
 import ai.choosh.engine.WebauthnResult
 import ai.choosh.engine.WorkspaceStatus
+import ai.choosh.engine.WorkspaceSummary
+import ai.choosh.engine.WorkspaceTreeListResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.DeserializationStrategy
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonContentPolymorphicSerializer
 import kotlinx.serialization.json.JsonElement
@@ -137,6 +144,43 @@ class NativeChooshEngine : ChooshEngine {
         decodeOrThrow(raw) { body -> json.decodeFromString<List<WireItemSummary>>(body).map { it.toDomain() } }
     }
 
+    override suspend fun createItem(
+        deviceId: String,
+        workspaceId: String,
+        itemType: ItemType,
+        name: String,
+        agent: AgentKind?,
+        command: List<String>?,
+        port: Int?,
+    ): CreateItemResult = withContext(Dispatchers.IO) {
+        val raw = NativeBridge.nativeItemCreate(
+            handle,
+            deviceId,
+            workspaceId,
+            wireItemTypeFromDomain(itemType),
+            name,
+            agent?.let { wireAgentKindFromDomain(it) }.orEmpty(),
+            command?.let { json.encodeToString(it) }.orEmpty(),
+            (port ?: 0).toLong(),
+        )
+        decodeCreateItemResult(raw)
+    }
+
+    override suspend fun workspaceList(deviceId: String): List<WorkspaceSummary> = withContext(Dispatchers.IO) {
+        val raw = NativeBridge.nativeWorkspaceList(handle, deviceId)
+        decodeOrThrow(raw) { body -> json.decodeFromString<List<WireWorkspaceSummary>>(body).map { it.toDomain() } }
+    }
+
+    override suspend fun workspaceTreeList(
+        deviceId: String,
+        workspaceId: String,
+        pathPrefix: String,
+        cursor: String?,
+    ): WorkspaceTreeListResult = withContext(Dispatchers.IO) {
+        val raw = NativeBridge.nativeWorkspaceTreeList(handle, deviceId, workspaceId, pathPrefix, "", cursor.orEmpty())
+        decodeOrThrow(raw) { body -> json.decodeFromString<WireWorkspaceTreeListResult>(body).toDomain() }
+    }
+
     override suspend fun projectList(deviceId: String): List<ProjectSummary> = withContext(Dispatchers.IO) {
         val raw = NativeBridge.nativeProjectList(handle, deviceId)
         decodeOrThrow(raw) { body -> json.decodeFromString<List<WireProjectSummary>>(body).map { it.toDomain() } }
@@ -215,9 +259,36 @@ private object NativeBridge {
     // M5 service-tunnels.md item listing.
     @JvmStatic external fun nativeItemList(handle: Long, targetDeviceId: String, workspaceId: String): String
 
+    // host-rpc.md's Item RPCs: item.create. `agent`/`commandJson` empty
+    // means "omitted"; `port <= 0` means "omitted" — mirrors this file's
+    // existing `from`/`to`/`revset` empty-string-means-null convention.
+    @JvmStatic external fun nativeItemCreate(
+        handle: Long,
+        targetDeviceId: String,
+        workspaceId: String,
+        itemType: String,
+        name: String,
+        agent: String,
+        commandJson: String,
+        port: Long,
+    ): String
+
     // host-rpc.md's fleet-drawer Project-mode RPCs.
     @JvmStatic external fun nativeProjectList(handle: Long, targetDeviceId: String): String
     @JvmStatic external fun nativeProjectSetPrimaryWorkspace(handle: Long, targetDeviceId: String, projectId: String, workspaceId: String): String
+
+    // host-rpc.md's workspace.list/workspace.tree.list — the Fleet drawer's
+    // real per-devhost workspace list and the explorer's searchable
+    // project-tree section.
+    @JvmStatic external fun nativeWorkspaceList(handle: Long, targetDeviceId: String): String
+    @JvmStatic external fun nativeWorkspaceTreeList(
+        handle: Long,
+        targetDeviceId: String,
+        workspaceId: String,
+        pathPrefix: String,
+        revision: String,
+        cursor: String,
+    ): String
 
     // docs/specs/agent-events.md's live-subscription/resume surface.
     @JvmStatic external fun nativePollAgentEvents(handle: Long): String
@@ -513,6 +584,82 @@ private data class WireItemSummary(
         status = wireItemStatusToDomain(status),
         port = port,
     )
+}
+
+/**
+ * The reverse of [wireItemTypeToDomain] — [ChooshEngine.createItem]'s
+ * `itemType` argument, encoded to the exact `kebab-case` string
+ * `rust/choosh-android-bridge/src/engine.rs`'s `Engine::item_create`
+ * (`parse_item_type`) expects. [ItemType.UNKNOWN] has no wire
+ * representation (per host-rpc.md, only these three item types have an
+ * `item.create` call of their own) — callers must not pass it; this maps it
+ * to `"shell"` only so the function stays total, never as a caller-visible
+ * "valid" choice (the Kotlin call sites this module owns — the explorer's
+ * create-agent/create-service flows — only ever construct
+ * `AGENT_TERMINAL`/`WEB_SERVICE`).
+ */
+private fun wireItemTypeFromDomain(type: ItemType): String = when (type) {
+    ItemType.AGENT_TERMINAL -> "agent-terminal"
+    ItemType.SHELL, ItemType.UNKNOWN -> "shell"
+    ItemType.WEB_SERVICE -> "web-service"
+}
+
+/** The reverse of `AgentKind`'s wire mapping — [ChooshEngine.createItem]'s `agent` argument, encoded to `CHOOSH_AGENT`'s exact `lowercase` string (agent-events.md). */
+private fun wireAgentKindFromDomain(kind: AgentKind): String = when (kind) {
+    AgentKind.CODEX -> "codex"
+    AgentKind.CLAUDE -> "claude"
+    AgentKind.OPENCODE -> "opencode"
+}
+
+/** `Engine::item_create`'s success shape: `{"item_id":...,"item_type":...,"name":...,"tab_target":...}`. Decoded via [decodeOrThrow] first (shares the module's `{"error": ...}` shape on any failure — not connected, invalid `item_type`/`agent`, or a `hostd`-side rejection), so a thrown [IllegalStateException] there is caught here and turned into [CreateItemResult.Failure] rather than propagating — see this method's doc comment on [ChooshEngine.createItem] for why this is a typed outcome, not an exception, at the public interface. */
+@Serializable
+private data class WireCreateItemResult(val item_id: String, val item_type: String, val name: String, val tab_target: String)
+
+private fun decodeCreateItemResult(raw: String): CreateItemResult = runCatching {
+    decodeOrThrow(raw) { body -> json.decodeFromString<WireCreateItemResult>(body) }
+}.fold(
+    onSuccess = { wire ->
+        CreateItemResult.Success(itemId = wire.item_id, itemType = wireItemTypeToDomain(wire.item_type), name = wire.name, tabTarget = wire.tab_target)
+    },
+    onFailure = { failure -> CreateItemResult.Failure(failure.message ?: "item.create failed") },
+)
+
+// --- host-rpc.md workspace.list/workspace.tree.list wire shapes ---------
+
+/** Mirrors `choosh_protocol::host_rpc::WorkspaceSummary` field-for-field. */
+@Serializable
+private data class WireWorkspaceSummary(
+    val workspace_id: String,
+    val workspace_name: String,
+    val devhost_id: String,
+    val project_id: String,
+    val created_at: String,
+) {
+    fun toDomain() = WorkspaceSummary(
+        workspaceId = workspace_id,
+        workspaceName = workspace_name,
+        devHostId = devhost_id,
+        projectId = project_id,
+        createdAt = created_at,
+    )
+}
+
+private fun wireTreeEntryKindToDomain(kind: String): TreeEntryKind = when (kind) {
+    "file" -> TreeEntryKind.FILE
+    "directory" -> TreeEntryKind.DIRECTORY
+    else -> TreeEntryKind.UNKNOWN
+}
+
+/** Mirrors `choosh_protocol::host_rpc::TreeEntry` field-for-field. */
+@Serializable
+private data class WireTreeEntry(val name: String, val kind: String, val conflicted: Boolean) {
+    fun toDomain() = TreeEntry(name = name, kind = wireTreeEntryKindToDomain(kind), conflicted = conflicted)
+}
+
+/** `Engine::workspace_tree_list`'s own `{"entries": [...], "next_cursor": ...}` wrapper — see that method's doc comment. */
+@Serializable
+private data class WireWorkspaceTreeListResult(val entries: List<WireTreeEntry>, val next_cursor: String? = null) {
+    fun toDomain() = WorkspaceTreeListResult(entries = entries.map { it.toDomain() }, nextCursor = next_cursor)
 }
 
 // --- host-rpc.md Project-mode wire shapes -------------------------------

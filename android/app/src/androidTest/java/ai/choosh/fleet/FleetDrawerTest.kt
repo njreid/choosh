@@ -10,6 +10,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
 
@@ -150,6 +151,54 @@ class FleetDrawerTest {
         assert(clicked?.primaryWorkspaceId == "ws-hot") {
             "expected the tapped project's primaryWorkspaceId to be ws-hot, got ${clicked?.primaryWorkspaceId}"
         }
+    }
+
+    @Test
+    fun expandingAProjectRowRevealsItsWorkspacesWithoutOpeningAny() {
+        // UX-friction audit finding #3: "Project mode renders one row per
+        // Project with no expand affordance". This proves the real
+        // expand-to-workspace-list chevron this pass adds actually reveals
+        // the nested Workspace rows, and that expanding alone (not tapping
+        // a nested row) never fires onWorkspaceClick.
+        var workspaceClicked: Workspace? = null
+        composeTestRule.setContent {
+            FleetDrawer(
+                state = stateWithFixtures(SortMode.PROJECT),
+                onSortModeSelected = {},
+                onProjectClick = {},
+                onDevHostClick = {},
+                onWorkspaceClick = { workspaceClicked = it },
+            )
+        }
+
+        composeTestRule.onNodeWithTag("project-workspaces-proj-1").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("project-expand-proj-1").performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("project-workspaces-proj-1").assertExists()
+        composeTestRule.onNodeWithTag("project-workspace-row-ws-calm").assertExists()
+        composeTestRule.onNodeWithTag("project-workspace-row-ws-hot").assertExists()
+        assert(workspaceClicked == null) { "expanding a project row must not itself open a workspace" }
+    }
+
+    @Test
+    fun tappingANestedWorkspaceRowInvokesOnWorkspaceClickWithThatWorkspace() {
+        var clicked: Workspace? = null
+        composeTestRule.setContent {
+            FleetDrawer(
+                state = stateWithFixtures(SortMode.PROJECT),
+                onSortModeSelected = {},
+                onProjectClick = {},
+                onDevHostClick = {},
+                onWorkspaceClick = { clicked = it },
+            )
+        }
+
+        composeTestRule.onNodeWithTag("project-expand-proj-1").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("project-workspace-row-ws-hot").performClick()
+
+        assertEquals("ws-hot", clicked?.workspaceId)
     }
 
     @Test
