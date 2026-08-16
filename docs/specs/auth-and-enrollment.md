@@ -36,6 +36,25 @@ a tunnel to a `phone` or `laptop-proxy` Identity. `relayd` enforces this in
 per DESIGN.md §5) who may hold multiple passkey credentials (one per
 enrolled phone/browser).
 
+- **Registration is bootstrap-secret-gated.** `register_start` is the only
+  path in this entire system that mints a new, fully-trusted `phone`
+  Identity from nothing — every other credential is minted by an
+  already-authenticated `phone` connection via an enrollment token (see
+  below). Because `relayd`'s HTTP surface is meant to be reachable at a
+  stable public DNS name (per DESIGN.md), `register_start` requires the
+  caller to present `CHOOSH_RELAYD_BOOTSTRAP_SECRET` (an operator-chosen
+  value, set as an env var at `relayd` deploy time) via the
+  `X-Choosh-Bootstrap-Secret` HTTP header, compared in constant time. If
+  `CHOOSH_RELAYD_BOOTSTRAP_SECRET` is unset (or empty), registration is
+  refused outright for every caller — fail closed, with no built-in
+  default. The system's owner obtains this secret when they deploy `relayd`
+  and provides it to their own phone once, out of band (e.g. typed in
+  manually, or embedded in a one-time setup link), during first-time setup;
+  it is not a standing credential presented on every request, only the one
+  registration ceremony that establishes the phone's first passkey. Nothing
+  about `login_start`/`login_finish` requires this secret — logging in only
+  ever re-asserts an *already-registered* passkey, which by construction
+  means someone already passed the bootstrap gate once.
 - **Registration** (first phone, or adding a second device): standard
   WebAuthn attestation ceremony via Android Credential Manager
   (`CreatePublicKeyCredentialRequest`) or a browser's platform
@@ -43,6 +62,16 @@ enrolled phone/browser).
   additional attestation-format restriction. On success, `relayd` mints a
   long-lived session credential (an opaque bearer token, not the passkey
   itself) and returns it; the app stores it in Android Keystore.
+- **Concurrent ceremonies are independent.** `register_start`/`login_start`
+  each mint a fresh, unguessable per-ceremony correlation id alongside the
+  ceremony's challenge, returned to the caller as a `correlation_id` field
+  sitting alongside the standard WebAuthn JSON body. The matching
+  `register_finish`/`login_finish` call must present that same
+  `correlation_id` (as a query parameter) to complete the ceremony. This
+  keys `relayd`'s in-flight challenge state per ceremony rather than in a
+  single global slot, so two ceremonies started close together (e.g. two
+  browser tabs, or an app retry racing its own first attempt) cannot
+  clobber each other's challenge.
 - **Reuse**: every later app open presents the stored session credential
   directly over the WebSocket handshake — no WebAuthn ceremony repeats
   unless the credential has been revoked or has expired (session

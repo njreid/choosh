@@ -15,7 +15,13 @@
 //! revocation that closes an already-live connection immediately
 //! (`crate::ws::dispatch`'s `RevokeDevice`/`RevokePhoneSession` arms), a
 //! per-Identity control-frame rate limit (`crate::ws::RateLimiter`), and a
-//! connection-wide idle timeout (`AppState::connection_idle_timeout`).
+//! connection-wide idle timeout (`AppState::connection_idle_timeout`). Also,
+//! per the unauthenticated-registration finding this crate's own
+//! `webauthn.rs` previously left open: `/webauthn/register/start` now
+//! requires a `CHOOSH_RELAYD_BOOTSTRAP_SECRET`-gated header before it will
+//! begin a registration ceremony (see `webauthn.rs`'s module doc), and the
+//! in-flight registration/login ceremony state is keyed per-ceremony rather
+//! than held in a single global slot.
 
 mod ca;
 mod fcm;
@@ -88,10 +94,14 @@ pub fn build_state_in(dir: &Path) -> Arc<AppState> {
     let rp_id = std::env::var("CHOOSH_RELAYD_RP_ID").unwrap_or_else(|_| DEFAULT_RP_ID.to_string());
     let rp_origin_str = std::env::var("CHOOSH_RELAYD_RP_ORIGIN")
         .unwrap_or_else(|_| format!("https://{rp_id}"));
+    // No default: an unset `CHOOSH_RELAYD_BOOTSTRAP_SECRET` means
+    // `register_start` refuses every request (fail closed) rather than
+    // falling back to some baked-in value — see `webauthn.rs`'s module doc.
+    let bootstrap_secret = std::env::var("CHOOSH_RELAYD_BOOTSTRAP_SECRET").ok();
     Arc::new(AppState {
         registry: Arc::new(state::Registry::new()),
         ca_key,
-        webauthn: webauthn::build(&rp_id, &rp_origin_str),
+        webauthn: webauthn::build(&rp_id, &rp_origin_str, bootstrap_secret),
         connection_idle_timeout: std::time::Duration::from_secs(state::CONNECTION_IDLE_TIMEOUT_SECONDS),
         fcm: fcm::FcmClient::from_env(),
     })

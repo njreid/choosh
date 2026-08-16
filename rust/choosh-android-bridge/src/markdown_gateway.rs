@@ -297,6 +297,23 @@ async fn serve_asset_response(query: &str, range_header: Option<&str>, fetcher: 
         return build_response(400, "Bad Request", &[], b"missing path");
     };
 
+    // Same gate the markdown-embedding path already runs every reference
+    // through (via `AssetUrlResolver`/`sanitize_reference` in
+    // `choosh-web`'s `markdown.rs`) before it ever becomes an `/asset?path=`
+    // URL in the first place — applied here too, because this route is a
+    // second, independent entry point into `fetcher` that a `WebView` (or
+    // anything else that can reach this loopback port) can hit directly
+    // with an arbitrary `path`, not just via a rendered document's already-
+    // sanitized links. Without this, this route's only defense against
+    // `path=../../../secret` would be `hostd`'s separate server-side root
+    // confinement, contradicting this module's own doc comment promising
+    // the asset route is "root-confined" — this gate makes that promise
+    // true at this layer too, and rejects before `fetcher` (i.e. before any
+    // RPC round trip to `hostd`) is ever called.
+    if !choosh_web::is_safe_relative_asset(&path) {
+        return build_response(403, "Forbidden", &[], b"invalid asset path");
+    }
+
     let requested_range = range_header.and_then(parse_range_header);
     let client_asked_for_range = requested_range.is_some();
     let (offset, length) = requested_range.unwrap_or((0, MAX_ASSET_CHUNK_BYTES));
@@ -592,6 +609,82 @@ mod tests {
         assert!(head_text.starts_with("HTTP/1.1 206 Partial Content"), "{head_text}");
         assert!(head_text.contains("Content-Range: bytes 10-19/256"), "{head_text}");
         assert_eq!(body, (10_u8..=19).collect::<Vec<u8>>());
+        gateway.stop().await;
+    }
+
+    /// The security-relevant regression: a direct `GET /asset?path=` with a
+    /// `../`-escaping value must be rejected by this route's own
+    /// `choosh_web::is_safe_relative_asset` gate before `fetcher` is ever
+    /// invoked — not merely produce a 403/404 that happens to also be what
+    /// a missing/denied file would return. `recording_fetcher` proves the
+    /// "before" half: if this test only checked the HTTP status, a
+    /// regression that dropped the gate but still relied on `hostd`'s
+    /// separate server-side root confinement to fail the fetch could still
+    /// pass it.
+    #[tokio::test]
+    async fn asset_request_with_a_path_traversal_value_is_rejected_before_the_fetcher_is_called() {
+        let files = std::collections::HashMap::from([("etc/passwd".to_string(), b"root:x:0:0".to_vec())]);
+        let (fetcher, mut fetch_calls) = recording_fetcher(files);
+        let gateway = start_markdown_gateway("README.md".to_string(), fetcher, MarkdownGatewayCaps::default()).await.unwrap();
+        let request = format!(
+            "GET /asset?path=..%2F..%2F..%2Fetc%2Fpasswd HTTP/1.1\r\nHost: x\r\nCookie: {}={}\r\n\r\n",
+            TOKEN_COOKIE_NAME, gateway.token,
+        );
+        let response = connect_and_send(gateway.port, request.as_bytes()).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 403"), "{text}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), fetch_calls.recv()).await.is_err(),
+            "the fetcher was called despite a path-traversal `path` value"
+        );
+        gateway.stop().await;
+    }
+
+    /// Same shape, but with an absolute path — `is_safe_relative_asset`
+    /// rejects a leading `/` too, and this route must too, for the same
+    /// "never even reach `fetcher`" reason as the traversal case above.
+    #[tokio::test]
+    async fn asset_request_with_an_absolute_path_value_is_rejected_before_the_fetcher_is_called() {
+        let files = std::collections::HashMap::from([("etc/passwd".to_string(), b"root:x:0:0".to_vec())]);
+        let (fetcher, mut fetch_calls) = recording_fetcher(files);
+        let gateway = start_markdown_gateway("README.md".to_string(), fetcher, MarkdownGatewayCaps::default()).await.unwrap();
+        let request = format!(
+            "GET /asset?path=%2Fetc%2Fpasswd HTTP/1.1\r\nHost: x\r\nCookie: {}={}\r\n\r\n",
+            TOKEN_COOKIE_NAME, gateway.token,
+        );
+        let response = connect_and_send(gateway.port, request.as_bytes()).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 403"), "{text}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), fetch_calls.recv()).await.is_err(),
+            "the fetcher was called despite an absolute `path` value"
+        );
+        gateway.stop().await;
+    }
+
+    /// Regression protection alongside the two rejection tests above: a
+    /// legitimate, already-safe relative asset path must still reach
+    /// `fetcher` and be served normally — the new gate must not be so
+    /// strict that it breaks the ordinary case `relative_image_reference_
+    /// is_rewritten_to_a_loopback_asset_url` shows `AssetUrlResolver`
+    /// actually produces.
+    #[tokio::test]
+    async fn asset_request_with_a_legitimate_relative_path_still_reaches_the_fetcher_and_succeeds() {
+        let files = std::collections::HashMap::from([("docs/images/logo.png".to_string(), vec![1, 2, 3, 4])]);
+        let (fetcher, mut fetch_calls) = recording_fetcher(files);
+        let gateway = start_markdown_gateway("docs/README.md".to_string(), fetcher, MarkdownGatewayCaps::default()).await.unwrap();
+        let request = format!(
+            "GET /asset?path=docs%2Fimages%2Flogo.png HTTP/1.1\r\nHost: x\r\nCookie: {}={}\r\n\r\n",
+            TOKEN_COOKIE_NAME, gateway.token,
+        );
+        let response = connect_and_send(gateway.port, request.as_bytes()).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
+        assert!(response.ends_with(&[1, 2, 3, 4][..]));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(200), fetch_calls.recv()).await.unwrap().unwrap(),
+            "docs/images/logo.png"
+        );
         gateway.stop().await;
     }
 

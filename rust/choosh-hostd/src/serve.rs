@@ -29,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::backoff::compute_backoff;
 use crate::credential::{self, Credential, CredentialError};
 use crate::frame_channel::FrameChannel;
+use crate::hooks;
 use crate::jj_ops;
 use crate::local_ipc;
 use crate::pty::{PtySession, PtyWriteHalf};
@@ -177,6 +178,35 @@ pub async fn run() -> Result<(), ServeError> {
         },
         Err(error) => tracing::error!(%error, "failed to determine local IPC socket path; agent hooks will not be delivered"),
     }
+
+    // `hooks::install_claude_hooks` (agent-events.md's "Hook installation
+    // is explicit, user-level, and merge-safe" — the spec pins the
+    // *properties* the install must have, not an exact trigger point, so
+    // per this crate's established "non-fatal, log and continue" posture
+    // for optional startup conveniences, doing this once per `serve`
+    // startup — right here, before the connect loop below, needing
+    // neither a relayd connection nor any registered workspace — is the
+    // most defensible reading: it's the one point every `serve` run
+    // reaches regardless of enrollment/reconnect state, and repeating it
+    // on every startup (not just a first-ever install) means a real
+    // `hostd_binary` path change (e.g. this binary moved after a
+    // self-update) gets reflected in the installed hook command too, per
+    // `install_claude_hooks`'s own merge-safe/idempotent contract. Never
+    // fatal to `serve` startup: a user with no Claude Code installed yet,
+    // or a `settings.json` this process can't write for some reason, must
+    // not prevent `serve` from doing its actual job.
+    match std::env::current_exe() {
+        Ok(hostd_binary) => match claude_settings_path() {
+            Ok(settings_path) => {
+                if let Err(error) = hooks::install_claude_hooks(&settings_path, &hostd_binary.to_string_lossy()) {
+                    tracing::warn!(%error, path = %settings_path.display(), "failed to install/refresh Claude Code agent hooks; input_required/turn_completed/etc. events will not be observed for this user until this succeeds");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "failed to determine Claude Code settings.json path; agent hooks will not be installed"),
+        },
+        Err(error) => tracing::warn!(%error, "failed to determine this binary's own path (std::env::current_exe()); Claude Code agent hooks will not be installed"),
+    }
+
     // `open_pty_tunnel`'s auth_required detector (agent-events.md,
     // auth_detect.rs) needs its own sender into this exact same channel —
     // it's a producer alongside `local_ipc` and the SSH bridge below, not a
@@ -254,6 +284,29 @@ fn mise_project_tools_dir() -> Result<PathBuf, ServeError> {
             .data_dir()
             .join("mise-project-tools")),
     }
+}
+
+/// The real Claude Code `settings.json` this devhost's observational
+/// agent hooks get installed into (`hooks::install_claude_hooks`) —
+/// Claude Code's own fixed, protocol-mandated location under the current
+/// user's home directory, not an app-specific `choosh-hostd` config path,
+/// so this follows `proxy.rs`'s own `$HOME`-based `known_hosts_path`/
+/// `ssh_config_path` convention (a real third-party tool's own fixed
+/// config location) rather than `directories::ProjectDirs` (which is for
+/// `choosh-hostd`'s own config — a different kind of path, used by
+/// `mise_host_tools_dir`/`mise_project_tools_dir`/`build_rpc_context`
+/// above). `CHOOSH_HOSTD_CLAUDE_SETTINGS_PATH` overrides it, matching this
+/// crate's other env-var-first path resolution — the only way a test (or
+/// an operator who genuinely keeps Claude Code's config somewhere
+/// nonstandard) can point this at something other than the real user's
+/// real settings file.
+fn claude_settings_path() -> Result<PathBuf, ServeError> {
+    if let Ok(path) = std::env::var("CHOOSH_HOSTD_CLAUDE_SETTINGS_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| ServeError::Credential(CredentialError::Io(std::io::Error::other("$HOME is not set"))))?;
+    Ok(PathBuf::from(home).join(".claude").join("settings.json"))
 }
 
 /// How often [`spawn_host_tool_currency_checks`] rechecks `jj`/`zellij`
@@ -719,7 +772,13 @@ async fn serve_dispatch(
             Some(output) = tunnel_output_rx.recv() => {
                 let is_web = web_tunnels.contains_key(&output.tunnel_id);
                 let is_offload = offload_active.contains(&output.tunnel_id);
-                if !pty_tunnels.contains_key(&output.tunnel_id) && !is_web && !is_offload {
+                // `rpc_tunnels` membership is this purpose's own liveness
+                // tracking — see `spawn_rpc_dispatch`'s doc comment for why
+                // a backgrounded `rpc::dispatch` response also arrives on
+                // this same channel now, rather than being sent inline by
+                // `handle_tunnel_frame`.
+                let is_rpc = rpc_tunnels.contains(&output.tunnel_id);
+                if !pty_tunnels.contains_key(&output.tunnel_id) && !is_web && !is_offload && !is_rpc {
                     continue; // the tunnel closed after this output was already queued; drop it.
                 }
                 let mut payload = Vec::with_capacity(TUNNEL_ID_BYTES + output.bytes.len());
@@ -1096,19 +1155,102 @@ async fn handle_tunnel_frame(
             return FrameOutcome::Continue;
         }
     };
-    let response = rpc::dispatch(rpc_context, request).await;
-    let mut response_payload = Vec::with_capacity(TUNNEL_ID_BYTES + 1 + 128);
-    response_payload.extend_from_slice(&tunnel_id);
-    response_payload.push(FRAME_CLASS_CONTROL);
-    if let Err(error) = serde_json::to_writer(&mut response_payload, &response) {
-        tracing::error!(%error, "failed to serialize rpc response");
-        return FrameOutcome::Continue;
-    }
-    if let Err(error) = channel.send_bytes(FRAME_CLASS_TUNNEL, &response_payload).await {
-        tracing::warn!(%error, "failed to send rpc response over tunnel");
-        return FrameOutcome::Disconnect;
-    }
+    // Backgrounded, not awaited inline: `rpc::dispatch` can perform real,
+    // slow I/O (`workspace.create`'s `jj clone` over the network,
+    // `item.create`'s `mise install`), and this whole function runs inside
+    // `serve_dispatch`'s single `tokio::select!` loop — awaiting it here
+    // would stall every other frame on this connection (other rpc
+    // requests, pty/web tunnel byte forwarding, agent-event delivery) for
+    // as long as it takes. See [`spawn_rpc_dispatch`]'s doc comment for the
+    // rest of the reasoning; this mirrors [`spawn_offload_process`]'s
+    // already-established "background task owns the work, the response
+    // flows back through `tunnel_output_tx`" shape for exactly this same
+    // risk on the `offload` tunnel purpose.
+    spawn_rpc_dispatch(clone_rpc_context(rpc_context), request, tunnel_id, tunnel_output_tx.clone());
     FrameOutcome::Continue
+}
+
+/// A cheap, manual `RpcContext` clone (every field is itself `Clone` —
+/// `registry` is an `Arc<Mutex<Registry>>`, the rest are `String`/`PathBuf`
+/// — `RpcContext` just doesn't derive `Clone` itself in `rpc.rs`) so
+/// [`spawn_rpc_dispatch`]'s spawned task can own a `'static` context rather
+/// than borrowing `handle_tunnel_frame`'s own `&RpcContext`, which does not
+/// outlive this call.
+fn clone_rpc_context(context: &RpcContext) -> RpcContext {
+    RpcContext {
+        registry: context.registry.clone(),
+        devhost_id: context.devhost_id.clone(),
+        workspaces_dir: context.workspaces_dir.clone(),
+        mise_bin: context.mise_bin.clone(),
+        mise_project_tools_dir: context.mise_project_tools_dir.clone(),
+    }
+}
+
+/// Runs one `rpc`-tunnel request's `rpc::dispatch` off of `serve_dispatch`'s
+/// main loop, sending its eventual response back through `output_tx` —
+/// tagged with `tunnel_id`, exactly the [`TunnelOutput`] shape
+/// [`spawn_offload_process`]'s background task already produces for the
+/// `offload` tunnel purpose, and consumed by the exact same
+/// `tunnel_output_rx` branch in `serve_dispatch`.
+///
+/// **`spawn_blocking` + `Handle::block_on`, not a plain `tokio::spawn`.**
+/// `rpc::dispatch`'s returned future is not `Send`: some of its match arms
+/// (`workspace.status` and its siblings) go through `jj_ops.rs`'s real,
+/// in-process `jj-lib` calls (per `lib.rs`'s `#![recursion_limit]` doc
+/// comment), which hold a `jj-lib`-internal, non-`Send` type live across
+/// an `.await` point — confirmed directly: handing `rpc::dispatch(...)`'s
+/// future straight to `tokio::spawn` fails to compile with exactly this
+/// bound. Since `dispatch` is one function whose match arms all share a
+/// single generated state-machine type, this makes its future
+/// unconditionally `!Send` regardless of which arm actually runs, and
+/// nothing about that is something this fix may change — `rpc.rs`/
+/// `jj_ops.rs` are out of scope here. `tokio::task::spawn_blocking`'s own
+/// closure only needs to be `Send` itself (true here — every captured
+/// value is plain owned data), not whatever future it happens to run to
+/// completion on its one dedicated blocking-pool thread, so driving
+/// `dispatch`'s non-`Send` future via `Handle::block_on` inside that
+/// closure sidesteps the bound entirely while still keeping this off
+/// `serve_dispatch`'s own `tokio::select!` loop — the actual bug this
+/// function exists to fix.
+///
+/// Response *ordering* across concurrent requests on the same `rpc` tunnel
+/// is deliberately not preserved here — nothing in `host-rpc.md` requires
+/// it: every `RpcRequest`/`RpcResponse` pair already carries a matching
+/// `request_id` the caller correlates by (`RpcRequest::request_id`/
+/// `RpcResponse::request_id`), the same "correlate by id, not by arrival
+/// order" posture this connection already has for interleaved output
+/// across *different* `tunnel_ids` sharing this one `tunnel_output_tx`
+/// channel. Tunnel *lifecycle* is unaffected: `rpc_tunnels`'s membership
+/// (inserted on `tunnel-offered`, removed on the tunnel's own close frame)
+/// is untouched by this function, and `serve_dispatch`'s `tunnel_output_rx`
+/// branch checks it before forwarding — a response that finishes after the
+/// tunnel already closed is silently dropped, the same "the tunnel closed
+/// after this output was already queued" handling every other tunnel
+/// purpose on that branch already gets.
+fn spawn_rpc_dispatch(
+    rpc_context: RpcContext,
+    request: choosh_protocol::host_rpc::RpcRequest,
+    tunnel_id: [u8; TUNNEL_ID_BYTES],
+    output_tx: tokio::sync::mpsc::Sender<TunnelOutput>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let response = tokio::runtime::Handle::current().block_on(rpc::dispatch(&rpc_context, request));
+        let mut bytes = Vec::with_capacity(1 + 128);
+        bytes.push(FRAME_CLASS_CONTROL);
+        if let Err(error) = serde_json::to_writer(&mut bytes, &response) {
+            tracing::error!(%error, "failed to serialize rpc response");
+            return;
+        }
+        // `tunnel_output_tx`'s receiver is `serve_dispatch`'s own loop,
+        // which only stops draining it once that connection has ended —
+        // a send failure here means the connection is already gone, in
+        // which case there is nothing left to deliver this response to.
+        // `blocking_send`, not `.send().await`: this closure runs on a
+        // blocking-pool thread with no `.await` point of its own (the
+        // `dispatch` future was already driven to completion above, via
+        // `block_on`, not polled cooperatively here).
+        let _ = output_tx.blocking_send(TunnelOutput { tunnel_id, bytes });
+    });
 }
 
 /// Sends one [`OffloadError`] frame followed by the ordinary zero-payload

@@ -3,6 +3,7 @@ package ai.choosh.fleet
 import ai.choosh.engine.ConnectionState
 import ai.choosh.engine.DevHostPresence
 import ai.choosh.engine.FakeChooshEngine
+import ai.choosh.engine.WorkspaceSummary
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -200,6 +201,31 @@ class FleetRowsForTest {
     @Test
     fun `tapping a workspace opens that workspace`() {
         val ws = workspace("ws-x", "x", "dev-a", lastActiveAt = "2026-08-14T10:00:00Z")
+        val event = FleetViewModel(FakeChooshEngine()).onWorkspaceTapped(ws)
+        assertEquals(FleetNavigationEvent.OpenWorkspace("ws-x", "dev-a", "x"), event)
+    }
+
+    /**
+     * The `Fleet drawer -> DevHost -> Workspace` path's own tap site
+     * ([ai.choosh.fleet.DevHostWorkspacesScreen]'s `onWorkspaceClick`, fed a
+     * real `workspace.list` [ai.choosh.engine.WorkspaceSummary], not this
+     * package's own [Workspace]) — a regression test for the bug where
+     * `ChooshApp.kt` reimplemented this mapping inline at this call site and
+     * dropped `workspaceName`, even though the sibling
+     * `Fleet -> Workspace` path (the test directly above) correctly carried
+     * it. Asserts the identical [FleetNavigationEvent.OpenWorkspace] shape as
+     * that test — both tap sites now go through this one overload set, so
+     * there is nowhere left for the two to diverge again.
+     */
+    @Test
+    fun `tapping a devhost's workspace list entry opens that workspace with its real name`() {
+        val ws = WorkspaceSummary(
+            workspaceId = "ws-x",
+            workspaceName = "x",
+            devHostId = "dev-a",
+            projectId = "proj-1",
+            createdAt = "2026-08-14T10:00:00Z",
+        )
         val event = FleetViewModel(FakeChooshEngine()).onWorkspaceTapped(ws)
         assertEquals(FleetNavigationEvent.OpenWorkspace("ws-x", "dev-a", "x"), event)
     }

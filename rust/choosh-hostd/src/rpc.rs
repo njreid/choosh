@@ -122,13 +122,48 @@ async fn handle_create(
     if !valid_workspace_name(&workspace_name) {
         return error(request_id, "invalid_argument", "workspace_name must be a non-empty alphanumeric/-/_ string, max 64 bytes");
     }
+
+    // Reserves `workspace_name` atomically, *before* any of this request's
+    // expensive real work (clone/`jj workspace add`, Zellij session
+    // creation) starts — closing a real race the old code had: an early,
+    // non-authoritative `find_workspace_by_name` read here (with the lock
+    // then released) let two concurrent `workspace.create`s for the same
+    // name both pass, both do the expensive work, and only one win the
+    // *authoritative* uniqueness check that used to run only at the very
+    // end, inside `Registry::register_workspace` — orphaning the loser's
+    // clone/session with no cleanup. See `Registry::reserve_workspace_name`'s
+    // doc comment for the full mechanism.
     {
-        let registry = ctx.registry.lock().await;
-        if registry.find_workspace_by_name(&workspace_name).is_some() {
-            return error(request_id, "conflict", "workspace_name is already registered on this host");
+        let mut registry = ctx.registry.lock().await;
+        if let Err(RegistryError::WorkspaceNameTaken(name)) = registry.reserve_workspace_name(&workspace_name) {
+            return error(request_id, "conflict", format!("workspace_name {name:?} is already registered on this host"));
         }
     }
 
+    let response = handle_create_after_reservation(ctx, request_id, workspace_name.clone(), project_source, parent_workspace_id).await;
+
+    // Released unconditionally, on every path: on success `register_workspace`
+    // has already promoted this name to a real registered entry (so this is
+    // just bookkeeping), and on every failure path this is what actually
+    // frees the name back up for a future `workspace.create` — never left
+    // held forever by a failed request.
+    ctx.registry.lock().await.release_workspace_name_reservation(&workspace_name);
+
+    response
+}
+
+/// The rest of `handle_create`, run only once `workspace_name` is held
+/// under an exclusive reservation (see `handle_create`'s own comment) — kept
+/// as a separate function so `handle_create` can guarantee the reservation
+/// is released on every one of this function's return paths without each
+/// one having to remember to do it itself.
+async fn handle_create_after_reservation(
+    ctx: &RpcContext,
+    request_id: String,
+    workspace_name: String,
+    project_source: ProjectSource,
+    parent_workspace_id: Option<String>,
+) -> RpcResponse {
     let outcome = if let Some(parent_id) = parent_workspace_id {
         create_agent_workspace(ctx, &parent_id, &workspace_name, &project_source).await
     } else {
@@ -186,6 +221,18 @@ async fn handle_create(
     ) {
         Ok(()) => RpcResponse::WorkspaceCreateOk { request_id, workspace_id, workspace_name, project_id },
         Err(RegistryError::WorkspaceNameTaken(name)) => {
+            // Should be unreachable in production: `workspace_name` was
+            // held under an exclusive reservation (`handle_create`) for
+            // this entire function's duration, so no concurrent
+            // `workspace.create` could have registered it out from under
+            // us. Kept as real defense-in-depth rather than an
+            // `unwrap`/`assert!` — and, unlike the old code's equivalent
+            // branch, actually cleans up the Zellij session this call just
+            // created rather than orphaning it, on the chance this is ever
+            // reached (e.g. a future direct `register_workspace` caller
+            // that bypasses the reservation).
+            drop(registry);
+            zellij_ops::kill_session(&workspace_name).await.ok();
             error(request_id, "conflict", format!("workspace_name {name:?} is already registered on this host"))
         }
         Err(other) => error(request_id, "internal", other.to_string()),
@@ -259,17 +306,35 @@ async fn create_agent_workspace(
 
 /// Confines a caller-supplied `existing_path` under `ctx.workspaces_dir`,
 /// per `host-rpc.md`'s root-confinement requirement for
-/// `project_source.existing_path`.
+/// `project_source.existing_path`. Canonicalizes the resolved path and
+/// verifies it's actually under `ctx.workspaces_dir`'s own canonical form —
+/// so a symlink planted under `workspaces_dir` that points elsewhere is
+/// rejected, not silently followed (this is exactly the check `fs_ops::confine`
+/// performs for every other root-confined path in this crate; see that
+/// function's own doc comment and `confine_rejects_a_symlink_escaping_the_root`
+/// for the same guarantee proven against it directly).
 fn confine_workspaces_dir(ctx: &RpcContext, existing_path: &str) -> Result<PathBuf, RpcResponse> {
     if existing_path.starts_with('/') || existing_path.split('/').any(|s| s == "..") {
         // An absolute path is meaningful here (unlike fs_ops::confine's
-        // RPC-relative paths) but MUST still land inside workspaces_dir;
-        // reject `..` outright and resolve everything else against the
-        // configured root rather than trusting the caller's own prefix.
+        // RPC-relative paths, which reject a leading '/' outright) but MUST
+        // still land inside workspaces_dir; reject `..` outright and resolve
+        // everything else against the configured root rather than trusting
+        // the caller's own prefix.
         return Err(error(String::new(), "out_of_root", "existing_path must not contain '..' segments"));
     }
-    let candidate = ctx.workspaces_dir.join(existing_path.trim_start_matches('/'));
-    Ok(candidate)
+    // Reuses fs_ops::confine's canonicalize-and-verify logic rather than
+    // reimplementing it a second time: strip the leading '/' this
+    // function alone accepts (already proven `..`-free above), then hand
+    // the rest to the same symlink-safe resolution every other
+    // root-confined path in this crate goes through. Works unchanged for
+    // both of confine_workspaces_dir's two callers: an existing_path that
+    // must already exist (create_root_workspace's adopt-existing-repo
+    // case) and one that must NOT yet exist (create_agent_workspace's
+    // fresh `jj workspace add` destination) — fs_ops::confine only
+    // requires the parent to exist and resolve under the root; a leaf that
+    // doesn't exist yet is accepted with nothing left to canonicalize.
+    let relative = existing_path.trim_start_matches('/');
+    fs_ops::confine(&ctx.workspaces_dir, relative).map_err(|fs_error| fs_error_response(String::new(), &fs_error))
 }
 
 async fn handle_list(ctx: &RpcContext, request_id: String) -> RpcResponse {
@@ -528,17 +593,54 @@ async fn handle_item_create(
     if !valid_item_name(&name) {
         return error(request_id, "invalid_argument", "name must be a non-empty alphanumeric/-/_ string, max 64 bytes");
     }
+
+    // Reserves `(workspace_id, name)` atomically, before any of this
+    // request's expensive real work (Zellij tab creation) starts — the
+    // `item.create` analog of `handle_create`'s own reservation; see
+    // `Registry::reserve_item_name`'s doc comment for the race this closes.
     let (workspace_name, root_path) = {
-        let registry = ctx.registry.lock().await;
+        let mut registry = ctx.registry.lock().await;
         let Some(workspace) = registry.find_workspace(workspace_id) else {
             return error(request_id, "not_found", "workspace_id is not registered on this host");
         };
-        if registry.find_item_by_name(workspace_id, &name).is_some() {
-            return error(request_id, "conflict", "item name is already registered in this workspace");
+        let workspace_name = workspace.workspace_name.clone();
+        let root_path = workspace.root_path.clone();
+        if let Err(RegistryError::ItemNameTaken(taken)) = registry.reserve_item_name(workspace_id, &name) {
+            return error(request_id, "conflict", format!("item name {taken:?} is already registered in this workspace"));
         }
-        (workspace.workspace_name.clone(), workspace.root_path.clone())
+        (workspace_name, root_path)
     };
 
+    let response =
+        handle_item_create_after_reservation(ctx, request_id, workspace_id, item_type, name.clone(), agent, command, port, workspace_name, root_path)
+            .await;
+
+    // Released unconditionally, same reasoning as `handle_create`'s own
+    // release call: frees the name back up on every failure path, and is
+    // just bookkeeping on the success path where `register_item` already
+    // promoted it to a real registered entry.
+    ctx.registry.lock().await.release_item_name_reservation(workspace_id, &name);
+
+    response
+}
+
+/// The rest of `handle_item_create`, run only once `(workspace_id, name)` is
+/// held under an exclusive reservation — see `handle_item_create`'s own
+/// comment and `handle_create_after_reservation`'s matching doc comment for
+/// why this is split out.
+#[allow(clippy::too_many_arguments)]
+async fn handle_item_create_after_reservation(
+    ctx: &RpcContext,
+    request_id: String,
+    workspace_id: &str,
+    item_type: ItemType,
+    name: String,
+    agent: Option<choosh_protocol::host_rpc::AgentKind>,
+    command: Option<Vec<String>>,
+    port: Option<u16>,
+    workspace_name: String,
+    root_path: PathBuf,
+) -> RpcResponse {
     // Project-pinned toolchains, second half (see `handle_create`'s own
     // mise-related comment for the first half): resolve this workspace's
     // `mise env` fresh for *this* spawn, per toolchain-provisioning.md
@@ -633,6 +735,14 @@ async fn handle_item_create(
             RpcResponse::ItemCreateOk { request_id, item_id, item_type, name: name.clone(), tab_target: name }
         }
         Err(RegistryError::ItemNameTaken(taken)) => {
+            // Should be unreachable in production for the same reason
+            // `handle_create_after_reservation`'s analogous branch is:
+            // `(workspace_id, name)` was held under an exclusive
+            // reservation (`handle_item_create`) for this entire function's
+            // duration. Kept as real defense-in-depth: clean up the Zellij
+            // tab this call just created rather than orphaning it.
+            drop(registry);
+            zellij_ops::close_tab(&workspace_name, &name).await.ok();
             error(request_id, "conflict", format!("item name {taken:?} is already registered in this workspace"))
         }
         Err(other) => error(request_id, "internal", other.to_string()),
@@ -1669,6 +1779,91 @@ mod tests {
         );
     }
 
+    /// Regression test for a real bug: `confine_workspaces_dir` used to only
+    /// reject literal `..` segments and a leading `/`, never canonicalizing
+    /// the resolved path to verify it actually stayed under
+    /// `ctx.workspaces_dir` — unlike its sibling `fs_ops::confine` (whose own
+    /// `confine_rejects_a_symlink_escaping_the_root` test proves the same
+    /// guarantee directly against `confine`). A symlink planted under
+    /// `workspaces_dir` that points somewhere else would have been silently
+    /// followed. Driven end to end through `dispatch`, mirroring
+    /// `fs_ops.rs`'s own symlink test's shape (a symlink named `escape`
+    /// pointing at `/etc`, then a path through it).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn workspace_create_rejects_an_existing_path_that_is_a_symlink_escaping_workspaces_dir() {
+        let (_dir, ctx) = ctx_with_tempdir();
+        std::os::unix::fs::symlink("/etc", ctx.workspaces_dir.join("escape")).unwrap();
+
+        let response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "r1".to_string(),
+                workspace_name: "escapetest2".to_string(),
+                project_source: ProjectSource::ExistingPath { existing_path: "escape/passwd".to_string() },
+                parent_workspace_id: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&response, RpcResponse::Error { code, .. } if code == "out_of_root"),
+            "a symlink under workspaces_dir escaping its root must be rejected as out_of_root, got {response:?}"
+        );
+    }
+
+    /// Direct proof that `workspace.create`'s name reservation
+    /// (`Registry::reserve_workspace_name`, taken by `handle_create` before
+    /// any expensive work) actually gates the expensive work itself, not
+    /// just the final registration: with `workspace_name` already held
+    /// under a reservation — simulating a concurrent in-flight
+    /// `workspace.create` for the same name that reserved it first — a
+    /// second `workspace.create` for that name must fail immediately as
+    /// `conflict`, and critically must never get as far as creating a
+    /// Zellij session for it. Before this fix, the analogous early check
+    /// only looked at *registered* names (never reserved-but-not-yet-
+    /// registered ones), so a second caller racing a first one that hadn't
+    /// finished registering yet would sail past it and do the real
+    /// clone/session work anyway, only to lose the authoritative check at
+    /// the very end and leave that work orphaned with no cleanup.
+    #[tokio::test]
+    async fn workspace_create_is_rejected_immediately_while_the_name_is_reserved_without_doing_any_real_work() {
+        let name = format!("reservetest-{}", uuid::Uuid::new_v4());
+        let (_dir, ctx) = ctx_with_tempdir();
+        let existing = ctx.workspaces_dir.join(&name);
+        std::fs::create_dir_all(&existing).unwrap();
+        init_git_repo(&existing);
+
+        // Simulates another in-flight `workspace.create` for this exact
+        // name that has already passed its own reservation but hasn't
+        // finished the expensive work / registration yet.
+        ctx.registry.lock().await.reserve_workspace_name(&name).unwrap();
+
+        let response = dispatch(
+            &ctx,
+            RpcRequest::WorkspaceCreate {
+                request_id: "r1".to_string(),
+                workspace_name: name.clone(),
+                project_source: ProjectSource::ExistingPath { existing_path: name.clone() },
+                parent_workspace_id: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&response, RpcResponse::Error { code, .. } if code == "conflict"),
+            "expected conflict while the name is reserved, got {response:?}"
+        );
+
+        // The real proof: no Zellij session was ever created for the
+        // rejected caller — it never got past the reservation check to do
+        // any of workspace.create's expensive work.
+        assert!(
+            !zellij_ops::list_sessions().await.unwrap().contains(&name),
+            "a workspace.create rejected at the reservation stage must never create a Zellij session"
+        );
+
+        ctx.registry.lock().await.release_workspace_name_reservation(&name);
+    }
+
     /// `WorkspaceTreeList`/`WorkspaceFileRead`'s shared `reject_non_live_revision`
     /// gate: a `revision` other than `None`/`Some("@")` must be
     /// `invalid_argument`, never silently served against `@` instead.
@@ -1865,6 +2060,46 @@ mod tests {
         assert!(
             matches!(&duplicate, RpcResponse::Error { code, .. } if code == "conflict"),
             "expected conflict for a duplicate item name, got {duplicate:?}"
+        );
+    }
+
+    /// The `item.create` analog of `workspace_create_is_rejected_immediately_
+    /// while_the_name_is_reserved_without_doing_any_real_work`: with
+    /// `(workspace_id, name)` already reserved — simulating a concurrent
+    /// in-flight `item.create` for that exact pair — a second `item.create`
+    /// is rejected immediately as `conflict`, and critically never creates
+    /// a Zellij tab for it. Direct proof that `Registry::reserve_item_name`
+    /// gates `item.create`'s expensive work (Zellij tab creation), not just
+    /// its final registration.
+    #[tokio::test]
+    async fn item_create_is_rejected_immediately_while_the_name_is_reserved_without_doing_any_real_work() {
+        let (_dir, ctx, name, workspace_id) = setup_m3_workspace("m2itemreserve").await;
+
+        ctx.registry.lock().await.reserve_item_name(&workspace_id, "sh").unwrap();
+
+        let response = dispatch(
+            &ctx,
+            RpcRequest::ItemCreate {
+                request_id: "r1".to_string(),
+                workspace_id: workspace_id.clone(),
+                item_type: ItemType::Shell,
+                name: "sh".to_string(),
+                agent: None,
+                command: None,
+                port: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&response, RpcResponse::Error { code, .. } if code == "conflict"),
+            "expected conflict while the item name is reserved, got {response:?}"
+        );
+
+        let tabs = zellij_ops::list_tabs(&name).await.unwrap();
+        zellij_ops::kill_session(&name).await.ok();
+        assert!(
+            !tabs.contains(&"sh".to_string()),
+            "an item.create rejected at the reservation stage must never create a Zellij tab, got tabs {tabs:?}"
         );
     }
 

@@ -380,14 +380,17 @@ impl Perform for Terminal {
         match action {
             'A' => self.cursor.row = self.cursor.row.saturating_sub(Self::param(params, 0, 1)),
             'B' => {
-                self.cursor.row = (self.cursor.row + Self::param(params, 0, 1)).min(self.grid().rows() - 1);
+                self.cursor.row =
+                    self.cursor.row.saturating_add(Self::param(params, 0, 1)).min(self.grid().rows() - 1);
             }
             'C' => {
-                self.cursor.col = (self.cursor.col + Self::param(params, 0, 1)).min(self.grid().cols() - 1);
+                self.cursor.col =
+                    self.cursor.col.saturating_add(Self::param(params, 0, 1)).min(self.grid().cols() - 1);
             }
             'D' => self.cursor.col = self.cursor.col.saturating_sub(Self::param(params, 0, 1)),
             'E' => {
-                self.cursor.row = (self.cursor.row + Self::param(params, 0, 1)).min(self.grid().rows() - 1);
+                self.cursor.row =
+                    self.cursor.row.saturating_add(Self::param(params, 0, 1)).min(self.grid().rows() - 1);
                 self.cursor.col = 0;
             }
             'F' => {
@@ -465,7 +468,7 @@ impl Perform for Terminal {
             'X' => {
                 let count = Self::param(params, 0, 1);
                 let (row, col) = (self.cursor.row, self.cursor.col);
-                self.grid_mut().clear_row_range(row, col, col + count);
+                self.grid_mut().clear_row_range(row, col, col.saturating_add(count));
             }
             'd' => self.cursor.row = Self::param(params, 0, 1).saturating_sub(1).min(self.grid().rows() - 1),
             'h' if private => {
@@ -697,6 +700,60 @@ mod tests {
         engine.resize(4, 3);
         let cursor = engine.terminal().cursor();
         assert!(cursor.col < 4 && cursor.row < 3);
+    }
+
+    /// A maliciously/erroneously huge CUD (cursor down) parameter — the max
+    /// a `vte` `u16` CSI param can carry — must not overflow the
+    /// `row + param` addition (a panic in a checked-arithmetic build, a
+    /// silent wraparound in release) and must instead clamp the cursor to
+    /// the last valid row, exactly like `resize_clamps_cursor_into_new_bounds`
+    /// expects of a resize.
+    #[test]
+    fn cud_with_out_of_range_param_clamps_instead_of_overflowing() {
+        let mut engine = Engine::new(10, 5);
+        engine.write(b"\x1b[65535B");
+        let cursor = engine.terminal().cursor();
+        assert_eq!(cursor.row, 4);
+        assert!(cursor.col < 10);
+    }
+
+    /// Same overflow class as `cud_with_out_of_range_param_clamps_instead_of_overflowing`,
+    /// for CUF (cursor forward): `col + param` must saturate, not overflow.
+    #[test]
+    fn cuf_with_out_of_range_param_clamps_instead_of_overflowing() {
+        let mut engine = Engine::new(10, 5);
+        engine.write(b"\x1b[65535C");
+        let cursor = engine.terminal().cursor();
+        assert_eq!(cursor.col, 9);
+        assert!(cursor.row < 5);
+    }
+
+    /// Same overflow class, for CNL (cursor next line): `row + param` must
+    /// saturate, and CNL's own column reset to 0 must still happen.
+    #[test]
+    fn cnl_with_out_of_range_param_clamps_instead_of_overflowing() {
+        let mut engine = Engine::new(10, 5);
+        engine.write(b"\x1b[65535E");
+        let cursor = engine.terminal().cursor();
+        assert_eq!(cursor.row, 4);
+        assert_eq!(cursor.col, 0);
+    }
+
+    /// Same overflow class, for ECH (erase char): `col + param` used as the
+    /// erase range's exclusive end must saturate rather than overflow, and
+    /// erasing must not panic even though the requested range vastly
+    /// exceeds the grid's width.
+    #[test]
+    fn ech_with_out_of_range_param_does_not_panic_and_erases_to_end_of_row() {
+        let mut engine = Engine::new(10, 5);
+        engine.write(b"abcdefghij");
+        engine.write(b"\x1b[3;3H"); // move to col 2, row 2 (0-indexed)
+        engine.write(b"\x1b[65535X");
+        for col in 2..10 {
+            assert!(engine.terminal().grid().cell(col, 2).unwrap().is_blank());
+        }
+        let cursor = engine.terminal().cursor();
+        assert!(cursor.col < 10 && cursor.row < 5);
     }
 
     #[test]

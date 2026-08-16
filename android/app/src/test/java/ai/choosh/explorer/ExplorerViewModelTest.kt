@@ -9,6 +9,8 @@ import ai.choosh.engine.CreateItemResult
 import ai.choosh.engine.FakeChooshEngine
 import ai.choosh.engine.ItemSummary
 import ai.choosh.engine.ItemType
+import ai.choosh.engine.TreeEntry
+import ai.choosh.engine.TreeEntryKind
 import ai.choosh.engine.WebServiceStatus
 import ai.choosh.engine.WorkspaceStatus
 import ai.choosh.engine.WorkspaceTreeListResult
@@ -17,6 +19,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -42,6 +45,25 @@ private class EmptyItemListChooshEngine(private val delegate: ChooshEngine = Fak
 private class FailingTreeListChooshEngine(private val delegate: ChooshEngine = FakeChooshEngine()) : ChooshEngine by delegate {
     override suspend fun workspaceTreeList(deviceId: String, workspaceId: String, pathPrefix: String, cursor: String?): WorkspaceTreeListResult =
         error("simulated workspace.tree.list failure")
+}
+
+/**
+ * [ChooshEngine] wrapper whose `workspace.tree.list` never terminates — every
+ * call returns exactly one entry and a non-null `nextCursor`, no matter how
+ * many pages have already been fetched. Exercises [ExplorerViewModel.loadTree]'s
+ * pagination cap ([ExplorerViewModel.MAX_TREE_LIST_PAGES]): a pathological or
+ * malicious `hostd` response that always claims "more remain" must not hang
+ * the ViewModel or grow [ai.choosh.explorer.TreeUiState.entries] without
+ * bound.
+ */
+private class UnboundedTreeListChooshEngine(private val delegate: ChooshEngine = FakeChooshEngine()) : ChooshEngine by delegate {
+    override suspend fun workspaceTreeList(deviceId: String, workspaceId: String, pathPrefix: String, cursor: String?): WorkspaceTreeListResult {
+        val pageIndex = cursor?.toIntOrNull() ?: 0
+        return WorkspaceTreeListResult(
+            entries = listOf(TreeEntry("infinite-$pageIndex.txt", TreeEntryKind.FILE, conflicted = false)),
+            nextCursor = (pageIndex + 1).toString(),
+        )
+    }
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -209,7 +231,7 @@ class ExplorerViewModelTest {
         val tree = viewModel.state.value.tree
         assertNull(tree.error)
         assertEquals("", tree.pathPrefix)
-        assertEquals(setOf("README.md", "app.kt", "docs"), tree.entries.map { it.name }.toSet())
+        assertEquals(setOf("README.md", "app.kt", "docs", FakeChooshEngine.PAGINATED_DIR_NAME), tree.entries.map { it.name }.toSet())
     }
 
     @Test
@@ -304,5 +326,34 @@ class ExplorerViewModelTest {
         val tree = viewModel.state.value.tree
         assertNotNull(tree.error)
         assertTrue(tree.entries.isEmpty())
+    }
+
+    @Test
+    fun `loadTree follows nextCursor across every page of a directory over the per-call entry bound`() = runTest(mainDispatcherRule.dispatcher) {
+        val viewModel = ExplorerViewModel(FakeChooshEngine(), deviceId = "dev-1", workspaceId = "ws-1")
+        advanceUntilIdle()
+
+        viewModel.loadTree(FakeChooshEngine.PAGINATED_DIR_NAME)
+        advanceUntilIdle()
+
+        val tree = viewModel.state.value.tree
+        assertNull(tree.error)
+        assertFalse("the fixture directory fits well under the pagination cap, so it must not be reported as truncated", tree.truncated)
+        // The fixture chains 3 pages of 5/5/2 entries behind `nextCursor` — asserting all 12 names are
+        // present (not just the first page's 5) is what actually proves loadTree paginates rather than
+        // stopping after one workspaceTreeList call.
+        val expectedNames = (1..12).map { "file-$it.txt" }.toSet()
+        assertEquals(expectedNames, tree.entries.map { it.name }.toSet())
+    }
+
+    @Test
+    fun `loadTree caps pagination and marks the result truncated rather than fetching an endless nextCursor chain`() = runTest(mainDispatcherRule.dispatcher) {
+        val viewModel = ExplorerViewModel(UnboundedTreeListChooshEngine(), deviceId = "dev-1", workspaceId = "ws-1")
+        advanceUntilIdle()
+
+        val tree = viewModel.state.value.tree
+        assertNull(tree.error)
+        assertEquals(ExplorerViewModel.MAX_TREE_LIST_PAGES, tree.entries.size)
+        assertTrue("hitting the pagination cap must be surfaced as a partial result, not silently truncated", tree.truncated)
     }
 }

@@ -246,6 +246,25 @@ class FleetViewModel(
         FleetNavigationEvent.OpenWorkspace(workspace.workspaceId, workspace.devHostId, workspace.name)
 
     /**
+     * The [DevHostWorkspacesScreen] tap-site's equivalent of the overload
+     * above — same [FleetNavigationEvent.OpenWorkspace] mapping, just from
+     * [WorkspaceSummary] (the real `workspace.list` wire shape
+     * [DevHostWorkspacesViewModel] hands its screen directly) rather than
+     * this package's own [Workspace]. Before this overload existed,
+     * `ChooshApp.kt` reimplemented this exact mapping inline at this call
+     * site and — unlike the [Workspace] overload above — dropped
+     * `workspaceName` entirely, so a workspace reached via
+     * `Fleet drawer -> DevHost -> Workspace` showed the raw `workspaceId` as
+     * its page title (UX-friction audit finding #11, regressed). Routing
+     * both tap sites through this class is what makes that divergence
+     * structurally impossible to reintroduce: there is exactly one place
+     * (this one) that decides what a tapped workspace's [FleetNavigationEvent]
+     * looks like, regardless of which screen the tap came from.
+     */
+    fun onWorkspaceTapped(workspace: WorkspaceSummary): FleetNavigationEvent =
+        FleetNavigationEvent.OpenWorkspace(workspace.workspaceId, workspace.devHostId, workspace.workspaceName)
+
+    /**
      * Merges [attentionTracker]'s live `needsAttention` set into
      * [projects] before deriving rows via [rowsFor] — deliberately a
      * union with each [Workspace]'s own (fixture-sourced) flag, never a

@@ -133,6 +133,65 @@ class ConnectionViewModelTest {
         assertEquals(ConnectionUiState.NeedsRegistration, viewModel.state.value)
     }
 
+    // --- onConnectSucceeded / AgentEventSubscription.resubscribeAll wiring ---
+    //
+    // Per AgentEventSubscription.resubscribeAll's own doc comment, a reconnect after any
+    // gap (network loss, app backgrounding, the relay connection cycling) "MUST resume
+    // from the last acknowledged sequence ... MUST NOT silently drop events" — this was,
+    // until this pass, never actually called anywhere in production. ConnectionViewModel
+    // exposes onConnectSucceeded as the hook the composition root wires resubscribeAll
+    // through; these tests exercise that ConnectionViewModel itself invokes it reliably,
+    // independent of whatever AgentEventSubscription happens to be wired in production.
+
+    @Test
+    fun `a successful connect invokes onConnectSucceeded`() = runTest(mainDispatcherRule.dispatcher) {
+        val credentialStore = FakeSessionCredentialStore(initial = "stored-cred")
+        var connectSucceededCount = 0
+        val viewModel = ConnectionViewModel(
+            FakeChooshEngine(),
+            credentialStore,
+            onConnectSucceeded = { connectSucceededCount++ },
+        )
+        advanceUntilIdle()
+
+        assertEquals(ConnectionUiState.Connected, viewModel.state.value)
+        assertEquals(
+            "the very first connect must also invoke the callback — a harmless no-op " +
+                "resubscribe with nothing yet subscribed, per onConnectSucceeded's own doc comment",
+            1,
+            connectSucceededCount,
+        )
+    }
+
+    @Test
+    fun `a reconnect via retry invokes onConnectSucceeded again, so a dropped agent-event stream resumes`() =
+        runTest(mainDispatcherRule.dispatcher) {
+            val credentialStore = FakeSessionCredentialStore(initial = "still-valid-cred")
+            val engine = FakeChooshEngine().apply { simulateConnectTransportFailure = "timed out reaching relayd" }
+            var connectSucceededCount = 0
+            val viewModel = ConnectionViewModel(
+                engine,
+                credentialStore,
+                onConnectSucceeded = { connectSucceededCount++ },
+            )
+            advanceUntilIdle()
+            assertTrue(viewModel.state.value is ConnectionUiState.Error)
+            assertEquals("a failed connect must not invoke the reconnect callback", 0, connectSucceededCount)
+
+            // The simulated transport failure is one-shot (see FakeChooshEngine.connect);
+            // this reconnect succeeds — the exact "reconnect after a dropped connection"
+            // case resubscribeAll exists for.
+            viewModel.retry()
+            advanceUntilIdle()
+
+            assertEquals(ConnectionUiState.Connected, viewModel.state.value)
+            assertEquals(
+                "a successful reconnect must invoke the callback so agent-event subscriptions resume",
+                1,
+                connectSucceededCount,
+            )
+        }
+
     @Test
     fun `an engine throwing on connect is treated as a transport failure, not a crash`() = runTest(mainDispatcherRule.dispatcher) {
         val credentialStore = FakeSessionCredentialStore(initial = "some-cred")

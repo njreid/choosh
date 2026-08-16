@@ -119,6 +119,19 @@ pub struct Registry {
     /// would have produced these events, so there is nothing meaningful to
     /// carry across one.
     last_event_at: std::collections::HashMap<String, time::OffsetDateTime>,
+    /// `workspace_name`s currently reserved by an in-flight `workspace.create`
+    /// that has passed its uniqueness check but not yet (successfully or
+    /// unsuccessfully) reached [`Self::register_workspace`] — see
+    /// [`Self::reserve_workspace_name`]'s doc comment for the race this
+    /// closes. In-memory-only, same reasoning as `last_event_at`: a
+    /// reservation only needs to outlive one in-flight RPC call within this
+    /// process, never a `choosh-hostd` restart (which drops every in-flight
+    /// call anyway).
+    reserved_workspace_names: std::collections::HashSet<String>,
+    /// The `item.create` analog of `reserved_workspace_names`, keyed by
+    /// `(workspace_id, name)` since item names are unique per-Workspace, not
+    /// host-wide (see [`Self::find_item_by_name`]).
+    reserved_item_names: std::collections::HashSet<(String, String)>,
 }
 
 impl Registry {
@@ -138,7 +151,13 @@ impl Registry {
             Err(error) if error.kind() == io::ErrorKind::NotFound => RegistryState::default(),
             Err(error) => return Err(RegistryError::Io(error)),
         };
-        Ok(Self { path: path.to_path_buf(), state, last_event_at: std::collections::HashMap::new() })
+        Ok(Self {
+            path: path.to_path_buf(),
+            state,
+            last_event_at: std::collections::HashMap::new(),
+            reserved_workspace_names: std::collections::HashSet::new(),
+            reserved_item_names: std::collections::HashSet::new(),
+        })
     }
 
     /// The default per-devhost registry file location:
@@ -243,6 +262,55 @@ impl Registry {
         self.save()
     }
 
+    /// Atomically reserves `workspace_name` for an in-flight `workspace.create`,
+    /// per `rpc.rs`'s `handle_create`: called (under `RpcContext.registry`'s
+    /// lock) immediately after the request's own validation, *before*
+    /// `handle_create` does any of `workspace.create`'s expensive real work
+    /// (`jj_ops::clone`/`workspace_add`, `zellij_ops::create_session`) —
+    /// unlike the early check that used to live directly in `handle_create`
+    /// (a plain [`Self::find_workspace_by_name`] read with no reservation),
+    /// this closes the real race two concurrent `workspace.create`s for the
+    /// same name used to have: both could pass a non-authoritative early
+    /// check, both would then do the expensive clone/session work, and only
+    /// one would win the *authoritative* check that used to run only inside
+    /// [`Self::register_workspace`] at the very end — leaving the loser's
+    /// clone/session orphaned on disk/in Zellij with no cleanup. Checked
+    /// against both already-*registered* names (the same check
+    /// [`Self::register_workspace`] itself performs) and already-*reserved*
+    /// ones, so two concurrent callers can never both hold a reservation for
+    /// the same name — whichever calls this second gets
+    /// [`RegistryError::WorkspaceNameTaken`] immediately, before it does any
+    /// real work at all, rather than after.
+    ///
+    /// The caller MUST release this reservation exactly once, via
+    /// [`Self::release_workspace_name_reservation`], regardless of whether
+    /// its subsequent [`Self::register_workspace`] call (or an earlier
+    /// failure that never reaches it) succeeds — this function does not
+    /// release it on the caller's behalf, since only the caller knows
+    /// whether a rollback (killing an orphaned Zellij session, etc.) needs
+    /// to happen first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::WorkspaceNameTaken`] if `workspace_name` is
+    /// already registered, or already reserved by another in-flight
+    /// `workspace.create`.
+    pub fn reserve_workspace_name(&mut self, workspace_name: &str) -> Result<(), RegistryError> {
+        if self.find_workspace_by_name(workspace_name).is_some() || self.reserved_workspace_names.contains(workspace_name) {
+            return Err(RegistryError::WorkspaceNameTaken(workspace_name.to_string()));
+        }
+        self.reserved_workspace_names.insert(workspace_name.to_string());
+        Ok(())
+    }
+
+    /// Releases a reservation taken by [`Self::reserve_workspace_name`].
+    /// Idempotent (removing an absent name is a no-op) — deliberately safe
+    /// to call from every one of `handle_create`'s exit paths without each
+    /// one having to prove it's the first to release.
+    pub fn release_workspace_name_reservation(&mut self, workspace_name: &str) {
+        self.reserved_workspace_names.remove(workspace_name);
+    }
+
     /// Registers a new Workspace under `project_id` (creating the Project
     /// record if it doesn't exist yet, with itself as the primary
     /// Workspace, per `DESIGN.md` §4's "defaults to the first Workspace
@@ -252,7 +320,12 @@ impl Registry {
     ///
     /// Returns [`RegistryError::WorkspaceNameTaken`] if `workspace_name` is
     /// already registered on this host, per `host-rpc.md`'s "reject
-    /// collisions... rather than silently adopting it".
+    /// collisions... rather than silently adopting it". In the normal
+    /// `handle_create` flow this is unreachable — the caller already holds
+    /// an exclusive [`Self::reserve_workspace_name`] reservation for
+    /// `workspace_name` for this call's entire duration — but is kept as a
+    /// real, checked invariant rather than an `assert!`/`unwrap`, in case a
+    /// future caller ever invokes this directly without reserving first.
     pub fn register_workspace(
         &mut self,
         workspace_id: String,
@@ -298,11 +371,42 @@ impl Registry {
         self.state.items.iter().filter(|i| i.workspace_id == workspace_id).collect()
     }
 
+    /// The `item.create` analog of [`Self::reserve_workspace_name`] — see
+    /// that function's doc comment for the full race it closes and the
+    /// reservation-release contract, which applies here identically. Keyed
+    /// by `(workspace_id, name)` since item names are only unique
+    /// per-Workspace ([`Self::find_item_by_name`]), not host-wide.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::ItemNameTaken`] if `name` is already
+    /// registered within `workspace_id`, or already reserved by another
+    /// in-flight `item.create` in the same workspace.
+    pub fn reserve_item_name(&mut self, workspace_id: &str, name: &str) -> Result<(), RegistryError> {
+        if self.find_item_by_name(workspace_id, name).is_some()
+            || self.reserved_item_names.contains(&(workspace_id.to_string(), name.to_string()))
+        {
+            return Err(RegistryError::ItemNameTaken(name.to_string()));
+        }
+        self.reserved_item_names.insert((workspace_id.to_string(), name.to_string()));
+        Ok(())
+    }
+
+    /// Releases a reservation taken by [`Self::reserve_item_name`].
+    /// Idempotent, same reasoning as [`Self::release_workspace_name_reservation`].
+    pub fn release_item_name_reservation(&mut self, workspace_id: &str, name: &str) {
+        self.reserved_item_names.remove(&(workspace_id.to_string(), name.to_string()));
+    }
+
     /// # Errors
     ///
     /// Returns [`RegistryError::ItemNameTaken`] if `name` is already
     /// registered within `workspace_id`, per `host-rpc.md`'s "Unique within
-    /// the workspace" requirement for `item.create`'s `name` field.
+    /// the workspace" requirement for `item.create`'s `name` field. In the
+    /// normal `handle_item_create` flow this is unreachable for the same
+    /// reason documented on [`Self::register_workspace`]'s matching branch —
+    /// the caller already holds an exclusive [`Self::reserve_item_name`]
+    /// reservation for `(workspace_id, name)`.
     ///
     /// `initial_status` is caller-supplied rather than hardcoded: per
     /// `service-tunnels.md`'s Lifecycle section, a `WebService` item starts
@@ -574,6 +678,112 @@ mod tests {
             .unwrap();
         let result = registry.set_primary_workspace("proj-1", "ws-does-not-exist");
         assert!(matches!(result, Err(RegistryError::WorkspaceNotFound(id)) if id == "ws-does-not-exist"));
+    }
+
+    /// The core regression test for the `workspace.create` race: while a
+    /// name is reserved, a second, concurrent reservation attempt for the
+    /// *same* name must fail immediately — proving that two racing
+    /// `handle_create` calls can never both proceed to do the expensive
+    /// clone/session work this reservation exists to gate. Releasing the
+    /// first reservation then frees the name back up, exactly as
+    /// `handle_create`'s cleanup path relies on.
+    #[test]
+    fn reserve_workspace_name_is_exclusive_and_release_frees_it_for_reuse() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+
+        registry.reserve_workspace_name("app").unwrap();
+        let second = registry.reserve_workspace_name("app");
+        assert!(
+            matches!(&second, Err(RegistryError::WorkspaceNameTaken(name)) if name == "app"),
+            "a name already held under reservation must be rejected, got {second:?}"
+        );
+
+        registry.release_workspace_name_reservation("app");
+        assert!(registry.reserve_workspace_name("app").is_ok(), "releasing a reservation must free the name for reuse");
+    }
+
+    /// A reservation must also be rejected against a name that's already
+    /// *registered* (not merely reserved) — the reservation step subsumes
+    /// the old early, non-authoritative uniqueness check entirely, rather
+    /// than only guarding the reserved-but-not-yet-registered window.
+    #[test]
+    fn reserve_workspace_name_rejects_an_already_registered_name() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+        registry
+            .register_workspace(
+                "ws-1".to_string(),
+                "app".to_string(),
+                "proj-1".to_string(),
+                "app".to_string(),
+                PathBuf::from("/workspaces/app"),
+                "2026-08-14T00:00:00Z".to_string(),
+            )
+            .unwrap();
+
+        let result = registry.reserve_workspace_name("app");
+        assert!(matches!(result, Err(RegistryError::WorkspaceNameTaken(name)) if name == "app"));
+    }
+
+    /// Releasing a reservation that was never held (e.g. a name that was
+    /// never reserved, or was already released) is a safe no-op —
+    /// `handle_create`'s exit paths all call this unconditionally without
+    /// tracking whether some earlier path already did.
+    #[test]
+    fn release_workspace_name_reservation_is_idempotent() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+        registry.release_workspace_name_reservation("never-reserved");
+        registry.reserve_workspace_name("app").unwrap();
+        registry.release_workspace_name_reservation("app");
+        registry.release_workspace_name_reservation("app");
+        assert!(registry.reserve_workspace_name("app").is_ok());
+    }
+
+    /// The `item.create` analog of `reserve_workspace_name_is_exclusive_...`:
+    /// item-name reservations are exclusive per `(workspace_id, name)`, but
+    /// the *same* name is independently reservable in a different
+    /// workspace — matching `find_item_by_name`'s own per-workspace
+    /// uniqueness scope.
+    #[test]
+    fn reserve_item_name_is_exclusive_per_workspace_and_release_frees_it_for_reuse() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+
+        registry.reserve_item_name("ws-1", "sh").unwrap();
+        let second = registry.reserve_item_name("ws-1", "sh");
+        assert!(
+            matches!(&second, Err(RegistryError::ItemNameTaken(name)) if name == "sh"),
+            "an item name already held under reservation in the same workspace must be rejected, got {second:?}"
+        );
+
+        // A different workspace reserving the identical name is unaffected.
+        assert!(registry.reserve_item_name("ws-2", "sh").is_ok());
+
+        registry.release_item_name_reservation("ws-1", "sh");
+        assert!(registry.reserve_item_name("ws-1", "sh").is_ok(), "releasing a reservation must free the name for reuse");
+    }
+
+    #[test]
+    fn reserve_item_name_rejects_an_already_registered_name() {
+        let (_dir, path) = temp_registry();
+        let mut registry = Registry::load(&path).unwrap();
+        registry
+            .register_item(
+                "item-1".to_string(),
+                "ws-1".to_string(),
+                ItemType::Shell,
+                "sh".to_string(),
+                "sh".to_string(),
+                None,
+                None,
+                ItemStatus::Running,
+            )
+            .unwrap();
+
+        let result = registry.reserve_item_name("ws-1", "sh");
+        assert!(matches!(result, Err(RegistryError::ItemNameTaken(name)) if name == "sh"));
     }
 
     #[test]

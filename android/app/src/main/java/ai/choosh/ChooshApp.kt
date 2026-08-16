@@ -157,6 +157,24 @@ private sealed interface Screen {
     data class MarkdownPreview(val deviceId: String, val workspaceId: String, val path: String) : Screen
 }
 
+/**
+ * The one place a [FleetNavigationEvent] (itself the one place a tapped
+ * [ai.choosh.engine.DevHostPresence]/[ai.choosh.fleet.Project]/
+ * [ai.choosh.fleet.Workspace]/[ai.choosh.engine.WorkspaceSummary] maps to a
+ * navigation outcome — see [FleetViewModel]'s own doc comment) becomes a
+ * [Screen] to push. Every fleet-adjacent tap site in [ChooshApp] goes
+ * through `viewModel.onXTapped(...).toScreen()`, never an inline
+ * `Screen.Workspace(...)`/`Screen.DevHostWorkspaces(...)` construction — this
+ * is what makes two independently-diverging inline copies of this mapping
+ * (the bug that dropped [Screen.Workspace.workspaceName] on the
+ * DevHost->Workspace path while the Fleet->Workspace path kept it)
+ * structurally impossible to reintroduce.
+ */
+private fun FleetNavigationEvent.toScreen(): Screen = when (this) {
+    is FleetNavigationEvent.OpenWorkspace -> Screen.Workspace(workspaceId, deviceId, workspaceName)
+    is FleetNavigationEvent.OpenDevHost -> Screen.DevHostWorkspaces(deviceId)
+}
+
 @Composable
 fun ChooshApp(
     context: Context,
@@ -277,7 +295,21 @@ fun ChooshApp(
                 is Screen.Connection -> {
                     val viewModel: ConnectionViewModel = viewModel(
                         factory = singleInstanceFactory {
-                            ConnectionViewModel(engine, credentialStore, fcmTokenProvider = ::fetchFcmToken)
+                            ConnectionViewModel(
+                                engine,
+                                credentialStore,
+                                fcmTokenProvider = ::fetchFcmToken,
+                                // Per AgentEventSubscription.resubscribeAll's own doc comment: a
+                                // reconnect (network loss, app backgrounding, the relay connection
+                                // cycling) MUST resume every previously-subscribed workspace's
+                                // event stream from its last acknowledged sequence, not silently
+                                // stop delivering live updates. ConnectionViewModel.connectWith
+                                // funnels both the first connect and every retry() reconnect
+                                // through the same ConnectResult.Connected branch, so this one
+                                // callback covers both — see this parameter's own doc comment for
+                                // why a first-connect no-op call here is safe.
+                                onConnectSucceeded = { subscription.resubscribeAll() },
+                            )
                         },
                     )
                     ConnectionScreen(
@@ -313,16 +345,13 @@ fun ChooshApp(
                     FleetDrawer(
                         state = state,
                         onSortModeSelected = viewModel::setSortMode,
-                        onProjectClick = { project ->
-                            backStack.push(
-                                when (val event = viewModel.onProjectTapped(project)) {
-                                    is FleetNavigationEvent.OpenWorkspace -> Screen.Workspace(event.workspaceId, event.deviceId, event.workspaceName)
-                                    is FleetNavigationEvent.OpenDevHost -> Screen.DevHostWorkspaces(event.deviceId)
-                                },
-                            )
-                        },
-                        onDevHostClick = { devHost -> backStack.push(Screen.DevHostWorkspaces(devHost.deviceId)) },
-                        onWorkspaceClick = { workspace -> backStack.push(Screen.Workspace(workspace.workspaceId, workspace.devHostId, workspace.name)) },
+                        // Every tap site below pushes `viewModel.onXTapped(...).toScreen()` —
+                        // never an inline Screen(...) construction — so FleetViewModel is the
+                        // one and only place a DevHostPresence/Project/Workspace tap's mapping
+                        // to a Screen lives (see toScreen's own doc comment).
+                        onProjectClick = { project -> backStack.push(viewModel.onProjectTapped(project).toScreen()) },
+                        onDevHostClick = { devHost -> backStack.push(viewModel.onDevHostTapped(devHost).toScreen()) },
+                        onWorkspaceClick = { workspace -> backStack.push(viewModel.onWorkspaceTapped(workspace).toScreen()) },
                         onRequestEnrollmentToken = viewModel::requestEnrollmentToken,
                         onDismissEnrollmentToken = viewModel::dismissEnrollmentToken,
                     )
@@ -336,6 +365,17 @@ fun ChooshApp(
                     // just the first.
                     LaunchedEffect(current.workspaceId, current.deviceId) {
                         subscription.subscribe(current.deviceId, current.workspaceId)
+                    }
+                    // The subscribe effect's counterpart: stops treating this workspace as
+                    // one AgentEventSubscription keeps caught up once its screen actually
+                    // leaves composition (back, or navigating on to a pinned item) — per
+                    // AgentEventSubscription.unsubscribe's own doc comment, this was
+                    // previously never called anywhere in production. Keyed on workspaceId
+                    // alone, matching unsubscribe's own signature; onDispose (not the
+                    // LaunchedEffect body above) is what fires on leaving, so this must be
+                    // its own DisposableEffect rather than folded into that one.
+                    DisposableEffect(current.workspaceId) {
+                        onDispose { subscription.unsubscribe(current.workspaceId) }
                     }
                     WorkspaceScreen(
                         engine = engine,
@@ -360,6 +400,16 @@ fun ChooshApp(
                 }
 
                 is Screen.DevHostWorkspaces -> {
+                    // Same FleetViewModel instance Screen.Fleet uses (no key given here either,
+                    // so ViewModelProvider resolves both to the process-lifetime singleton this
+                    // Activity already owns) — reached for the sole purpose of routing this
+                    // screen's own workspace tap through FleetViewModel.onWorkspaceTapped too,
+                    // so the DevHost->Workspace path stops reimplementing that mapping inline
+                    // (the root cause of the workspaceName drop this fixes: see
+                    // FleetViewModel.onWorkspaceTapped's WorkspaceSummary-overload doc comment).
+                    val fleetViewModel: FleetViewModel = viewModel(
+                        factory = singleInstanceFactory { FleetViewModel(engine, attentionTracker) },
+                    )
                     val viewModel: DevHostWorkspacesViewModel = viewModel(
                         key = "devhost-workspaces:${current.deviceId}",
                         factory = singleInstanceFactory { DevHostWorkspacesViewModel(engine, current.deviceId) },
@@ -368,7 +418,7 @@ fun ChooshApp(
                     DevHostWorkspacesScreen(
                         deviceId = current.deviceId,
                         state = state,
-                        onWorkspaceClick = { workspace -> backStack.push(Screen.Workspace(workspace.workspaceId, workspace.devHostId)) },
+                        onWorkspaceClick = { workspace -> backStack.push(fleetViewModel.onWorkspaceTapped(workspace).toScreen()) },
                         onRefresh = viewModel::refresh,
                         onBack = { backStack.pop() },
                     )

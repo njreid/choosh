@@ -34,8 +34,8 @@ use std::collections::HashMap;
 use choosh_protocol::host_rpc::{RpcRequest, RpcResponse};
 use choosh_protocol::relay::{
     AgentEventsResumeRequest, AgentEventsResumeResponse, AuthResult, ClientAuth, ControlRequest, ControlResponse,
-    DevHostPresence, FRAME_CLASS_CONTROL, FRAME_CLASS_TUNNEL, PhoneAuth, ServerHello, ServerPush, TUNNEL_ID_BYTES,
-    WireAgentEvent, decode_tunnel_id_hex,
+    DevHostPresence, FRAME_CLASS_CONTROL, FRAME_CLASS_TUNNEL, MAX_TUNNEL_FRAME_BYTES, PhoneAuth, ServerHello, ServerPush,
+    TUNNEL_ID_BYTES, WireAgentEvent, decode_tunnel_id_hex,
 };
 use frame_channel::{ChannelError, FrameChannel};
 use tokio::sync::{mpsc, oneshot};
@@ -132,6 +132,22 @@ const PTY_TUNNEL_CHANNEL_CAPACITY: usize = 64;
 /// itself applies its own tighter per-connection caps, see
 /// `choosh-android-bridge::web_gateway`).
 const WEB_TUNNEL_CHANNEL_CAPACITY: usize = 128;
+
+/// The most opaque payload bytes [`PtyTunnelHandle::write`]/
+/// [`WebTunnelHandle::write`] may pack into a single tunnel frame before
+/// [`frame_channel::FrameChannel::send_tunnel`] itself would reject it.
+/// **Not simply [`MAX_TUNNEL_FRAME_BYTES`]**: `send_tunnel` bounds the
+/// *whole* encoded tunnel-frame body — [`FRAME_CLASS_TUNNEL`]'s one class
+/// byte, [`TUNNEL_ID_BYTES`] (8) of tunnel ID, then the payload — against
+/// that constant (see `choosh_protocol::relay::encode_tunnel_frame` plus
+/// `frame_channel::FrameChannel::send_tunnel`'s own `encode_frame` call), so
+/// the payload alone has 9 fewer bytes of headroom than the raw constant
+/// suggests. Chunking a large write at exactly `MAX_TUNNEL_FRAME_BYTES`
+/// instead of this would make every full-size chunk fail with
+/// `FrameError::FrameTooLarge` by those same 9 bytes — the oversized-write
+/// regression tests below caught exactly that off-by-9 the first time this
+/// was written.
+const MAX_TUNNEL_WRITE_CHUNK_BYTES: usize = MAX_TUNNEL_FRAME_BYTES - (1 + TUNNEL_ID_BYTES);
 
 /// One `ServerPush::AgentEvent` delivered on the phone's normal control
 /// connection, per `agent-events.md`'s "Delivery and replay" section —
@@ -589,13 +605,52 @@ impl PtyTunnelHandle {
     /// wire contract, a `"pty:"`-purpose tunnel carries bytes verbatim — no
     /// inner class tag, unlike an `"rpc"`-purpose tunnel.
     ///
+    /// **Transparently splits payloads larger than
+    /// [`MAX_TUNNEL_FRAME_BYTES`] across multiple tunnel frames**, per
+    /// relay-protocol.md's framing section: "A larger logical payload MUST
+    /// be split across multiple tunnel frames by the sender; `relayd` MUST
+    /// NOT reassemble or inspect them to do so." This is safe here
+    /// specifically because a `"pty:"`-purpose tunnel carries an opaque byte
+    /// stream with no message-boundary semantics — `choosh-hostd::serve`'s
+    /// receiving side (`handle_tunnel_frame`) just `write_all`s each
+    /// non-empty frame's payload straight to the PTY fd in arrival order, so
+    /// several same-tunnel-ID frames sent back to back are byte-for-byte
+    /// equivalent to one giant frame, not several distinct messages. Before
+    /// this existed, a single oversized `write` call would fail
+    /// [`encode_frame`](choosh_protocol::framing::encode_frame) inside the
+    /// background I/O task and take the *entire* connection down (every
+    /// other open tunnel and in-flight RPC included) — see this crate's
+    /// `run_io_task`/`handle_command`.
+    ///
+    /// A caller MUST NOT pass an empty `bytes` slice expecting a no-op: an
+    /// empty payload is itself the tunnel's close signal on the wire (see
+    /// [`Self::close`]) and is sent through unchanged, exactly as before
+    /// this splitting was added.
+    ///
     /// # Errors
     ///
     /// [`CallError::Transport`] if the underlying connection has already
     /// ended.
     pub fn write(&self, bytes: &[u8]) -> Result<(), CallError> {
+        // <= (not <) MAX_TUNNEL_WRITE_CHUNK_BYTES takes the single-frame
+        // path unchanged, including the empty-slice/close-signal case
+        // above. See that constant's doc comment for why it, not
+        // MAX_TUNNEL_FRAME_BYTES itself, is the real per-chunk ceiling.
+        if bytes.len() <= MAX_TUNNEL_WRITE_CHUNK_BYTES {
+            return self.send_chunk(bytes);
+        }
+        for chunk in bytes.chunks(MAX_TUNNEL_WRITE_CHUNK_BYTES) {
+            self.send_chunk(chunk)?;
+        }
+        Ok(())
+    }
+
+    /// Sends exactly one tunnel frame's worth of bytes — `write`'s
+    /// single-frame primitive, factored out so both its unchunked
+    /// fast path and its multi-chunk loop share the same send call.
+    fn send_chunk(&self, payload: &[u8]) -> Result<(), CallError> {
         self.command_tx
-            .send(IoCommand::SendTunnelBytes { tunnel_id: self.tunnel_id, payload: bytes.to_vec(), ack: None })
+            .send(IoCommand::SendTunnelBytes { tunnel_id: self.tunnel_id, payload: payload.to_vec(), ack: None })
             .map_err(|_| CallError::Transport(ChannelError::Closed))
     }
 
@@ -653,14 +708,56 @@ impl WebTunnelHandle {
     /// tunnel carries bytes verbatim, exactly like `"pty:"` — no inner class
     /// tag.
     ///
+    /// **Transparently splits payloads larger than
+    /// [`MAX_TUNNEL_FRAME_BYTES`] across multiple tunnel frames**, awaiting
+    /// each chunk's own ack before sending the next — see
+    /// [`PtyTunnelHandle::write`]'s doc comment for why this is safe for a
+    /// `"web:"`-purpose tunnel specifically (`choosh-hostd::serve`'s
+    /// receiving side `write_all`s each frame's payload straight to the
+    /// upstream TCP socket, in arrival order, with no message-boundary
+    /// semantics — an HTTP request body chunked across several tunnel
+    /// frames is byte-for-byte identical to sending it as one). This also
+    /// keeps the real per-chunk backpressure this type's doc comment
+    /// describes: a caller handing this one very large body still never has
+    /// more than one *frame-sized* chunk in flight, not the whole body
+    /// queued unboundedly on the background task's command channel at once.
+    /// Before this existed, a single oversized `write` call would fail
+    /// [`encode_frame`](choosh_protocol::framing::encode_frame) inside the
+    /// background I/O task and take the *entire* connection down (every
+    /// other open tunnel and in-flight RPC included) — see this crate's
+    /// `run_io_task`/`handle_command`.
+    ///
+    /// A caller MUST NOT pass an empty `bytes` slice expecting a no-op: an
+    /// empty payload is itself the tunnel's close signal on the wire (see
+    /// [`Self::close`]) and is sent through unchanged, exactly as before
+    /// this splitting was added.
+    ///
     /// # Errors
     ///
     /// [`CallError::Transport`] if the underlying connection has already
     /// ended.
     pub async fn write(&self, bytes: &[u8]) -> Result<(), CallError> {
+        // <= (not <) MAX_TUNNEL_WRITE_CHUNK_BYTES takes the single-frame
+        // path unchanged, including the empty-slice/close-signal case
+        // above. See that constant's doc comment for why it, not
+        // MAX_TUNNEL_FRAME_BYTES itself, is the real per-chunk ceiling.
+        if bytes.len() <= MAX_TUNNEL_WRITE_CHUNK_BYTES {
+            return self.send_chunk(bytes).await;
+        }
+        for chunk in bytes.chunks(MAX_TUNNEL_WRITE_CHUNK_BYTES) {
+            self.send_chunk(chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// Sends exactly one tunnel frame's worth of bytes and awaits its ack —
+    /// `write`'s single-frame primitive, factored out so both its unchunked
+    /// fast path and its multi-chunk loop share the same send-and-await
+    /// call, preserving order between chunks of one logical write.
+    async fn send_chunk(&self, payload: &[u8]) -> Result<(), CallError> {
         let (ack, ack_rx) = oneshot::channel();
         self.command_tx
-            .send(IoCommand::SendTunnelBytes { tunnel_id: self.tunnel_id, payload: bytes.to_vec(), ack: Some(ack) })
+            .send(IoCommand::SendTunnelBytes { tunnel_id: self.tunnel_id, payload: payload.to_vec(), ack: Some(ack) })
             .map_err(|_| CallError::Transport(ChannelError::Closed))?;
         ack_rx.await.map_err(|_| CallError::Transport(ChannelError::Closed))
     }
@@ -938,26 +1035,103 @@ pub async fn run_with_reconnect<F, D>(
 }
 
 fn rand_unit() -> f64 {
+    rand_unit_from(getrandom_fill)
+}
+
+/// [`rand_unit`]'s actual logic, parameterized over the OS-RNG fill
+/// function purely so tests can inject a failing one (see the
+/// `backoff_never_collapses_to_zero_when_the_os_rng_is_unavailable` test
+/// below) — production code only ever calls it via [`rand_unit`], which
+/// always passes [`getrandom_fill`].
+///
+/// On a successful fill, returns a ratio drawn from the OS RNG. On failure
+/// (per [`getrandom_fill`]'s doc comment, a real possibility inside
+/// Android's JNI sandbox), this deliberately does NOT proceed with `buf`'s
+/// untouched all-zero contents the way the old code did: `compute_backoff`
+/// is a pure function of whatever ratio it's handed, so silently handing it
+/// a ratio that's always exactly `0.0` doesn't fail loudly — it just makes
+/// every future reconnect attempt compute a real, valid-looking
+/// `Duration::ZERO` backoff forever, turning "reconnect with backoff" into
+/// a tight zero-delay spin loop hammering a downed `relayd`. Falling back
+/// to [`fallback_rand_unit`] instead keeps that failure mode from ever
+/// happening, at the cost of the fallback draws not being cryptographically
+/// random — fine here, since this ratio only ever feeds jitter, nothing
+/// security-sensitive.
+fn rand_unit_from(fill: impl FnOnce(&mut [u8]) -> bool) -> f64 {
     // Only the top 32 bits go into the ratio — plenty of entropy for a
     // jitter multiplier, and it keeps both operands exactly representable
     // as f64 (avoiding a precision-loss cast from a full u64).
     let mut bytes = [0u8; 8];
-    getrandom_fill(&mut bytes);
-    let high32 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    f64::from(high32) / f64::from(u32::MAX)
+    if fill(&mut bytes) {
+        let high32 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        f64::from(high32) / f64::from(u32::MAX)
+    } else {
+        fallback_rand_unit()
+    }
 }
 
-fn getrandom_fill(buf: &mut [u8]) {
-    // Minimal inline OS-RNG read: std has no stable public RNG, and this
-    // crate has no other need for a full `rand`/`getrandom` dependency
-    // beyond this one jitter value. `/dev/urandom` is unavailable on
-    // Android's JNI boundary the same way it is on Linux — reading through
-    // `std::fs` keeps this dependency-free and portable to both host and
-    // Android targets without a platform `cfg` split.
+/// Reads `buf.len()` bytes from `/dev/urandom`. Returns whether the read
+/// actually succeeded — callers (just [`rand_unit_from`]) MUST NOT treat
+/// `false` as "close enough, `buf` is still zeroed and that's a fine
+/// jitter value": see that function's doc comment for why a silently
+/// all-zero jitter source is itself the bug this exists to avoid.
+///
+/// Minimal inline OS-RNG read: std has no stable public RNG, and this
+/// crate has no other need for a full `rand`/`getrandom` dependency beyond
+/// this one jitter value. `/dev/urandom` is unavailable on Android's JNI
+/// boundary the same way it is on Linux — reading through `std::fs` keeps
+/// this dependency-free and portable to both host and Android targets
+/// without a platform `cfg` split.
+fn getrandom_fill(buf: &mut [u8]) -> bool {
     use std::io::Read;
-    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-        let _ = file.read_exact(buf);
-    }
+    let Ok(mut file) = std::fs::File::open("/dev/urandom") else {
+        return false;
+    };
+    file.read_exact(buf).is_ok()
+}
+
+/// The smallest ratio [`fallback_rand_unit`] may return — chosen so that
+/// even at `attempt == 0` (`compute_backoff`'s smallest cap, `BASE_SECS` =
+/// 1s), the resulting delay is always at least `50ms`: comfortably above
+/// `Duration`'s nanosecond rounding floor (so it can never round back down
+/// to `Duration::ZERO`), and comfortably enough delay to not read as a busy
+/// spin loop against a downed `relayd`, while still leaving most of the
+/// `[0, cap)` jitter range intact at every later attempt.
+const FALLBACK_MIN_UNIT: f64 = 0.05;
+
+/// A pseudo-random fallback ratio in `[FALLBACK_MIN_UNIT, 1.0)`, used only
+/// when [`getrandom_fill`] itself fails. **Not cryptographically random —
+/// backoff-jitter only.** Mixes the current wall-clock time with a
+/// process-local monotonic counter (a simple xorshift64 round, not a real
+/// CSPRNG) specifically so repeated calls — e.g. every attempt of a
+/// reconnect loop stuck failing against a downed `relayd`, one after
+/// another — don't all collapse to the same value the way plain
+/// all-zero-on-failure did; each attempt still gets its own jitter, it's
+/// just not OS-RNG-quality jitter. Floor-bounded by [`FALLBACK_MIN_UNIT`]
+/// (see its own doc comment) rather than left free to draw arbitrarily
+/// close to `0.0`, because unlike genuine OS-RNG jitter — where a draw near
+/// zero is a rare, one-off event — every single draw takes this path for as
+/// long as the OS RNG stays unavailable, so an unbounded-low fallback could
+/// still spend an entire outage effectively spinning with negligible delay.
+fn fallback_rand_unit() -> f64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |elapsed| elapsed.subsec_nanos().into());
+
+    // One xorshift64 round: cheap, dependency-free, good enough to spread
+    // successive draws apart — again, not a claim of cryptographic quality.
+    let mut x = (nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+
+    #[allow(clippy::cast_precision_loss)] // a ratio only needs to land roughly in [0, 1); losing low bits of a u64 is fine.
+    let raw = (x as f64) / (u64::MAX as f64);
+    FALLBACK_MIN_UNIT + raw * (1.0 - FALLBACK_MIN_UNIT)
 }
 
 #[cfg(test)]
@@ -1672,5 +1846,172 @@ mod tests {
             .expect("run_with_reconnect should stop promptly once cancelled")
             .unwrap();
         server.abort();
+    }
+
+    /// Regression test for the bug where a `PtyTunnelHandle::write` larger
+    /// than `MAX_TUNNEL_FRAME_BYTES` failed `encode_frame` inside the
+    /// shared background I/O task, which killed the *entire* connection —
+    /// every open tunnel and in-flight RPC — instead of just that one send.
+    /// Per relay-protocol.md's framing section ("A larger logical payload
+    /// MUST be split across multiple tunnel frames by the sender") and
+    /// `choosh-hostd::serve::handle_tunnel_frame`'s pty branch (a plain
+    /// `write_half.write_all(payload)` per frame, in arrival order, no
+    /// message-boundary meaning), splitting is the correct fix, not merely
+    /// failing the call: this proves the oversized write both succeeds and
+    /// reassembles correctly on the wire, and that the connection is still
+    /// fully usable afterward.
+    #[tokio::test]
+    async fn pty_tunnel_write_larger_than_one_frame_is_chunked_and_the_connection_survives() {
+        let (listener, url) = bind_fake_relayd().await;
+        let big_payload: Vec<u8> =
+            (0..MAX_TUNNEL_FRAME_BYTES * 2 + 100).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        let expected = big_payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, purpose, .. } = open else {
+                panic!("expected open-tunnel");
+            };
+            assert_eq!(purpose, "pty:item-1");
+            let tunnel_id: TunnelId = [6; 8];
+            send_control(
+                &mut ws,
+                &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) },
+            )
+            .await;
+
+            // Reassemble the oversized payload from however many frames it
+            // arrives as — each individual frame must still respect the
+            // wire bound.
+            let mut reassembled = Vec::new();
+            while reassembled.len() < expected.len() {
+                let (id, payload) = recv_tunnel_frame(&mut ws).await;
+                assert_eq!(id, tunnel_id);
+                assert!(payload.len() <= MAX_TUNNEL_FRAME_BYTES, "no single tunnel frame may exceed MAX_TUNNEL_FRAME_BYTES");
+                assert!(!payload.is_empty(), "a chunk of a real write must never be the zero-length close signal");
+                reassembled.extend(payload);
+            }
+            assert_eq!(reassembled, expected);
+
+            // Prove the connection (and its one shared background I/O task)
+            // is still alive by serving one more, unrelated control request
+            // on the very same connection right after.
+            let request: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::ListDevhosts { request_id } = request else { panic!("expected list-devhosts") };
+            send_control(&mut ws, &ControlResponse::ListDevhostsOk { request_id, devhosts: vec![] }).await;
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let handle = connection.open_pty_tunnel("dev-1", "item-1").await.expect("open_pty_tunnel should succeed");
+        handle.write(&big_payload).expect("an oversized write must not error — it should be transparently chunked");
+
+        // Before the fix, this would hang/error: the write above would have
+        // already killed run_io_task, so nothing would ever answer this.
+        let devhosts = connection.list_devhosts().await.expect("the connection must survive an oversized tunnel write");
+        assert!(devhosts.is_empty());
+
+        server.await.unwrap();
+    }
+
+    /// Same regression as
+    /// [`pty_tunnel_write_larger_than_one_frame_is_chunked_and_the_connection_survives`],
+    /// for [`WebTunnelHandle::write`]'s ack-awaiting, per-chunk-backpressured
+    /// path instead of [`PtyTunnelHandle::write`]'s fire-and-forget one —
+    /// both must chunk, not just the fire-and-forget side.
+    #[tokio::test]
+    async fn web_tunnel_write_larger_than_one_frame_is_chunked_and_the_connection_survives() {
+        let (listener, url) = bind_fake_relayd().await;
+        let big_payload: Vec<u8> =
+            (0..MAX_TUNNEL_FRAME_BYTES * 2 + 100).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        let expected = big_payload.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let open: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::OpenTunnel { request_id, purpose, .. } = open else {
+                panic!("expected open-tunnel");
+            };
+            assert_eq!(purpose, "web:item-1");
+            let tunnel_id: TunnelId = [11; 8];
+            send_control(
+                &mut ws,
+                &ControlResponse::OpenTunnelOk { request_id, tunnel_id: encode_tunnel_id_hex(tunnel_id) },
+            )
+            .await;
+
+            let mut reassembled = Vec::new();
+            while reassembled.len() < expected.len() {
+                let (id, payload) = recv_tunnel_frame(&mut ws).await;
+                assert_eq!(id, tunnel_id);
+                assert!(payload.len() <= MAX_TUNNEL_FRAME_BYTES, "no single tunnel frame may exceed MAX_TUNNEL_FRAME_BYTES");
+                assert!(!payload.is_empty(), "a chunk of a real write must never be the zero-length close signal");
+                reassembled.extend(payload);
+            }
+            assert_eq!(reassembled, expected);
+
+            let request: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::ListDevhosts { request_id } = request else { panic!("expected list-devhosts") };
+            send_control(&mut ws, &ControlResponse::ListDevhostsOk { request_id, devhosts: vec![] }).await;
+        });
+
+        let mut connection = PhoneConnection::connect(&url, "good-cred").await.unwrap();
+        let handle = connection.open_web_tunnel("dev-1", "item-1").await.expect("open_web_tunnel should succeed");
+        handle.write(&big_payload).await.expect("an oversized write must not error — it should be transparently chunked");
+
+        // Before the fix, this would hang/error: the write above would have
+        // already killed run_io_task, so nothing would ever answer this.
+        let devhosts = connection.list_devhosts().await.expect("the connection must survive an oversized tunnel write");
+        assert!(devhosts.is_empty());
+
+        server.await.unwrap();
+    }
+
+    /// Regression test for the bug where a failed `/dev/urandom` open (a
+    /// real possibility inside Android's JNI sandbox, per
+    /// `getrandom_fill`'s own doc comment) left `rand_unit`'s buffer
+    /// all-zero and used it anyway, so `rand_unit()` always returned
+    /// exactly `0.0` — and `backoff::compute_backoff(_, 0.0)` always
+    /// evaluates to `Duration::ZERO`, collapsing "reconnect with
+    /// exponential backoff and jitter" into a tight, no-delay spin loop
+    /// against a downed `relayd`. Drives `rand_unit_from` directly with an
+    /// injected always-failing fill function (this crate's only test seam
+    /// for the OS-RNG dependency) and asserts the resulting backoff is
+    /// never zero, across a spread of attempt numbers and many repeated
+    /// draws — the fallback is time/counter-based, so hammering it in a
+    /// tight loop (exactly what a real stuck reconnect loop would do) is
+    /// the adversarial case worth covering, not just a single sample.
+    #[test]
+    fn backoff_never_collapses_to_zero_when_the_os_rng_is_unavailable() {
+        for attempt in 0..8 {
+            for _ in 0..200 {
+                let unit = rand_unit_from(|_buf| false);
+                assert!((0.0..1.0).contains(&unit), "fallback ratio out of [0, 1) range: {unit}");
+                let delay = backoff::compute_backoff(attempt, unit);
+                assert!(
+                    delay > std::time::Duration::ZERO,
+                    "attempt {attempt} produced a zero backoff delay from a failed RNG (unit={unit})"
+                );
+            }
+        }
+    }
+
+    /// Pins the other half of [`rand_unit_from`]'s branching: when the fill
+    /// function reports success, its bytes are what actually drive the
+    /// ratio (not the fallback) — an all-`0xFF` fill must produce a ratio
+    /// of essentially `1.0`, the top of the valid range.
+    #[test]
+    fn rand_unit_draws_from_the_provided_bytes_when_the_fill_succeeds() {
+        let unit = rand_unit_from(|buf| {
+            buf.fill(0xFF);
+            true
+        });
+        assert!((unit - 1.0).abs() < f64::EPSILON, "an all-0xFF fill should produce a ratio of exactly 1.0, got {unit}");
     }
 }

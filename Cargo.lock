@@ -725,6 +725,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "subtle",
  "time",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -732,6 +733,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webauthn-authenticator-rs",
  "webauthn-rs",
 ]
 

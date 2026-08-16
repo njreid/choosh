@@ -20,6 +20,9 @@ openssl = { version = "0.10.81", features = ["vendored"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "=1.0.150"
+# Constant-time bootstrap-secret comparison in `webauthn.rs::register_start`
+# — never `==` on a secret string, per that module's doc comment.
+subtle = "2.6.1"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }
 tokio = { version = "=1.53.0", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 tokio-tungstenite = "0.30.0"
@@ -30,3 +33,8 @@ webauthn-rs = { version = "0.5.5", default-features = false, features = ["reside
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
+# Software `WebAuthn` authenticator for `webauthn.rs`'s test suite — drives
+# real registration/login ceremonies end to end (real cryptography, no
+# hardware) rather than only exercising the HTTP plumbing around them. Same
+# crate `choosh-android-bridge::dev_passkey` uses for the identical reason.
+webauthn-authenticator-rs = { version = "0.6.1-dev", default-features = false, features = ["softpasskey"] }

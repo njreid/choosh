@@ -140,10 +140,17 @@ fn sanitize_event<'a>(event: Event<'a>, resolver: &dyn AssetResolver) -> Event<'
 
 /// An absolute-scheme reference (`https://...`, `mailto:...`, a
 /// protocol-relative `//host/...`, or an in-page `#fragment`) is genuinely
-/// external content, not a workspace-relative path — pass it through
-/// unchanged. `crate::is_safe_relative_asset` doesn't itself reject every
-/// scheme form (e.g. `mailto:` has no `://`), so this check runs first
-/// rather than relying on that gate to draw this particular line.
+/// external content, not a workspace-relative path — so it never goes
+/// through [`crate::is_safe_relative_asset`]/[`AssetResolver`] at all.
+/// `crate::is_safe_relative_asset` doesn't itself reject every scheme form
+/// (e.g. `mailto:` has no `://`), so this check runs first rather than
+/// relying on that gate to draw this particular line.
+///
+/// This only tests whether `reference` is syntactically absolute per RFC
+/// 3986's scheme grammar — it says nothing about which scheme, so every
+/// caller must pair it with [`is_safe_absolute_reference`] before treating
+/// the reference as safe to pass through: `javascript:...` and
+/// `data:...` are syntactically absolute too.
 fn is_absolute_reference(reference: &str) -> bool {
     if reference.starts_with('#') || reference.starts_with("//") {
         return true;
@@ -156,11 +163,42 @@ fn is_absolute_reference(reference: &str) -> bool {
     })
 }
 
+/// Schemes an absolute reference is allowed to carry through to the
+/// rendered `href`/`src` unchanged. Deliberately an explicit allowlist
+/// rather than "any syntactically valid RFC 3986 scheme"
+/// ([`is_absolute_reference`]): syntactic validity says nothing about
+/// whether a `WebView` is safe to act on the result, and `javascript:`,
+/// `vbscript:`, and `data:` are all syntactically valid schemes too.
+const SAFE_ABSOLUTE_SCHEMES: [&str; 3] = ["https", "http", "mailto"];
+
+/// True only for an [`is_absolute_reference`] reference whose scheme (or
+/// lack of one, for a fragment/protocol-relative reference, neither of
+/// which carries a scheme to check) is on [`SAFE_ABSOLUTE_SCHEMES`].
+fn is_safe_absolute_reference(reference: &str) -> bool {
+    if reference.starts_with('#') || reference.starts_with("//") {
+        return true;
+    }
+    match reference.find(':') {
+        Some(colon) => SAFE_ABSOLUTE_SCHEMES.contains(&reference[..colon].to_ascii_lowercase().as_str()),
+        None => false,
+    }
+}
+
 /// Rewrites (or neutralizes) one link/image destination per
 /// [`render_markdown`]'s reference-handling rules.
 fn sanitize_reference<'a>(reference: &str, resolver: &dyn AssetResolver) -> CowStr<'a> {
     if is_absolute_reference(reference) {
-        return CowStr::from(reference.to_string());
+        // Syntactically absolute, but only pass it through unchanged if
+        // its scheme is actually on the allowlist — an unsafe scheme
+        // (`javascript:`, `vbscript:`, `data:`, ...) is neutralized here,
+        // the same way an unresolved/unsafe relative reference is below,
+        // rather than falling through to the relative-asset gate (which
+        // has no notion of schemes to reject it on).
+        return if is_safe_absolute_reference(reference) {
+            CowStr::from(reference.to_string())
+        } else {
+            CowStr::from("")
+        };
     }
     if crate::is_safe_relative_asset(reference)
         && let Some(resolved) = resolver.resolve(reference)
@@ -257,6 +295,56 @@ mod tests {
         let html = render_markdown("[escape](../../etc/passwd)\n", &MapResolver).unwrap();
         assert!(html.contains("href=\"\""), "expected neutralized href: {html}");
         assert!(!html.contains("etc/passwd"), "traversal path leaked into output: {html}");
+    }
+
+    #[test]
+    fn javascript_scheme_link_is_neutralized_not_passed_through() {
+        let html = render_markdown("[click me](javascript:alert(document.cookie))\n", &NoAssetResolver).unwrap();
+        assert!(html.contains("href=\"\""), "expected neutralized href: {html}");
+        assert!(!html.contains("javascript:"), "javascript: scheme leaked into output: {html}");
+    }
+
+    #[test]
+    fn javascript_scheme_image_is_neutralized_not_passed_through() {
+        let html = render_markdown("![x](javascript:alert(1))\n", &NoAssetResolver).unwrap();
+        assert!(html.contains("src=\"\""), "expected neutralized src: {html}");
+        assert!(!html.contains("javascript:"), "javascript: scheme leaked into output: {html}");
+    }
+
+    #[test]
+    fn vbscript_scheme_reference_is_neutralized_not_passed_through() {
+        let html = render_markdown("[click me](vbscript:msgbox(1))\n", &NoAssetResolver).unwrap();
+        assert!(html.contains("href=\"\""), "expected neutralized href: {html}");
+        assert!(!html.contains("vbscript:"), "vbscript: scheme leaked into output: {html}");
+    }
+
+    #[test]
+    fn data_scheme_reference_is_neutralized_not_passed_through() {
+        let html =
+            render_markdown("[click me](data:text/html,<script>alert(1)</script>)\n", &NoAssetResolver).unwrap();
+        assert!(html.contains("href=\"\""), "expected neutralized href: {html}");
+        assert!(!html.contains("data:text/html"), "data: scheme leaked into output: {html}");
+    }
+
+    #[test]
+    fn uppercase_javascript_scheme_is_also_neutralized() {
+        // Scheme comparison must be case-insensitive per RFC 3986 — a
+        // WebView doesn't care about the casing of `javascript:` either.
+        let html = render_markdown("[click me](JavaScript:alert(1))\n", &NoAssetResolver).unwrap();
+        assert!(html.contains("href=\"\""), "expected neutralized href: {html}");
+        assert!(!html.to_lowercase().contains("javascript:"), "javascript: scheme leaked into output: {html}");
+    }
+
+    #[test]
+    fn allowlisted_absolute_schemes_still_pass_through_unchanged() {
+        let html = render_markdown(
+            "[a](https://example.test/x) [b](http://example.test/y) [c](mailto:a@example.test)\n",
+            &NoAssetResolver,
+        )
+        .unwrap();
+        assert!(html.contains("href=\"https://example.test/x\""), "{html}");
+        assert!(html.contains("href=\"http://example.test/y\""), "{html}");
+        assert!(html.contains("href=\"mailto:a@example.test\""), "{html}");
     }
 
     #[test]

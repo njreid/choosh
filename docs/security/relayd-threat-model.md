@@ -28,6 +28,107 @@ this pass.
 
 ---
 
+## 0. Unauthenticated `WebAuthn` registration (anyone can become the owner)
+
+**Attack.** `relayd`'s HTTP surface is meant to be reachable at a stable
+public DNS name (DESIGN.md). Before this fix, `register_start`/
+`register_finish` (`webauthn.rs`) were mounted with no gate at all — any
+network caller who could reach that DNS name could perform a full `WebAuthn`
+registration ceremony and mint themselves a brand-new, fully-trusted `phone`
+Identity. Since `phone` may `list-devhosts`, `open-tunnel` to any devhost,
+`request-enrollment-token` (which mints machine credentials in turn), and
+revoke other identities' access (Case 3), this was a complete bypass of
+every other control in this document: an attacker never needed to compromise
+a device credential or steal a token, because the credential-issuance path
+itself required nothing.
+
+**Current code behavior.** `register_start` now requires the caller to
+present `CHOOSH_RELAYD_BOOTSTRAP_SECRET` — an operator-chosen secret set as
+an env var at `relayd` deploy time — via the `X-Choosh-Bootstrap-Secret`
+header, checked with a constant-time compare
+(`webauthn::bootstrap_secret_matches`, backed by `subtle::ConstantTimeEq`,
+not `==`). If the env var is unset (or empty), `WebauthnState::build`
+records `bootstrap_secret: None` and `register_start` refuses every request
+with `503 Service Unavailable` before ever touching the `webauthn-rs`
+ceremony state — fail closed, no built-in default a forgetful deploy could
+accidentally rely on. `register_finish` needs no separate check: it can only
+ever complete a ceremony whose `correlation_id` was minted by a `register_start`
+call that already passed the secret gate (see Case 0a below for why that id
+can't be forged or guessed), so gating the one entry point is sufficient —
+there is no second unauthenticated path into the same state. `login_start`/
+`login_finish` are deliberately left ungated: they only ever re-assert an
+*already-registered* passkey, which by construction means someone already
+passed the bootstrap gate once, so gating login again would add no
+additional protection.
+
+Verified by `webauthn::tests::register_start_is_refused_when_no_bootstrap_secret_is_configured`,
+`register_start_without_a_header_is_rejected`,
+`register_start_with_the_wrong_secret_is_rejected`,
+`register_start_with_a_secret_that_is_a_prefix_of_the_real_one_is_rejected`
+(guards specifically against a non-constant-time compare that
+short-circuits, and so behaves differently, on a partial match), and
+`register_start_and_finish_round_trips_a_real_ceremony` (the positive case,
+driven end to end against a real software `WebAuthn` authenticator, not
+just asserting the header check in isolation).
+
+**Verdict: Mitigated.**
+
+**Reasoning.** The secret is the only thing standing between "anyone on the
+network" and "the system's owner" for this one operation, so its own
+handling matters: it's read once from the environment (never hardcoded,
+never defaulted), compared in constant time, and required before any
+`webauthn-rs` state is touched (so an unauthenticated caller can't even
+learn whether a registration is already in progress). The remaining trust
+boundary is operational, not code: whoever holds the deploy-time secret and
+whoever the owner shares it with (out of band, once, during first-time
+setup) are trusted to keep it — the same trust model this system already
+places in enrollment tokens (Case 2) and device private keys (Case 3), not
+a new kind of risk.
+
+## 0a. Concurrent registration/login ceremonies clobbering each other
+
+**Attack (availability/correctness, not directly a privilege escalation).**
+`WebauthnState::in_flight_registration`/`in_flight_authentication` were each
+a single `RwLock<Option<...>>` — one global slot per ceremony type, for the
+whole server. Two ceremonies started close together (two browser tabs, an
+app retry racing its own first attempt, or simply the owner starting a
+second registration for a new device before finishing setup on the first)
+would silently overwrite each other's challenge state: the second `start`
+call's `Some(..)` clobbers the first's, so the first ceremony's `finish`
+call either fails outright or — worse, if the timing lined up — completes
+against the *wrong* challenge.
+
+**Current code behavior.** `in_flight_registration`/`in_flight_authentication`
+are now `RwLock<HashMap<String, (state, started_at_unix)>>`, keyed by a
+fresh, unguessable per-ceremony `correlation_id` (24 bytes of OS CSPRNG
+entropy, `webauthn::generate_correlation_id`) minted in `register_start`/
+`login_start` and returned to the caller as a sibling field alongside the
+standard `CreationChallengeResponse`/`RequestChallengeResponse` JSON body.
+The matching `register_finish`/`login_finish` call must present that same
+`correlation_id` as a query parameter; `relayd` looks up (and removes) only
+that entry, so one ceremony's `finish` call can never observe or consume
+another's state. Entries older than 5 minutes are pruned inline on every
+`start`/`finish` call (`prune_expired_ceremonies`), so an abandoned ceremony
+(e.g. the user cancels the OS biometric prompt) doesn't accumulate in
+memory forever.
+
+Verified by `webauthn::tests::two_concurrent_registrations_do_not_clobber_each_other`
+and `two_concurrent_logins_do_not_clobber_each_other`, each of which starts
+two ceremonies *before* finishing either, confirms both get distinct
+correlation ids and both entries coexist in the map, then completes them out
+of order (second-then-first) and asserts both succeed against their own
+challenge — plus `prune_expired_ceremonies_removes_only_stale_entries` for
+the TTL-pruning logic in isolation.
+
+**Verdict: Mitigated.**
+
+**Reasoning.** The fix removes the shared-mutable-slot structure that made
+clobbering possible in the first place, rather than trying to detect or
+reduce the race window — with per-ceremony keys, there is no shared state
+between two concurrent ceremonies to race over at all.
+
+---
+
 ## 1. Devhost/laptop identity impersonation
 
 **Attack.** A connection claims to be device X (e.g. to receive X's tunnels,
@@ -505,6 +606,63 @@ follow-up remains open:
   deployment — one phone, a handful of devhosts/laptop-proxies — so this is
   a defense-in-depth gap against a misbehaving or malicious client opening
   many connections, not a gap in the core protocol guarantees).
+
+## Summary of the unauthenticated-registration fix
+
+A real, unauthenticated privilege-escalation bug — not a theoretical
+gap — found after the M8 review above was written: `register_start`/
+`register_finish` had no gate at all, and `WebauthnState`'s in-flight
+ceremony state was a single global slot per ceremony type. See Cases 0 and
+0a above for the full writeup; summarized here for the changelog:
+
+1. **`rust/choosh-relayd/src/webauthn.rs`** — `WebauthnState` gained
+   `bootstrap_secret: Option<String>` (from `CHOOSH_RELAYD_BOOTSTRAP_SECRET`,
+   no default); `register_start` now refuses every request with `503` if
+   it's unset, or `401` if the caller's `X-Choosh-Bootstrap-Secret` header
+   doesn't match (constant-time compare via `subtle::ConstantTimeEq`).
+   `in_flight_registration`/`in_flight_authentication` changed from
+   `RwLock<Option<T>>` to `RwLock<HashMap<String, (T, u64)>>`, keyed by a
+   fresh per-ceremony `correlation_id` returned from `register_start`/
+   `login_start` and required (as a query parameter) on the matching
+   `finish` call; stale entries are pruned on a 5-minute TTL.
+2. **`rust/choosh-relayd/src/lib.rs`** — `build_state_in` reads
+   `CHOOSH_RELAYD_BOOTSTRAP_SECRET` and threads it into `webauthn::build`.
+3. **`rust/choosh-relayd/Cargo.toml`** — added `subtle` (constant-time
+   compare) and, as a dev-dependency, `webauthn-authenticator-rs` with the
+   `softpasskey` feature (the same software authenticator
+   `choosh-android-bridge::dev_passkey` already uses), so `webauthn.rs`'s
+   own test suite can drive real registration/login ceremonies end to end
+   rather than only exercising the HTTP plumbing around them.
+4. **`docs/specs/auth-and-enrollment.md`** — documents the bootstrap-secret
+   gate and the correlation-id ceremony contract.
+
+Covered by `rust/choosh-relayd/src/webauthn.rs`'s new `tests` module (14
+new tests: the bootstrap-secret gate's positive/negative/edge cases, a full
+registration round trip, a full login round trip, and dedicated
+two-ceremonies-in-flight-at-once tests for both registration and login).
+`cargo test --release -p choosh-relayd` and
+`cargo clippy --release -p choosh-relayd --all-targets` both pass clean
+with this change in place.
+
+**Known follow-up, not fixed here (out of this fix's scope — backend-only):**
+the real HTTP callers of `register_start`/`register_finish` — 
+`rust/choosh-android-bridge/src/engine.rs`'s `Engine::webauthn_register_start`/
+`webauthn_register_finish` (used by the real Android app via JNI) and
+`rust/choosh-android-bridge/examples/dev_cli.rs`'s `enroll_token` — do not
+yet send the bootstrap-secret header, and will get `503`/`401` from
+`relayd` once `CHOOSH_RELAYD_BOOTSTRAP_SECRET` is actually set in a
+deployment. Threading the secret through to those callers needs a UX
+decision (where does the phone user enter/receive the secret — a settings
+field, a one-time setup link, etc.) that this fix deliberately leaves to a
+human rather than guessing; see the implementing agent's report for the
+specific files/functions involved. The correlation-id ceremony contract
+above is an *additive* JSON field (`correlation_id`) and a new, currently
+unconsumed query parameter on `finish` — existing callers that ignore
+unknown JSON fields (verified: `NativeChooshEngine.kt`'s decoder sets
+`ignoreUnknownKeys = true`; `webauthn-rs-proto`'s wire types don't deny
+unknown fields either) won't break on `start`, but will fail `finish` calls
+against a real `relayd` build until they're updated to round-trip
+`correlation_id` back to `relayd`.
 
 ## Summary of the revocation/rate-limit/idle-timeout follow-up
 

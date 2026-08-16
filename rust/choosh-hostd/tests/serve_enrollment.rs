@@ -204,3 +204,79 @@ async fn corrupt_credential_file_fails_serve_run_instead_of_silently_re_enrollin
 
     assert!(result.is_err(), "a corrupt credential file must fail run(), not silently re-enroll");
 }
+
+/// `hooks::install_claude_hooks` (merge-safe installation of `choosh-hostd
+/// emit` into a Claude Code `settings.json`) is fully implemented and
+/// well-tested in `hooks.rs` itself, but was never actually called from
+/// anywhere in production — no RPC handler, no CLI subcommand, nothing in
+/// `serve::run()`'s own startup sequence. This proves the fix: `run()`'s
+/// startup path really does attempt the install, before its connect-retry
+/// loop ever starts trying to reach `relayd` — a fresh, valid credential is
+/// pre-saved (the same shape `corrupt_credential_file_fails_serve_run_instead_of_silently_re_enrolling`
+/// above uses) so `run()` skips enrollment's own network round-trip
+/// entirely, and `CHOOSH_RELAYD_URL` deliberately points at nothing —
+/// this test's only interest is the step that runs before that loop even
+/// starts, so it never needs a working relayd connection to observe it.
+///
+/// `CHOOSH_HOSTD_CLAUDE_SETTINGS_PATH` is the test-injectable override
+/// `serve::claude_settings_path` gained for exactly this: without it,
+/// `run()` would target the real, current user's actual
+/// `~/.claude/settings.json`, which a test must never touch.
+#[tokio::test]
+async fn serve_run_installs_claude_code_hooks_at_startup() {
+    let root = tempfile::tempdir().unwrap();
+
+    let credential_path = root.path().join("device-credential.json");
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rng());
+    let cred = credential::Credential::new("hooks-test-device".to_string(), "fake-cert".to_string(), &signing_key);
+    credential::save(&credential_path, &cred).unwrap();
+
+    let settings_path = root.path().join("claude-settings.json");
+    let workspaces_dir = root.path().join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).unwrap();
+
+    Box::pin(temp_env::async_with_vars(
+        [
+            ("CHOOSH_HOSTD_CREDENTIAL_PATH", Some(credential_path.to_str().unwrap())),
+            ("CHOOSH_RELAYD_URL", Some("ws://127.0.0.1:1/connect")),
+            ("CHOOSH_HOSTD_CLAUDE_SETTINGS_PATH", Some(settings_path.to_str().unwrap())),
+            ("CHOOSH_HOSTD_WORKSPACES_DIR", Some(workspaces_dir.to_str().unwrap())),
+            ("CHOOSH_HOSTD_REGISTRY_PATH", Some(root.path().join("registry.json").to_str().unwrap())),
+            ("CHOOSH_HOSTD_MISE_HOST_TOOLS_DIR", Some(root.path().join("mise-host-tools").to_str().unwrap())),
+            ("CHOOSH_HOSTD_MISE_PROJECT_TOOLS_DIR", Some(root.path().join("mise-project-tools").to_str().unwrap())),
+        ],
+        async {
+            let task = tokio::spawn(serve::run());
+            // `run()`'s connect-retry loop never returns on its own here
+            // (nothing is listening at `CHOOSH_RELAYD_URL`, and no
+            // shutdown signal is ever sent) — this test's whole job is the
+            // hook-install step that happens BEFORE that loop starts, so
+            // it only needs to wait for the settings file to appear, then
+            // abort the still-running task rather than await it to
+            // completion.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !settings_path.exists() {
+                assert!(tokio::time::Instant::now() < deadline, "serve::run() never installed Claude Code hooks within the deadline");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            task.abort();
+        },
+    ))
+    .await;
+
+    let content: serde_json::Value = serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+    // The real running binary's own path, matching `emit_command`'s
+    // documented reason for using `std::env::current_exe()` rather than a
+    // bare `"choosh-hostd"` — `run()` executed in-process inside this very
+    // test binary (via `tokio::spawn` above, not a subprocess), so this
+    // test process's own `current_exe()` is exactly what `run()` itself
+    // resolved.
+    let expected_command = format!("{} emit --surface Stop", std::env::current_exe().unwrap().display());
+    let stop_groups = content["hooks"]["Stop"].as_array().expect("Stop surface must have installed hook groups");
+    assert!(
+        stop_groups
+            .iter()
+            .any(|group| group["hooks"].as_array().unwrap().iter().any(|hook| hook["command"] == expected_command)),
+        "expected the Stop surface to carry a real, running-binary-pathed choosh-hostd emit command, got: {content}"
+    );
+}

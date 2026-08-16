@@ -393,26 +393,47 @@ class FakeChooshEngine : ChooshEngine {
     }
 
     /**
-     * A small, fixed two-level fixture tree (`README.md`/`app.kt`/`docs/`
-     * at the root, `docs/guide.md` one level down) — enough for
-     * [ai.choosh.explorer.ExplorerViewModel]'s drill-down/search paths to
-     * be genuinely exercisable without a real backend. Unknown
-     * `pathPrefix`es return an empty page rather than an error (a
-     * plausible `hostd` response for an as-yet-unpopulated directory, not a
-     * failure this fake needs to simulate separately).
+     * A small, fixed fixture tree (`README.md`/`app.kt`/`docs/`/
+     * [PAGINATED_DIR_NAME] at the root, `docs/guide.md` one level down) —
+     * enough for [ai.choosh.explorer.ExplorerViewModel]'s drill-down/search
+     * paths to be genuinely exercisable without a real backend.
+     * [PAGINATED_DIR_NAME] is a genuinely paginated directory: its
+     * [PAGINATED_DIR_ENTRIES] span multiple [PAGINATED_DIR_PAGE_SIZE]-sized
+     * pages chained by a real `nextCursor` (an opaque string cursor here —
+     * this fixture's own choice of encoding, not a contract
+     * [ExplorerViewModel] is allowed to assume anything about beyond
+     * "non-null means more"), mirroring `workspace.tree.list`'s real
+     * 500-entries-per-page bound (host-rpc.md's Bounds) at a size small
+     * enough for a test to exercise without actually needing 500+ fixture
+     * rows. Unknown `pathPrefix`es return an empty page rather than an
+     * error (a plausible `hostd` response for an as-yet-unpopulated
+     * directory, not a failure this fake needs to simulate separately).
      */
     override suspend fun workspaceTreeList(deviceId: String, workspaceId: String, pathPrefix: String, cursor: String?): WorkspaceTreeListResult {
         delay(FAKE_LATENCY_MS)
-        val entries = when (pathPrefix) {
-            "" -> listOf(
-                TreeEntry("README.md", TreeEntryKind.FILE, conflicted = false),
-                TreeEntry("app.kt", TreeEntryKind.FILE, conflicted = false),
-                TreeEntry("docs", TreeEntryKind.DIRECTORY, conflicted = false),
+        return when (pathPrefix) {
+            "" -> WorkspaceTreeListResult(
+                entries = listOf(
+                    TreeEntry("README.md", TreeEntryKind.FILE, conflicted = false),
+                    TreeEntry("app.kt", TreeEntryKind.FILE, conflicted = false),
+                    TreeEntry("docs", TreeEntryKind.DIRECTORY, conflicted = false),
+                    TreeEntry(PAGINATED_DIR_NAME, TreeEntryKind.DIRECTORY, conflicted = false),
+                ),
+                nextCursor = null,
             )
-            "docs" -> listOf(TreeEntry("guide.md", TreeEntryKind.FILE, conflicted = false))
-            else -> emptyList()
+            "docs" -> WorkspaceTreeListResult(entries = listOf(TreeEntry("guide.md", TreeEntryKind.FILE, conflicted = false)), nextCursor = null)
+            PAGINATED_DIR_NAME -> paginatedDirPage(cursor)
+            else -> WorkspaceTreeListResult(entries = emptyList(), nextCursor = null)
         }
-        return WorkspaceTreeListResult(entries = entries, nextCursor = null)
+    }
+
+    /** One page of [PAGINATED_DIR_ENTRIES], per [workspaceTreeList]'s [PAGINATED_DIR_NAME] branch — `cursor` is the (string-encoded) index of the first entry still owed, `null` meaning "from the start". */
+    private fun paginatedDirPage(cursor: String?): WorkspaceTreeListResult {
+        val startIndex = cursor?.toIntOrNull() ?: 0
+        val page = PAGINATED_DIR_ENTRIES.drop(startIndex).take(PAGINATED_DIR_PAGE_SIZE)
+        val nextIndex = startIndex + page.size
+        val nextCursor = if (nextIndex < PAGINATED_DIR_ENTRIES.size) nextIndex.toString() else null
+        return WorkspaceTreeListResult(entries = page, nextCursor = nextCursor)
     }
 
     /**
@@ -518,6 +539,13 @@ class FakeChooshEngine : ChooshEngine {
         private const val FAKE_ENROLLMENT_TOKEN_LIFETIME_SECONDS = 15L * 60
         const val FIXTURE_DEVICE_ID = "dev-mbp-home"
         const val FIXTURE_WORKSPACE_ID = "ws-choosh-app"
+
+        /** [workspaceTreeList]'s genuinely-paginated fixture directory name, at the workspace root. */
+        const val PAGINATED_DIR_NAME = "big"
+        private const val PAGINATED_DIR_PAGE_SIZE = 5
+
+        /** 12 entries over a 5-per-page fixture spans three pages (5, 5, 2) — enough to prove a consumer follows `nextCursor` more than once, not just a single hop. */
+        private val PAGINATED_DIR_ENTRIES: List<TreeEntry> = (1..12).map { i -> TreeEntry("file-$i.txt", TreeEntryKind.FILE, conflicted = false) }
 
         private fun documentKey(deviceId: String, workspaceId: String, path: String) = "$deviceId|$workspaceId|$path"
         private fun base64Of(text: String): String = Base64.getEncoder().encodeToString(text.toByteArray(Charsets.UTF_8))

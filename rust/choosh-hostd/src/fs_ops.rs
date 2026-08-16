@@ -7,8 +7,10 @@
 //! `jj_ops.rs`'s module docs for the same "reported CLI-fallback, not
 //! `jj-lib`" posture this module's caller, `rpc.rs`, inherits).
 
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use choosh_protocol::host_rpc::{ChangeKind, TreeEntry, TreeEntryKind};
 use sha2::{Digest, Sha256};
@@ -197,6 +199,20 @@ pub fn read_file_range(
 /// invocation — writing the bytes to `@`'s checkout is the entire effect
 /// this RPC needs to produce.
 ///
+/// The read-compare-write sequence below runs under [`path_lock`]'s guard
+/// for `resolved` — see that function's doc comment for why: without it,
+/// two concurrent callers racing the same stale `base_revision` against the
+/// same path could both read the pre-write content, both observe a match,
+/// and both proceed to write, with the second silently clobbering the
+/// first. That defeats `base_revision`'s entire purpose (the `editor-
+/// protocol.md` "someone else wrote first" check) and violates
+/// `host-rpc.md`'s "effectively transactional... either the full effect
+/// happened, or none of it did" requirement for this RPC. Holding a
+/// per-path lock across the whole sequence makes read-compare-write atomic
+/// with respect to any other concurrent `write_file` call on the same
+/// resolved path, so at most one of two racing same-`base_revision` writers
+/// can ever observe a match and proceed.
+///
 /// # Errors
 ///
 /// See [`confine`]; [`FsError::NotFound`] if `path` doesn't already exist
@@ -213,6 +229,14 @@ pub fn write_file(
     max_content_bytes: u64,
 ) -> Result<WriteOutcome, FsError> {
     let resolved = confine(root, path)?;
+
+    // Held across every check below through the final `fs::write`, not just
+    // the read/compare — a concurrent writer racing in between, say, the
+    // `is_file` check and the read would be just as able to defeat
+    // `base_revision` as one racing the read and the write themselves.
+    let lock = path_lock(&resolved);
+    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let metadata = std::fs::metadata(&resolved)?;
     if !metadata.is_file() {
         return Err(FsError::NotAFile);
@@ -242,6 +266,29 @@ pub fn write_file(
     std::fs::write(&resolved, new_content)?;
     let new_revision = content_revision(new_content);
     Ok(WriteOutcome::Written { new_revision })
+}
+
+/// Returns the process-wide lock guarding `write_file`'s read-compare-write
+/// sequence for `resolved_path` (the already-[`confine`]d, canonical-form
+/// path — every `write_file` call for the same logical file resolves to the
+/// same key, regardless of which `(root, path)` request pair produced it).
+///
+/// `hostd` is a single process per devhost (this module's top-level doc
+/// comment), so a process-wide `static` map is exactly as consistent as
+/// callers of `write_file` need it to be — there's no cross-process or
+/// cross-host sharing of the same working copy to account for.
+///
+/// The map only ever grows: entries are never evicted once a path has been
+/// written to. That's a deliberate, accepted tradeoff rather than an
+/// oversight — cleaning up an entry safely requires knowing no other thread
+/// is about to look it up, which needs its own synchronization and would
+/// add real complexity for a map whose size is bounded by "distinct file
+/// paths ever written by this devhost's lifetime", not by unbounded churn.
+fn path_lock(resolved_path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut table = locks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    table.entry(resolved_path.to_path_buf()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
 }
 
 /// [`write_file`]'s result: a stale `base_revision` is a normal, expected
@@ -484,5 +531,66 @@ mod tests {
         let dir = sample_root();
         let result = write_file(dir.path(), "sub", "irrelevant", b"content", 4 * 1024 * 1024);
         assert!(matches!(result, Err(FsError::NotAFile)));
+    }
+
+    /// Regression test for the write/write race `path_lock` fixes: two
+    /// writers racing the same (both currently-valid, both about-to-be-
+    /// stale) `base_revision` against the same path must not both pass the
+    /// staleness check. Without a lock held across the whole read-compare-
+    /// write sequence, both threads can read the pre-write content, both
+    /// see a match, and both write — the second silently clobbering the
+    /// first, exactly the "someone else wrote first" case `base_revision`
+    /// exists to catch (`editor-protocol.md`).
+    ///
+    /// This uses real OS-thread concurrency (via `spawn_blocking`, since
+    /// `write_file` itself is synchronous), synchronized with a
+    /// `std::sync::Barrier` so both threads enter `write_file` at
+    /// essentially the same instant — a sequential call-then-call
+    /// simulation would never be able to exercise the race this guards
+    /// against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn write_file_concurrent_writers_racing_the_same_stale_base_revision_do_not_both_succeed() {
+        let dir = sample_root();
+        let root = dir.path().to_path_buf();
+        let base_revision = content_revision(b"hello world");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let handle_a = {
+            let root = root.clone();
+            let base_revision = base_revision.clone();
+            let barrier = barrier.clone();
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                write_file(&root, "a.txt", &base_revision, b"writer A wins?", 4 * 1024 * 1024)
+            })
+        };
+        let handle_b = {
+            let root = root.clone();
+            let base_revision = base_revision.clone();
+            let barrier = barrier.clone();
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                write_file(&root, "a.txt", &base_revision, b"writer B wins?", 4 * 1024 * 1024)
+            })
+        };
+
+        let (result_a, result_b) = tokio::join!(handle_a, handle_b);
+        let outcome_a = result_a.expect("writer A's task must not panic").expect("writer A must not error");
+        let outcome_b = result_b.expect("writer B's task must not panic").expect("writer B must not error");
+
+        let written_count = [&outcome_a, &outcome_b].iter().filter(|o| matches!(o, WriteOutcome::Written { .. })).count();
+        let stale_count = [&outcome_a, &outcome_b].iter().filter(|o| matches!(o, WriteOutcome::Stale { .. })).count();
+        assert_eq!(written_count, 1, "exactly one racing writer must win, not zero or both: {outcome_a:?} / {outcome_b:?}");
+        assert_eq!(
+            stale_count, 1,
+            "the losing writer must observe a real staleness conflict (not a silent clobber): {outcome_a:?} / {outcome_b:?}"
+        );
+
+        // The on-disk content must be exactly whichever side actually won —
+        // never a torn write, and never both writes landing in sequence
+        // (which is what "silently clobbers" would look like here).
+        let final_content = std::fs::read(dir.path().join("a.txt")).unwrap();
+        let expected: &[u8] = if matches!(outcome_a, WriteOutcome::Written { .. }) { b"writer A wins?" } else { b"writer B wins?" };
+        assert_eq!(final_content, expected, "final content must match the single winning write exactly");
     }
 }

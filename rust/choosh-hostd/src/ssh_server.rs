@@ -32,6 +32,7 @@
 //! here (see `Cargo.toml`) for consistency across the workspace.
 
 use std::collections::HashMap;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -145,18 +146,33 @@ impl russh::server::Server for SshBridge {
 /// Per-channel state once a shell or exec has actually started — the
 /// write half a `data()` callback forwards client input into, plus enough
 /// to clean up when the channel closes.
+///
+/// `child` is `Arc<Mutex<..>>`, not an owned [`tokio::process::Child`],
+/// because two independent tasks need it: [`SessionHandler::channel_close`]
+/// (below) needs to `start_kill` it if the SSH channel closes first, while
+/// the spawned output-forwarder task (`spawn_pty_output_forwarder`/
+/// `forward_piped_output`) needs to `wait()` it — *after* its output stream
+/// closes — to learn the child's real exit status, which is the only place
+/// that status is ever actually available. Sharing ownership via the mutex
+/// (rather than, say, only ever `wait()`-ing from one fixed place) lets
+/// either "the client hung up" or "the child actually exited" happen first
+/// without racing: whichever task gets there first does its own
+/// `lock().await`, and `wait()` on an already-killed-but-not-yet-reaped
+/// child still resolves to that child's real (signal) exit status.
+type SharedChild = Arc<Mutex<tokio::process::Child>>;
+
 enum RunningChannel {
     /// A PTY-backed child (interactive shell, or a plain, unrecognized
     /// exec — both behave "exactly as it would over a normal SSH
     /// connection", per ssh-bridge-and-zed.md, which for a real sshd
     /// means a real controlling terminal is available when one was
     /// requested).
-    Pty { master_write: tokio::fs::File, child: tokio::process::Child },
+    Pty { master_write: tokio::fs::File, child: SharedChild },
     /// A raw-pipe child (the Zed `zed-remote-server` exec path): no PTY,
     /// since Zed's remote-server speaks a binary framed protocol over
     /// stdio that a PTY's line-discipline processing (echo, `ICANON`,
     /// CR/LF translation) would corrupt.
-    Piped { stdin: tokio::process::ChildStdin, child: tokio::process::Child },
+    Piped { stdin: tokio::process::ChildStdin, child: SharedChild },
 }
 
 struct SessionHandler {
@@ -222,8 +238,9 @@ impl Handler for SessionHandler {
         let handle = session.handle();
         match spawn_pty_backed(&shell_command(), &[]) {
             Ok((master_write, child, output_task_input)) => {
-                self.channels.insert(channel, RunningChannel::Pty { master_write, child });
-                spawn_pty_output_forwarder(handle, channel, output_task_input);
+                let child = Arc::new(Mutex::new(child));
+                self.channels.insert(channel, RunningChannel::Pty { master_write, child: child.clone() });
+                spawn_pty_output_forwarder(handle, channel, output_task_input, child);
                 let _ = session.channel_success(channel);
             }
             Err(error) => {
@@ -258,8 +275,9 @@ impl Handler for SessionHandler {
         let handle = session.handle();
         match spawn_pty_backed(&shell_command(), &["-c".to_string(), command.to_string()]) {
             Ok((master_write, child, output_task_input)) => {
-                self.channels.insert(channel, RunningChannel::Pty { master_write, child });
-                spawn_pty_output_forwarder(handle, channel, output_task_input);
+                let child = Arc::new(Mutex::new(child));
+                self.channels.insert(channel, RunningChannel::Pty { master_write, child: child.clone() });
+                spawn_pty_output_forwarder(handle, channel, output_task_input, child);
                 let _ = session.channel_success(channel);
             }
             Err(error) => {
@@ -310,8 +328,12 @@ impl Handler for SessionHandler {
     }
 
     async fn channel_close(&mut self, channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
-        if let Some(RunningChannel::Pty { mut child, .. } | RunningChannel::Piped { mut child, .. }) = self.channels.remove(&channel) {
-            let _ = child.start_kill();
+        if let Some(RunningChannel::Pty { child, .. } | RunningChannel::Piped { child, .. }) = self.channels.remove(&channel) {
+            // Only signals the kill (see `SharedChild`'s doc comment for why
+            // this doesn't also `wait()`): the output forwarder that's
+            // still holding its own clone of this same `Arc` is the one
+            // that reaps the child and reports its real exit status.
+            let _ = child.lock().await.start_kill();
         }
         Ok(())
     }
@@ -371,12 +393,13 @@ impl SessionHandler {
                 .await;
         }
 
-        self.channels.insert(channel, RunningChannel::Piped { stdin, child });
+        let child = Arc::new(Mutex::new(child));
+        self.channels.insert(channel, RunningChannel::Piped { stdin, child: child.clone() });
 
         let handle = session.handle();
         let agent_event_tx = self.config.agent_event_tx.clone();
         tokio::spawn(async move {
-            Box::pin(forward_piped_output(handle.clone(), channel, stdout, stderr)).await;
+            Box::pin(forward_piped_output(handle.clone(), channel, stdout, stderr, child)).await;
             if let Some(workspace_id) = workspace_id {
                 let _ = agent_event_tx.send(WireAgentEvent::EditorDetached { workspace_id, editor: WireEditor::Zed }).await;
             }
@@ -434,11 +457,13 @@ fn spawn_pty_backed(program: &str, args: &[String]) -> std::io::Result<(tokio::f
 }
 
 /// Forwards everything read from `master_read` as SSH channel `data`
-/// pushes, until the pty closes (the child exited) — then reports an exit
-/// status (best-effort; a pty doesn't cleanly separate stdout/stderr, so
-/// there is no `ExtendedData` here, matching a real interactive shell
-/// session) and closes the channel.
-fn spawn_pty_output_forwarder(handle: Handle, channel: ChannelId, mut master_read: tokio::fs::File) {
+/// pushes, until the pty closes (the child exited) — then `wait()`s `child`
+/// to reap it and learn its *real* exit status (see [`SharedChild`]'s doc
+/// comment for why this is an `Arc<Mutex<..>>` rather than an owned
+/// `Child`), reports that status (best-effort; a pty doesn't cleanly
+/// separate stdout/stderr, so there is no `ExtendedData` here, matching a
+/// real interactive shell session), and closes the channel.
+fn spawn_pty_output_forwarder(handle: Handle, channel: ChannelId, mut master_read: tokio::fs::File, child: SharedChild) {
     tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
@@ -458,18 +483,26 @@ fn spawn_pty_output_forwarder(handle: Handle, channel: ChannelId, mut master_rea
                 }
             }
         }
+        let exit_status = match child.lock().await.wait().await {
+            Ok(status) => exit_status_code(status),
+            Err(error) => {
+                tracing::warn!(%error, "failed to reap the shell/exec child after its pty closed");
+                EXIT_STATUS_UNKNOWN
+            }
+        };
         let _ = handle.eof(channel).await;
-        let _ = handle.exit_status_request(channel, 0).await;
+        let _ = handle.exit_status_request(channel, exit_status).await;
         let _ = handle.close(channel).await;
     });
 }
 
 /// Forwards a raw-piped child's stdout/stderr as SSH channel `data`/
-/// `extended_data` (code 1) pushes, then its real exit status, then closes
-/// the channel — the Zed exec path's counterpart to
+/// `extended_data` (code 1) pushes, then `wait()`s `child` (see
+/// [`SharedChild`]'s doc comment) to reap it and report its real exit
+/// status, then closes the channel — the Zed exec path's counterpart to
 /// [`spawn_pty_output_forwarder`], reading two separate streams instead of
 /// one pty master since there is no pty here to merge them.
-async fn forward_piped_output(handle: Handle, channel: ChannelId, mut stdout: impl AsyncRead + Unpin, mut stderr: impl AsyncRead + Unpin) {
+async fn forward_piped_output(handle: Handle, channel: ChannelId, mut stdout: impl AsyncRead + Unpin, mut stderr: impl AsyncRead + Unpin, child: SharedChild) {
     let mut stdout_buf = [0u8; 8192];
     let mut stderr_buf = [0u8; 8192];
     loop {
@@ -484,9 +517,48 @@ async fn forward_piped_output(handle: Handle, channel: ChannelId, mut stdout: im
             },
         }
     }
+    let exit_status = match child.lock().await.wait().await {
+        Ok(status) => exit_status_code(status),
+        Err(error) => {
+            tracing::warn!(%error, "failed to reap the zed-remote-server child after its output closed");
+            EXIT_STATUS_UNKNOWN
+        }
+    };
     let _ = handle.eof(channel).await;
-    let _ = handle.exit_status_request(channel, 0).await;
+    let _ = handle.exit_status_request(channel, exit_status).await;
     let _ = handle.close(channel).await;
+}
+
+/// The exit status reported when a child's real one is unavailable —
+/// `Child::wait()` itself failed (an `io::Error`, not a nonzero exit; this
+/// should not happen for a child this module already successfully spawned
+/// and is the only case that falls back to this rather than the child's
+/// own real status). `1` matches the generic-failure convention a real
+/// shell's `$?` uses for its own internal errors.
+const EXIT_STATUS_UNKNOWN: u32 = 1;
+
+/// Converts a child's real [`std::process::ExitStatus`] into the `u32`
+/// [`Handle::exit_status_request`] expects, matching real-sshd/POSIX shell
+/// conventions:
+///
+/// - A normal exit reports its own code, masked to the 0-255 range a
+///   process's exit code is only ever actually delivered in (via `wait()`'s
+///   underlying `waitpid()`, which only ever transports 8 bits) — matching
+///   what `exit_status_request`'s own doc comment and every real sshd
+///   already send.
+/// - A signal-terminated process (`code()` is `None`, `signal()` is
+///   `Some`) reports `128 + signal`, the same convention a POSIX shell's
+///   `$?` and OpenSSH's own client-side exit-status mapping use.
+/// - Neither (should not happen — every real `ExitStatus` unix produces
+///   has one or the other) falls back to [`EXIT_STATUS_UNKNOWN`].
+fn exit_status_code(status: std::process::ExitStatus) -> u32 {
+    if let Some(code) = status.code() {
+        return code.cast_unsigned() & 0xff;
+    }
+    if let Some(signal) = status.signal() {
+        return 128 + signal.cast_unsigned();
+    }
+    EXIT_STATUS_UNKNOWN
 }
 
 /// Detects Zed's remote-server SSH exec invocation and extracts the
@@ -763,6 +835,33 @@ mod session_tests {
         let (stdout, _stderr, exit_status) = tokio::time::timeout(std::time::Duration::from_secs(10), drain_channel(channel)).await.unwrap();
         assert!(String::from_utf8_lossy(&stdout).contains(&marker), "expected the real echoed marker in stdout, got: {:?}", String::from_utf8_lossy(&stdout));
         assert_eq!(exit_status, Some(0));
+    }
+
+    /// The regression test for the real bug this module's forwarders used
+    /// to have: both `spawn_pty_output_forwarder` and
+    /// `forward_piped_output` used to hardcode `exit_status_request(channel,
+    /// 0)` regardless of how the child actually exited — a client (Zed's
+    /// own error handling included) has no way to tell a failed command
+    /// from a successful one. `real_shell_exec_round_trips_real_output`
+    /// above never would have caught this: `echo` always exits `0`, so a
+    /// hardcoded `0` and the real exit code were indistinguishable there.
+    /// This drives a command that deliberately exits nonzero through the
+    /// same real exec path and asserts the client actually observes that
+    /// real code.
+    #[tokio::test]
+    async fn real_shell_exec_round_trips_a_nonzero_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let signing_key = SigningKey::generate(&mut rand::rng());
+        let registry = Registry::load(&dir.path().join("registry.json")).unwrap();
+        let (config, _agent_event_rx) = bridge_config(registry, "mise-not-used-in-this-test", &dir.path().join("mise"));
+        let port = spawn_loopback_server(&signing_key, config).await.unwrap();
+
+        let handle = connected_client(port).await;
+        let channel = handle.channel_open_session().await.unwrap();
+        channel.exec(true, b"exit 42".to_vec()).await.unwrap();
+
+        let (_stdout, _stderr, exit_status) = tokio::time::timeout(std::time::Duration::from_secs(10), drain_channel(channel)).await.unwrap();
+        assert_eq!(exit_status, Some(42), "the client must see the shell's real exit code, not a hardcoded 0");
     }
 
     #[tokio::test]

@@ -40,6 +40,16 @@ data class TreeUiState(
     val error: String? = null,
     val query: String = "",
     val searchResults: List<String> = emptyList(),
+    /**
+     * `true` when [loadTree] stopped paginating this directory level because
+     * it hit [ExplorerViewModel.MAX_TREE_LIST_PAGES] rather than because
+     * `workspace.tree.list` ran out of pages (`nextCursor` came back `null`)
+     * — i.e. [entries] is a genuinely partial view of a directory that has
+     * more entries `hostd` never got asked for. False for every ordinary
+     * directory, including one that spans multiple pages but still
+     * terminates within the cap.
+     */
+    val truncated: Boolean = false,
 )
 
 data class ExplorerUiState(
@@ -218,19 +228,53 @@ class ExplorerViewModel(
     fun onTreeSearchResultTapped(path: String): ExplorerNavigationEvent =
         if (isMarkdownPath(path)) ExplorerNavigationEvent.OpenMarkdownPreview(deviceId, workspaceId, path) else ExplorerNavigationEvent.OpenSourceEditor(deviceId, workspaceId, path)
 
-    /** Fetches one directory level (`pathPrefix` empty means the workspace root) and caches it for [onTreeSearchQueryChanged]. Public so [ExplorerScreen]'s breadcrumb/refresh affordances can call it directly. */
+    /**
+     * Fetches every page of one directory level (`pathPrefix` empty means
+     * the workspace root) and caches the combined result for
+     * [onTreeSearchQueryChanged]. `workspace.tree.list` returns at most 500
+     * entries per call and a non-null `nextCursor` when more remain
+     * (host-rpc.md's Bounds) — this follows that chain automatically rather
+     * than presenting only the first page, up to [MAX_TREE_LIST_PAGES]
+     * pages. A directory that still has more entries beyond that cap sets
+     * [TreeUiState.truncated] rather than fetching unboundedly; every
+     * ordinary directory (including one spanning a few pages under the cap)
+     * loads in full. Public so [ExplorerScreen]'s breadcrumb/refresh
+     * affordances can call it directly.
+     */
     fun loadTree(pathPrefix: String) {
         viewModelScope.launch {
             _state.value = _state.value.copy(tree = _state.value.tree.copy(pathPrefix = pathPrefix, isLoading = true, error = null))
-            runCatching { engine.workspaceTreeList(deviceId, workspaceId, pathPrefix) }
-                .onSuccess { result ->
-                    treeCache[pathPrefix] = result.entries
-                    _state.value = _state.value.copy(tree = _state.value.tree.copy(entries = result.entries, isLoading = false, error = null))
+            runCatching { fetchAllTreePages(pathPrefix) }
+                .onSuccess { (entries, truncated) ->
+                    treeCache[pathPrefix] = entries
+                    _state.value = _state.value.copy(tree = _state.value.tree.copy(entries = entries, isLoading = false, error = null, truncated = truncated))
                 }
                 .onFailure { failure ->
                     _state.value = _state.value.copy(tree = _state.value.tree.copy(isLoading = false, error = failure.message ?: "failed to load file tree"))
                 }
         }
+    }
+
+    /**
+     * Drains `workspace.tree.list`'s cursor chain for `pathPrefix`, oldest
+     * page first, stopping either when `nextCursor` comes back `null` (the
+     * ordinary case) or after [MAX_TREE_LIST_PAGES] pages — whichever comes
+     * first. The second element of the returned pair is `true` only when
+     * the cap was the reason it stopped, i.e. entries genuinely remain
+     * unfetched.
+     */
+    private suspend fun fetchAllTreePages(pathPrefix: String): Pair<List<TreeEntry>, Boolean> {
+        val entries = mutableListOf<TreeEntry>()
+        var cursor: String? = null
+        var pagesFetched = 0
+        do {
+            val page = engine.workspaceTreeList(deviceId, workspaceId, pathPrefix, cursor)
+            entries += page.entries
+            cursor = page.nextCursor
+            pagesFetched += 1
+        } while (cursor != null && pagesFetched < MAX_TREE_LIST_PAGES)
+        val truncated = cursor != null
+        return entries to truncated
     }
 
     /** Drills back up to the current directory's parent (root's parent is itself a no-op — there's nowhere above the workspace root). */
@@ -256,6 +300,19 @@ class ExplorerViewModel(
         val current = _state.value.agents
         if (current.isEmpty()) return
         _state.value = _state.value.copy(agents = current.map { row -> live[row.itemId]?.let { row.copy(status = it) } ?: row })
+    }
+
+    companion object {
+        /**
+         * [loadTree]'s per-directory page cap — at 500 entries/page
+         * (host-rpc.md's Bounds) this is up to 5,000 entries auto-fetched
+         * for one directory level before [TreeUiState.truncated] takes
+         * over, comfortably past any real `node_modules`/build-output
+         * directory while still bounding a single [loadTree] call against a
+         * pathological or malicious `nextCursor` chain that never
+         * terminates.
+         */
+        const val MAX_TREE_LIST_PAGES = 10
     }
 }
 

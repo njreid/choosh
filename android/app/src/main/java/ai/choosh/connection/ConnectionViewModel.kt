@@ -35,6 +35,21 @@ class ConnectionViewModel(
      * failure.
      */
     private val fcmTokenProvider: suspend () -> String? = { null },
+    /**
+     * Invoked every time [connectWith] reaches [ConnectResult.Connected] —
+     * both the very first connect ([init]'s stored-credential path) and
+     * every later reconnect ([retry]'s). The composition root wires this to
+     * [ai.choosh.agentevents.AgentEventSubscription.resubscribeAll], per
+     * that method's own doc comment: "call this after a fresh
+     * `ChooshEngine.connect` succeeds (a reconnect) ... MUST resume from the
+     * last acknowledged sequence." Calling it unconditionally on every
+     * successful connect (not just ones this class can itself identify as
+     * "a reconnect" rather than "the first connect") is deliberate and safe:
+     * on a genuine first connect [resubscribeAll]-equivalent has nothing
+     * registered yet to resubscribe, so this is a no-op; the default no-op
+     * lambda preserves every existing call site/test that doesn't pass one.
+     */
+    private val onConnectSucceeded: suspend () -> Unit = {},
 ) : ViewModel() {
     private val _state = MutableStateFlow<ConnectionUiState>(ConnectionUiState.CheckingStoredCredential)
     val state: StateFlow<ConnectionUiState> = _state.asStateFlow()
@@ -129,6 +144,7 @@ class ConnectionViewModel(
         }) {
             is ConnectResult.Connected -> {
                 registerFcmTokenBestEffort()
+                onConnectSucceeded()
                 _state.value = ConnectionUiState.Connected
             }
             is ConnectResult.Rejected -> {
