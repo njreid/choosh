@@ -166,6 +166,60 @@ pub enum RpcRequest {
         project_id: String,
         workspace_id: String,
     },
+    /// `docs/specs/resources-and-reauth.md`'s `resource.list`: every
+    /// Resource declared on this devhost, confirmed ones only — a pending,
+    /// unconfirmed agent proposal is not a real Resource yet (see
+    /// `ResourcePropose` below) and never appears here.
+    ResourceList {
+        request_id: String,
+    },
+    /// An agent's request to declare a new Resource — per the spec's
+    /// "Agent-declared resources" decision, this does NOT create a real,
+    /// listed Resource by itself. It stores the proposal as scratch state
+    /// and surfaces an `input_required`/`Elicitation` agent-event to the
+    /// phone; only `ResourceConfirm` against the returned `resource_id`
+    /// turns it into something `ResourceList` will ever return.
+    ResourcePropose {
+        request_id: String,
+        display_name: String,
+        /// A built-in kind or `"custom"` — see
+        /// `WireAgentEvent::ResourceReauthRequired`'s own field doc for why
+        /// this is a string, not a closed enum.
+        resource_kind: String,
+        /// `None` for a non-reauth Resource (e.g. a second EC2 test host).
+        pattern: Option<crate::relay::WireResourcePattern>,
+        /// The command that starts this Resource's re-auth (patterns a/b/c)
+        /// or a plain description of what it's for (pattern `None`).
+        reauth_command: Option<String>,
+        mobile_profile: crate::relay::WireMobileProfile,
+    },
+    /// The human's answer to a pending `ResourcePropose` — approve (and
+    /// persist) or discard. `approve: false` simply drops the pending
+    /// proposal; it never becomes a listed Resource.
+    ResourceConfirm {
+        request_id: String,
+        resource_id: String,
+        approve: bool,
+    },
+    /// Starts a Resource's re-auth as a `choosh-hostd`-managed subprocess
+    /// (patterns c/d always; a/b when proactively triggered rather than
+    /// detected mid-task in someone else's PTY — see
+    /// `resources-and-reauth.md`'s lifecycle diagram). The actual
+    /// url/code/instructions arrive asynchronously as a
+    /// `WireAgentEvent::ResourceReauthRequired`, not in this RPC's own
+    /// response.
+    ResourceReauthStart {
+        request_id: String,
+        resource_id: String,
+    },
+    /// The phone hands back whatever value its human obtained — a pasted
+    /// code (pattern b/d) or a fetched secret (pattern c). Never valid for
+    /// pattern a, which needs nothing typed back at all.
+    ResourceReauthComplete {
+        request_id: String,
+        resource_id: String,
+        value: String,
+    },
 }
 
 impl_request_id! {
@@ -173,7 +227,8 @@ impl_request_id! {
         WorkspaceCreate, WorkspaceList, WorkspaceStatus, WorkspaceTreeList, WorkspaceFileRead,
         ItemCreate, ItemList, ItemStop, WorkspaceDiff, WorkspaceLog, WorkspaceOpLog,
         WorkspaceOpUndo, WorkspaceOpRestore, WorkspaceFileWrite, ProjectList,
-        ProjectSetPrimaryWorkspace,
+        ProjectSetPrimaryWorkspace, ResourceList, ResourcePropose, ResourceConfirm,
+        ResourceReauthStart, ResourceReauthComplete,
     }
 }
 
@@ -436,6 +491,30 @@ pub enum RpcResponse {
     ProjectSetPrimaryWorkspaceOk {
         request_id: String,
     },
+    ResourceListOk {
+        request_id: String,
+        resources: Vec<WireResource>,
+    },
+    /// `resource_id` here names the *pending* proposal, not yet a real,
+    /// listed Resource — see `RpcRequest::ResourcePropose`'s doc comment.
+    ResourceProposeOk {
+        request_id: String,
+        resource_id: String,
+    },
+    /// Present only when `approve: true` resolved to a genuinely new,
+    /// now-listed Resource; `None` when `approve: false` (nothing to
+    /// return — the proposal was simply discarded).
+    ResourceConfirmOk {
+        request_id: String,
+        resource: Option<WireResource>,
+    },
+    ResourceReauthStartOk {
+        request_id: String,
+    },
+    ResourceReauthCompleteOk {
+        request_id: String,
+        verified: bool,
+    },
     Error {
         request_id: String,
         /// One of `host-rpc.md`'s fixed error codes: `not_found`,
@@ -452,8 +531,28 @@ impl_request_id! {
         WorkspaceFileReadOk, ItemCreateOk, ItemListOk, ItemStopOk, WorkspaceDiffOk,
         WorkspaceLogOk, WorkspaceOpLogOk, WorkspaceOpUndoOk, WorkspaceOpRestoreOk,
         WorkspaceFileWriteOk, WorkspaceFileWriteStale, ProjectListOk,
-        ProjectSetPrimaryWorkspaceOk, Error,
+        ProjectSetPrimaryWorkspaceOk, ResourceListOk, ResourceProposeOk, ResourceConfirmOk,
+        ResourceReauthStartOk, ResourceReauthCompleteOk, Error,
     }
+}
+
+/// One devhost-scoped Resource, as returned by `ResourceListOk`/
+/// `ResourceConfirmOk` — `docs/specs/resources-and-reauth.md`'s entity,
+/// confirmed/listed ones only (never a pending, unconfirmed proposal).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WireResource {
+    pub resource_id: String,
+    pub display_name: String,
+    pub resource_kind: String,
+    pub pattern: Option<crate::relay::WireResourcePattern>,
+    pub mobile_profile: crate::relay::WireMobileProfile,
+    /// `"operator"` or `"agent:<id>"` — per the spec's confirmation-gate
+    /// decision, every listed Resource has already been human-approved
+    /// regardless of which one created it; this is audit metadata, not a
+    /// trust signal about whether it's safe to reuse.
+    pub created_by: String,
+    pub last_used_at: Option<String>,
+    pub last_verified_at: Option<String>,
 }
 
 /// `host-rpc.md`'s bounds: page size for `workspace.tree.list`, and the max

@@ -286,7 +286,7 @@ fn sign_jwt_bearer_assertion(key: &ServiceAccountKey) -> Result<String, String> 
 /// this ties the payload's redaction guarantee directly to
 /// [`WireAgentEvent`]'s own `#[serde(tag = "kind", ...)]` shape (already
 /// enforced at the type level — see its doc comment on
-/// `WireAgentEvent::AuthRequired` and the round-trip tests in
+/// `WireAgentEvent::ResourceReauthRequired` and the round-trip tests in
 /// `choosh-protocol/src/relay.rs`) instead of duplicating a second,
 /// driftable list of "which fields are safe" here.
 fn redacted_data_payload(from_device_id: &str, event: &WireAgentEvent) -> serde_json::Map<String, serde_json::Value> {
@@ -318,7 +318,7 @@ fn plain_string(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use choosh_protocol::relay::{WireAuthProvider, WireInputReason};
+    use choosh_protocol::relay::{WireInputReason, WireMobileProfile, WireResourcePattern};
 
     #[tokio::test]
     async fn unconfigured_client_dispatch_never_panics_or_sends() {
@@ -352,26 +352,47 @@ mod tests {
         assert_eq!(data.get("reason").unwrap(), "permission");
     }
 
-    /// The hard redaction rule under test: an `auth_required` FCM payload
-    /// may contain `user_code`/`verification_uri` (meant to be shown to
-    /// the user) but must never contain anything else — no token,
+    /// The hard redaction rule under test: a `resource_reauth_required` FCM
+    /// payload may contain `user_code`/`verification_uri` (meant to be
+    /// shown to the user) but must never contain anything else — no token,
     /// session id, or credential material, mirroring
-    /// `choosh-hostd::auth_detect`'s and `choosh-protocol::relay`'s own
-    /// `AuthRequired` round-trip test.
+    /// `choosh-protocol::relay`'s own `ResourceReauthRequired` round-trip
+    /// test.
     #[test]
-    fn redacted_data_payload_for_auth_required_has_exactly_the_spec_fields_and_nothing_else() {
-        let event = WireAgentEvent::AuthRequired {
-            provider: WireAuthProvider::Aws,
-            user_code: "WDJB-MJHT".to_string(),
-            verification_uri: "https://example.com/device".to_string(),
+    fn redacted_data_payload_for_resource_reauth_required_has_exactly_the_spec_fields_and_nothing_else() {
+        let event = WireAgentEvent::ResourceReauthRequired {
+            resource_id: "res-1".to_string(),
+            display_name: "Prod AWS SSO".to_string(),
+            resource_kind: "aws-sso".to_string(),
+            pattern: WireResourcePattern::A,
+            verification_uri: Some("https://example.com/device".to_string()),
+            user_code: Some("WDJB-MJHT".to_string()),
+            fetch_instructions: None,
+            mobile_profile: WireMobileProfile::Work,
         };
         let data = redacted_data_payload("devhost-1", &event);
         let mut keys: Vec<&str> = data.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, vec!["host_id", "kind", "provider", "user_code", "verification_uri"]);
-        assert_eq!(data.get("provider").unwrap(), "aws");
+        assert_eq!(
+            keys,
+            vec![
+                "display_name",
+                "fetch_instructions",
+                "host_id",
+                "kind",
+                "mobile_profile",
+                "pattern",
+                "resource_id",
+                "resource_kind",
+                "user_code",
+                "verification_uri",
+            ]
+        );
+        assert_eq!(data.get("resource_kind").unwrap(), "aws-sso");
+        assert_eq!(data.get("pattern").unwrap(), "a");
         assert_eq!(data.get("user_code").unwrap(), "WDJB-MJHT");
         assert_eq!(data.get("verification_uri").unwrap(), "https://example.com/device");
+        assert_eq!(data.get("fetch_instructions").unwrap(), "", "None flattens to an empty string, per plain_string's doc comment");
     }
 
     #[test]

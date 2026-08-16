@@ -186,22 +186,50 @@ pub enum WireAgentEvent {
         workspace_id: String,
         editor: WireEditor,
     },
-    /// `choosh-hostd` detected a headless device-code SSO/cloud-CLI auth
-    /// flow (`agent-events.md`'s `auth_required`: `aws sso login`, `gcloud
-    /// auth login`, `az login`, `gh auth login`) with no local browser to
-    /// hand off to. Deliberately carries no `workspace_id`/`item_id` — per
-    /// the spec, this payload is exactly these three fields, nothing else;
-    /// it is not attributable to a single workspace item the way every
-    /// other variant above is. **No token, credential, or session
-    /// identifier MUST ever appear here** — `choosh-hostd`'s detector
-    /// (`choosh-hostd::auth_detect`) is responsible for extracting only
-    /// these three fields from a provider's real output before this type
-    /// is ever constructed, never forwarding a captured line/buffer
-    /// wholesale.
-    AuthRequired {
-        provider: WireAuthProvider,
-        user_code: String,
-        verification_uri: String,
+    /// `choosh-hostd` needs a human to complete (or re-complete) some
+    /// external Resource's authentication — supersedes the old, narrower
+    /// `auth_required` (`aws`/`gcp`/`azure`/`github` only). Per
+    /// `docs/specs/resources-and-reauth.md`'s taxonomy, four structurally
+    /// different interaction shapes exist ([`WireResourcePattern`]); which
+    /// fields are populated depends on which one `pattern` names. Carries
+    /// no `workspace_id`/`item_id` — a Resource is devhost-scoped, not
+    /// attributable to a single workspace item the way every other variant
+    /// above is. **No token, credential, or session identifier MUST ever
+    /// appear here** — whatever detector/managed-subprocess produced this
+    /// is responsible for extracting only these bounded fields from a
+    /// provider's real output before this type is ever constructed, never
+    /// forwarding a captured line/buffer wholesale (see
+    /// `choosh-hostd::auth_detect`'s existing bounds-checking discipline,
+    /// which this generalizes rather than replaces).
+    ResourceReauthRequired {
+        resource_id: String,
+        /// Operator- or agent-chosen label shown on the phone — untrusted
+        /// display text, never proof of where `verification_uri` actually
+        /// goes; the phone UI MUST show the real URL, not just this.
+        display_name: String,
+        /// A built-in kind (`"aws-sso"`, `"aws-iam-key"`, `"aws-sts-mfa"`,
+        /// `"gcloud"`, `"firebase"`, `"github"`, `"azure"`) or `"custom"` —
+        /// deliberately a plain string, not a closed enum, so a new
+        /// provider is a new data row, not a wire-format/recompile change.
+        /// Named `resource_kind`, not `kind` — `WireAgentEvent`'s own
+        /// `#[serde(tag = "kind")]` already claims that JSON key for the
+        /// variant discriminant (`"resource_reauth_required"`); reusing it
+        /// here would silently collide in the flattened wire object.
+        resource_kind: String,
+        pattern: WireResourcePattern,
+        /// Populated for patterns a/b/d; `None` for pattern c (nothing to
+        /// visit — see `fetch_instructions` instead).
+        verification_uri: Option<String>,
+        /// Populated for patterns a/b; `None` for c/d (d's phone-supplied
+        /// value is a resume argument, not something typed at a URL the
+        /// same way).
+        user_code: Option<String>,
+        /// Populated for pattern c only: human-readable "go get X from Y"
+        /// text (e.g. "Copy your Account SID and Auth Token from
+        /// <https://console.twilio.com/>..."), since there is nothing in the
+        /// CLI's own output to key off.
+        fetch_instructions: Option<String>,
+        mobile_profile: WireMobileProfile,
     },
 }
 
@@ -223,9 +251,54 @@ impl WireAgentEvent {
             | Self::AgentStatus { workspace_id, .. }
             | Self::EditorAttached { workspace_id, .. }
             | Self::EditorDetached { workspace_id, .. } => Some(workspace_id),
-            Self::AuthRequired { .. } => None,
+            Self::ResourceReauthRequired { .. } => None,
         }
     }
+}
+
+/// The four re-auth interaction shapes `docs/specs/resources-and-reauth.md`
+/// identifies — not every provider fits the "CLI prints a code, human types
+/// it into a browser" flow this crate's earlier `auth_required` assumed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WireResourcePattern {
+    /// Self-polling device code (RFC 8628-shaped): CLI prints a code+URL,
+    /// blocks, polls in the background, exits on its own once the browser
+    /// step completes. Nothing is ever typed back into the CLI.
+    A,
+    /// Manual code paste-back: CLI prints a URL, blocks on an interactive
+    /// prompt in the *same* process; the phone-supplied value must reach
+    /// that specific still-live process's stdin.
+    B,
+    /// Static secret paste: no browser flow, no code exchange — the CLI
+    /// just prompts for a value the human already has or must separately
+    /// fetch (see `fetch_instructions` on
+    /// [`WireAgentEvent::ResourceReauthRequired`]).
+    C,
+    /// Resume via a fresh command, not stdin: CLI prints a URL and
+    /// instructs running a brand-new, non-interactive invocation with a
+    /// value once it's in hand — no PTY injection needed.
+    D,
+}
+
+/// Which Android profile a Resource's re-auth should be attempted in, per
+/// `resources-and-reauth.md`'s "Mobile profile targeting" — e.g. an org's
+/// AWS SSO login may only be reachable from a Work Profile's browser
+/// session, while a personal AWS root account only exists in the personal
+/// profile. Android gives no reliable API for a third-party app to force a
+/// link into a specific other profile (see that spec section for the real
+/// platform constraint this is honest about); this is a declared hint the
+/// phone UI uses for labeling and best-effort `Intent` resolution, not a
+/// guarantee.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireMobileProfile {
+    Personal,
+    Work,
+    /// Unknown/unspecified — the phone UI skips the profile label
+    /// entirely and defaults to whatever profile the app itself is
+    /// currently running in.
+    Ask,
 }
 
 /// One workspace-scoped agent event as retained in `choosh-hostd`'s
@@ -293,17 +366,6 @@ pub enum AgentEventsResumeResponse {
     },
 }
 
-/// The four named cloud/SSO providers `agent-events.md`'s `auth_required`
-/// event covers. Serializes exactly as the spec's payload shape shows
-/// (`"aws"`/`"gcp"`/`"azure"`/`"github"`), not as `PascalCase`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WireAuthProvider {
-    Aws,
-    Gcp,
-    Azure,
-    Github,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -894,13 +956,18 @@ mod tests {
 
     #[test]
     fn agent_event_request_with_no_sequence_round_trips_through_json() {
-        // The `AuthRequired` case: no `workspace_id`, so no sequence.
+        // The `ResourceReauthRequired` case: no `workspace_id`, so no sequence.
         let request = ControlRequest::AgentEvent {
             request_id: "id".to_string(),
-            event: WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Github,
-                user_code: "WDJB-MJHT".to_string(),
-                verification_uri: "https://example.com/device".to_string(),
+            event: WireAgentEvent::ResourceReauthRequired {
+                resource_id: "res-1".to_string(),
+                display_name: "Prod GitHub".to_string(),
+                resource_kind: "github".to_string(),
+                pattern: WireResourcePattern::A,
+                verification_uri: Some("https://example.com/device".to_string()),
+                user_code: Some("WDJB-MJHT".to_string()),
+                fetch_instructions: None,
+                mobile_profile: WireMobileProfile::Ask,
             },
             sequence: None,
         };
@@ -939,16 +1006,21 @@ mod tests {
     }
 
     #[test]
-    fn wire_agent_event_workspace_id_is_none_only_for_auth_required() {
+    fn wire_agent_event_workspace_id_is_none_only_for_resource_reauth_required() {
         assert_eq!(
             WireAgentEvent::TurnCompleted { workspace_id: "ws-1".to_string(), item_id: "item-1".to_string() }.workspace_id(),
             Some("ws-1")
         );
         assert_eq!(
-            WireAgentEvent::AuthRequired {
-                provider: WireAuthProvider::Aws,
-                user_code: "WDJB-MJHT".to_string(),
-                verification_uri: "https://example.com/device".to_string(),
+            WireAgentEvent::ResourceReauthRequired {
+                resource_id: "res-1".to_string(),
+                display_name: "Prod AWS SSO".to_string(),
+                resource_kind: "aws-sso".to_string(),
+                pattern: WireResourcePattern::A,
+                verification_uri: Some("https://example.com/device".to_string()),
+                user_code: Some("WDJB-MJHT".to_string()),
+                fetch_instructions: None,
+                mobile_profile: WireMobileProfile::Ask,
             }
             .workspace_id(),
             None
@@ -1045,39 +1117,89 @@ mod tests {
     }
 
     #[test]
-    fn auth_required_event_round_trips_and_uses_the_spec_exact_payload_shape() {
-        for provider in [WireAuthProvider::Aws, WireAuthProvider::Gcp, WireAuthProvider::Azure, WireAuthProvider::Github] {
-            let event = WireAgentEvent::AuthRequired {
-                provider,
-                user_code: "WDJB-MJHT".to_string(),
-                verification_uri: "https://example.com/device".to_string(),
+    fn resource_reauth_required_event_round_trips_for_every_pattern() {
+        for pattern in [WireResourcePattern::A, WireResourcePattern::B, WireResourcePattern::C, WireResourcePattern::D] {
+            let event = WireAgentEvent::ResourceReauthRequired {
+                resource_id: "res-1".to_string(),
+                display_name: "Prod AWS SSO".to_string(),
+                resource_kind: "aws-sso".to_string(),
+                pattern,
+                verification_uri: Some("https://example.com/device".to_string()),
+                user_code: Some("WDJB-MJHT".to_string()),
+                fetch_instructions: None,
+                mobile_profile: WireMobileProfile::Work,
             };
             let json = serde_json::to_string(&event).expect("serialize");
             let decoded: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(decoded, event);
         }
-        let json = serde_json::to_string(&WireAgentEvent::AuthRequired {
-            provider: WireAuthProvider::Aws,
-            user_code: "WDJB-MJHT".to_string(),
-            verification_uri: "https://example.com/device".to_string(),
+    }
+
+    #[test]
+    fn resource_reauth_required_event_uses_the_spec_exact_payload_shape_and_field_names() {
+        let json = serde_json::to_string(&WireAgentEvent::ResourceReauthRequired {
+            resource_id: "res-1".to_string(),
+            display_name: "Prod AWS SSO".to_string(),
+            resource_kind: "aws-sso".to_string(),
+            pattern: WireResourcePattern::A,
+            verification_uri: Some("https://example.com/device".to_string()),
+            user_code: Some("WDJB-MJHT".to_string()),
+            fetch_instructions: None,
+            mobile_profile: WireMobileProfile::Work,
         })
         .unwrap();
-        assert!(json.contains("\"kind\":\"auth_required\""));
-        assert!(json.contains("\"provider\":\"aws\""));
+        assert!(json.contains("\"kind\":\"resource_reauth_required\""));
+        assert!(json.contains("\"resource_id\":\"res-1\""));
+        assert!(json.contains("\"resource_kind\":\"aws-sso\""));
+        assert!(json.contains("\"pattern\":\"a\""));
         assert!(json.contains("\"user_code\":\"WDJB-MJHT\""));
         assert!(json.contains("\"verification_uri\":\"https://example.com/device\""));
+        assert!(json.contains("\"mobile_profile\":\"work\""));
         // Per agent-events.md: "No token, credential, or session identifier
-        // MUST ever appear in this event" — this is the type-level half of
-        // that guarantee: the struct has exactly three fields, so there is
-        // no field a future edit could accidentally start populating with
+        // MUST ever appear in this event" — the type-level half of that
+        // guarantee: exactly these named fields, nothing else, so a future
+        // edit can't accidentally start populating an extra field with
         // captured output. Parsed back as a generic Value to assert the
-        // object literally has no other keys, not just that the ones we
-        // expect are present.
+        // object literally has no other keys.
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let object = value.as_object().unwrap();
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, vec!["kind", "provider", "user_code", "verification_uri"]);
+        assert_eq!(
+            keys,
+            vec![
+                "display_name",
+                "fetch_instructions",
+                "kind",
+                "mobile_profile",
+                "pattern",
+                "resource_id",
+                "resource_kind",
+                "user_code",
+                "verification_uri",
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_reauth_required_pattern_c_carries_fetch_instructions_and_no_url_or_code() {
+        let event = WireAgentEvent::ResourceReauthRequired {
+            resource_id: "res-2".to_string(),
+            display_name: "Twilio".to_string(),
+            resource_kind: "twilio".to_string(),
+            pattern: WireResourcePattern::C,
+            verification_uri: None,
+            user_code: None,
+            fetch_instructions: Some("Copy your Account SID and Auth Token from https://console.twilio.com/".to_string()),
+            mobile_profile: WireMobileProfile::Ask,
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(json.contains("\"pattern\":\"c\""));
+        assert!(json.contains("\"fetch_instructions\":\"Copy your Account SID"));
+        assert!(json.contains("\"verification_uri\":null"));
+        assert!(json.contains("\"user_code\":null"));
+        let decoded: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, event);
     }
 
     #[test]
