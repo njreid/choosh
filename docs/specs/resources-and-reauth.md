@@ -23,6 +23,30 @@ survey" below, which corrects some assumptions the current detector's own
 doc comments already flag as unverified). Implementation is intentionally
 out of scope; see "Open questions" at the end.
 
+## Decisions
+
+Four design forks were raised and settled before implementation:
+
+1. **Build scope**: all four patterns (A/B/C/D) ship in the first
+   implementation pass, not just the two PTY-injection-free ones. B (see
+   below) is still the highest-effort/highest-risk piece and should be
+   built and tested last within that pass, but it's in scope for v1, not
+   deferred to a later one.
+2. **Wire format**: `resource_reauth_required` replaces `auth_required`
+   outright. The four existing hardcoded providers (`aws`/`gcp`/`azure`/
+   `github`) become built-in Resource `kind`s under the new event —
+   `agent_events.md` gets updated to describe the new event and mark
+   `auth_required` as superseded, not kept as a parallel legacy path.
+3. **Agent-declared resources require confirmation before persisting.** An
+   agent's proposal reaches the human as a question first (reusing
+   `input_required`/`Elicitation`); nothing becomes a real, reusable
+   Resource until approved. See "Agent-declared resources" below.
+4. **One shared entity.** Non-reauth Resources (a second EC2 test host)
+   use the same `Resource` schema as credential re-auth ones, just with
+   `pattern: null` and the reauth-only fields unset — one list, one RPC
+   family, one place to look, rather than two similar-but-separate
+   entities.
+
 ## Why one shape doesn't fit all of these
 
 The temptation is to model every CLI re-auth as "the CLI prints a URL and
@@ -42,16 +66,18 @@ run on a devhost:
 | **C — static secret paste, no browser flow at all** | CLI prompts for a value the human already has, or must separately fetch from a web console unrelated to anything the CLI itself printed; no polling, no code exchange | Value flows from wherever it lives (a web console, an authenticator app) into the CLI's stdin/argv; the CLI never mediates the round trip | `aws configure` (Access Key ID/Secret Access Key); `aws sts get-session-token --serial-number <mfa-arn> --token-code <code>` (the code comes from an authenticator app, not a website); Twilio CLI's Account SID/Auth Token prompt |
 | **D — resume via a fresh command, not stdin** | CLI prints a URL, exits (or keeps polling as a *fallback*), and separately instructs the human to run a **new**, non-interactive invocation with a value once they have it — never types into the original blocked process | Value flows devhost→phone→devhost, but lands as an argument to a brand-new subprocess, not as injected keystrokes into a live PTY | `firebase login --no-localhost` (verified below) |
 
-Patterns A and D are the two worth building first: neither requires
-injecting synthetic keystrokes into a live, possibly-scrolled PTY session
-— A needs no devhost-side action at all beyond waiting, and D just means
-spawning a fresh, fully-formed command once the phone hands back a value.
-B requires real PTY stdin injection into a specific still-blocked process,
-which is a meaningfully bigger and riskier piece of plumbing (see "PTY
-injection" under Open questions). C needs no CLI-output detection at all —
-there's nothing in the terminal to pattern-match, so this only becomes
-tractable once Resources are explicit, human/agent-declared entities
-rather than something a text scanner infers.
+All four are in scope for v1 (see "Decisions" above), but they are not
+equally risky to build. A needs no devhost-side action at all beyond
+waiting; D just means spawning a fresh, fully-formed command once the
+phone hands back a value; C needs no CLI-output detection at all — there's
+nothing in the terminal to pattern-match, so it only becomes tractable
+once Resources are explicit, human/agent-declared entities rather than
+something a text scanner infers. B is the outlier: it requires real PTY
+stdin injection into a specific, still-blocked process (see "PTY
+injection" under Open questions), which is the one piece here with a real
+failure mode if the human has since navigated away from that terminal —
+build and test it last within the v1 pass, after A/C/D have proven the
+rest of the plumbing (event delivery, phone UI, Resource storage) works.
 
 ## Provider survey
 
@@ -235,12 +261,11 @@ testing" is a Resource with `pattern: null` — just a named pointer to
 connection info (host alias, and either a choosh devhost's own device
 credential if it's itself enrolled, or a plain SSH target/key reference
 otherwise). This reuses the `display_name`/`devhost_id`/`created_by`
-shape above without needing any of the reauth-specific fields. Whether
-this belongs in the *same* entity/table as auth resources, or a sibling
-one that merely shares the "agent-addable, devhost-attached, named" shape,
-is an open question below — they're similar enough to sketch together
-here, but "credential re-auth" and "here's another box" are different
-enough in what they're *for* that forcing one schema might be a mistake.
+shape above without needing any of the reauth-specific fields. Per
+"Decisions" above, this is the *same* entity/table as auth Resources, not
+a sibling one — `pattern: null` plus the reauth-only fields (`detect`,
+`resume_command_template`, `fetch_instructions`) left unset is sufficient
+to represent it without growing a second schema.
 
 ### Mobile profile targeting
 
@@ -282,11 +307,20 @@ question" (`agent-events.md`'s `input_required`,
 `WireInputReason::Elicitation` fits this shape well: "I need something
 from you before I can continue" is exactly what a missing/expired
 Resource is). The response either supplies an existing `resource_id` to
-retry against, or walks the human through declaring a new one (kind,
-command, mobile profile) — at which point it's stored via the same path
-an operator-declared Resource would use. `created_by` on the entity
-records which case happened, mostly for audit/cleanup ("what did agents
-add on their own that I should review").
+retry against, or proposes a new one (kind, command, mobile profile).
+
+**Per "Decisions" above, a proposed Resource is never persisted directly
+by the agent.** The `input_required`/`Elicitation` round trip's answer is
+the only thing that creates the real, stored `Resource` record — an
+agent's proposal is scratch state (attached to the pending question, not
+written to the Resource store) until the human's response confirms it,
+at which point `choosh-hostd` is the one that actually persists it, the
+same as if the human had declared it directly. `created_by` on the
+resulting entity still records `agent:<id>` vs. `operator` so the human
+can later audit/prune what agents have asked for, but by the time
+anything shows up in `resource.list`, a human has already seen and
+approved it — there's no window where an unconfirmed, agent-hallucinated
+Resource is live and reusable.
 
 ## Re-auth lifecycle (per pattern)
 
@@ -299,10 +333,10 @@ idle
   ▼
 triggered ──────────────────────────────────────────────┐
   │ hostd emits a `resource_reauth_required` agent-event  │
-  │ (superset of today's `auth_required`; see Open        │
-  │ questions) with resource_id, pattern, and whatever     │
-  │ fields that pattern needs (url+code for a/b, fetch     │
-  │ instructions for c, url+resume-template for d)         │
+  │ (replaces `auth_required` — see "Decisions" above)     │
+  │ with resource_id, pattern, and whatever fields that     │
+  │ pattern needs (url+code for a/b, fetch instructions     │
+  │ for c, url+resume-template for d)                       │
   ▼                                                        │
 phone-notified                                             │
   │ human completes the browser/console step on their      │
@@ -358,25 +392,28 @@ verified (reauth_command's own exit code / a follow-up
 
 ## Open questions (deliberately not decided here)
 
-- **Wire format**: does `resource_reauth_required` fully replace
-  `auth_required`, or does `auth_required` stay as a legacy/simplified
-  alias for pattern-a-only cases? Leaning toward replace-and-migrate
-  (`auth_required`'s four providers become four built-in `kind`s), but
-  that's a wire-compat decision, not a design one, and belongs in
-  `agent-events.md` once settled.
+The four design forks (build scope, wire format, agent-declared-resource
+confirmation, shared-vs-separate entity) are settled — see "Decisions"
+above. What's left is implementation mechanics, not design:
+
 - **PTY injection for pattern b**: today's `pty:<item_id>` tunnel already
   carries human keystrokes into a live session, so the raw mechanism
   exists — the open part is identifying *which* still-running PTY a
   `detect` match came from once the phone hands a value back, especially
   if the human has since navigated away from that terminal item's screen.
-  Needs its own design pass; likely the highest-effort part of this whole
-  feature and the reason patterns a/d should ship first.
+  Needs its own design pass; per "Decisions," this is built and tested
+  last within the v1 pass, once A/C/D have proven the surrounding
+  plumbing.
 - **Storage**: a new `registry.rs`-style JSON store on `choosh-hostd`,
   mirroring how `Workspace`s are persisted today, is the obvious shape —
   not designed here.
 - **RPC surface**: `resource.create`/`resource.list`/`resource.reauth`-
   shaped RPCs, added to `host_rpc.rs` alongside the existing
-  `workspace.*`/`item.*`/`project.*` families — not designed here.
+  `workspace.*`/`item.*`/`project.*` families — not designed here. Note
+  that "propose" (agent-initiated, pending confirmation) and "create"
+  (the human-confirmed, actually-persisted write) are likely two distinct
+  RPCs or a two-phase one, per the confirmation-gate decision above — not
+  fully worked out here.
 - **Android UI**: where Resources live in the app (a new top-level list?
   hung off the devhost/fleet view?), and the actual profile-picker/
   copy-fallback UI for `mobile_profile` — not designed here, and the
