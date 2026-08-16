@@ -16,6 +16,7 @@ import ai.choosh.fleet.FleetViewModel
 import ai.choosh.markdown.MarkdownScreen
 import ai.choosh.markdown.MarkdownViewModel
 import ai.choosh.nav.ScreenBackStack
+import ai.choosh.notifications.NotificationDeepLinkTarget
 import ai.choosh.sourceeditor.SourceEditorScreen
 import ai.choosh.sourceeditor.SourceEditorViewModel
 import ai.choosh.terminal.TerminalScreen
@@ -108,13 +109,13 @@ private sealed interface Screen {
     /**
      * The `AgentTerminal` pinned-item page, per
      * `docs/specs/android-navigation.md`'s pinned-kinds table. `itemId` is
-     * now a real `item.list`/`item.create` id (never a hardcoded/reused
-     * `workspaceId`, as an earlier pass did) — reachable by tapping a real
-     * row in the Explorer's "active agents" section. `workspaceId` is
-     * carried alongside purely for [onBack] to return to the right
-     * Workspace — it plays no role in [TerminalScreen]'s own PTY-attach
-     * logic, which is `(deviceId, itemId)`-addressed per
-     * `terminal-experience.md`.
+     * a real `item.list`/`item.create` id — reachable by tapping a real row
+     * in the Explorer's "active agents" section, or from a tapped
+     * `input_required` notification's deep link (see [ChooshApp]'s
+     * `pendingDeepLink` handling). `workspaceId` is carried alongside purely
+     * for [onBack] to return to the right Workspace — it plays no role in
+     * [TerminalScreen]'s own PTY-attach logic, which is
+     * `(deviceId, itemId)`-addressed per `terminal-experience.md`.
      */
     data class Terminal(val deviceId: String, val itemId: String, val workspaceId: String) : Screen
 
@@ -140,7 +141,21 @@ private sealed interface Screen {
 }
 
 @Composable
-fun ChooshApp(context: Context) {
+fun ChooshApp(
+    context: Context,
+    // A tapped `input_required` notification's resolved target, per
+    // `MainActivity`'s `onCreate`/`onNewIntent` handling and
+    // docs/specs/android-navigation.md's "Notification deep link" section.
+    // `null` (the default) preserves every existing call site/preview/test
+    // exactly as before.
+    pendingDeepLink: NotificationDeepLinkTarget.OpenItem? = null,
+    // Called once [pendingDeepLink] has been acted on (either navigated to
+    // directly below, or handed off to `ConnectionScreen`'s `onConnected`)
+    // so `MainActivity` clears its own copy — otherwise a later
+    // configuration change / recomposition would re-navigate away from
+    // wherever the user went next.
+    onDeepLinkConsumed: () -> Unit = {},
+) {
     val engine = remember { buildEngine() }
     val credentialStore = remember { SessionCredentialStore(context) }
     // A real back stack (UX-friction audit finding #2), not a single
@@ -161,6 +176,46 @@ fun ChooshApp(context: Context) {
     // lets the platform's own default back handling apply (exit the app),
     // same as any other single-Activity app's root screen.
     BackHandler(enabled = backStack.canPop) { backStack.pop() }
+
+    // Per notifications.md's "Actionability" section ("tapping connects if
+    // necessary, opens the workspace, ensures the relevant item is pinned,
+    // focuses it, and acknowledges the notification") and
+    // docs/specs/android-navigation.md's "Notification deep link" section.
+    // "Acknowledges" (step 6, and step 1's "connects if necessary") are
+    // handled outside this function: `MainActivity.consumeDeepLink` already
+    // cancelled the Android notification by the time [pendingDeepLink]
+    // reaches here, and reaching [Screen.Connection] below already means
+    // `ConnectionViewModel` is mid-connect (or about to be) via its own
+    // `init` block — there is no separate "is connected" flag to check.
+    //
+    // What remains — "opens the workspace, ensures the relevant item is
+    // pinned, focuses it" (steps 2/3/4/5) — is approximated here as
+    // "navigate straight to `Screen.Terminal`": this codebase has no real
+    // per-workspace pin list yet (`WorkspaceScreen` renders three fixed
+    // tabs, not a pinned-item set), so there is nothing to insert an
+    // `AgentTerminal` pin into. `Screen.Terminal` is this codebase's
+    // existing stand-in for "the pinned/focused `AgentTerminal` page" (see
+    // its own doc comment) — landing there directly is the closest
+    // available approximation of "pinned and focused" until a real pin
+    // list exists. A human merging this with the concurrent `Screen`/
+    // back-stack rewrite should reconcile this against real pin state once
+    // it lands, and should decide whether the back stack should also
+    // contain [Screen.Workspace] underneath (this pass jumps straight to
+    // [Screen.Terminal] without visiting it, since nothing here reads or
+    // depends on Workspace-screen state first).
+    //
+    // If [screen] is already [Screen.Connection], this effect intentionally
+    // does nothing — `ConnectionScreen`'s `onConnected` callback below picks
+    // up [pendingDeepLink] itself once `ConnectionViewModel` reaches
+    // `Connected`, since navigating here would race an as-yet-unauthenticated
+    // connection.
+    LaunchedEffect(pendingDeepLink) {
+        val target = pendingDeepLink ?: return@LaunchedEffect
+        if (screen !is Screen.Connection) {
+            backStack.push(Screen.Terminal(deviceId = target.hostId, itemId = target.itemId, workspaceId = target.workspaceId))
+            onDeepLinkConsumed()
+        }
+    }
 
     // docs/specs/agent-events.md's live subscription — one process-wide
     // instance, per AgentEventSubscription's own doc comment on why this
@@ -208,7 +263,29 @@ fun ChooshApp(context: Context) {
                             ConnectionViewModel(engine, credentialStore, fcmTokenProvider = ::fetchFcmToken)
                         },
                     )
-                    ConnectionScreen(viewModel = viewModel, onConnected = { backStack.push(Screen.Fleet) })
+                    ConnectionScreen(
+                        viewModel = viewModel,
+                        onConnected = {
+                            // Per notifications.md's "Actionability": "tapping
+                            // connects if necessary [...]". A deep-linked
+                            // notification tap that arrived while unauthenticated
+                            // (cold start, or the app was on Screen.Connection
+                            // already) lands here once `ConnectionViewModel`
+                            // finishes connecting — route to the deep link's
+                            // target instead of the plain fleet drawer, then
+                            // consume it exactly once (mirrors the other
+                            // consumption site in the `LaunchedEffect` above).
+                            val target = pendingDeepLink
+                            backStack.push(
+                                if (target != null) {
+                                    Screen.Terminal(deviceId = target.hostId, itemId = target.itemId, workspaceId = target.workspaceId)
+                                } else {
+                                    Screen.Fleet
+                                },
+                            )
+                            if (target != null) onDeepLinkConsumed()
+                        },
+                    )
                 }
 
                 is Screen.Fleet -> {

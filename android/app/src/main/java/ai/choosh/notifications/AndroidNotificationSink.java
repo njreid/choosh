@@ -1,11 +1,17 @@
 package ai.choosh.notifications;
 
+import ai.choosh.MainActivity;
+
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.Intent;
+import android.net.Uri;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.Objects;
 
 /** Concrete, API-safe NotificationSink backed by Android's NotificationManager. */
@@ -38,14 +44,61 @@ public final class AndroidNotificationSink implements NotificationSink {
         // here, for either intent type — input_required's own direct
         // approve/reject actions are a separate, not-yet-implemented gap;
         // see PLAN.md's "Terminal accessibility"/actionability follow-ups).
+        // The single tap target itself IS wired below via setContentIntent,
+        // per that same "Actionability" section's "tapping ... connects if
+        // necessary, opens the workspace, ensures the relevant item is
+        // pinned, focuses it, and acknowledges the notification".
         Notification notification = new Notification.Builder(context, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentTitle(titleFor(intent))
                 .setContentText(textFor(intent))
+                .setContentIntent(pendingIntentFor(intent))
                 .setAutoCancel(true)
                 .setOnlyAlertOnce(true)
                 .build();
         manager.notify(TAG, notificationIdForKey(intent.key()), notification);
+    }
+
+    /**
+     * The tap target for {@code intent}'s notification. {@link NotificationIntent}
+     * (`input_required`) opens an explicit {@link MainActivity} {@code Intent}
+     * carrying {@link NotificationDeepLink}'s redacted host/workspace/item
+     * extras — {@code MainActivity} resolves those into a navigation target
+     * on {@code onCreate}/{@code onNewIntent}, per
+     * docs/specs/android-navigation.md's "Notification deep link" section.
+     * {@code FLAG_ACTIVITY_CLEAR_TOP | FLAG_ACTIVITY_SINGLE_TOP} route back
+     * into the single already-running {@code MainActivity} instance rather
+     * than stacking a duplicate.
+     *
+     * {@link AuthNotificationIntent} (`auth_required`) is simpler per
+     * notifications.md's "Actionability" section: "tapping opens the
+     * verification_uri in a Custom Tab, per DESIGN.md §6" — this uses a
+     * plain {@code ACTION_VIEW} browser {@code Intent} rather than a real
+     * {@code androidx.browser} {@code CustomTabsIntent}: no
+     * {@code androidx.browser} dependency is wired into this build yet (a
+     * real, tracked gap — see PLAN.md — not silently substituted), but
+     * {@code ACTION_VIEW} already delivers the substantive behavior this
+     * section requires: tapping shows the user {@code verificationUri} to
+     * act on, without ever routing through {@code MainActivity} at all.
+     */
+    private PendingIntent pendingIntentFor(RenderableNotification intent) {
+        int requestCode = notificationIdForKey(intent.key());
+        if (intent instanceof NotificationIntent waiting) {
+            Intent activityIntent = new Intent(context, MainActivity.class);
+            activityIntent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            for (Map.Entry<String, String> extra : NotificationDeepLink.extrasFor(waiting).entrySet()) {
+                activityIntent.putExtra(extra.getKey(), extra.getValue());
+            }
+            return PendingIntent.getActivity(context, requestCode, activityIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        }
+        if (intent instanceof AuthNotificationIntent auth) {
+            Intent viewIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(auth.verificationUri()));
+            viewIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            return PendingIntent.getActivity(context, requestCode, viewIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        }
+        throw new IllegalArgumentException("unknown RenderableNotification: " + intent);
     }
 
     @Override public void clear(String stableKey) {
