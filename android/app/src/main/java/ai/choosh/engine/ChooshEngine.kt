@@ -16,8 +16,21 @@ import kotlinx.serialization.Serializable
  * chooses which one the rest of the app sees.
  */
 interface ChooshEngine {
-    /** Starts a WebAuthn passkey registration ceremony. Returns creation-options JSON. */
-    suspend fun webauthnRegisterStart(): String
+    /**
+     * Starts a WebAuthn passkey registration ceremony. Returns creation-options JSON.
+     *
+     * `bootstrapSecret` is `relayd`'s `CHOOSH_RELAYD_BOOTSTRAP_SECRET`,
+     * scanned from the operator's `choosh-pair:v1:<secret>` pairing QR code
+     * (see [ai.choosh.connection.ConnectionScreen]) — since this app ships
+     * as a generic, reproducibly-built Obtainium APK, no per-installation
+     * secret can be a compile-time constant, so `relayd` now refuses to
+     * begin a registration ceremony at all without this header
+     * (`rust/choosh-relayd/src/webauthn.rs`'s `BOOTSTRAP_SECRET_HEADER`
+     * gate). This value is one-shot: callers MUST NOT persist it anywhere
+     * (no [ai.choosh.connection.SessionCredentialStore] write, no other
+     * storage) — it's used for this single call only.
+     */
+    suspend fun webauthnRegisterStart(bootstrapSecret: String): String
 
     /** Finishes registration with the Credential Manager response JSON; returns a [WebauthnResult]. */
     suspend fun webauthnRegisterFinish(credentialJson: String): WebauthnResult

@@ -11,6 +11,12 @@
 # window. `choosh-relayd` deploys are operator-triggered (`just deploy`), not
 # self-pushed over the relay (DESIGN.md §5 "Deployment"), so this script is
 # invoked by a human/CI job via SSM Run Command rather than by relayd itself.
+#
+# BOOTSTRAP_SECRET (CHOOSH_RELAYD_BOOTSTRAP_SECRET) is required, unlike
+# RP_ID/RP_ORIGIN: deploy-relayd.sh resolves it (from its own env var, or
+# else SSM Parameter Store /choosh/relayd/bootstrap-secret) and fails before
+# ever invoking this script if it can't get a non-empty value, so by the
+# time this script runs the value is guaranteed present and always written.
 set -euo pipefail
 
 INSTALL_DIR="/opt/choosh-relayd"
@@ -33,6 +39,9 @@ HEALTH_TIMEOUT_S=CHOOSH_DEPLOY_HEALTH_TIMEOUT_S
 # what that default is.
 RP_ID="CHOOSH_DEPLOY_RP_ID"
 RP_ORIGIN="CHOOSH_DEPLOY_RP_ORIGIN"
+# Required, non-empty by construction (see header comment above) — always
+# written to the unit below, unlike RP_ID/RP_ORIGIN's conditional extra_env.
+BOOTSTRAP_SECRET="CHOOSH_DEPLOY_BOOTSTRAP_SECRET"
 
 log() { printf '[deploy-relayd] %s\n' "$*"; }
 
@@ -80,13 +89,19 @@ Type=simple
 ExecStart=$BIN
 WorkingDirectory=$INSTALL_DIR
 Environment=CHOOSH_RELAYD_BIND=$BIND_ADDR
-Environment=CHOOSH_RELAYD_STATE_DIR=$STATE_DIR$extra_env
+Environment=CHOOSH_RELAYD_STATE_DIR=$STATE_DIR
+Environment=CHOOSH_RELAYD_BOOTSTRAP_SECRET=$BOOTSTRAP_SECRET$extra_env
 Restart=on-failure
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+# The unit now holds a real secret (previously it held none) — narrow its
+# readability. This box runs choosh-relayd as its sole root-run workload
+# (see comment above), so this alone is sufficient without a broader
+# service-user rework.
+chmod 600 "$UNIT_PATH"
 systemctl daemon-reload
 
 had_previous=0

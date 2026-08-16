@@ -57,6 +57,15 @@ fn connect_result_json(outcome: &str, message: Option<&str>) -> String {
 /// last-acknowledged sequence regardless of what this queue held onto.
 const AGENT_EVENT_QUEUE_CAPACITY: usize = 500;
 
+/// Mirrors `rust/choosh-relayd/src/webauthn.rs`'s `BOOTSTRAP_SECRET_HEADER`
+/// constant exactly (`"x-choosh-bootstrap-secret"`) — this crate doesn't
+/// depend on the `choosh-relayd` crate, so this is a deliberate duplicate of
+/// that literal, not an import, kept identical by convention (HTTP header
+/// names are case-insensitive, so a casing drift wouldn't even break this at
+/// runtime, but keeping the two literals textually identical avoids any
+/// confusion when reading the two crates side by side).
+const BOOTSTRAP_SECRET_HEADER: &str = "x-choosh-bootstrap-secret";
+
 pub struct Engine {
     http: reqwest::Client,
     http_base_url: String,
@@ -85,13 +94,23 @@ impl Engine {
         }
     }
 
-    async fn post_passthrough(&self, path: &str, body: Option<&str>) -> String {
+    /// `extra_header: Some((name, value))` adds one extra header to the
+    /// request before it's sent — currently only
+    /// [`Self::webauthn_register_start`]'s
+    /// [`BOOTSTRAP_SECRET_HEADER`]/`bootstrap_secret`, per
+    /// `rust/choosh-relayd/src/webauthn.rs`'s own `BOOTSTRAP_SECRET_HEADER`
+    /// gate on that one endpoint; every other passthrough call here passes
+    /// `None`.
+    async fn post_passthrough(&self, path: &str, body: Option<&str>, extra_header: Option<(&str, &str)>) -> String {
         let url = format!("{}{path}", self.http_base_url);
         let mut request = self.http.post(&url);
         request = match body {
             Some(body) => request.header("content-type", "application/json").body(body.to_string()),
             None => request.header("content-type", "application/json").body("{}"),
         };
+        if let Some((name, value)) = extra_header {
+            request = request.header(name, value);
+        }
         match request.send().await {
             Ok(response) => match response.text().await {
                 // Passed through verbatim whether relayd's own body was a
@@ -106,20 +125,29 @@ impl Engine {
         }
     }
 
-    pub async fn webauthn_register_start(&self) -> String {
-        self.post_passthrough("/webauthn/register/start", None).await
+    /// `bootstrap_secret` is sent as the [`BOOTSTRAP_SECRET_HEADER`] header,
+    /// per `rust/choosh-relayd/src/webauthn.rs`: since this app is
+    /// distributed as a generic, reproducibly-built Obtainium APK (no
+    /// per-installation secret can be a compile-time constant), `relayd`
+    /// now refuses to begin a registration ceremony at all unless the
+    /// caller presents `CHOOSH_RELAYD_BOOTSTRAP_SECRET` verbatim via this
+    /// header — the caller (ultimately [`ai.choosh.connection.ConnectionScreen`])
+    /// gets `bootstrap_secret` at pairing time from the operator's
+    /// `choosh-pair:v1:<secret>` QR code, never bakes it in.
+    pub async fn webauthn_register_start(&self, bootstrap_secret: &str) -> String {
+        self.post_passthrough("/webauthn/register/start", None, Some((BOOTSTRAP_SECRET_HEADER, bootstrap_secret))).await
     }
 
     pub async fn webauthn_register_finish(&self, credential_json: &str) -> String {
-        self.post_passthrough("/webauthn/register/finish", Some(credential_json)).await
+        self.post_passthrough("/webauthn/register/finish", Some(credential_json), None).await
     }
 
     pub async fn webauthn_login_start(&self) -> String {
-        self.post_passthrough("/webauthn/login/start", None).await
+        self.post_passthrough("/webauthn/login/start", None, None).await
     }
 
     pub async fn webauthn_login_finish(&self, credential_json: &str) -> String {
-        self.post_passthrough("/webauthn/login/finish", Some(credential_json)).await
+        self.post_passthrough("/webauthn/login/finish", Some(credential_json), None).await
     }
 
     /// Establishes the persistent relay connection, per auth-and-enrollment.md's
@@ -1050,16 +1078,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_start_passes_through_relayd_response_body() {
+    async fn register_start_passes_through_relayd_response_body_and_sends_the_bootstrap_secret_header() {
         let (listener, base_url) = bind_fake_relayd_http().await;
         let app = axum::Router::new().route(
             "/webauthn/register/start",
-            post(|| async { Json(json!({ "challenge": "abc123" })) }),
+            post(|headers: axum::http::HeaderMap| async move {
+                // The real assertion this test exists for: relayd now refuses to
+                // begin a registration ceremony at all unless this header is
+                // present with the exact secret the caller was given, per
+                // rust/choosh-relayd/src/webauthn.rs's BOOTSTRAP_SECRET_HEADER
+                // gate — this mock stands in for that gate to prove the header
+                // genuinely reaches the wire, not just that this method compiles.
+                assert_eq!(
+                    headers.get(BOOTSTRAP_SECRET_HEADER).and_then(|value| value.to_str().ok()),
+                    Some("test-bootstrap-secret"),
+                );
+                Json(json!({ "challenge": "abc123" }))
+            }),
         );
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let engine = Engine::new(base_url, "ws://unused".to_string());
-        let body = engine.webauthn_register_start().await;
+        let body = engine.webauthn_register_start("test-bootstrap-secret").await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["challenge"], "abc123");
     }
@@ -1086,7 +1126,7 @@ mod tests {
     #[tokio::test]
     async fn unreachable_relayd_is_a_json_error_not_a_panic() {
         let engine = Engine::new("http://127.0.0.1:1".to_string(), "ws://unused".to_string());
-        let body = engine.webauthn_register_start().await;
+        let body = engine.webauthn_register_start("test-bootstrap-secret").await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert!(parsed["error"].as_str().is_some());
     }

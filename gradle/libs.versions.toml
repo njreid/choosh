@@ -17,6 +17,9 @@ kotlinxCoroutines = "1.11.0"
 kotlinxSerializationJson = "1.9.0"
 googleServices = "4.4.4"
 firebaseBom = "34.5.0"
+# Google Play Services' Code Scanner (ML Kit) — no camera permission needed,
+# hosts its own scanner UI; backs ConnectionScreen's "Scan QR to pair" flow.
+gmsCodeScanner = "16.1.0"
 
 [libraries]
 junit4 = { module = "junit:junit", version.ref = "junit4" }
@@ -53,6 +56,7 @@ kotlinxCoroutinesPlayServices = { module = "org.jetbrains.kotlinx:kotlinx-corout
 kotlinxSerializationJson = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }
 firebaseBom = { module = "com.google.firebase:firebase-bom", version.ref = "firebaseBom" }
 firebaseMessaging = { module = "com.google.firebase:firebase-messaging" }
+gmsCodeScanner = { module = "com.google.android.gms:play-services-code-scanner", version.ref = "gmsCodeScanner" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

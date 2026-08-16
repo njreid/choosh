@@ -14,7 +14,7 @@
 //! authenticator) to build at all.
 //!
 //! Usage:
-//!   dev_cli enroll-token   <http_base_url> <ws_url> <session_file>
+//!   dev_cli enroll-token   <http_base_url> <ws_url> <session_file> <bootstrap_secret>
 //!   dev_cli list-devhosts  <ws_url> <session_file>
 //!   dev_cli create-workspace <ws_url> <session_file> <devhost_id> <workspace_name> <clone_url>
 //!   dev_cli create-item    <ws_url> <session_file> <workspace_id> <devhost_id> <name> <agent>
@@ -49,13 +49,17 @@ async fn main() {
 }
 
 async fn enroll_token(args: &[String]) -> Result<(), String> {
-    let [http_base_url, ws_url, session_file] = args else {
-        return Err("usage: enroll-token <http_base_url> <ws_url> <session_file>".to_string());
+    let [http_base_url, ws_url, session_file, bootstrap_secret] = args else {
+        return Err("usage: enroll-token <http_base_url> <ws_url> <session_file> <bootstrap_secret>".to_string());
     };
 
     let client = reqwest::Client::new();
     let creation_options_json = client
         .post(format!("{http_base_url}/webauthn/register/start"))
+        // relayd now refuses to begin a registration ceremony at all without this
+        // header, per rust/choosh-relayd/src/webauthn.rs's BOOTSTRAP_SECRET_HEADER
+        // gate — same header this crate's own Engine::webauthn_register_start sends.
+        .header("x-choosh-bootstrap-secret", bootstrap_secret)
         .send()
         .await
         .map_err(|error| format!("register/start request failed: {error}"))?

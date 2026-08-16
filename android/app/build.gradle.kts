@@ -121,6 +121,7 @@ dependencies {
 
     implementation(libs.soraEditor)
     implementation(libs.firebaseMessaging)
+    implementation(libs.gmsCodeScanner)
     implementation(libs.composeUi)
     implementation(libs.composeUiToolingPreview)
     implementation(libs.composeMaterial3)

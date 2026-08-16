@@ -35,8 +35,11 @@ class FakeChooshEngine : ChooshEngine {
     )
     private var workingCopyDescription = "merge A and B\n"
 
-    override suspend fun webauthnRegisterStart(): String {
+    override suspend fun webauthnRegisterStart(bootstrapSecret: String): String {
         delay(FAKE_LATENCY_MS)
+        // bootstrapSecret is ignored here, same as every other unused parameter
+        // this fake's other methods take (e.g. workspaceDiff's deviceId/workspaceId) —
+        // this fake has no relayd to gate, so there's nothing to verify it against.
         // Must be a well-formed WebAuthn PublicKeyCredentialCreationOptions JSON: androidx.credentials'
         // CreatePublicKeyCredentialRequest constructor validates this eagerly (before the ceremony even
         // starts) and throws IllegalArgumentException — uncaught by ConnectionScreen's

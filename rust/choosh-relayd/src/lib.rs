@@ -27,6 +27,7 @@ mod ca;
 mod fcm;
 #[cfg(test)]
 mod integration_tests;
+pub mod pair;
 mod rng;
 mod state;
 mod webauthn;

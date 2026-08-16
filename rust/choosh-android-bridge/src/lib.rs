@@ -110,8 +110,22 @@ fn native_init<'local>(env: &mut Env<'local>, _class: JClass<'local>, http_base_
     Ok(handle)
 }
 
-fn native_webauthn_register_start<'local>(env: &mut Env<'local>, _class: JClass<'local>, handle: jlong) -> Result<JString<'local>, jni::errors::Error> {
-    let body = with_handle(handle, error_json("unknown engine handle"), |h| h.runtime.block_on(h.engine.webauthn_register_start()));
+// `bootstrap_secret` stays `JString<'local>` by value to match
+// `native_method!`'s macro-generated wrapper — see `native_init`'s comment.
+// Scanned from the operator's `choosh-pair:v1:<secret>` QR code by
+// `ai.choosh.connection.ConnectionScreen`, never persisted — see
+// `Engine::webauthn_register_start`'s doc comment for the full "why".
+#[allow(clippy::needless_pass_by_value)]
+fn native_webauthn_register_start<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    bootstrap_secret: JString<'local>,
+) -> Result<JString<'local>, jni::errors::Error> {
+    let bootstrap_secret = jstring_to_string(env, &bootstrap_secret)?;
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| {
+        h.runtime.block_on(h.engine.webauthn_register_start(&bootstrap_secret))
+    });
     JString::new(env, body)
 }
 
@@ -546,7 +560,7 @@ const _INIT: jni::NativeMethod = native_method! {
 };
 const _REGISTER_START: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",
-    static extern fn NativeBridge::native_webauthn_register_start(handle: jlong) -> JString,
+    static extern fn NativeBridge::native_webauthn_register_start(handle: jlong, bootstrap_secret: JString) -> JString,
     fn = native_webauthn_register_start,
 };
 const _REGISTER_FINISH: jni::NativeMethod = native_method! {

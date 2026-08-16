@@ -65,10 +65,18 @@ class ConnectionViewModel(
         }
     }
 
-    /** Asks the engine for `WebAuthn` creation options to feed into Credential Manager. */
-    suspend fun beginRegistration(): String {
+    /**
+     * Asks the engine for `WebAuthn` creation options to feed into Credential
+     * Manager. `bootstrapSecret` is the pairing secret [ConnectionScreen]
+     * scanned from the operator's `choosh-pair:v1:<secret>` QR code — a
+     * one-shot local value passed straight through to
+     * [ChooshEngine.webauthnRegisterStart] and never persisted anywhere by
+     * this class (no [credentialStore] write, no other storage), per that
+     * method's own doc comment.
+     */
+    suspend fun beginRegistration(bootstrapSecret: String): String {
         _state.value = ConnectionUiState.Registering
-        return engine.webauthnRegisterStart()
+        return engine.webauthnRegisterStart(bootstrapSecret)
     }
 
     /** Hands Credential Manager's response back to the engine and, on success, connects. */
@@ -103,10 +111,13 @@ class ConnectionViewModel(
      * `runRegistrationCeremony` — self-contained here rather than split
      * across the screen/view-model boundary the way the real ceremony is,
      * since [DevPasskeyHooks.register] needs no `Activity` context.
+     * `bootstrapSecret` is threaded through to [beginRegistration] exactly
+     * like [ConnectionScreen]'s `runRegistrationCeremony` does for the real
+     * ceremony — see [beginRegistration]'s doc comment.
      */
-    fun registerWithDevPasskey() {
+    fun registerWithDevPasskey(bootstrapSecret: String) {
         viewModelScope.launch {
-            val creationOptionsJson = beginRegistration()
+            val creationOptionsJson = beginRegistration(bootstrapSecret)
             val result = runCatching { DevPasskeyHooks.register(creationOptionsJson) }
             result.fold(
                 onSuccess = ::finishRegistration,

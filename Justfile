@@ -47,5 +47,8 @@ release-bundle:
 
 # Ships choosh-relayd --release to an EC2 instance over SSM, restarts it,
 # health-checks it, and rolls back automatically on a failed health check.
+# Requires a WebAuthn bootstrap secret: set CHOOSH_RELAYD_BOOTSTRAP_SECRET,
+# or deploy-relayd.sh falls back to fetching one from SSM Parameter Store
+# (/choosh/relayd/bootstrap-secret) — it fails fast if neither is available.
 deploy INSTANCE REGION="us-east-1":
 	CARGO_TARGET_DIR={{env_var_or_default("CARGO_TARGET_DIR", "/tmp/choosh-target")}} ./scripts/deploy-relayd.sh "{{INSTANCE}}" "{{REGION}}"

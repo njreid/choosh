@@ -25,6 +25,16 @@
 #      0 only on CHOOSH_DEPLOY_RESULT=ok. Any rollback (successful or not)
 #      is a non-zero exit — deploy failed — but a successful rollback means
 #      the fleet is left on a working previous version, not disconnected.
+#
+# Bootstrap secret: choosh-relayd refuses all WebAuthn device registration
+# (503) unless CHOOSH_RELAYD_BOOTSTRAP_SECRET is set in its environment, so
+# every deploy must carry one through. This script resolves it (before the
+# slow cargo build) from the CHOOSH_RELAYD_BOOTSTRAP_SECRET env var if set,
+# else from SSM Parameter Store (/choosh/relayd/bootstrap-secret,
+# SecureString) — and fails fast, with no build/upload attempted, if neither
+# source produces a value. Unlike RP_ID/RP_ORIGIN this has no silent-omit
+# fallback: a missing bootstrap secret is always an error, never an empty
+# Environment= line.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -46,6 +56,27 @@ log() { printf '[deploy] %s\n' "$*" >&2; }
 fail() { printf '[deploy] FAILED: %s\n' "$*" >&2; exit 1; }
 
 command -v aws >/dev/null || fail "aws CLI is required"
+
+# Resolve the WebAuthn bootstrap secret before doing anything slow (build,
+# upload) so a missing secret fails fast. choosh-relayd hard-requires this
+# (503s all device registration without it) so — unlike RP_ID/RP_ORIGIN —
+# there is no silent-omit fallback here: an unset env var AND a failed/empty
+# SSM lookup is always a fatal error, not "write no Environment= line".
+bootstrap_secret="${CHOOSH_RELAYD_BOOTSTRAP_SECRET:-}"
+if [[ -z "$bootstrap_secret" ]]; then
+  log "CHOOSH_RELAYD_BOOTSTRAP_SECRET not set; looking up /choosh/relayd/bootstrap-secret in SSM Parameter Store ($region)"
+  # Check the command's actual exit code, not just its printed output: `aws`
+  # can emit "None" or an error message on stdout/stderr depending on the
+  # failure mode, and neither should be mistaken for a real secret value.
+  if bootstrap_secret=$(aws ssm get-parameter --name /choosh/relayd/bootstrap-secret \
+      --with-decryption --region "$region" --query Parameter.Value --output text 2>/dev/null); then
+    [[ "$bootstrap_secret" != "None" ]] || bootstrap_secret=""
+  else
+    bootstrap_secret=""
+  fi
+fi
+[[ -n "$bootstrap_secret" ]] || fail "no WebAuthn bootstrap secret available (choosh-relayd refuses all device registration without one): set CHOOSH_RELAYD_BOOTSTRAP_SECRET explicitly, or store one first with 'aws ssm put-parameter --name /choosh/relayd/bootstrap-secret --type SecureString --value <secret> --region $region'"
+log "bootstrap secret resolved (value not logged)"
 
 # Resolve instance-id-or-name to an instance ID.
 if [[ "$instance_arg" =~ ^i-[0-9a-f]+$ ]]; then
@@ -89,6 +120,7 @@ sed \
   -e "s|CHOOSH_DEPLOY_HEALTH_TIMEOUT_S|$(sed_escape "$health_timeout_s")|g" \
   -e "s|CHOOSH_DEPLOY_RP_ID|$(sed_escape "$rp_id")|g" \
   -e "s|CHOOSH_DEPLOY_RP_ORIGIN|$(sed_escape "$rp_origin")|g" \
+  -e "s|CHOOSH_DEPLOY_BOOTSTRAP_SECRET|$(sed_escape "$bootstrap_secret")|g" \
   "$root/scripts/deploy-relayd-remote.sh" > "$remote_script"
 
 b64=$(base64 -w0 "$remote_script")

@@ -68,8 +68,8 @@ class NativeChooshEngine : ChooshEngine {
 
     private val handle: Long = NativeBridge.nativeInit(BuildConfig.CHOOSH_RELAYD_HTTP_URL, BuildConfig.CHOOSH_RELAYD_URL)
 
-    override suspend fun webauthnRegisterStart(): String =
-        withContext(Dispatchers.IO) { NativeBridge.nativeWebauthnRegisterStart(handle) }
+    override suspend fun webauthnRegisterStart(bootstrapSecret: String): String =
+        withContext(Dispatchers.IO) { NativeBridge.nativeWebauthnRegisterStart(handle, bootstrapSecret) }
 
     override suspend fun webauthnRegisterFinish(credentialJson: String): WebauthnResult =
         withContext(Dispatchers.IO) { decodeWebauthnResult(NativeBridge.nativeWebauthnRegisterFinish(handle, credentialJson)) }
@@ -229,7 +229,10 @@ private object NativeBridge {
     // a real crash against the real .so before `@JvmStatic` was added
     // here). `@JvmStatic` is required on every one of these, not optional.
     @JvmStatic external fun nativeInit(httpBaseUrl: String, wsUrl: String): Long
-    @JvmStatic external fun nativeWebauthnRegisterStart(handle: Long): String
+    // `bootstrapSecret` is relayd's CHOOSH_RELAYD_BOOTSTRAP_SECRET, scanned
+    // from the operator's pairing QR code — see ChooshEngine.webauthnRegisterStart's
+    // doc comment for the full "why" and the "never persisted" contract.
+    @JvmStatic external fun nativeWebauthnRegisterStart(handle: Long, bootstrapSecret: String): String
     @JvmStatic external fun nativeWebauthnRegisterFinish(handle: Long, credentialJson: String): String
     @JvmStatic external fun nativeWebauthnLoginStart(handle: Long): String
     @JvmStatic external fun nativeWebauthnLoginFinish(handle: Long, credentialJson: String): String

@@ -17,6 +17,11 @@ ed25519-dalek = { version = "=3.0.0-rc.1", features = ["rand_core"] }
 futures-util = "0.3.34"
 getrandom = { version = "0.4.3", features = ["sys_rng"] }
 openssl = { version = "0.10.81", features = ["vendored"] }
+# QR rendering for the `pair` subcommand (`src/pair.rs`) — the
+# `render::unicode::Dense1x2` renderer is purpose-built for compact
+# terminal QR display. Default features pull in image/svg/pic rendering we
+# don't use; the unicode renderer needs none of that.
+qrcode = { version = "0.14.1", default-features = false }
 reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "=1.0.150"

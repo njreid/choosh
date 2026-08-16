@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive-icon background: a small ocean horizon behind the ship in
+  ic_launcher_foreground.xml. Full-bleed 108x108dp per the adaptive icon
+  spec (docs/AOSP "Adaptive icons") — the system mask crops this to
+  whatever shape the launcher uses, so it deliberately has no fine detail
+  near the edges.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#0E6BA8" android:pathData="M0,0h108v108h-108z" />
+    <path android:fillColor="#0B588C" android:pathData="M0,66h108v42h-108z" />
+    <path android:fillColor="#12C2E9" android:fillAlpha="0.35"
+        android:pathData="M0,60 C18,54 30,68 48,62 C66,56 78,70 108,60 L108,68 C78,78 66,64 48,70 C30,76 18,62 0,68 Z" />
+</vector>

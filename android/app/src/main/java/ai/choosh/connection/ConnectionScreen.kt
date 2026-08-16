@@ -12,7 +12,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -26,7 +29,21 @@ import androidx.credentials.exceptions.CreateCredentialException
 import androidx.credentials.exceptions.CreateCredentialInterruptedException
 import androidx.credentials.exceptions.CreateCredentialNoCreateOptionException
 import androidx.credentials.exceptions.CreateCredentialProviderConfigurationException
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+/**
+ * The literal prefix of a Choosh pairing QR code's raw scanned text —
+ * `choosh-pair:v1:<secret>`, printed by the operator-side `choosh-relayd
+ * pair` CLI subcommand. Fixed contract, not this app's to change: a scan
+ * that doesn't start with this exact prefix is rejected as "not a Choosh
+ * pairing code" rather than silently proceeding with garbage or failing
+ * unexplained.
+ */
+private const val PAIRING_QR_PREFIX = "choosh-pair:v1:"
 
 /**
  * Cold-start screen: triggers the passkey registration ceremony via Android
@@ -34,12 +51,25 @@ import kotlinx.coroutines.launch
  * the one place in the app that talks to `androidx.credentials` directly —
  * the ceremony needs an Activity context, which a `ViewModel` deliberately
  * doesn't hold (see that class's doc comment).
+ *
+ * [ConnectionUiState.NeedsRegistration] is a deliberately two-step affordance
+ * per the app's "no settings panel, just scan a QR code" pairing design:
+ * this app is a generic, reproducibly-built Obtainium APK with no
+ * per-installation secret baked in, so `relayd` now requires the operator's
+ * bootstrap secret (see `PAIRING_QR_PREFIX`'s doc comment) before it will
+ * even start a `WebAuthn` ceremony. Only after a successful scan does the
+ * "Set up with a passkey" button (and, in a debug build, the dev-passkey
+ * button) appear at all — the scanned secret is held purely in this
+ * composable's own [remember]ed state, never handed to [ConnectionViewModel]
+ * until the ceremony itself begins, and never persisted anywhere; backing
+ * out before finishing the ceremony just discards it on recomposition.
  */
 @Composable
 fun ConnectionScreen(viewModel: ConnectionViewModel, onConnected: () -> Unit) {
     val state by viewModel.state.collectAsState()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var bootstrapSecret by remember { mutableStateOf<String?>(null) }
 
     if (state is ConnectionUiState.Connected) {
         onConnected()
@@ -71,23 +101,56 @@ fun ConnectionScreen(viewModel: ConnectionViewModel, onConnected: () -> Unit) {
                 Text("Waiting for passkey…", modifier = Modifier.padding(top = 8.dp))
             }
             is ConnectionUiState.NeedsRegistration -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Button(
-                    modifier = Modifier.testTag("register-passkey-button"),
-                    onClick = {
-                        scope.launch {
-                            runRegistrationCeremony(context, viewModel)
-                        }
-                    },
-                ) { Text("Set up with a passkey") }
-                // See ai.choosh.connection.DevPasskeyHooks's doc comment: this
-                // branch is unreachable in a release build (`devPasskeyAvailable`
-                // is a compile-time-fixed `false` there), not just hidden by a
-                // runtime check.
-                if (viewModel.devPasskeyAvailable) {
+                val secret = bootstrapSecret
+                if (secret == null) {
                     Button(
-                        modifier = Modifier.testTag("dev-passkey-button").padding(top = 8.dp),
-                        onClick = viewModel::registerWithDevPasskey,
-                    ) { Text("Dev: register without a platform passkey") }
+                        modifier = Modifier.testTag("scan-pairing-qr-button"),
+                        onClick = {
+                            scope.launch {
+                                val scanned = try {
+                                    scanPairingQrCode(context)
+                                } catch (cancellation: kotlinx.coroutines.CancellationException) {
+                                    // This coroutine's own structured-concurrency cancellation
+                                    // (e.g. leaving composition mid-scan) — MUST propagate, never
+                                    // be mistaken for a genuine scanner failure below.
+                                    throw cancellation
+                                } catch (failure: Exception) {
+                                    Log.w("ConnectionScreen", "pairing QR scan failed", failure)
+                                    viewModel.onRegistrationCancelledOrFailed("Couldn't scan the pairing QR code: ${failure.message}")
+                                    return@launch
+                                }
+                                if (scanned == null) {
+                                    // The user backed out of the scanner without completing a scan —
+                                    // not an error, just stay on this same "Scan QR to pair" button.
+                                    return@launch
+                                }
+                                if (scanned.startsWith(PAIRING_QR_PREFIX)) {
+                                    bootstrapSecret = scanned.removePrefix(PAIRING_QR_PREFIX)
+                                } else {
+                                    viewModel.onRegistrationCancelledOrFailed("That QR code doesn't look like a Choosh pairing code.")
+                                }
+                            }
+                        },
+                    ) { Text("Scan QR to pair") }
+                } else {
+                    Button(
+                        modifier = Modifier.testTag("register-passkey-button"),
+                        onClick = {
+                            scope.launch {
+                                runRegistrationCeremony(context, viewModel, secret)
+                            }
+                        },
+                    ) { Text("Set up with a passkey") }
+                    // See ai.choosh.connection.DevPasskeyHooks's doc comment: this
+                    // branch is unreachable in a release build (`devPasskeyAvailable`
+                    // is a compile-time-fixed `false` there), not just hidden by a
+                    // runtime check.
+                    if (viewModel.devPasskeyAvailable) {
+                        Button(
+                            modifier = Modifier.testTag("dev-passkey-button").padding(top = 8.dp),
+                            onClick = { viewModel.registerWithDevPasskey(secret) },
+                        ) { Text("Dev: register without a platform passkey") }
+                    }
                 }
             }
             is ConnectionUiState.Error -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -97,10 +160,16 @@ fun ConnectionScreen(viewModel: ConnectionViewModel, onConnected: () -> Unit) {
                     modifier = Modifier.testTag("connection-error").padding(bottom = 16.dp),
                 )
                 Button(onClick = viewModel::retry) { Text("Try again") }
-                if (viewModel.devPasskeyAvailable) {
+                // Only offered once a pairing secret is actually held (e.g. this
+                // Error followed a failed ceremony after a successful QR scan) —
+                // an Error reached via a plain connect/transport failure, or an
+                // invalid-QR rejection before any secret was ever scanned, has no
+                // secret to register with, so this button stays hidden rather than
+                // calling registerWithDevPasskey with nothing meaningful to send.
+                if (viewModel.devPasskeyAvailable && bootstrapSecret != null) {
                     Button(
                         modifier = Modifier.testTag("dev-passkey-button").padding(top = 8.dp),
-                        onClick = viewModel::registerWithDevPasskey,
+                        onClick = { viewModel.registerWithDevPasskey(bootstrapSecret!!) },
                     ) { Text("Dev: register without a platform passkey") }
                 }
             }
@@ -109,8 +178,33 @@ fun ConnectionScreen(viewModel: ConnectionViewModel, onConnected: () -> Unit) {
     }
 }
 
-private suspend fun runRegistrationCeremony(context: android.content.Context, viewModel: ConnectionViewModel) {
-    val creationOptionsJson = viewModel.beginRegistration()
+/**
+ * Opens Google Play Services' Code Scanner (`GmsBarcodeScanning`) — no
+ * camera permission needed, hosts its own scanner UI — and returns the
+ * scanned barcode's raw text, or `null` if the user backed out of the
+ * scanner without completing a scan. A genuine scanner failure (as opposed
+ * to a user cancel) is rethrown, matching this screen's existing
+ * `CreateCredentialException`-only `try`/`catch` precedent in
+ * [runRegistrationCeremony] of only swallowing the specific "the user
+ * didn't complete this" case, not every possible failure. A manual
+ * [suspendCancellableCoroutine] wrapper (rather than this project's already-present
+ * `kotlinx-coroutines-play-services` `Task.await()` extension) is used
+ * deliberately: `Task.await()` surfaces a cancelled `Task` as a
+ * `CancellationException`, which is awkward to distinguish from this
+ * coroutine's own structured-concurrency cancellation — resuming the
+ * continuation with a plain `null` here keeps "user cancelled the scan"
+ * an ordinary, unambiguous return value instead.
+ */
+private suspend fun scanPairingQrCode(context: android.content.Context): String? = suspendCancellableCoroutine { continuation ->
+    val scanner = GmsBarcodeScanning.getClient(context)
+    scanner.startScan()
+        .addOnSuccessListener { barcode -> continuation.resume(barcode.rawValue) }
+        .addOnCanceledListener { continuation.resume(null) }
+        .addOnFailureListener { failure -> continuation.resumeWithException(failure) }
+}
+
+private suspend fun runRegistrationCeremony(context: android.content.Context, viewModel: ConnectionViewModel, bootstrapSecret: String) {
+    val creationOptionsJson = viewModel.beginRegistration(bootstrapSecret)
     val credentialManager = CredentialManager.create(context)
     try {
         val response: CreateCredentialResponse = credentialManager.createCredential(
