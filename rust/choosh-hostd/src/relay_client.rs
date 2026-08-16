@@ -96,3 +96,174 @@ pub(crate) async fn connect_authenticated(relay_url: &str, credential: &Credenti
 pub(crate) fn new_request_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use choosh_protocol::relay::{AuthFailed, AuthOk, IdentityClass, MAX_CONTROL_FRAME_BYTES};
+    use choosh_protocol::framing::encode_frame;
+    use ed25519_dalek::SigningKey;
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    fn fake_credential() -> Credential {
+        let signing_key = SigningKey::generate(&mut rand::rng());
+        Credential::new("laptop-1".to_string(), "fake-cert".to_string(), &signing_key)
+    }
+
+    async fn bind_fake_relayd() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, format!("ws://{addr}/connect"))
+    }
+
+    async fn send_control<T: serde::Serialize>(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, value: &T) {
+        let mut payload = vec![FRAME_CLASS_CONTROL];
+        payload.extend(serde_json::to_vec(value).unwrap());
+        let framed = encode_frame(&payload, MAX_CONTROL_FRAME_BYTES).unwrap();
+        ws.send(Message::Binary(framed.into())).await.unwrap();
+    }
+
+    /// `dial` against a `127.0.0.1` port nothing is listening on must
+    /// surface as a [`RelayClientError::Transport`], not a panic or a hang
+    /// — `connect_async` itself performs the TCP connect, so a refused
+    /// connection has to unwrap cleanly through our `map_err`.
+    #[tokio::test]
+    async fn dial_returns_a_transport_error_when_the_connection_is_refused() {
+        // Bind a listener just to reserve a free port, then drop it
+        // immediately so nothing is listening there once we dial it —
+        // guarantees a connection-refused rather than racing a real
+        // service that might happen to be on some fixed port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let result = dial(&format!("ws://{addr}/connect")).await;
+
+        match result {
+            Err(RelayClientError::Transport(_)) => {}
+            Err(other) => panic!("expected Transport error, got a different error: {other:?}"),
+            Ok(_) => panic!("expected Transport error, got Ok(channel) for a connection nothing was listening on"),
+        }
+    }
+
+    /// When `relayd` answers the signed challenge with `AuthResult::Failed`,
+    /// `connect_authenticated` must surface that as
+    /// `RelayClientError::AuthFailed` carrying `relayd`'s exact reason
+    /// string, not panic or silently return `Ok`.
+    #[tokio::test]
+    async fn connect_authenticated_surfaces_auth_failed_with_relayds_reason() {
+        let (listener, relay_url) = bind_fake_relayd().await;
+
+        let client_fut = async {
+            let credential = fake_credential();
+            connect_authenticated(&relay_url, &credential).await
+        };
+        let server_fut = async {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = ServerHello { nonce: "test-nonce".to_string() };
+            send_control(&mut ws, &hello).await;
+            let _client_auth: serde_json::Value = {
+                let mut decoder = choosh_protocol::framing::FrameDecoder::new(choosh_protocol::framing::FrameLimits::new(MAX_CONTROL_FRAME_BYTES, 4).unwrap());
+                loop {
+                    let Some(Ok(Message::Binary(bytes))) = futures_util::StreamExt::next(&mut ws).await else { panic!("expected a binary control message") };
+                    let frames = decoder.feed(&bytes).unwrap();
+                    if let Some(frame) = frames.into_iter().next() {
+                        let (_class, body) = frame.split_first().unwrap();
+                        break serde_json::from_slice(body).unwrap();
+                    }
+                }
+            };
+            send_control(&mut ws, &AuthResult::Failed(AuthFailed { reason: "device revoked".to_string() })).await;
+        };
+
+        let (result, ()) = tokio::join!(client_fut, server_fut);
+
+        match result {
+            Err(RelayClientError::AuthFailed(reason)) => assert_eq!(reason, "device revoked"),
+            Err(other) => panic!("expected AuthFailed(\"device revoked\"), got a different error: {other:?}"),
+            Ok(_) => panic!("expected AuthFailed(\"device revoked\"), got Ok(channel) despite relayd rejecting the device"),
+        }
+    }
+
+    /// If whatever answers first isn't a `ServerHello` at all (some other
+    /// control message shape), `connect_authenticated`'s `channel.recv()`
+    /// must fail deserializing it and return a
+    /// `RelayClientError::Transport`, not panic — this is the "malformed
+    /// first message" case: a peer that isn't a well-behaved `relayd`.
+    #[tokio::test]
+    async fn connect_authenticated_handles_a_malformed_first_message_without_panicking() {
+        let (listener, relay_url) = bind_fake_relayd().await;
+
+        let client_fut = async {
+            let credential = fake_credential();
+            connect_authenticated(&relay_url, &credential).await
+        };
+        let server_fut = async {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            // Send something that is neither `ServerHello` nor any other
+            // expected shape in place of the handshake's first message.
+            send_control(&mut ws, &AuthResult::Ok(AuthOk { identity_class: IdentityClass::LaptopProxy, device_id: "laptop-1".to_string() })).await;
+        };
+
+        let (result, ()) = tokio::join!(client_fut, server_fut);
+
+        match result {
+            Err(RelayClientError::Transport(_)) => {}
+            Err(other) => panic!("expected Transport error on a malformed first message, got a different error: {other:?}"),
+            Ok(_) => panic!("expected Transport error on a malformed first message, got Ok(channel)"),
+        }
+    }
+
+    /// Once past a valid `ServerHello`, a second message that isn't a valid
+    /// `AuthResult` (garbage JSON in the right shape to arrive, but not
+    /// deserializable as `AuthResult`) must likewise fail cleanly rather
+    /// than panicking the client.
+    #[tokio::test]
+    async fn connect_authenticated_handles_a_malformed_auth_response_without_panicking() {
+        let (listener, relay_url) = bind_fake_relayd().await;
+
+        let client_fut = async {
+            let credential = fake_credential();
+            connect_authenticated(&relay_url, &credential).await
+        };
+        let server_fut = async {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = ServerHello { nonce: "test-nonce".to_string() };
+            send_control(&mut ws, &hello).await;
+            let _client_auth: serde_json::Value = {
+                let mut decoder = choosh_protocol::framing::FrameDecoder::new(choosh_protocol::framing::FrameLimits::new(MAX_CONTROL_FRAME_BYTES, 4).unwrap());
+                loop {
+                    let Some(Ok(Message::Binary(bytes))) = futures_util::StreamExt::next(&mut ws).await else { panic!("expected a binary control message") };
+                    let frames = decoder.feed(&bytes).unwrap();
+                    if let Some(frame) = frames.into_iter().next() {
+                        let (_class, body) = frame.split_first().unwrap();
+                        break serde_json::from_slice(body).unwrap();
+                    }
+                }
+            };
+            // Not an `AuthResult` shape at all.
+            send_control(&mut ws, &serde_json::json!({ "unexpected": "shape" })).await;
+        };
+
+        let (result, ()) = tokio::join!(client_fut, server_fut);
+
+        match result {
+            Err(RelayClientError::Transport(_)) => {}
+            Err(other) => panic!("expected Transport error on a malformed auth response, got a different error: {other:?}"),
+            Ok(_) => panic!("expected Transport error on a malformed auth response, got Ok(channel)"),
+        }
+    }
+
+    /// Not exhaustive uniqueness proof, just a sanity check that repeated
+    /// calls don't collide or degenerate to a constant.
+    #[test]
+    fn new_request_id_produces_distinct_values_across_repeated_calls() {
+        let ids: Vec<String> = (0..100).map(|_| new_request_id()).collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "expected all 100 generated ids to be distinct");
+    }
+}

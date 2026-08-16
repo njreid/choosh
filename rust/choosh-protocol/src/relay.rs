@@ -694,13 +694,105 @@ mod tests {
 
     #[test]
     fn control_request_variants_carry_request_id() {
+        // Every `ControlRequest` variant, not just a representative subset —
+        // `impl_request_id!`'s match is compile-checked exhaustive, but this
+        // pins down the observable accessor behavior for each of the 9
+        // variants individually, the same discipline as a hand-written match.
+        assert_eq!(
+            ControlRequest::Enroll {
+                request_id: "id".to_string(),
+                token: "tok".to_string(),
+                identity_class: IdentityClass::Devhost,
+                public_key: "cHVi".to_string(),
+                host_ssh_public_key: None,
+                alias: None,
+                platform: None,
+                account_label: None,
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            ControlRequest::RequestEnrollmentToken {
+                request_id: "id".to_string(),
+                identity_class: IdentityClass::Phone,
+            }
+            .request_id(),
+            "id"
+        );
         assert_eq!(
             ControlRequest::ListDevhosts { request_id: "id".to_string() }.request_id(),
             "id"
         );
         assert_eq!(
+            ControlRequest::ListDevhostSshEndpoints { request_id: "id".to_string() }.request_id(),
+            "id"
+        );
+        assert_eq!(
+            ControlRequest::OpenTunnel {
+                request_id: "id".to_string(),
+                target_device_id: "dev-1".to_string(),
+                purpose: "rpc".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            ControlRequest::AgentEvent {
+                request_id: "id".to_string(),
+                event: WireAgentEvent::TurnCompleted {
+                    workspace_id: "ws-1".to_string(),
+                    item_id: "item-1".to_string(),
+                },
+                sequence: Some(1),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            ControlRequest::RegisterFcmToken { request_id: "id".to_string(), fcm_token: "tok".to_string() }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
             ControlRequest::RevokeDevice { request_id: "id".to_string(), device_id: "dev-1".to_string() }
                 .request_id(),
+            "id"
+        );
+        assert_eq!(
+            ControlRequest::RevokePhoneSession {
+                request_id: "id".to_string(),
+                device_id: "phone-1".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+    }
+
+    #[test]
+    fn enroll_ok_request_enrollment_token_ok_and_list_devhosts_ok_carry_request_id() {
+        // The remaining `ControlResponse` variants no other test's
+        // `.request_id()` assertion happens to cover.
+        assert_eq!(
+            ControlResponse::EnrollOk {
+                request_id: "id".to_string(),
+                device_id: "dev-1".to_string(),
+                certificate: "Y2Vy".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            ControlResponse::RequestEnrollmentTokenOk {
+                request_id: "id".to_string(),
+                token: "tok".to_string(),
+                expires_at: "2026-08-14T00:15:00Z".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            ControlResponse::ListDevhostsOk { request_id: "id".to_string(), devhosts: vec![] }.request_id(),
             "id"
         );
     }

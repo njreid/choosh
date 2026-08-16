@@ -566,4 +566,231 @@ mod tests {
         };
         assert_eq!(response.request_id(), "id");
     }
+
+    #[test]
+    fn every_rpc_request_variant_carries_request_id_part_one() {
+        // `impl_request_id!`'s match is compile-checked exhaustive, but
+        // before this test only `WorkspaceCreate` (covered above),
+        // `ProjectList`, and `ProjectSetPrimaryWorkspace` (both covered only
+        // via their *response*, not the request itself) had any
+        // `.request_id()` assertion — the other 13 of 16 variants had none.
+        // Split across two tests (part one/two) to stay under this crate's
+        // function-length lint rather than suppress it.
+        assert_eq!(RpcRequest::WorkspaceList { request_id: "id".to_string() }.request_id(), "id");
+        assert_eq!(
+            RpcRequest::WorkspaceStatus { request_id: "id".to_string(), workspace_id: "ws-1".to_string() }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::WorkspaceTreeList {
+                request_id: "id".to_string(),
+                workspace_id: "ws-1".to_string(),
+                path_prefix: String::new(),
+                revision: None,
+                cursor: None,
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::WorkspaceFileRead {
+                request_id: "id".to_string(),
+                workspace_id: "ws-1".to_string(),
+                path: "src/main.rs".to_string(),
+                revision: None,
+                range: Some(ByteRange { offset: 0, length: 10 }),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::ItemCreate {
+                request_id: "id".to_string(),
+                workspace_id: "ws-1".to_string(),
+                item_type: ItemType::Shell,
+                name: "shell-1".to_string(),
+                agent: None,
+                command: None,
+                port: None,
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::ItemList { request_id: "id".to_string(), workspace_id: "ws-1".to_string() }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::ItemStop { request_id: "id".to_string(), item_id: "item-1".to_string() }.request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::WorkspaceDiff {
+                request_id: "id".to_string(),
+                workspace_id: "ws-1".to_string(),
+                from: None,
+                to: None,
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::WorkspaceLog {
+                request_id: "id".to_string(),
+                workspace_id: "ws-1".to_string(),
+                revset: None,
+                limit: 10,
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::WorkspaceOpLog {
+                request_id: "id".to_string(),
+                workspace_id: "ws-1".to_string(),
+                limit: 10,
+            }
+            .request_id(),
+            "id"
+        );
+    }
+
+    #[test]
+    fn every_rpc_request_variant_carries_request_id_part_two() {
+        assert_eq!(
+            RpcRequest::WorkspaceOpUndo {
+                request_id: "id".to_string(),
+                workspace_id: "ws-1".to_string(),
+                op_id: "op-1".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::WorkspaceOpRestore {
+                request_id: "id".to_string(),
+                workspace_id: "ws-1".to_string(),
+                op_id: "op-1".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::WorkspaceFileWrite {
+                request_id: "id".to_string(),
+                workspace_id: "ws-1".to_string(),
+                path: "src/main.rs".to_string(),
+                base_revision: "rev-1".to_string(),
+                content_base64: "aGk=".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(RpcRequest::ProjectList { request_id: "id".to_string() }.request_id(), "id");
+        assert_eq!(
+            RpcRequest::ProjectSetPrimaryWorkspace {
+                request_id: "id".to_string(),
+                project_id: "proj-1".to_string(),
+                workspace_id: "ws-1".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+    }
+
+    #[test]
+    fn every_rpc_response_variant_carries_request_id() {
+        // Same gap as `every_rpc_request_variant_carries_request_id`, on the
+        // response side: before this test only `ProjectListOk`,
+        // `ProjectSetPrimaryWorkspaceOk`, and `Error` had a `.request_id()`
+        // assertion, leaving 15 of 18 variants unchecked.
+        assert_eq!(
+            RpcResponse::WorkspaceCreateOk {
+                request_id: "id".to_string(),
+                workspace_id: "ws-1".to_string(),
+                workspace_name: "app".to_string(),
+                project_id: "proj-1".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::WorkspaceListOk { request_id: "id".to_string(), workspaces: vec![] }.request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::WorkspaceStatusOk { request_id: "id".to_string(), changed: vec![], conflicted: vec![] }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::WorkspaceTreeListOk { request_id: "id".to_string(), entries: vec![], next_cursor: None }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::WorkspaceFileReadOk {
+                request_id: "id".to_string(),
+                content_base64: "aGk=".to_string(),
+                total_size: 2,
+                revision: "rev-1".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::ItemCreateOk {
+                request_id: "id".to_string(),
+                item_id: "item-1".to_string(),
+                item_type: ItemType::Shell,
+                name: "shell-1".to_string(),
+                tab_target: "tab-1".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::ItemListOk { request_id: "id".to_string(), items: vec![] }.request_id(),
+            "id"
+        );
+        assert_eq!(RpcResponse::ItemStopOk { request_id: "id".to_string() }.request_id(), "id");
+        assert_eq!(
+            RpcResponse::WorkspaceDiffOk { request_id: "id".to_string(), files: vec![] }.request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::WorkspaceLogOk { request_id: "id".to_string(), changes: vec![] }.request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::WorkspaceOpLogOk { request_id: "id".to_string(), operations: vec![] }.request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::WorkspaceOpUndoOk { request_id: "id".to_string(), new_op_id: "op-2".to_string() }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::WorkspaceOpRestoreOk { request_id: "id".to_string(), new_op_id: "op-2".to_string() }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::WorkspaceFileWriteOk { request_id: "id".to_string(), revision: "rev-2".to_string() }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::WorkspaceFileWriteStale {
+                request_id: "id".to_string(),
+                current_revision: "rev-2".to_string(),
+                current_content_base64: "aGk=".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+    }
 }

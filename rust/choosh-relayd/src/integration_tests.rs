@@ -1124,10 +1124,16 @@ async fn revoking_an_unknown_device_id_returns_a_typed_error() {
 
     send_control(&mut phone, &ControlRequest::RevokeDevice { request_id: "r".to_string(), device_id: "dev-does-not-exist".to_string() }).await;
     let response: ControlResponse = recv_control(&mut phone).await;
-    assert!(
-        matches!(&response, ControlResponse::Error { code, .. } if code == "unknown_device"),
-        "revoking a never-enrolled device_id must fail with a typed error, got {response:?}"
-    );
+    let ControlResponse::Error { code, message, .. } = &response else {
+        panic!("revoking a never-enrolled device_id must fail with a typed error, got {response:?}");
+    };
+    assert_eq!(code, "unknown_device");
+    // `revoke_response` (shared with `revoke-phone-session`, below) reports
+    // the same `unknown_device` code for both capabilities but an
+    // operation-specific `message` — pinning the exact text here catches a
+    // regression that swaps the two call sites' messages, which the `code`
+    // check alone cannot, since both call sites' `code` is identical.
+    assert_eq!(message, "no enrolled device with this device_id");
 }
 
 /// The phone-session analogue of `revoking_a_device_closes_its_live_connection_immediately`:
@@ -1189,10 +1195,14 @@ async fn revoking_an_unknown_phone_session_device_id_returns_a_typed_error() {
 
     send_control(&mut phone, &ControlRequest::RevokePhoneSession { request_id: "r".to_string(), device_id: "phone-does-not-exist".to_string() }).await;
     let response: ControlResponse = recv_control(&mut phone).await;
-    assert!(
-        matches!(&response, ControlResponse::Error { code, .. } if code == "unknown_device"),
-        "revoking a device_id with no recorded phone session must fail with a typed error, got {response:?}"
-    );
+    let ControlResponse::Error { code, message, .. } = &response else {
+        panic!("revoking a device_id with no recorded phone session must fail with a typed error, got {response:?}");
+    };
+    assert_eq!(code, "unknown_device");
+    // See the matching assertion in `revoking_an_unknown_device_id_returns_a_typed_error`
+    // above: same rationale, opposite call site — this message must be the
+    // `revoke-phone-session`-specific text, not `revoke-device`'s.
+    assert_eq!(message, "no phone session recorded for this device_id");
 }
 
 /// relay-protocol.md's "Errors and backpressure": control-frame requests

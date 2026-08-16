@@ -66,6 +66,44 @@ private class UnboundedTreeListChooshEngine(private val delegate: ChooshEngine =
     }
 }
 
+/**
+ * [ChooshEngine] wrapper whose `workspace.tree.list` returns exactly
+ * [totalPages] one-entry pages before `nextCursor` finally comes back
+ * `null` — unlike [UnboundedTreeListChooshEngine] (which never terminates),
+ * this exercises the exact boundary of
+ * [ExplorerViewModel.MAX_TREE_LIST_PAGES]: a directory whose page count is
+ * exactly the cap must terminate normally (not truncated), while one page
+ * over the cap must stop at the cap and report truncated.
+ */
+private class FixedPageCountTreeListChooshEngine(private val totalPages: Int, private val delegate: ChooshEngine = FakeChooshEngine()) : ChooshEngine by delegate {
+    override suspend fun workspaceTreeList(deviceId: String, workspaceId: String, pathPrefix: String, cursor: String?): WorkspaceTreeListResult {
+        val pageIndex = cursor?.toIntOrNull() ?: 0
+        val isLastPage = pageIndex + 1 >= totalPages
+        return WorkspaceTreeListResult(
+            entries = listOf(TreeEntry("page-$pageIndex.txt", TreeEntryKind.FILE, conflicted = false)),
+            nextCursor = if (isLastPage) null else (pageIndex + 1).toString(),
+        )
+    }
+}
+
+/**
+ * [ChooshEngine] wrapper whose `workspace.tree.list` succeeds for the first
+ * few pages of a directory, then throws when asked for page [failOnPage]
+ * (1-indexed) — exercises [ExplorerViewModel.loadTree]'s handling of a
+ * page-fetch failing partway through a multi-page directory, not just on
+ * the very first call.
+ */
+private class FailingPartwayThroughTreeListChooshEngine(private val failOnPage: Int, private val delegate: ChooshEngine = FakeChooshEngine()) : ChooshEngine by delegate {
+    override suspend fun workspaceTreeList(deviceId: String, workspaceId: String, pathPrefix: String, cursor: String?): WorkspaceTreeListResult {
+        val pageIndex = cursor?.toIntOrNull() ?: 0
+        if (pageIndex + 1 == failOnPage) error("simulated failure on page $failOnPage")
+        return WorkspaceTreeListResult(
+            entries = listOf(TreeEntry("page-$pageIndex.txt", TreeEntryKind.FILE, conflicted = false)),
+            nextCursor = (pageIndex + 1).toString(),
+        )
+    }
+}
+
 @OptIn(ExperimentalCoroutinesApi::class)
 class ExplorerViewModelTest {
 
@@ -356,4 +394,65 @@ class ExplorerViewModelTest {
         assertEquals(ExplorerViewModel.MAX_TREE_LIST_PAGES, tree.entries.size)
         assertTrue("hitting the pagination cap must be surfaced as a partial result, not silently truncated", tree.truncated)
     }
+
+    @Test
+    fun `a directory whose page count exactly equals the cap is not marked truncated`() = runTest(mainDispatcherRule.dispatcher) {
+        val viewModel = ExplorerViewModel(
+            FixedPageCountTreeListChooshEngine(totalPages = ExplorerViewModel.MAX_TREE_LIST_PAGES),
+            deviceId = "dev-1",
+            workspaceId = "ws-1",
+        )
+        advanceUntilIdle()
+
+        val tree = viewModel.state.value.tree
+        assertNull(tree.error)
+        assertEquals(ExplorerViewModel.MAX_TREE_LIST_PAGES, tree.entries.size)
+        assertFalse(
+            "a directory that terminates exactly at the cap (nextCursor null on the last page) genuinely " +
+                "has no more entries, so it must NOT be reported as truncated",
+            tree.truncated,
+        )
+    }
+
+    @Test
+    fun `a directory one page over the cap stops at the cap and is marked truncated`() = runTest(mainDispatcherRule.dispatcher) {
+        val viewModel = ExplorerViewModel(
+            FixedPageCountTreeListChooshEngine(totalPages = ExplorerViewModel.MAX_TREE_LIST_PAGES + 1),
+            deviceId = "dev-1",
+            workspaceId = "ws-1",
+        )
+        advanceUntilIdle()
+
+        val tree = viewModel.state.value.tree
+        assertNull(tree.error)
+        assertEquals(
+            "the (cap + 1)th page must never actually be fetched",
+            ExplorerViewModel.MAX_TREE_LIST_PAGES,
+            tree.entries.size,
+        )
+        assertTrue("one page beyond the cap genuinely has unfetched entries, so it must be reported as truncated", tree.truncated)
+    }
+
+    @Test
+    fun `a page fetch failing partway through a multi-page directory surfaces an error without hanging or crashing`() =
+        runTest(mainDispatcherRule.dispatcher) {
+            val viewModel = ExplorerViewModel(
+                FailingPartwayThroughTreeListChooshEngine(failOnPage = 3),
+                deviceId = "dev-1",
+                workspaceId = "ws-1",
+            )
+            advanceUntilIdle()
+
+            val tree = viewModel.state.value.tree
+            assertFalse("a mid-pagination failure must not leave the tree stuck loading", tree.isLoading)
+            assertTrue(
+                "the failure on page 3 must surface as an error",
+                tree.error?.contains("simulated failure on page 3") == true,
+            )
+            assertTrue(
+                "entries fetched from the two successful pages before the failure must not be surfaced " +
+                    "as if they were a complete (or trustworthy partial) result",
+                tree.entries.isEmpty(),
+            )
+        }
 }

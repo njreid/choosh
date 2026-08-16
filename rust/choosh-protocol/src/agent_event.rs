@@ -547,6 +547,50 @@ mod tests {
     }
 
     #[test]
+    fn rejects_correct_prefix_with_a_malformed_uuid_body() {
+        // A *right* prefix paired with a body that merely looks UUID-ish is
+        // the case none of the other malformed-context tests exercise: they
+        // cover a missing prefix (bare UUID) and a wrong-case body, but not
+        // a right prefix over a body that fails the dash/hex-digit shape
+        // check itself.
+        for workspace_id in [
+            // Right prefix, empty body.
+            "ws-",
+            // Right prefix, a non-hex character in the body.
+            "ws-1111111g-1111-4111-8111-111111111111",
+            // Right prefix, still 36 bytes and every byte a hex digit, but
+            // the dash positions are hex digits instead of `-` (exercises
+            // the dash-position check specifically, not just length/hex).
+            "ws-11111111a1111a4111a8111a111111111111",
+            // Right prefix, a real UUID with one extra trailing character.
+            "ws-11111111-1111-4111-8111-1111111111111",
+        ] {
+            let malformed = AdapterContext { workspace_id, ..context(AgentAdapter::Codex) };
+            assert_eq!(
+                normalize_codex(&malformed, &hook("Stop")),
+                Err(ValidationError::InvalidWorkspaceId),
+                "expected {workspace_id:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_valid_uuid_carrying_a_different_fields_prefix() {
+        // A real UUID body is present and well-formed, but under the wrong
+        // field's prefix entirely (an `item-` ID supplied as the workspace
+        // ID) — distinct from `rejects_correct_prefix_with_a_malformed_uuid_body`,
+        // which keeps the right prefix and breaks the body.
+        let wrong_prefix = AdapterContext {
+            workspace_id: "item-11111111-1111-4111-8111-111111111111",
+            ..context(AgentAdapter::Codex)
+        };
+        assert_eq!(
+            normalize_codex(&wrong_prefix, &hook("Stop")),
+            Err(ValidationError::InvalidWorkspaceId)
+        );
+    }
+
+    #[test]
     fn rejects_oversized_and_unknown_captures_before_copying_payload() {
         let oversized = CapturedHook {
             surface: "canary-secret",

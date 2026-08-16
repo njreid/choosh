@@ -1176,8 +1176,9 @@ pub async fn dev_mint_enrollment_token(State(state): State<Arc<AppState>>) -> im
 
 #[cfg(test)]
 mod tests {
-    use super::{RateLimiter, Tunnel, expired_tunnel_ids};
+    use super::{RateLimiter, Tunnel, expired_tunnel_ids, revoke_response};
     use crate::state::TUNNEL_IDLE_TIMEOUT_SECONDS;
+    use choosh_protocol::relay::ControlResponse;
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -1246,5 +1247,54 @@ mod tests {
         assert!(limiter.try_acquire_after(Duration::from_secs(10)));
         assert!(limiter.try_acquire_after(Duration::ZERO));
         assert!(!limiter.try_acquire_after(Duration::ZERO), "capacity is 2, both tokens already spent");
+    }
+
+    // `revoke_response` is the shared `unknown_device`-or-`*Ok` shape behind
+    // both `handle_revoke_device` and `handle_revoke_phone_session` — its own
+    // doc comment's entire point is that both call sites report the *same*
+    // `unknown_device` code but an *operation-specific* `message`. A test
+    // that only checks `code` (as the integration tests already do at both
+    // call sites) can't catch a regression that swaps the two call sites'
+    // `not_found_message` — these two pure, synchronous tests pin the exact
+    // contract directly against `revoke_response` itself: `found: false`
+    // must echo `not_found_message` verbatim under the `unknown_device` code
+    // without ever invoking `ok`, and `found: true` must call `ok` with
+    // `request_id`/`device_id` threaded through untouched and ignore
+    // `not_found_message` entirely.
+    #[test]
+    fn revoke_response_not_found_reports_the_given_operation_specific_message() {
+        let response = revoke_response(
+            false,
+            "no phone session recorded for this device_id",
+            "req-1".to_string(),
+            "dev-1".to_string(),
+            |_, _| panic!("the `ok` closure must not be called when `found` is false"),
+        );
+        match response {
+            ControlResponse::Error { request_id, code, message } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(code, "unknown_device");
+                assert_eq!(message, "no phone session recorded for this device_id");
+            }
+            other => panic!("expected ControlResponse::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revoke_response_found_delegates_to_ok_with_request_id_and_device_id_untouched() {
+        let response = revoke_response(
+            true,
+            "this message must never surface when found is true",
+            "req-2".to_string(),
+            "dev-2".to_string(),
+            |request_id, device_id| ControlResponse::RevokeDeviceOk { request_id, device_id },
+        );
+        match response {
+            ControlResponse::RevokeDeviceOk { request_id, device_id } => {
+                assert_eq!(request_id, "req-2");
+                assert_eq!(device_id, "dev-2");
+            }
+            other => panic!("expected the `ok` closure's own response passed through unchanged, got {other:?}"),
+        }
     }
 }
