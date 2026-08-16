@@ -10,9 +10,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -21,14 +24,22 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccessTime
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -37,9 +48,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 
 /**
@@ -55,10 +69,29 @@ fun FleetDrawer(
     onProjectClick: (Project) -> Unit,
     onDevHostClick: (DevHostPresence) -> Unit,
     onWorkspaceClick: (Workspace) -> Unit,
+    onRequestEnrollmentToken: () -> Unit = {},
+    onDismissEnrollmentToken: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier.fillMaxWidth()) {
-        SortModeSelector(selected = state.sortMode, onSelected = onSortModeSelected)
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            SortModeSelector(selected = state.sortMode, onSelected = onSortModeSelected, modifier = Modifier.weight(1f))
+            // Always visible, not just on the empty-fleet state below: a real
+            // user with an already-nonempty fleet still needs a way to enroll
+            // a *second* (or Nth) devhost, per auth-and-enrollment.md's
+            // "Enrollment tokens" section — the empty state's own copy of this
+            // action (EmptyFleetState) exists only because a first-run user
+            // never even sees this toolbar's row list to find this button, not
+            // because enrollment stops mattering once the fleet has members.
+            IconButton(
+                onClick = onRequestEnrollmentToken,
+                modifier = Modifier
+                    .testTag("enroll-devhost-icon-button")
+                    .semantics { contentDescription = "Enroll a devhost" },
+            ) {
+                Icon(Icons.Filled.Add, contentDescription = null)
+            }
+        }
         when {
             state.isLoading -> Text(
                 "Loading fleet…",
@@ -69,10 +102,7 @@ fun FleetDrawer(
                 modifier = Modifier.padding(16.dp),
                 color = MaterialTheme.colorScheme.error,
             )
-            state.rows.isEmpty() -> Text(
-                "No devhosts enrolled yet.",
-                modifier = Modifier.padding(16.dp),
-            )
+            state.rows.isEmpty() -> EmptyFleetState(onRequestEnrollmentToken = onRequestEnrollmentToken)
             else -> {
                 // Adaptive layout, per `docs/accessibility-device-report.md`'s
                 // item 3/4 ("Fleet drawer content occupies a small
@@ -97,12 +127,131 @@ fun FleetDrawer(
             }
         }
     }
+
+    when (val enrollmentToken = state.enrollmentToken) {
+        EnrollmentTokenUiState.Idle -> Unit
+        else -> EnrollmentTokenDialog(state = enrollmentToken, onRequestEnrollmentToken = onRequestEnrollmentToken, onDismiss = onDismissEnrollmentToken)
+    }
+}
+
+/**
+ * The empty-fleet state's real next action, per UX-friction-audit finding
+ * #13: `request-enrollment-token` (docs/specs/auth-and-enrollment.md) was
+ * already implemented end to end at the transport layer but never exposed
+ * through the UI, leaving this state a dead end. Tapping the button starts
+ * a real relay call; [EnrollmentTokenDialog] renders its loading/success/
+ * error outcome.
+ */
+@Composable
+private fun EmptyFleetState(onRequestEnrollmentToken: () -> Unit) {
+    Column(modifier = Modifier.padding(16.dp)) {
+        Text("No devhosts enrolled yet.")
+        Spacer(modifier = Modifier.height(12.dp))
+        Button(onClick = onRequestEnrollmentToken, modifier = Modifier.testTag("enroll-devhost-button")) {
+            Text("Enroll a devhost")
+        }
+    }
+}
+
+/**
+ * Loading/success/error rendering for [FleetViewModel.requestEnrollmentToken],
+ * per docs/specs/auth-and-enrollment.md's "Enrollment tokens" section (a
+ * single-use, 15-minute-lifetime token) and
+ * docs/specs/host-deployment.md's "Bootstrap install" command shape. No real
+ * install-script hosting URL exists yet (host-deployment.md's own
+ * `relay.example/install.sh` is itself a placeholder) — the instructions
+ * below say so plainly rather than presenting a fake, clickable-looking URL
+ * as if it were real.
+ */
+@Composable
+private fun EnrollmentTokenDialog(
+    state: EnrollmentTokenUiState,
+    onRequestEnrollmentToken: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Enroll a devhost") },
+        text = {
+            when (state) {
+                EnrollmentTokenUiState.Idle -> Unit
+
+                EnrollmentTokenUiState.Loading -> Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text("Requesting a token from relayd…")
+                }
+
+                is EnrollmentTokenUiState.Success -> EnrollmentTokenSuccessBody(state)
+
+                is EnrollmentTokenUiState.Error -> Text(
+                    "Couldn't get an enrollment token: ${state.message}",
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.testTag("enroll-devhost-error"),
+                )
+            }
+        },
+        confirmButton = {
+            when (state) {
+                is EnrollmentTokenUiState.Error -> TextButton(onClick = onRequestEnrollmentToken, modifier = Modifier.testTag("enroll-devhost-retry")) {
+                    Text("Try again")
+                }
+                else -> TextButton(onClick = onDismiss) { Text("Done") }
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
-private fun SortModeSelector(selected: SortMode, onSelected: (SortMode) -> Unit) {
+private fun EnrollmentTokenSuccessBody(state: EnrollmentTokenUiState.Success) {
+    val clipboardManager = LocalClipboardManager.current
+    Column {
+        Text(
+            "This single-use token is valid for 15 minutes, until ${state.expiresAt}. " +
+                "On the machine you want to add, install choosh-hostd and run its enrollment " +
+                "step with this token (per docs/specs/host-deployment.md — no public install " +
+                "script is hosted yet, so for now that means building/running choosh-hostd " +
+                "from source with --token=<token> below):",
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Surface(
+                modifier = Modifier.weight(1f),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+            ) {
+                Text(
+                    state.token,
+                    modifier = Modifier
+                        .padding(8.dp)
+                        .testTag("enrollment-token-text")
+                        .semantics { contentDescription = "Enrollment token ${state.token}" },
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+            IconButton(
+                onClick = { clipboardManager.setText(AnnotatedString(state.token)) },
+                modifier = Modifier
+                    .testTag("enrollment-token-copy")
+                    .semantics { contentDescription = "Copy enrollment token" },
+            ) {
+                Icon(Icons.Filled.ContentCopy, contentDescription = null)
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = { clipboardManager.setText(AnnotatedString("curl -fsSL <install-script-url> | sudo sh -s -- --token=${state.token}")) },
+            modifier = Modifier.testTag("enrollment-command-copy"),
+        ) {
+            Text("Copy install command")
+        }
+    }
+}
+
+@Composable
+private fun SortModeSelector(selected: SortMode, onSelected: (SortMode) -> Unit, modifier: Modifier = Modifier) {
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .padding(8.dp),
         horizontalArrangement = Arrangement.SpaceEvenly,

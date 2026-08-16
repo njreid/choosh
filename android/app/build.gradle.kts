@@ -186,6 +186,24 @@ val buildRustAndroidDevPasskey = tasks.register<Exec>("buildRustAndroidDevPasske
     environment("CHOOSH_ANDROID_RUST_FEATURES", "dev-passkey")
     environment("CHOOSH_ANDROID_RUST_DEST", project.file("src/debug/jniLibs").absolutePath)
     commandLine(rootProject.file("scripts/build-android-rust.sh").absolutePath)
+    // MUST NOT run concurrently with `buildRustAndroid` — confirmed by a real
+    // repeated failure (`testDebugUnitTest`, no CLI flags): both tasks invoke
+    // `scripts/build-android-rust.sh`, which builds into the SAME shared
+    // intermediate path (`$root/target/<triple>/release/libchoosh_android_bridge.so`,
+    // since neither task's `cargo build` sets `CARGO_TARGET_DIR`) before copying
+    // to their own distinct `jniLibs` destinations. Gradle schedules these two
+    // independent Exec tasks concurrently by default (no dependency relation
+    // between them), so one task's post-build `nm` check/copy can race against
+    // the other task's `cargo build` overwriting that shared path mid-flight —
+    // confirmed via `nm -D` on the resulting `.so` showing the wrong feature
+    // set's symbols after a concurrent run, even though each task's own
+    // standalone (non-concurrent) invocation of the identical command
+    // consistently produces the correct symbols. `mustRunAfter` (not
+    // `dependsOn`, which would also make one implicitly trigger the other)
+    // is the minimal fix: it only constrains relative order when both are
+    // already going to run, which — per the `dependsOn` wiring below — is
+    // every debug build/test anyway.
+    mustRunAfter(buildRustAndroid)
 }
 
 tasks.matching { it.name == "testDebugUnitTest" }.configureEach {

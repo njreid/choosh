@@ -306,6 +306,8 @@ fun ChooshApp(
                         },
                         onDevHostClick = { devHost -> backStack.push(Screen.DevHostWorkspaces(devHost.deviceId)) },
                         onWorkspaceClick = { workspace -> backStack.push(Screen.Workspace(workspace.workspaceId, workspace.devHostId)) },
+                        onRequestEnrollmentToken = viewModel::requestEnrollmentToken,
+                        onDismissEnrollmentToken = viewModel::dismissEnrollmentToken,
                     )
                 }
 

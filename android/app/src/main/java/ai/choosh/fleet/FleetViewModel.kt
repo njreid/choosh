@@ -4,6 +4,7 @@ import ai.choosh.agentevents.AgentAttentionTracker
 import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.ConnectionState
 import ai.choosh.engine.DevHostPresence
+import ai.choosh.engine.EnrollmentTokenResult
 import ai.choosh.engine.ProjectSummary
 import ai.choosh.engine.WorkspaceSummary
 import androidx.lifecycle.ViewModel
@@ -18,7 +19,23 @@ data class FleetUiState(
     val rows: List<FleetRow> = emptyList(),
     val isLoading: Boolean = true,
     val error: String? = null,
+    /**
+     * Drives the "enroll a devhost" affordance on the empty-fleet state
+     * (per docs/specs/auth-and-enrollment.md's "Enrollment tokens" section)
+     * — [FleetDrawer] renders this independently of [rows]/[isLoading]/
+     * [error] above, which stay scoped to the `list-devhosts`/`project.list`
+     * load this state has always covered.
+     */
+    val enrollmentToken: EnrollmentTokenUiState = EnrollmentTokenUiState.Idle,
 )
+
+/** State machine for [FleetViewModel.requestEnrollmentToken], per [FleetUiState.enrollmentToken]'s doc comment. */
+sealed interface EnrollmentTokenUiState {
+    data object Idle : EnrollmentTokenUiState
+    data object Loading : EnrollmentTokenUiState
+    data class Success(val token: String, val expiresAt: String) : EnrollmentTokenUiState
+    data class Error(val message: String) : EnrollmentTokenUiState
+}
 
 /**
  * Fired once per Project/Workspace tap; the composition root turns
@@ -97,6 +114,33 @@ class FleetViewModel(
     fun setSortMode(mode: SortMode) {
         _state.value = _state.value.copy(sortMode = mode)
         recompute()
+    }
+
+    /**
+     * `request-enrollment-token`, per docs/specs/auth-and-enrollment.md —
+     * mints a single-use, 15-minute `devhost` enrollment token and surfaces
+     * it via [FleetUiState.enrollmentToken] for [FleetDrawer]'s empty-state
+     * dialog to render (token, expiry, and the paste-into-install-command
+     * instructions). [ChooshEngine.requestEnrollmentToken] never throws
+     * (see its own doc comment), so this only ever lands in
+     * [EnrollmentTokenUiState.Success]/[EnrollmentTokenUiState.Error], never
+     * an unhandled exception.
+     */
+    fun requestEnrollmentToken() {
+        viewModelScope.launch {
+            _state.value = _state.value.copy(enrollmentToken = EnrollmentTokenUiState.Loading)
+            _state.value = _state.value.copy(
+                enrollmentToken = when (val result = engine.requestEnrollmentToken()) {
+                    is EnrollmentTokenResult.Success -> EnrollmentTokenUiState.Success(result.token, result.expiresAt)
+                    is EnrollmentTokenResult.Failure -> EnrollmentTokenUiState.Error(result.message)
+                },
+            )
+        }
+    }
+
+    /** Dismisses the enrollment-token dialog, returning [FleetUiState.enrollmentToken] to [EnrollmentTokenUiState.Idle]. */
+    fun dismissEnrollmentToken() {
+        _state.value = _state.value.copy(enrollmentToken = EnrollmentTokenUiState.Idle)
     }
 
     /**

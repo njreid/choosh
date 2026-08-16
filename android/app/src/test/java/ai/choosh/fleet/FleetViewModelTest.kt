@@ -191,4 +191,69 @@ class FleetViewModelTest {
             val unchanged = state.rows.filterIsInstance<FleetRow.ProjectRow>().single { it.project.projectId == "proj-choosh" }
             assertEquals("ws-choosh-app", unchanged.project.primaryWorkspaceId)
         }
+
+    // --- request-enrollment-token, per docs/specs/auth-and-enrollment.md ---
+
+    @Test
+    fun `requestEnrollmentToken surfaces a Success state with the real token and expiry`() = runTest(mainDispatcherRule.dispatcher) {
+        val engine = FakeChooshEngine()
+        engine.connect("fake-session-credential")
+        val viewModel = FleetViewModel(engine)
+        advanceUntilIdle()
+        assertEquals(EnrollmentTokenUiState.Idle, viewModel.state.value.enrollmentToken)
+
+        viewModel.requestEnrollmentToken()
+        advanceUntilIdle()
+
+        val result = viewModel.state.value.enrollmentToken
+        assertTrue("expected a Success state, got $result", result is EnrollmentTokenUiState.Success)
+        val success = result as EnrollmentTokenUiState.Success
+        assertTrue("expected a non-blank token", success.token.isNotBlank())
+        assertTrue("expected a non-blank expiry", success.expiresAt.isNotBlank())
+    }
+
+    @Test
+    fun `requestEnrollmentToken before connect surfaces an Error state, not a crash`() = runTest(mainDispatcherRule.dispatcher) {
+        // Deliberately not calling connect() first — mirrors this file's other
+        // "before connect" tests above.
+        val viewModel = FleetViewModel(FakeChooshEngine())
+        advanceUntilIdle()
+
+        viewModel.requestEnrollmentToken()
+        advanceUntilIdle()
+
+        val result = viewModel.state.value.enrollmentToken
+        assertTrue("expected an Error state, got $result", result is EnrollmentTokenUiState.Error)
+        assertTrue((result as EnrollmentTokenUiState.Error).message.contains("not connected"))
+    }
+
+    @Test
+    fun `requestEnrollmentToken surfaces a real failure as an Error state`() = runTest(mainDispatcherRule.dispatcher) {
+        val engine = FakeChooshEngine()
+        engine.connect("fake-session-credential")
+        engine.simulateEnrollmentTokenFailure = true
+        val viewModel = FleetViewModel(engine)
+        advanceUntilIdle()
+
+        viewModel.requestEnrollmentToken()
+        advanceUntilIdle()
+
+        val result = viewModel.state.value.enrollmentToken
+        assertTrue("expected an Error state, got $result", result is EnrollmentTokenUiState.Error)
+    }
+
+    @Test
+    fun `dismissEnrollmentToken returns the state to Idle`() = runTest(mainDispatcherRule.dispatcher) {
+        val engine = FakeChooshEngine()
+        engine.connect("fake-session-credential")
+        val viewModel = FleetViewModel(engine)
+        advanceUntilIdle()
+        viewModel.requestEnrollmentToken()
+        advanceUntilIdle()
+        assertTrue(viewModel.state.value.enrollmentToken is EnrollmentTokenUiState.Success)
+
+        viewModel.dismissEnrollmentToken()
+
+        assertEquals(EnrollmentTokenUiState.Idle, viewModel.state.value.enrollmentToken)
+    }
 }

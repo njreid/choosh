@@ -165,6 +165,34 @@ impl Engine {
         }
     }
 
+    /// Requests a single-use `devhost` enrollment token over the live
+    /// connection, per auth-and-enrollment.md's "Enrollment tokens" section
+    /// — only `IdentityClass::Devhost` is exposed here since that's the only
+    /// class a phone's fleet UI currently needs to mint (enrolling a
+    /// `laptop-proxy` is a `choosh-hostd proxy enroll` CLI flow, not a phone
+    /// affordance, per that same doc's "Laptop-proxy enrollment" section).
+    /// `{"token": "...", "expires_at": "..."}` on success (`expires_at` is
+    /// the RFC 3339 string `relayd` returns, not a Unix timestamp — passed
+    /// through verbatim); this module's shared `{"error": "..."}` shape on
+    /// a not-connected or failed call, matching every other connection-level
+    /// method above (e.g. [`Self::list_devhosts`]).
+    pub async fn request_enrollment_token(&self) -> String {
+        let mut guard = self.connection.lock().await;
+        let Some(connection) = guard.as_mut() else {
+            return error_json("not connected: call nativeConnect first");
+        };
+        match connection.request_enrollment_token(choosh_protocol::relay::IdentityClass::Devhost).await {
+            Ok((token, expires_at)) => json!({ "token": token, "expires_at": expires_at }).to_string(),
+            Err(error) => {
+                // Same discipline as `list_devhosts`: a failed call means
+                // the connection is presumed stale, so drop it rather than
+                // let a later call silently reuse a known-broken channel.
+                *guard = None;
+                error_json(&format!("request_enrollment_token failed: {error}"))
+            }
+        }
+    }
+
     /// Sends one `jj`-backed workspace RPC ([`RpcRequest::WorkspaceDiff`],
     /// `WorkspaceLog`, `WorkspaceOpLog`, `WorkspaceOpUndo`,
     /// `WorkspaceOpRestore`, `WorkspaceStatus` — the diff/log/op-log/undo/
@@ -1073,6 +1101,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_enrollment_token_before_connect_is_a_typed_error() {
+        assert_error_json_mentions_not_connected(&unconnected_engine().request_enrollment_token().await);
+    }
+
+    #[tokio::test]
     async fn register_fcm_token_before_connect_returns_false() {
         assert!(!unconnected_engine().register_fcm_token("tok").await);
     }
@@ -1312,6 +1345,73 @@ mod tests {
         let body = engine.list_devhosts().await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed[0]["alias"], "build-box");
+    }
+
+    #[tokio::test]
+    async fn connect_then_request_enrollment_token_round_trips_over_a_real_websocket() {
+        use choosh_protocol::relay::{ControlRequest, ControlResponse, IdentityClass};
+
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let request: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::RequestEnrollmentToken { request_id, identity_class } = request else {
+                panic!("expected request-enrollment-token")
+            };
+            assert_eq!(identity_class, IdentityClass::Devhost);
+            send_control(
+                &mut ws,
+                &ControlResponse::RequestEnrollmentTokenOk {
+                    request_id,
+                    token: "tok-123".to_string(),
+                    expires_at: "2026-08-14T00:15:00Z".to_string(),
+                },
+            )
+            .await;
+        });
+
+        let engine = Engine::new("http://unused".to_string(), ws_url);
+        assert!(engine.connect("good-cred").await, "connect should succeed against a well-behaved fake relayd");
+        let body = engine.request_enrollment_token().await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["token"], "tok-123");
+        assert_eq!(parsed["expires_at"], "2026-08-14T00:15:00Z");
+    }
+
+    #[tokio::test]
+    async fn request_enrollment_token_server_error_is_reported_and_drops_the_connection() {
+        use choosh_protocol::relay::{ControlRequest, ControlResponse};
+
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            authenticate_fake_relayd(&mut ws).await;
+
+            let request: ControlRequest = recv_control(&mut ws).await;
+            let ControlRequest::RequestEnrollmentToken { request_id, .. } = request else {
+                panic!("expected request-enrollment-token")
+            };
+            send_control(
+                &mut ws,
+                &ControlResponse::Error { request_id, code: "internal".to_string(), message: "boom".to_string() },
+            )
+            .await;
+        });
+
+        let engine = Engine::new("http://unused".to_string(), ws_url);
+        assert!(engine.connect("good-cred").await, "connect should succeed against a well-behaved fake relayd");
+        let body = engine.request_enrollment_token().await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("boom"), "{body}");
+
+        // The failed call should have dropped the stale connection, so a
+        // second call reports "not connected" rather than hanging on a
+        // dead socket.
+        assert_error_json_mentions_not_connected(&engine.request_enrollment_token().await);
     }
 
     /// Drives a full RPC round trip (hello/auth, open-tunnel, one tunnel

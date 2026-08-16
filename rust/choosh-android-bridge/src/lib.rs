@@ -161,6 +161,11 @@ fn native_list_devhosts<'local>(env: &mut Env<'local>, _class: JClass<'local>, h
     JString::new(env, body)
 }
 
+fn native_request_enrollment_token<'local>(env: &mut Env<'local>, _class: JClass<'local>, handle: jlong) -> Result<JString<'local>, jni::errors::Error> {
+    let body = with_handle(handle, error_json("unknown engine handle"), |h| h.runtime.block_on(h.engine.request_enrollment_token()));
+    JString::new(env, body)
+}
+
 // `fcm_token` must stay `JString<'local>` by value to match the exact
 // signature `native_method!`'s macro expects below (mirroring
 // `native_connect`'s `session_credential` and `native_webauthn_*`'s
@@ -562,6 +567,11 @@ const _LIST_DEVHOSTS: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",
     static extern fn NativeBridge::native_list_devhosts(handle: jlong) -> JString,
     fn = native_list_devhosts,
+};
+const _REQUEST_ENROLLMENT_TOKEN: jni::NativeMethod = native_method! {
+    java_type = "ai.choosh.NativeBridge",
+    static extern fn NativeBridge::native_request_enrollment_token(handle: jlong) -> JString,
+    fn = native_request_enrollment_token,
 };
 const _CLOSE: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",

@@ -18,6 +18,7 @@ import ai.choosh.engine.DiffSegment
 import ai.choosh.engine.DiffSegmentKind
 import ai.choosh.engine.DocumentOpenResult
 import ai.choosh.engine.DocumentSaveResult
+import ai.choosh.engine.EnrollmentTokenResult
 import ai.choosh.engine.InputReason
 import ai.choosh.engine.ItemSummary
 import ai.choosh.engine.ItemType
@@ -87,6 +88,9 @@ class NativeChooshEngine : ChooshEngine {
 
     override suspend fun registerFcmToken(fcmToken: String): Boolean =
         withContext(Dispatchers.IO) { NativeBridge.nativeRegisterFcmToken(handle, fcmToken) }
+
+    override suspend fun requestEnrollmentToken(): EnrollmentTokenResult =
+        withContext(Dispatchers.IO) { decodeEnrollmentTokenResult(NativeBridge.nativeRequestEnrollmentToken(handle)) }
 
     override suspend fun workspaceDiff(deviceId: String, workspaceId: String, from: String?, to: String?): List<DiffFileEntry> =
         withContext(Dispatchers.IO) {
@@ -231,6 +235,7 @@ private object NativeBridge {
     @JvmStatic external fun nativeConnect(handle: Long, sessionCredential: String): Boolean
     @JvmStatic external fun nativeListDevhosts(handle: Long): String
     @JvmStatic external fun nativeRegisterFcmToken(handle: Long, fcmToken: String): Boolean
+    @JvmStatic external fun nativeRequestEnrollmentToken(handle: Long): String
     @JvmStatic external fun nativeClose(handle: Long)
 
     // M3 jj RPCs (docs/specs/jj-integration.md). `from`/`to`/`revset` take
@@ -395,6 +400,39 @@ private fun decodeWebauthnResult(raw: String): WebauthnResult {
         WebauthnResult.Success(wire.session_credential)
     } else {
         WebauthnResult.Failure("relayd_error", wire.error ?: "native engine returned no message")
+    }
+}
+
+/**
+ * Matches `Engine::request_enrollment_token`'s wire shape exactly:
+ * `{"token": "...", "expires_at": "..."}` on success, this module's shared
+ * `{"error": "..."}` shape (not connected, or a `relayd`-side failure) on
+ * failure — the same "presence of the success field distinguishes the two
+ * cases" convention [WireWebauthnResult]/[decodeWebauthnResult] already use.
+ */
+@Serializable
+internal data class WireEnrollmentTokenResult(
+    val token: String? = null,
+    val expires_at: String? = null,
+    val error: String? = null,
+)
+
+/**
+ * `internal`, not `private` (unlike this file's other decode functions) —
+ * see [nativeDevPasskeyRegister]'s identical precedent — so
+ * `NativeChooshEngineEnrollmentTokenDecodeTest` can exercise the real
+ * success/error wire-decode logic directly, the same JSON-decode surface
+ * `NativeChooshEngine.requestEnrollmentToken` calls through the JNI
+ * boundary, without needing the real native `.so` loaded (constructing a
+ * whole [NativeChooshEngine] instance isn't possible in a plain JVM unit
+ * test — see that class's constructor).
+ */
+internal fun decodeEnrollmentTokenResult(raw: String): EnrollmentTokenResult {
+    val wire = json.decodeFromString<WireEnrollmentTokenResult>(raw)
+    return if (wire.token != null) {
+        EnrollmentTokenResult.Success(token = wire.token, expiresAt = wire.expires_at ?: "")
+    } else {
+        EnrollmentTokenResult.Failure(wire.error ?: "native engine returned no message")
     }
 }
 

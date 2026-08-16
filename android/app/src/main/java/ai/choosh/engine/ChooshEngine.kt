@@ -43,6 +43,22 @@ interface ChooshEngine {
     suspend fun registerFcmToken(fcmToken: String): Boolean
 
     /**
+     * `request-enrollment-token`, per docs/specs/auth-and-enrollment.md's
+     * "Enrollment tokens" section: mints a single-use, 15-minute-lifetime
+     * token that lets one fresh `devhost` Identity enroll (the resulting
+     * token is what an operator pastes into
+     * `curl ... | sudo sh -s -- --token=<token>` on the target machine, per
+     * docs/specs/host-deployment.md's "Bootstrap install"). Only the
+     * `devhost` identity class is exposed here — enrolling a `laptop-proxy`
+     * is a `choosh-hostd proxy enroll` CLI flow, not a phone-UI affordance,
+     * per that same spec's "Laptop-proxy enrollment" section. Never throws:
+     * like [WebauthnResult], an expected rejection (not connected, or a
+     * `relayd`-side failure) is returned as [EnrollmentTokenResult.Failure]
+     * for the caller to render as UI state.
+     */
+    suspend fun requestEnrollmentToken(): EnrollmentTokenResult
+
+    /**
      * `workspace.diff`, per docs/specs/jj-integration.md: structured hunks
      * computed host-side by `jj-lib`, never on-device. `from`/`to` `null`
      * means the RPC's own documented defaults (`"@-"`/`"@"`).
@@ -471,6 +487,17 @@ sealed interface WebauthnResult {
 
     @Serializable
     data class Failure(val code: String, val message: String) : WebauthnResult
+}
+
+/**
+ * Outcome of [ChooshEngine.requestEnrollmentToken], per
+ * docs/specs/auth-and-enrollment.md's "Enrollment tokens" section.
+ */
+sealed interface EnrollmentTokenResult {
+    /** `expiresAt` is the RFC 3339 timestamp `relayd` returned verbatim — 15 minutes from issuance. */
+    data class Success(val token: String, val expiresAt: String) : EnrollmentTokenResult
+
+    data class Failure(val message: String) : EnrollmentTokenResult
 }
 
 /** Mirrors `choosh_protocol::relay::DevHostPresence` exactly (see relay-protocol.md). */
