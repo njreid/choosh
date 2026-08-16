@@ -187,7 +187,7 @@ class FleetRowsForTest {
 
         val event = FleetViewModel(FakeChooshEngine()).onProjectTapped(project)
 
-        assertEquals(FleetNavigationEvent.OpenWorkspace("ws-second", "dev-a"), event)
+        assertEquals(FleetNavigationEvent.OpenWorkspace("ws-second", "dev-a", "second"), event)
     }
 
     @Test
@@ -201,6 +201,30 @@ class FleetRowsForTest {
     fun `tapping a workspace opens that workspace`() {
         val ws = workspace("ws-x", "x", "dev-a", lastActiveAt = "2026-08-14T10:00:00Z")
         val event = FleetViewModel(FakeChooshEngine()).onWorkspaceTapped(ws)
-        assertEquals(FleetNavigationEvent.OpenWorkspace("ws-x", "dev-a"), event)
+        assertEquals(FleetNavigationEvent.OpenWorkspace("ws-x", "dev-a", "x"), event)
+    }
+
+    /**
+     * UX-friction audit finding #11: `Screen.Workspace`'s title used to show
+     * the raw `workspaceId` even though the real [Workspace.name] was
+     * available at both of these tap sites — [FleetNavigationEvent.OpenWorkspace.workspaceName]
+     * is what threads it through. A designated `primaryWorkspaceId` genuinely
+     * absent from the tapped [Project]'s own workspace list (a data
+     * inconsistency, not the common case) is the one situation with no real
+     * name to offer — `null`, the documented fallback, not a crash or a
+     * fabricated placeholder.
+     */
+    @Test
+    fun `tapping a project with a dangling primary workspace id yields no workspace name, not a crash`() {
+        val project = Project(
+            projectId = "proj-1",
+            name = "p",
+            primaryWorkspaceId = "ws-missing",
+            workspaces = listOf(Workspace("ws-first", "first", "dev-a", needsAttention = false, lastActiveAt = "2026-08-14T10:00:00Z")),
+        )
+
+        val event = FleetViewModel(FakeChooshEngine()).onProjectTapped(project)
+
+        assertEquals(FleetNavigationEvent.OpenWorkspace("ws-missing", "", null), event)
     }
 }

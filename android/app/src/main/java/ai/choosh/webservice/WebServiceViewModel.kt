@@ -96,6 +96,25 @@ class WebServiceViewModel(
         gateway = if (started != null) WebGatewayHandleState.Started(started) else WebGatewayHandleState.Failed
     }
 
+    /**
+     * UX-friction audit finding #7: once [gateway] became [WebGatewayHandleState.Failed],
+     * [ensureGatewayStarted]'s own guard (`if (gateway !is WebGatewayHandleState.None) return`)
+     * meant it never tried again — not automatically, and (before this method existed) not on
+     * any user action either, even if the item later reported `RUNNING` again. This is the
+     * `Failed`→retry transition [ensureGatewayStarted] itself can't make on its own: reset back
+     * to [WebGatewayHandleState.None] (satisfying that guard) and immediately re-[poll], so a
+     * user tapping [WebServiceScreen]'s Failed-state retry button gets an actual fresh attempt,
+     * not a permanently stuck screen. Deliberately user-triggered rather than wired into the
+     * passive [startPolling] loop itself: a bind failure that keeps failing every
+     * [pollIntervalMs] indefinitely would otherwise hammer [gatewayController] with no backoff.
+     * A no-op when [gateway] isn't actually [WebGatewayHandleState.Failed] (nothing to retry).
+     */
+    fun retry() {
+        if (gateway !is WebGatewayHandleState.Failed) return
+        gateway = WebGatewayHandleState.None
+        viewModelScope.launch { poll() }
+    }
+
     private fun stopGatewayIfStarted() {
         val current = gateway
         if (current is WebGatewayHandleState.Started) {

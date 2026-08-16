@@ -49,12 +49,29 @@ import androidx.lifecycle.viewmodel.compose.viewModel
  */
 private enum class WorkspaceTab { EXPLORER, DIFF, GRAPH }
 
+/**
+ * Pure derivation, unit-tested directly — mirrors this codebase's existing
+ * `FleetViewModel.rowsFor`/`deriveWebServiceUiState` precedent of keeping
+ * UI-state/label logic as a plain function. UX-friction audit finding #11:
+ * prefers the real [workspaceName] over the raw, meaningless-to-a-user
+ * [workspaceId] whenever it's genuinely available.
+ */
+internal fun workspaceScreenTitle(workspaceId: String, workspaceName: String?): String =
+    workspaceName?.let { "Workspace: $it" } ?: "Workspace $workspaceId"
+
 @Composable
 fun WorkspaceScreen(
     engine: ChooshEngine,
     workspaceId: String,
     deviceId: String,
     onBack: () -> Unit,
+    // UX-friction audit finding #11: the real name (ai.choosh.fleet.Workspace.name) is
+    // available earlier in the navigation flow that opens this screen (ChooshApp.kt's
+    // Screen.Workspace) — threaded through here rather than this screen showing the raw,
+    // meaningless-to-a-user workspaceId. `null` only when genuinely unavailable at the
+    // navigating call site (see Screen.Workspace's own doc comment), in which case this
+    // falls back to the old workspaceId-based title, unchanged from before this param existed.
+    workspaceName: String? = null,
     modifier: Modifier = Modifier,
     // Both default to `null` (and render no button) rather than a no-op
     // lambda: `ChooshApp.kt`'s tests/previews that don't wire real
@@ -87,7 +104,7 @@ fun WorkspaceScreen(
         Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
             Button(onClick = onBack) { Text("Back") }
             Text(
-                "Workspace $workspaceId",
+                workspaceScreenTitle(workspaceId, workspaceName),
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.padding(start = 12.dp),
             )

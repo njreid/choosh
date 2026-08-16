@@ -61,10 +61,25 @@ class FakeChooshEngine : ChooshEngine {
         return WebauthnResult.Success(sessionCredential = "fake-session-credential")
     }
 
-    override suspend fun connect(sessionCredential: String): Boolean {
+    /** One-shot: when non-null, the next [connect] call returns [ConnectResult.Rejected] with this message instead of succeeding, then clears itself. */
+    var simulateConnectRejection: String? = null
+
+    /** One-shot: when non-null, the next [connect] call returns [ConnectResult.TransportFailure] with this message instead of succeeding, then clears itself. */
+    var simulateConnectTransportFailure: String? = null
+
+    override suspend fun connect(sessionCredential: String): ConnectResult {
         delay(FAKE_LATENCY_MS)
+        simulateConnectRejection?.let { message ->
+            simulateConnectRejection = null
+            connected = false
+            return ConnectResult.Rejected(message)
+        }
+        simulateConnectTransportFailure?.let { message ->
+            simulateConnectTransportFailure = null
+            return ConnectResult.TransportFailure(message)
+        }
         connected = true
-        return true
+        return ConnectResult.Connected
     }
 
     override suspend fun listDevhosts(): List<DevHostPresence> {

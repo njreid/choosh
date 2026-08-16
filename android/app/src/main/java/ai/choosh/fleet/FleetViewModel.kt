@@ -27,9 +27,21 @@ data class FleetUiState(
  * `(target_device_id, workspace_id)` together — the workspace list/tap
  * chain is the only place that pairing is available, so it's carried
  * through from here rather than re-derived downstream.
+ *
+ * [OpenWorkspace.workspaceName] carries [Workspace.name] along for the same
+ * reason: `ChooshApp`'s composition root needs it to give `Screen.Workspace`
+ * a real display name (UX-friction audit finding #11 — a raw
+ * `workspaceId` was shown as the page title even though the real name was
+ * available earlier in this exact flow) rather than re-deriving it later
+ * from a screen that no longer has this event's [Project]/[Workspace] data
+ * in scope. `null` only when [FleetViewModel.onProjectTapped]'s designated
+ * primary workspace can't actually be found in the tapped [Project]'s own
+ * workspace list (a data inconsistency this method already tolerated before
+ * this field existed, via `primary?.devHostId.orEmpty()`) — genuinely no
+ * name to offer in that case, not an oversight.
  */
 sealed interface FleetNavigationEvent {
-    data class OpenWorkspace(val workspaceId: String, val deviceId: String) : FleetNavigationEvent
+    data class OpenWorkspace(val workspaceId: String, val deviceId: String, val workspaceName: String? = null) : FleetNavigationEvent
     data class OpenDevHost(val deviceId: String) : FleetNavigationEvent
 }
 
@@ -167,14 +179,14 @@ class FleetViewModel(
     /** Per android-navigation.md: tapping a Project opens its primary Workspace directly. */
     fun onProjectTapped(project: Project): FleetNavigationEvent {
         val primary = project.workspaces.firstOrNull { it.workspaceId == project.primaryWorkspaceId }
-        return FleetNavigationEvent.OpenWorkspace(project.primaryWorkspaceId, primary?.devHostId.orEmpty())
+        return FleetNavigationEvent.OpenWorkspace(project.primaryWorkspaceId, primary?.devHostId.orEmpty(), primary?.name)
     }
 
     fun onDevHostTapped(devHost: DevHostPresence): FleetNavigationEvent =
         FleetNavigationEvent.OpenDevHost(devHost.deviceId)
 
     fun onWorkspaceTapped(workspace: Workspace): FleetNavigationEvent =
-        FleetNavigationEvent.OpenWorkspace(workspace.workspaceId, workspace.devHostId)
+        FleetNavigationEvent.OpenWorkspace(workspace.workspaceId, workspace.devHostId, workspace.name)
 
     /**
      * Merges [attentionTracker]'s live `needsAttention` set into

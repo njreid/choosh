@@ -3,7 +3,7 @@
 //! anywhere in this module. `lib.rs`'s `extern "system"` functions are thin
 //! marshaling wrappers around this.
 
-use choosh_android_transport::{AgentEventPush, CallError, PhoneConnection, PtyTunnelHandle, WebTunnelHandle};
+use choosh_android_transport::{AgentEventPush, CallError, ConnectError, PhoneConnection, PtyTunnelHandle, WebTunnelHandle};
 use choosh_protocol::host_rpc::{ByteRange, RpcRequest, RpcResponse};
 use choosh_protocol::relay::AgentEventsResumeResponse;
 use serde::Serialize;
@@ -20,6 +20,22 @@ use tokio::sync::Mutex;
 /// error shape to handle across both the HTTP and native-bridge layers.
 fn error_json(message: &str) -> String {
     json!({ "error": message }).to_string()
+}
+
+/// [`Engine::connect`]'s own result shape — deliberately distinct from
+/// [`error_json`]'s generic `{"error": ...}` because a Kotlin caller needs
+/// to distinguish "relayd genuinely rejected this session credential"
+/// (`outcome: "rejected"` — the credential is dead, a fresh `WebAuthn`
+/// ceremony is required) from "couldn't even complete the connection"
+/// (`outcome: "transport"` — a plain connectivity failure that must NOT be
+/// treated as proof the credential itself is invalid). See UX-friction
+/// audit finding #5 / `ai.choosh.connection.ConnectionViewModel.connectWith`'s
+/// doc comment on the Kotlin side, which is what actually branches on this.
+fn connect_result_json(outcome: &str, message: Option<&str>) -> String {
+    match message {
+        Some(message) => json!({ "outcome": outcome, "message": message }).to_string(),
+        None => json!({ "outcome": outcome }).to_string(),
+    }
 }
 
 /// Bound on how many un-polled live agent-event pushes [`Engine`] holds at
@@ -102,9 +118,19 @@ impl Engine {
     }
 
     /// Establishes the persistent relay connection, per auth-and-enrollment.md's
-    /// phone-reuse path. `true` on `AuthResult::Ok`; `false` on any
-    /// rejection or transport failure — the caller (Kotlin) is expected to
-    /// force a fresh `WebAuthn` ceremony on `false`, not retry blindly.
+    /// phone-reuse path. Returns [`connect_result_json`]'s JSON shape:
+    /// `{"outcome":"ok"}` on `AuthResult::Ok`; `{"outcome":"rejected",
+    /// "message":...}` when relayd itself rejected `session_credential`
+    /// (`ConnectError::Rejected` — a genuine `AuthResult::Failed`); or
+    /// `{"outcome":"transport", "message":...}` for every other failure
+    /// (couldn't dial, a transport-level error, or a protocol-level
+    /// surprise) — none of which say anything about whether the credential
+    /// itself is still valid. The caller (Kotlin) is expected to force a
+    /// fresh `WebAuthn` ceremony only on `"rejected"`, never on
+    /// `"transport"` — see this method's own history: an earlier version
+    /// returned a bare `bool`, which collapsed both cases into the same
+    /// `false` and caused a plain connectivity failure to wipe a
+    /// still-valid stored credential (UX-friction audit finding #5).
     ///
     /// Also takes ownership of the fresh connection's agent-event push
     /// receiver (`PhoneConnection::take_agent_event_receiver`) and spawns
@@ -112,19 +138,20 @@ impl Engine {
     /// lifetime of this connection — see that function's doc comment for
     /// why this happens here, before the connection is stored behind
     /// `self.connection`'s lock, rather than lazily on first poll.
-    pub async fn connect(&self, session_credential: &str) -> bool {
+    pub async fn connect(&self, session_credential: &str) -> String {
         match PhoneConnection::connect(&self.ws_url, session_credential).await {
             Ok(mut connection) => {
                 if let Some(agent_event_rx) = connection.take_agent_event_receiver() {
                     tokio::spawn(pump_agent_events(agent_event_rx, Arc::clone(&self.agent_events)));
                 }
                 *self.connection.lock().await = Some(connection);
-                true
+                connect_result_json("ok", None)
             }
             Err(error) => {
                 tracing::warn!(%error, "phone connect failed");
                 *self.connection.lock().await = None;
-                false
+                let outcome = if matches!(error, ConnectError::Rejected(_)) { "rejected" } else { "transport" };
+                connect_result_json(outcome, Some(&error.to_string()))
             }
         }
     }
@@ -1080,6 +1107,16 @@ mod tests {
         send_control(ws, &AuthResult::Ok(AuthOk { identity_class: IdentityClass::Phone, device_id: "phone-1".to_string() })).await;
     }
 
+    /// Asserts [`Engine::connect`]'s JSON result is the `{"outcome":"ok"}`
+    /// success shape — every existing test below just needs "connect
+    /// succeeded", not the exact JSON, so this is the one place that shape
+    /// is pinned down (see [`connect_reports_rejected_outcome_on_auth_failure`]/
+    /// [`connect_reports_transport_outcome_when_relayd_unreachable`] below for
+    /// the two failure shapes).
+    fn assert_connect_ok(result: &str) {
+        assert_eq!(result, "{\"outcome\":\"ok\"}", "connect should succeed against a well-behaved fake relayd: {result}");
+    }
+
     #[tokio::test]
     async fn connect_then_list_devhosts_round_trips_over_a_real_websocket() {
         use choosh_protocol::relay::{ConnectionState, ControlRequest, ControlResponse, DevHostPresence};
@@ -1110,10 +1147,50 @@ mod tests {
         });
 
         let engine = Engine::new("http://unused".to_string(), ws_url);
-        assert!(engine.connect("good-cred").await, "connect should succeed against a well-behaved fake relayd");
+        assert_connect_ok(&engine.connect("good-cred").await);
         let body = engine.list_devhosts().await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed[0]["alias"], "build-box");
+    }
+
+    /// UX-friction audit finding #5's core distinction: a genuine relayd
+    /// rejection (`AuthResult::Failed`, e.g. a revoked/expired session
+    /// credential) MUST decode to `outcome: "rejected"`, never the same
+    /// `"transport"` outcome a plain connectivity failure gets — that's
+    /// exactly what `ai.choosh.connection.ConnectionViewModel.connectWith`
+    /// branches on to decide whether to clear the stored credential.
+    #[tokio::test]
+    async fn connect_reports_rejected_outcome_on_auth_failure() {
+        use choosh_protocol::relay::{AuthFailed, AuthResult, ClientAuth, ServerHello};
+
+        let (listener, ws_url) = bind_fake_relayd_ws().await;
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            send_control(&mut ws, &ServerHello { nonce: "n".to_string() }).await;
+            let _auth: ClientAuth = recv_control(&mut ws).await;
+            send_control(&mut ws, &AuthResult::Failed(AuthFailed { reason: "session credential revoked".to_string() })).await;
+        });
+
+        let engine = Engine::new("http://unused".to_string(), ws_url);
+        let result = engine.connect("revoked-cred").await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["outcome"], "rejected", "{result}");
+        assert!(parsed["message"].as_str().unwrap().contains("revoked"), "{result}");
+    }
+
+    /// The other half of the finding #5 distinction: relayd simply being
+    /// unreachable (nothing listening on the target port) is a transport
+    /// failure, not a credential rejection — `outcome: "transport"`, so the
+    /// Kotlin caller keeps the stored credential and lets the user retry
+    /// rather than forcing a fresh `WebAuthn` ceremony.
+    #[tokio::test]
+    async fn connect_reports_transport_outcome_when_relayd_unreachable() {
+        let engine = Engine::new("http://unused".to_string(), "ws://127.0.0.1:1/connect".to_string());
+        let result = engine.connect("some-cred").await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["outcome"], "transport", "{result}");
+        assert!(parsed["message"].as_str().is_some(), "{result}");
     }
 
     /// Drives a full RPC round trip (hello/auth, open-tunnel, one tunnel
@@ -1156,7 +1233,7 @@ mod tests {
         });
 
         let engine = Engine::new("http://unused".to_string(), ws_url);
-        assert!(engine.connect("good-cred").await, "connect should succeed against a well-behaved fake relayd");
+        assert_connect_ok(&engine.connect("good-cred").await);
         engine
     }
 
@@ -1205,7 +1282,7 @@ mod tests {
         });
 
         let engine = Engine::new("http://unused".to_string(), ws_url);
-        assert!(engine.connect("good-cred").await, "connect should succeed against a well-behaved fake relayd");
+        assert_connect_ok(&engine.connect("good-cred").await);
         engine
     }
 
@@ -1504,7 +1581,7 @@ mod tests {
         });
 
         let engine = Engine::new("http://unused".to_string(), ws_url);
-        assert!(engine.connect("good-cred").await);
+        assert_connect_ok(&engine.connect("good-cred").await);
         server.await.unwrap();
 
         let body = engine.open_document("dev-1", "ws-1", "a.txt").await;
@@ -1571,7 +1648,7 @@ mod tests {
         });
 
         let engine = Engine::new("http://unused".to_string(), ws_url);
-        assert!(engine.connect("good-cred").await);
+        assert_connect_ok(&engine.connect("good-cred").await);
 
         let events = poll_until_nonempty(&engine).await;
         let events = events.as_array().unwrap();
@@ -1645,7 +1722,7 @@ mod tests {
         });
 
         let engine = Engine::new("http://unused".to_string(), ws_url);
-        assert!(engine.connect("good-cred").await);
+        assert_connect_ok(&engine.connect("good-cred").await);
         let body = engine.agent_events_resume("dev-1", "ws-1", 5).await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["outcome"], "replayed", "{body}");
@@ -1692,7 +1769,7 @@ mod tests {
         });
 
         let engine = Engine::new("http://unused".to_string(), ws_url);
-        assert!(engine.connect("good-cred").await);
+        assert_connect_ok(&engine.connect("good-cred").await);
         // A very old/unknown sequence — this is exactly the shape a real
         // devhost spool would answer with snapshot_required for.
         let body = engine.agent_events_resume("dev-1", "ws-1", 999_999).await;
@@ -1738,7 +1815,7 @@ mod tests {
         });
 
         let engine = Engine::new("http://unused".to_string(), ws_url);
-        assert!(engine.connect("good-cred").await);
+        assert_connect_ok(&engine.connect("good-cred").await);
         let _ = engine.agent_events_resume("dev-1", "ws-1", 0).await;
         let _ = engine.agent_events_resume("dev-1", "ws-1", -1).await;
         server.await.unwrap();

@@ -1,6 +1,5 @@
 package ai.choosh.fleet
 
-import ai.choosh.engine.ConnectionState
 import ai.choosh.engine.DevHostPresence
 import ai.choosh.ui.WindowWidthSizeClass
 import ai.choosh.ui.rememberWindowWidthSizeClass
@@ -207,9 +206,11 @@ private fun FleetRowView(
         if (row.needsAttention) {
             AttentionDot()
         }
-        if (row is FleetRow.DevHostRow && row.devHost.connectionState == ConnectionState.OFFLINE) {
-            Text("offline", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
+        // UX-friction audit finding #14: a DevHostRow's sublabel above already includes
+        // `connectionState` (e.g. "macos · offline · 2 workspace(s)") and is also what this
+        // row's own `contentDescription` (above) is built from — a second, standalone "offline"
+        // Text here duplicated that same fact in the same row rather than adding new
+        // information. Removed rather than kept as a redundant visual badge.
     }
 }
 

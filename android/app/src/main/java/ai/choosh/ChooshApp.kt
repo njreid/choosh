@@ -5,7 +5,7 @@ import ai.choosh.agentevents.AgentEventCursorStore
 import ai.choosh.agentevents.AgentEventSubscription
 import ai.choosh.connection.ConnectionScreen
 import ai.choosh.connection.ConnectionViewModel
-import ai.choosh.connection.SessionCredentialStore
+import ai.choosh.connection.RealSessionCredentialStore
 import ai.choosh.engine.ChooshEngine
 import ai.choosh.fleet.FleetDrawer
 import ai.choosh.fleet.FleetNavigationEvent
@@ -72,7 +72,18 @@ private suspend fun fetchFcmToken(): String? = runCatching { FirebaseMessaging.g
 private sealed interface Screen {
     data object Connection : Screen
     data object Fleet : Screen
-    data class Workspace(val workspaceId: String, val deviceId: String) : Screen
+
+    /**
+     * `workspaceName` is [ai.choosh.fleet.Workspace.name] — carried through
+     * from wherever this screen was navigated to from (see
+     * [ai.choosh.fleet.FleetNavigationEvent.OpenWorkspace]'s own doc
+     * comment), so [ai.choosh.workspace.WorkspaceScreen] can title itself
+     * with the real name instead of the raw [workspaceId] (UX-friction
+     * audit finding #11). `null` only where genuinely unavailable at the
+     * navigating call site — [ai.choosh.workspace.WorkspaceScreen] falls
+     * back to [workspaceId] in that case, never a crash or a fabricated name.
+     */
+    data class Workspace(val workspaceId: String, val deviceId: String, val workspaceName: String? = null) : Screen
     data class DevHostPlaceholder(val deviceId: String) : Screen
 
     /**
@@ -91,8 +102,17 @@ private sealed interface Screen {
      * today only from [Workspace]'s demo affordance — a real entry point
      * (tapping an actual `AgentTerminal` item in the explorer) lands with
      * `item.list` wiring into the explorer itself, a later increment.
+     *
+     * `itemName`: same "thread the real name through instead of showing a
+     * raw id" fix as [Workspace.workspaceName] (UX-friction audit finding
+     * #11) — there is no real named `AgentTerminal` item to source this
+     * from yet (this screen's own `itemId` is actually a reused
+     * `workspaceId`, see the demo-affordance call site below), so this is
+     * the current [Workspace]'s own name, the closest genuinely-available
+     * name today. `null` falls back to [itemId]/[deviceId], unchanged from
+     * before this field existed.
      */
-    data class Terminal(val deviceId: String, val itemId: String) : Screen
+    data class Terminal(val deviceId: String, val itemId: String, val itemName: String? = null) : Screen
 
     /**
      * `WebService` pinned-item demo, per `docs/specs/service-tunnels.md`.
@@ -119,7 +139,7 @@ private sealed interface Screen {
 @Composable
 fun ChooshApp(context: Context) {
     val engine = remember { buildEngine() }
-    val credentialStore = remember { SessionCredentialStore(context) }
+    val credentialStore = remember { RealSessionCredentialStore(context) }
     // Plain `remember`, not `rememberSaveable`: `Screen` isn't `Parcelable`, and this
     // navigation state is cheap to rebuild from `ConnectionViewModel`'s own stored-credential
     // check on a configuration change anyway — not worth a custom Saver for this pass.
@@ -180,12 +200,12 @@ fun ChooshApp(context: Context) {
                         onSortModeSelected = viewModel::setSortMode,
                         onProjectClick = { project ->
                             screen = when (val event = viewModel.onProjectTapped(project)) {
-                                is FleetNavigationEvent.OpenWorkspace -> Screen.Workspace(event.workspaceId, event.deviceId)
+                                is FleetNavigationEvent.OpenWorkspace -> Screen.Workspace(event.workspaceId, event.deviceId, event.workspaceName)
                                 is FleetNavigationEvent.OpenDevHost -> Screen.DevHostPlaceholder(event.deviceId)
                             }
                         },
                         onDevHostClick = { devHost -> screen = Screen.DevHostPlaceholder(devHost.deviceId) },
-                        onWorkspaceClick = { workspace -> screen = Screen.Workspace(workspace.workspaceId, workspace.devHostId) },
+                        onWorkspaceClick = { workspace -> screen = Screen.Workspace(workspace.workspaceId, workspace.devHostId, workspace.name) },
                     )
                 }
 
@@ -201,13 +221,16 @@ fun ChooshApp(context: Context) {
                     WorkspaceScreen(
                         engine = engine,
                         workspaceId = current.workspaceId,
+                        workspaceName = current.workspaceName,
                         deviceId = current.deviceId,
                         onBack = { screen = Screen.Fleet },
                         // Demo entry points — the explorer doesn't yet surface real
                         // AgentTerminal/SourceEditor pinned items to tap directly
                         // (item.list wiring is a later increment), so these open a
                         // fixed item/path against the current workspace instead.
-                        onOpenTerminal = { screen = Screen.Terminal(deviceId = current.deviceId, itemId = current.workspaceId) },
+                        onOpenTerminal = {
+                            screen = Screen.Terminal(deviceId = current.deviceId, itemId = current.workspaceId, itemName = current.workspaceName)
+                        },
                         onOpenEditor = { path -> screen = Screen.SourceEditor(current.deviceId, current.workspaceId, path) },
                         onOpenWebServiceDemo = { screen = Screen.WebServiceDemo(current.deviceId, current.workspaceId) },
                         onOpenMarkdownDemo = { screen = Screen.MarkdownDemo },
@@ -230,6 +253,10 @@ fun ChooshApp(context: Context) {
                     SourceEditorScreen(
                         viewModel = viewModel,
                         path = current.path,
+                        // No workspace name to carry back here — Screen.SourceEditor itself doesn't
+                        // carry one (see Screen.Workspace's doc comment on this being a documented,
+                        // acceptable fallback, not an oversight); WorkspaceScreen falls back to the
+                        // raw workspaceId in this one path.
                         onBack = { screen = Screen.Workspace(current.workspaceId, current.deviceId) },
                     )
                 }
@@ -237,6 +264,7 @@ fun ChooshApp(context: Context) {
                 is Screen.Terminal -> TerminalScreen(
                     deviceId = current.deviceId,
                     itemId = current.itemId,
+                    itemName = current.itemName,
                     // Hardcoded null, not yet wired to `(engine as?
                     // NativeChooshEngine)?.connectionHandle` — a real, tracked gap
                     // (UX-friction audit finding #4/#12: this composition root's demo
@@ -244,7 +272,11 @@ fun ChooshApp(context: Context) {
                     // yet), not a "no live relayd" limitation anymore. The demo-output
                     // buttons still exercise the real VT parser + renderer end to end.
                     connectionHandle = null,
-                    onBack = { screen = Screen.Workspace(current.itemId, current.deviceId) },
+                    // itemName is passed straight back through as workspaceName too: in this
+                    // demo affordance current.itemId IS the workspaceId (see Screen.Terminal's
+                    // own doc comment), and current.itemName was itself sourced from the
+                    // workspace's name at the point this Terminal screen was opened.
+                    onBack = { screen = Screen.Workspace(current.itemId, current.deviceId, current.itemName) },
                 )
 
                 is Screen.WebServiceDemo -> {
@@ -260,7 +292,7 @@ fun ChooshApp(context: Context) {
                         Button(onClick = { screen = Screen.Workspace(current.workspaceId, current.deviceId) }, modifier = Modifier.padding(8.dp)) {
                             Text("Back")
                         }
-                        WebServiceScreen(state, Modifier.weight(1f))
+                        WebServiceScreen(state, Modifier.weight(1f), onRetry = viewModel::retry)
                     }
                 }
 

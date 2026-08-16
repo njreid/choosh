@@ -1,6 +1,7 @@
 package ai.choosh.connection
 
 import ai.choosh.engine.ChooshEngine
+import ai.choosh.engine.ConnectResult
 import ai.choosh.engine.WebauthnResult
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -99,22 +100,51 @@ class ConnectionViewModel(
         }
     }
 
+    /**
+     * Credential-aware retry: if a session credential is still stored (a
+     * prior [connectWith] hit [ConnectResult.TransportFailure], which
+     * deliberately does NOT clear it — see that method's doc comment),
+     * this re-attempts [connectWith] against it rather than forcing a full
+     * `WebAuthn` ceremony. Only when nothing is stored (either first launch,
+     * or a prior [ConnectResult.Rejected] already cleared it) does this fall
+     * back to [ConnectionUiState.NeedsRegistration]. This mirrors [init]'s
+     * own "load stored credential, connect if present" shape rather than
+     * duplicating it inline.
+     */
     fun retry() {
-        _state.value = ConnectionUiState.NeedsRegistration
+        viewModelScope.launch {
+            val stored = credentialStore.load()
+            if (stored != null) {
+                connectWith(stored)
+            } else {
+                _state.value = ConnectionUiState.NeedsRegistration
+            }
+        }
     }
 
     private suspend fun connectWith(sessionCredential: String) {
         _state.value = ConnectionUiState.Connecting
-        val connected = runCatching { engine.connect(sessionCredential) }.getOrDefault(false)
-        _state.value = if (connected) {
-            registerFcmTokenBestEffort()
-            ConnectionUiState.Connected
-        } else {
-            // A stored credential relayd no longer accepts (revoked, expired) forces a fresh
-            // ceremony rather than a silent/ambiguous retry loop, per auth-and-enrollment.md's
-            // revocation behavior.
-            credentialStore.clear()
-            ConnectionUiState.NeedsRegistration
+        when (val result = runCatching { engine.connect(sessionCredential) }.getOrElse { failure ->
+            ConnectResult.TransportFailure(failure.message ?: "connect failed")
+        }) {
+            is ConnectResult.Connected -> {
+                registerFcmTokenBestEffort()
+                _state.value = ConnectionUiState.Connected
+            }
+            is ConnectResult.Rejected -> {
+                // relayd itself rejected this credential (revoked, expired) — forces a fresh
+                // ceremony rather than a silent/ambiguous retry loop, per auth-and-enrollment.md's
+                // revocation behavior. A plain connectivity failure (ConnectResult.TransportFailure,
+                // below) deliberately does NOT do this: UX-friction audit finding #5 was exactly this
+                // distinction missing, when this method's only signal was a bare Boolean.
+                credentialStore.clear()
+                _state.value = ConnectionUiState.NeedsRegistration
+            }
+            is ConnectResult.TransportFailure -> {
+                // The stored credential may still be perfectly valid — only unreachable right now.
+                // Left in place so retry() (and the next app open) can use it again, no re-registration.
+                _state.value = ConnectionUiState.Error("Couldn't connect: ${result.message}")
+            }
         }
     }
 
