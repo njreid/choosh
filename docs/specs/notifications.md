@@ -44,8 +44,11 @@ Only two normalized events (see [agent-events.md](agent-events.md)) produce
 a notification:
 
 - `input_required` — an agent is blocked on the user.
-- `auth_required` — a headless devhost needs the user to complete an SSO
-  device-code flow.
+- `resource_reauth_required` — a devhost-attached Resource (an SSO/cloud-CLI
+  session, or other credentialed external dependency) needs the user to
+  complete a re-authentication step. Supersedes the earlier, narrower
+  `auth_required` event — see [agent-events.md](agent-events.md) and
+  [resources-and-reauth.md](resources-and-reauth.md).
 
 `turn_completed`, `files_changed`, `agent_status`, and `editor_attached`/
 `editor_detached` MUST NOT produce a notification; they update in-app state
@@ -56,13 +59,19 @@ silently.
 A notification payload — whether rendered from the local relay connection
 or reconstructed from an FCM data message — MUST contain only:
 
-- workspace id and display name;
-- agent id (for `input_required`) or provider name (for `auth_required`);
+- workspace id and display name (`input_required` only — a
+  `resource_reauth_required` event is devhost/Resource-scoped, not
+  workspace-scoped, and carries no `workspace_id`);
+- agent id (for `input_required`) or the Resource's `display_name` and
+  `resource_kind` (for `resource_reauth_required`) — `display_name` is
+  operator- or agent-chosen text and MUST NOT be trusted as proof of where
+  a shown link actually goes;
 - a coarse enum reason: for `input_required`, one of `approval`,
   `permission`, `question`, `elicitation`, `next_prompt` (per
-  [agent-events.md](agent-events.md)); for `auth_required`, the provider's
-  `user_code` and `verification_uri` only, since those are meant to be
-  shown to the user and are not secrets on their own.
+  [agent-events.md](agent-events.md)); for `resource_reauth_required`, the
+  pattern-appropriate subset of `verification_uri`, `user_code`, and
+  `fetch_instructions` only, since those are meant to be shown to the user
+  and are not secrets on their own.
 
 A notification payload MUST NOT contain command text, tool arguments, file
 contents, prompts, tokens, session identifiers, or any other credential
@@ -73,15 +82,16 @@ output into a notification string as a defect.
 ## Dedup
 
 Notifications are keyed by `(host_id, workspace_id, item_id)` for
-`input_required` and `(host_id, provider)` for `auth_required`. A new event
-for the same key MUST update the existing notification in place rather than
-creating an additional one. A notification is cleared when:
+`input_required` and `(host_id, resource_id)` for `resource_reauth_required`.
+A new event for the same key MUST update the existing notification in place
+rather than creating an additional one. A notification is cleared when:
 
-- the user opens the relevant terminal/auth flow from the notification
+- the user opens the relevant terminal/re-auth flow from the notification
   (acknowledging it), or
 - the underlying condition resolves on its own — the agent leaves
-  `waiting` (per `agent_status`), or the SSO flow completes — even if the
-  user never touched the notification.
+  `waiting` (per `agent_status`), or the Resource's re-auth flow completes
+  (`resources-and-reauth.md`'s "verified" state) — even if the user never
+  touched the notification.
 
 ## Actionability
 
@@ -95,29 +105,42 @@ tapping it still connects, pins, and focuses the right terminal per
 [agent-events.md](agent-events.md)'s tap behavior, it just can't resolve
 the block without the user typing into the agent directly.
 
-`auth_required` notifications are always open-app-only: tapping opens the
-`verification_uri` in a Custom Tab, per DESIGN.md §6.
+`resource_reauth_required` notifications are always open-app-only: tapping
+opens the app to the pattern-appropriate re-auth prompt — `verification_uri`
+in a Custom Tab (patterns a/b/d), per DESIGN.md §6, or an in-app view of
+`fetch_instructions` (pattern c, which has no URL to open).
 
-**Implementation status**: the Android app's notification model now covers
-both shapes — `ai.choosh.notifications.NotificationIntent` for
-`input_required` (`workspaceId`/`itemId`/`agentName`, keyed `(host_id,
-workspace_id, item_id)`) and `ai.choosh.notifications.AuthNotificationIntent`
-for `auth_required` (`provider`/`userCode`/`verificationUri`, keyed
-`(host_id, provider)`, always open-app-only per "Actionability" above),
-both implementing `RenderableNotification` and flowing through the same
-`NotificationSink`/`NotificationProjector`/`NotificationServiceLifecycle`
-path. `relayd`'s FCM dispatch (`rust/choosh-relayd/src/fcm.rs`) is a real
-v1 API implementation (service-account JWT-bearer OAuth2 exchange +
-`messages:send`), and `ChooshFirebaseMessagingService.onMessageReceived`
-parses a real data payload via `FcmNotificationParser` and projects it
-through the same path described above, rather than only logging receipt.
-**Neither has been exercised against a live `fcm.googleapis.com` send or a
-real device** — no service-account credential is available in the
-environment this was built in (see [PLAN.md](../../PLAN.md)'s Known
-follow-ups for the specific finding), so `relayd`'s dispatcher currently
-always takes its logging-only fallback path. The FCM-reconstructed
-`input_required` notification also has a known display-fidelity gap: the
-wire event carries no workspace display name or agent name, so the FCM
-path falls back to raw ids for those fields where the live persistent-
-connection path (once it has a local registry to draw from) would show
-real names — see `FcmNotificationParser`'s doc comment.
+**Implementation status — stale, not yet migrated to
+`resource_reauth_required`.** The Android app's notification model
+currently only implements the superseded `auth_required` shape:
+`ai.choosh.notifications.NotificationIntent` for `input_required`
+(`workspaceId`/`itemId`/`agentName`, keyed `(host_id, workspace_id,
+item_id)`) and `ai.choosh.notifications.AuthNotificationIntent` for the old
+`auth_required` event (`provider`/`userCode`/`verificationUri`, keyed
+`(host_id, provider)`), both implementing `RenderableNotification` and
+flowing through the same `NotificationSink`/`NotificationProjector`/
+`NotificationServiceLifecycle` path. `FcmNotificationParser` likewise still
+parses an `"auth_required"` FCM data payload
+(`ai.choosh.notifications.FcmNotificationParser`), not
+`"resource_reauth_required"`. Since `choosh-protocol`'s wire event was
+renamed and reshaped this session (`WireAgentEvent::AuthRequired` removed,
+replaced by `WireAgentEvent::ResourceReauthRequired` — see
+[agent-events.md](agent-events.md)), this Android notification path is now
+out of sync with the actual wire event and needs its own migration
+(`AuthNotificationIntent` → a `resource_id`/`display_name`/
+`resource_kind`/pattern-aware shape, dedup key `(host_id, resource_id)`,
+`FcmNotificationParser`'s `"auth_required"` case renamed and reshaped to
+match); not fixed here. `relayd`'s FCM dispatch
+(`rust/choosh-relayd/src/fcm.rs`) is a real v1 API implementation
+(service-account JWT-bearer OAuth2 exchange + `messages:send`) and is
+unaffected by this gap — it dispatches whatever `WireAgentEvent` it's given
+today. **Neither the relayd nor Android FCM path has been exercised against
+a live `fcm.googleapis.com` send or a real device** — no service-account
+credential is available in the environment this was built in (see
+[PLAN.md](../../PLAN.md)'s Known follow-ups for the specific finding), so
+`relayd`'s dispatcher currently always takes its logging-only fallback
+path. The FCM-reconstructed `input_required` notification also has a known
+display-fidelity gap: the wire event carries no workspace display name or
+agent name, so the FCM path falls back to raw ids for those fields where
+the live persistent-connection path (once it has a local registry to draw
+from) would show real names — see `FcmNotificationParser`'s doc comment.

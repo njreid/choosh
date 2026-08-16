@@ -644,25 +644,41 @@ two-ceremonies-in-flight-at-once tests for both registration and login).
 `cargo clippy --release -p choosh-relayd --all-targets` both pass clean
 with this change in place.
 
-**Known follow-up, not fixed here (out of this fix's scope — backend-only):**
-the real HTTP callers of `register_start`/`register_finish` — 
-`rust/choosh-android-bridge/src/engine.rs`'s `Engine::webauthn_register_start`/
-`webauthn_register_finish` (used by the real Android app via JNI) and
-`rust/choosh-android-bridge/examples/dev_cli.rs`'s `enroll_token` — do not
-yet send the bootstrap-secret header, and will get `503`/`401` from
-`relayd` once `CHOOSH_RELAYD_BOOTSTRAP_SECRET` is actually set in a
-deployment. Threading the secret through to those callers needs a UX
-decision (where does the phone user enter/receive the secret — a settings
-field, a one-time setup link, etc.) that this fix deliberately leaves to a
-human rather than guessing; see the implementing agent's report for the
-specific files/functions involved. The correlation-id ceremony contract
-above is an *additive* JSON field (`correlation_id`) and a new, currently
-unconsumed query parameter on `finish` — existing callers that ignore
-unknown JSON fields (verified: `NativeChooshEngine.kt`'s decoder sets
-`ignoreUnknownKeys = true`; `webauthn-rs-proto`'s wire types don't deny
-unknown fields either) won't break on `start`, but will fail `finish` calls
-against a real `relayd` build until they're updated to round-trip
-`correlation_id` back to `relayd`.
+**Bootstrap-secret threading — resolved since, via QR pairing.** The UX
+decision this originally deferred (where does the phone user enter/receive
+the secret) has since been made and implemented: `choosh-relayd pair`
+(`rust/choosh-relayd/src/main.rs`'s `pair()`, rendering logic in
+`rust/choosh-relayd/src/pair.rs`) prints the operator's already-configured
+`CHOOSH_RELAYD_BOOTSTRAP_SECRET` as a `choosh-pair:v1:<secret>` QR code.
+`ai.choosh.connection.ConnectionScreen` scans it once (`PAIRING_QR_PREFIX`)
+and threads the secret straight through
+`ConnectionViewModel.beginRegistration`/`registerWithDevPasskey` to
+`Engine::webauthn_register_start` (`rust/choosh-android-bridge/src/engine.rs:137-139`),
+which sends it as the `X-Choosh-Bootstrap-Secret` header — matching the gate
+described above. The secret is never baked into the app or persisted
+(`ConnectionViewModel`'s own doc comment on `beginRegistration` is explicit
+about this — no `credentialStore` write, no other storage). `dev_cli.rs`'s
+`enroll_token` also now takes the secret as a required CLI argument and
+sends the same header.
+
+**Correlation-id round-trip — still not threaded through; a real, distinct
+gap that remains open.** `register_finish`/`login_finish` require
+`correlation_id` as a query parameter with no default
+(`webauthn.rs`'s `CeremonyQuery`, `register_finish` at `webauthn.rs:210-241`,
+`login_finish` at `webauthn.rs:273-312`) — but neither
+`Engine::webauthn_register_finish`/`webauthn_login_finish`
+(`rust/choosh-android-bridge/src/engine.rs:141-151`, no query string ever
+appended) nor their Kotlin callers
+(`ai.choosh.connection.ConnectionViewModel.finishRegistration`,
+`ai.choosh.engine.ChooshEngine.webauthnRegisterFinish`/`webauthnLoginFinish`)
+capture the `correlation_id` that `register_start`/`login_start`'s response
+now carries, let alone send it back on `finish`. Every real registration or
+login ceremony against a `relayd` build with this fix in place will fail its
+`finish` call on axum's own missing-query-parameter rejection, before ever
+reaching this module's own "no registration/authentication in progress"
+check. This is a separate bug from the bootstrap-secret gap above (which
+*is* now resolved) and is not fixed in this docs pass — flagged here for the
+Android/bridge code owners.
 
 ## Summary of the revocation/rate-limit/idle-timeout follow-up
 

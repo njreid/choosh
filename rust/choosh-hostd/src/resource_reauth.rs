@@ -116,6 +116,14 @@ pub enum ReauthError {
     /// in-progress pattern-b/d subprocess (`resource.reauth_start` was
     /// never called, already completed, or timed out).
     NoActiveReauth,
+    /// `resource.reauth_start` named a `resource_id` that already has a
+    /// pattern-b/d subprocess in flight. Rejected, not silently replaced —
+    /// see [`ReauthProcesses::start`]'s own doc comment for why a second,
+    /// concurrent start for the same resource is a genuine caller error
+    /// (a double-tap, a naive RPC retry after a slow response, two phone
+    /// sessions racing) rather than something safe to let overwrite the
+    /// map entry a first, still-in-progress attempt is relying on.
+    AlreadyInProgress,
 }
 
 impl std::fmt::Display for ReauthError {
@@ -125,6 +133,7 @@ impl std::fmt::Display for ReauthError {
             Self::MissingCommand => write!(f, "this resource has no command configured for its pattern"),
             Self::Spawn(error) => write!(f, "failed to spawn the resource's reauth command: {error}"),
             Self::NoActiveReauth => write!(f, "no in-progress reauth subprocess for this resource"),
+            Self::AlreadyInProgress => write!(f, "a reauth is already in progress for this resource; call resource.reauth_complete or wait for it to time out"),
         }
     }
 }
@@ -182,11 +191,48 @@ impl ReauthProcesses {
                 Ok(())
             }
             WireResourcePattern::B | WireResourcePattern::D => {
+                // A cheap up-front check so the overwhelmingly common case
+                // (no concurrent start in flight) doesn't pay for spawning
+                // a process it's just going to reject — the real
+                // correctness guarantee is the `Entry` match below, not
+                // this check (see its own comment).
+                if self.inner.lock().await.contains_key(&resource.resource_id) {
+                    return Err(ReauthError::AlreadyInProgress);
+                }
                 let command = resource.reauth_command.as_deref().ok_or(ReauthError::MissingCommand)?;
                 let mut child = spawn_piped(command).map_err(ReauthError::Spawn)?;
                 let stdout = child.stdout.take().expect("stdout is always piped by spawn_piped");
                 let resource_id = resource.resource_id.clone();
-                self.inner.lock().await.insert(resource_id.clone(), Entry { child });
+                {
+                    let mut map = self.inner.lock().await;
+                    match map.entry(resource_id.clone()) {
+                        std::collections::hash_map::Entry::Occupied(_) => {
+                            // Lost a race against a concurrent `start` for
+                            // the same resource_id between the check above
+                            // and this insert — kill the child just spawned
+                            // rather than silently overwriting the map
+                            // entry. Overwriting would be worse than just a
+                            // wasted spawn: each `start` also schedules its
+                            // own idle-timeout cleanup task keyed on
+                            // `resource_id` alone (see below), so a second
+                            // `start` racing in and replacing the entry
+                            // would leave the *first* call's cleanup task
+                            // free to remove/kill whatever now sits under
+                            // that key once its own timer fires — including
+                            // the second, still-legitimately-in-progress
+                            // attempt. Rejecting the loser outright keeps
+                            // "one resource_id has at most one live entry,
+                            // and its cleanup task is the only one that can
+                            // ever remove it" true.
+                            drop(map);
+                            let _ = child.start_kill();
+                            return Err(ReauthError::AlreadyInProgress);
+                        }
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(Entry { child });
+                        }
+                    }
+                }
 
                 let watcher_resource = resource.clone();
                 let watcher_map = self.inner.clone();
@@ -237,17 +283,26 @@ impl ReauthProcesses {
                 }
                 let template = resource.resume_command_template.as_deref().ok_or(ReauthError::MissingCommand)?;
                 let command = template.replace("{code}", value);
-                let status = Command::new("sh")
+                // `stdin(Stdio::null())`, not piped: the phone-supplied
+                // value is already embedded in `command` via `{code}`, not
+                // written to this process's stdin — reusing
+                // `write_value_and_await_exit` here is still correct (it
+                // only writes when `child.stdin` is `Some`, which it never
+                // is for a `Stdio::null()` child) and, per
+                // `REAUTH_COMPLETE_WAIT`'s own doc comment ("spawning a
+                // fresh resume command (pattern d)"), is what actually
+                // bounds this wait — a plain `.status().await` here would
+                // let a hung resume command block this RPC indefinitely.
+                let mut child = Command::new("sh")
                     .arg("-c")
                     .arg(&command)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .kill_on_drop(true)
-                    .status()
-                    .await
+                    .spawn()
                     .map_err(ReauthError::Spawn)?;
-                Ok(status.success())
+                Ok(write_value_and_await_exit(&mut child, value).await)
             }
         }
     }
@@ -447,6 +502,68 @@ mod tests {
         assert!(marker.exists(), "complete must have actually spawned the resume_command_template with {{code}} substituted and run it");
         assert!(!processes.has_entry(&res.resource_id).await, "the original watcher entry must be removed on complete");
         let _ = std::fs::remove_file(&marker);
+    }
+
+    /// Regression test for a real bug found in review: pattern d's
+    /// `complete` used to `.status().await` its freshly-spawned resume
+    /// command with no timeout at all, unlike pattern b/c's
+    /// `write_value_and_await_exit` — a hung `resume_command_template`
+    /// (a real, plausible failure mode: the resumed CLI itself hangs on a
+    /// network call) would have blocked the `resource.reauth_complete` RPC
+    /// handler indefinitely. `REAUTH_COMPLETE_WAIT`'s own doc comment
+    /// already claimed to bound "spawning a fresh resume command (pattern
+    /// d)" — this proves that's actually true now, not just documented.
+    #[tokio::test]
+    async fn pattern_d_resume_command_that_hangs_is_bounded_and_reports_unverified() {
+        let watcher_script = "echo 'https://example.com/device'; sleep 30";
+        let resume_template = "sleep 30 && exit 0".to_string();
+        let res = resource(WireResourcePattern::D, Some(watcher_script), Some(&resume_template), None);
+        let processes = ReauthProcesses::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        processes.start(&res, tx).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+
+        let started = tokio::time::Instant::now();
+        let verified = processes.complete(&res, "irrelevant-value").await.unwrap();
+        assert!(!verified, "a resume command that never exits within REAUTH_COMPLETE_WAIT must not be reported as verified");
+        assert!(
+            started.elapsed() < REAUTH_COMPLETE_WAIT + Duration::from_secs(5),
+            "a hung resume command must be bounded by REAUTH_COMPLETE_WAIT, not block indefinitely (elapsed: {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// Regression test for a real race found in review: `start` used to
+    /// unconditionally `insert` into the shared map, so a second
+    /// `resource.reauth_start` for the same `resource_id` while one was
+    /// already in flight (a double-tap, a client retry after a slow
+    /// response) would silently replace the first entry — and because each
+    /// `start` also schedules its own idle-timeout cleanup task keyed on
+    /// nothing but `resource_id`, the *first* call's cleanup, once its
+    /// timer fired, could then reap whichever entry currently sat under
+    /// that key, including the second, still-legitimate attempt. A second
+    /// `start` must now be rejected outright, and must not disturb the
+    /// first attempt at all.
+    #[tokio::test]
+    async fn a_second_concurrent_start_for_the_same_resource_id_is_rejected_and_does_not_disturb_the_first() {
+        let script = "echo 'https://example.com/device'; read -r code; if [ \"$code\" = \"SECRET-1\" ]; then exit 0; else exit 1; fi";
+        let res = resource(WireResourcePattern::B, Some(script), None, None);
+        let processes = ReauthProcesses::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        processes.start(&res, tx.clone()).await.unwrap();
+        assert!(processes.has_entry(&res.resource_id).await);
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().expect("first start must emit ResourceReauthRequired");
+
+        let second = processes.start(&res, tx).await;
+        assert!(matches!(second, Err(ReauthError::AlreadyInProgress)), "a second start for an in-progress resource must be rejected, got {second:?}");
+
+        // The first attempt must still be the live one, and still
+        // completable — the rejected second call must not have touched it.
+        assert!(processes.has_entry(&res.resource_id).await, "the first attempt's entry must survive a rejected concurrent start");
+        let verified = processes.complete(&res, "SECRET-1").await.unwrap();
+        assert!(verified, "the first, legitimate in-progress attempt must still be completable after a rejected concurrent start");
     }
 
     #[tokio::test]

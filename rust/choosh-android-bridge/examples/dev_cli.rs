@@ -68,11 +68,20 @@ async fn enroll_token(args: &[String]) -> Result<(), String> {
         .map_err(|error| format!("register/start body read failed: {error}"))?;
     eprintln!("register/start -> {creation_options_json}");
 
+    // relayd's register_finish looks up its in-flight ceremony state by this
+    // id (rust/choosh-relayd/src/webauthn.rs's CeremonyQuery) and rejects the
+    // request outright without it — merged into register/start's own
+    // response body by that file's with_correlation_id.
+    let correlation_id = serde_json::from_str::<serde_json::Value>(&creation_options_json)
+        .ok()
+        .and_then(|value| value["correlation_id"].as_str().map(str::to_string))
+        .ok_or_else(|| format!("register/start response had no correlation_id: {creation_options_json}"))?;
+
     let credential_json = dev_passkey::register(http_base_url, &creation_options_json)?;
     eprintln!("dev passkey produced a credential ({} bytes)", credential_json.len());
 
     let finish_body = client
-        .post(format!("{http_base_url}/webauthn/register/finish"))
+        .post(format!("{http_base_url}/webauthn/register/finish?correlation_id={correlation_id}"))
         .header("Content-Type", "application/json")
         .body(credential_json)
         .send()

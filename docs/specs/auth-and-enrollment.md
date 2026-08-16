@@ -48,13 +48,17 @@ enrolled phone/browser).
   `CHOOSH_RELAYD_BOOTSTRAP_SECRET` is unset (or empty), registration is
   refused outright for every caller — fail closed, with no built-in
   default. The system's owner obtains this secret when they deploy `relayd`
-  and provides it to their own phone once, out of band (e.g. typed in
-  manually, or embedded in a one-time setup link), during first-time setup;
-  it is not a standing credential presented on every request, only the one
-  registration ceremony that establishes the phone's first passkey. Nothing
-  about `login_start`/`login_finish` requires this secret — logging in only
-  ever re-asserts an *already-registered* passkey, which by construction
-  means someone already passed the bootstrap gate once.
+  and provides it to their own phone once, out of band, during first-time
+  setup: `choosh-relayd pair` (`rust/choosh-relayd/src/pair.rs`) prints the
+  already-configured secret as a scannable `choosh-pair:v1:<secret>` QR
+  code, and the Android app's connection screen scans it once to obtain the
+  secret for that one registration call — it is never typed in by hand,
+  baked into the app, or persisted after use. It is not a standing
+  credential presented on every request, only the one registration
+  ceremony that establishes the phone's first passkey. Nothing about
+  `login_start`/`login_finish` requires this secret — logging in only ever
+  re-asserts an *already-registered* passkey, which by construction means
+  someone already passed the bootstrap gate once.
 - **Registration** (first phone, or adding a second device): standard
   WebAuthn attestation ceremony via Android Credential Manager
   (`CreatePublicKeyCredentialRequest`) or a browser's platform

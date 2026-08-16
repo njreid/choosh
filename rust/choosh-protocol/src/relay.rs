@@ -237,9 +237,9 @@ impl WireAgentEvent {
     /// The workspace this event is attributable to, per `agent-events.md`'s
     /// "Delivery and replay" section ("MUST receive a monotonically
     /// increasing sequence number per workspace"). `None` only for
-    /// [`Self::AuthRequired`] — per its own doc comment, that variant is
-    /// deliberately not scoped to a single workspace, so it is not
-    /// sequenced or retained in [`SequencedAgentEvent`]'s per-workspace
+    /// [`Self::ResourceReauthRequired`] — per its own doc comment, that
+    /// variant is deliberately not scoped to a single workspace, so it is
+    /// not sequenced or retained in [`SequencedAgentEvent`]'s per-workspace
     /// spool (`choosh-hostd::agent_event_spool`); it is still delivered
     /// live exactly as before, just outside the replay mechanism.
     #[must_use]
@@ -306,7 +306,7 @@ pub enum WireMobileProfile {
 /// carrying the sequence number `agent-events.md`'s "Delivery and replay"
 /// section requires. Only ever constructed for an event whose
 /// [`WireAgentEvent::workspace_id`] is `Some` — the spool never assigns a
-/// sequence to (or retains) a [`WireAgentEvent::AuthRequired`].
+/// sequence to (or retains) a [`WireAgentEvent::ResourceReauthRequired`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SequencedAgentEvent {
     pub sequence: u64,
@@ -456,7 +456,7 @@ pub enum ControlRequest {
         /// The sequence `choosh-hostd` assigned this event in its
         /// per-workspace spool (see [`SequencedAgentEvent`]), or `None` for
         /// an event with no [`WireAgentEvent::workspace_id`] (only
-        /// `AuthRequired`). Added additively alongside the pre-existing
+        /// `ResourceReauthRequired`). Added additively alongside the pre-existing
         /// `event` field, per `agent-events.md`'s "Delivery and replay"
         /// section — `relayd` forwards it unmodified in the matching
         /// `ServerPush::AgentEvent`.
@@ -1200,6 +1200,23 @@ mod tests {
         assert!(json.contains("\"user_code\":null"));
         let decoded: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn wire_mobile_profile_variants_round_trip_with_the_expected_snake_case_wire_names() {
+        // The `ResourceReauthRequired` tests above only ever exercise
+        // `Work`/`Ask` — `Personal` (the third variant) had no explicit
+        // serialization coverage at all before this test.
+        let cases = [
+            (WireMobileProfile::Personal, "\"personal\""),
+            (WireMobileProfile::Work, "\"work\""),
+            (WireMobileProfile::Ask, "\"ask\""),
+        ];
+        for (profile, wire) in cases {
+            let json = serde_json::to_string(&profile).unwrap();
+            assert_eq!(json, wire);
+            assert_eq!(serde_json::from_str::<WireMobileProfile>(&json).unwrap(), profile);
+        }
     }
 
     #[test]

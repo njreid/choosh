@@ -205,4 +205,120 @@ class ConnectionViewModelTest {
         assertTrue(viewModel.state.value is ConnectionUiState.Error)
         assertNotNull("a thrown exception must not be mistaken for a rejection", credentialStore.load())
     }
+
+    // --- beginRegistration / finishRegistration ---
+    //
+    // The QR-pairing pass ([ConnectionScreen]'s "Scan QR to pair" button) threads a
+    // scanned bootstrapSecret through beginRegistration, but until now nothing at this
+    // ViewModel layer exercised the registration round trip itself (Registering ->
+    // Connected on a successful ceremony, Registering -> Error on a rejected one) — only
+    // the already-stored-credential connect/retry paths above were covered.
+
+    @Test
+    fun `beginRegistration moves to Registering and returns the engine's creation options`() = runTest(mainDispatcherRule.dispatcher) {
+        val viewModel = ConnectionViewModel(FakeChooshEngine(), FakeSessionCredentialStore())
+        advanceUntilIdle()
+        assertEquals(ConnectionUiState.NeedsRegistration, viewModel.state.value)
+
+        val creationOptionsJson = viewModel.beginRegistration("scanned-bootstrap-secret")
+
+        assertEquals(ConnectionUiState.Registering, viewModel.state.value)
+        assertTrue(
+            "must return whatever the engine's webauthnRegisterStart produced, unmodified",
+            creationOptionsJson.contains("\"challenge\""),
+        )
+    }
+
+    @Test
+    fun `finishRegistration on success saves the credential and connects`() = runTest(mainDispatcherRule.dispatcher) {
+        val credentialStore = FakeSessionCredentialStore()
+        val viewModel = ConnectionViewModel(FakeChooshEngine(), credentialStore)
+        advanceUntilIdle()
+        viewModel.beginRegistration("scanned-bootstrap-secret")
+        advanceUntilIdle()
+
+        viewModel.finishRegistration("fake-credential-response-json")
+        advanceUntilIdle()
+
+        assertEquals(ConnectionUiState.Connected, viewModel.state.value)
+        assertEquals(
+            "a successful ceremony must persist the session credential for next launch",
+            "fake-session-credential",
+            credentialStore.load(),
+        )
+    }
+
+    @Test
+    fun `finishRegistration on failure surfaces as Error and does not store a credential`() = runTest(mainDispatcherRule.dispatcher) {
+        val credentialStore = FakeSessionCredentialStore()
+        val failingEngine = object : ai.choosh.engine.ChooshEngine by FakeChooshEngine() {
+            override suspend fun webauthnRegisterFinish(credentialJson: String, correlationId: String): ai.choosh.engine.WebauthnResult =
+                ai.choosh.engine.WebauthnResult.Failure(code = "rejected", message = "bootstrap secret was invalid")
+        }
+        val viewModel = ConnectionViewModel(failingEngine, credentialStore)
+        advanceUntilIdle()
+        viewModel.beginRegistration("scanned-bootstrap-secret")
+        advanceUntilIdle()
+
+        viewModel.finishRegistration("fake-credential-response-json")
+        advanceUntilIdle()
+
+        val state = viewModel.state.value
+        assertTrue("a rejected ceremony must surface as an Error state, not Connected", state is ConnectionUiState.Error)
+        assertTrue((state as ConnectionUiState.Error).message.contains("bootstrap secret was invalid"))
+        assertNull("a failed ceremony must never persist a credential", credentialStore.load())
+    }
+
+    @Test
+    fun `finishRegistration sends the correlation_id beginRegistration's response carried`() = runTest(mainDispatcherRule.dispatcher) {
+        // Regression test: relayd's real register_finish rejects any request
+        // that doesn't carry the exact correlation_id its matching
+        // register_start response minted (rust/choosh-relayd/src/webauthn.rs's
+        // CeremonyQuery) — a prior version of this class never captured or
+        // sent it at all, so every real ceremony would have failed this way.
+        var receivedCorrelationId: String? = null
+        val capturingEngine = object : ai.choosh.engine.ChooshEngine by FakeChooshEngine() {
+            override suspend fun webauthnRegisterStart(bootstrapSecret: String): String =
+                """{"challenge":"c","correlation_id":"corr-xyz-789"}"""
+            override suspend fun webauthnRegisterFinish(credentialJson: String, correlationId: String): ai.choosh.engine.WebauthnResult {
+                receivedCorrelationId = correlationId
+                return ai.choosh.engine.WebauthnResult.Success(sessionCredential = "fake-session-credential")
+            }
+        }
+        val viewModel = ConnectionViewModel(capturingEngine, FakeSessionCredentialStore())
+        advanceUntilIdle()
+        viewModel.beginRegistration("scanned-bootstrap-secret")
+        advanceUntilIdle()
+
+        viewModel.finishRegistration("fake-credential-response-json")
+        advanceUntilIdle()
+
+        assertEquals("corr-xyz-789", receivedCorrelationId)
+    }
+
+    @Test
+    fun `finishRegistration without a prior beginRegistration fails cleanly instead of sending a missing correlation_id`() =
+        runTest(mainDispatcherRule.dispatcher) {
+            val viewModel = ConnectionViewModel(FakeChooshEngine(), FakeSessionCredentialStore())
+            advanceUntilIdle()
+
+            // No beginRegistration call first — pendingCorrelationId is still null.
+            viewModel.finishRegistration("fake-credential-response-json")
+            advanceUntilIdle()
+
+            val state = viewModel.state.value
+            assertTrue("must fail cleanly, not crash or silently proceed", state is ConnectionUiState.Error)
+        }
+
+    @Test
+    fun `onRegistrationCancelledOrFailed surfaces as Error, e g for an invalid pairing QR scan`() = runTest(mainDispatcherRule.dispatcher) {
+        val viewModel = ConnectionViewModel(FakeChooshEngine(), FakeSessionCredentialStore())
+        advanceUntilIdle()
+
+        viewModel.onRegistrationCancelledOrFailed("That QR code doesn't look like a Choosh pairing code.")
+
+        val state = viewModel.state.value
+        assertTrue(state is ConnectionUiState.Error)
+        assertEquals("That QR code doesn't look like a Choosh pairing code.", (state as ConnectionUiState.Error).message)
+    }
 }

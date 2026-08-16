@@ -9,6 +9,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Per auth-and-enrollment.md: a stored session credential means every later
@@ -54,6 +57,17 @@ class ConnectionViewModel(
     private val _state = MutableStateFlow<ConnectionUiState>(ConnectionUiState.CheckingStoredCredential)
     val state: StateFlow<ConnectionUiState> = _state.asStateFlow()
 
+    /**
+     * The `"correlation_id"` [beginRegistration]'s response JSON carried
+     * alongside the creation options, held only long enough to hand back to
+     * [finishRegistration] — `relayd` requires it to look up this
+     * ceremony's in-flight state (see [ChooshEngine.webauthnRegisterFinish]'s
+     * doc comment). Not a secret like `bootstrapSecret` (it identifies a
+     * ceremony, not a credential), but still scoped to one ceremony
+     * attempt: cleared implicitly by the next [beginRegistration] call.
+     */
+    private var pendingCorrelationId: String? = null
+
     init {
         viewModelScope.launch {
             val stored = credentialStore.load()
@@ -76,14 +90,32 @@ class ConnectionViewModel(
      */
     suspend fun beginRegistration(bootstrapSecret: String): String {
         _state.value = ConnectionUiState.Registering
-        return engine.webauthnRegisterStart(bootstrapSecret)
+        val creationOptionsJson = engine.webauthnRegisterStart(bootstrapSecret)
+        pendingCorrelationId = runCatching {
+            Json.parseToJsonElement(creationOptionsJson).jsonObject["correlation_id"]?.jsonPrimitive?.content
+        }.getOrNull()
+        return creationOptionsJson
     }
 
-    /** Hands Credential Manager's response back to the engine and, on success, connects. */
+    /**
+     * Hands Credential Manager's response back to the engine and, on
+     * success, connects. Uses [beginRegistration]'s stored
+     * `pendingCorrelationId` — if that's somehow missing (an engine
+     * response with no `correlation_id`, which should never happen against
+     * a real `relayd`), fails the same honest way an actually-mismatched
+     * or expired correlation id would: `relayd` rejects it and this
+     * surfaces as an ordinary [WebauthnResult.Failure], not a crash.
+     */
     fun finishRegistration(credentialResponseJson: String) {
         viewModelScope.launch {
-            when (val result = engine.webauthnRegisterFinish(credentialResponseJson)) {
+            val correlationId = pendingCorrelationId
+            if (correlationId == null) {
+                _state.value = ConnectionUiState.Error("Registration failed: no pairing session in progress — please scan the QR code again.")
+                return@launch
+            }
+            when (val result = engine.webauthnRegisterFinish(credentialResponseJson, correlationId)) {
                 is WebauthnResult.Success -> {
+                    pendingCorrelationId = null
                     credentialStore.save(result.sessionCredential)
                     connectWith(result.sessionCredential)
                 }

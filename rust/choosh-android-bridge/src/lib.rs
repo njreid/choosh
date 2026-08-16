@@ -129,16 +129,22 @@ fn native_webauthn_register_start<'local>(
     JString::new(env, body)
 }
 
+// `correlation_id` is the value `native_webauthn_register_start`'s own
+// response carried alongside the creation options — see
+// `Engine::webauthn_register_finish`'s doc comment for why `relayd`
+// requires it.
 #[allow(clippy::needless_pass_by_value)] // see native_init's comment
 fn native_webauthn_register_finish<'local>(
     env: &mut Env<'local>,
     _class: JClass<'local>,
     handle: jlong,
     credential_json: JString<'local>,
+    correlation_id: JString<'local>,
 ) -> Result<JString<'local>, jni::errors::Error> {
     let credential_json = jstring_to_string(env, &credential_json)?;
+    let correlation_id = jstring_to_string(env, &correlation_id)?;
     let body = with_handle(handle, error_json("unknown engine handle"), |h| {
-        h.runtime.block_on(h.engine.webauthn_register_finish(&credential_json))
+        h.runtime.block_on(h.engine.webauthn_register_finish(&credential_json, &correlation_id))
     });
     JString::new(env, body)
 }
@@ -148,16 +154,20 @@ fn native_webauthn_login_start<'local>(env: &mut Env<'local>, _class: JClass<'lo
     JString::new(env, body)
 }
 
+// See `native_webauthn_register_finish`'s comment above — the same
+// `correlation_id` requirement applies here.
 #[allow(clippy::needless_pass_by_value)] // see native_init's comment
 fn native_webauthn_login_finish<'local>(
     env: &mut Env<'local>,
     _class: JClass<'local>,
     handle: jlong,
     credential_json: JString<'local>,
+    correlation_id: JString<'local>,
 ) -> Result<JString<'local>, jni::errors::Error> {
     let credential_json = jstring_to_string(env, &credential_json)?;
+    let correlation_id = jstring_to_string(env, &correlation_id)?;
     let body = with_handle(handle, error_json("unknown engine handle"), |h| {
-        h.runtime.block_on(h.engine.webauthn_login_finish(&credential_json))
+        h.runtime.block_on(h.engine.webauthn_login_finish(&credential_json, &correlation_id))
     });
     JString::new(env, body)
 }
@@ -669,7 +679,7 @@ const _REGISTER_START: jni::NativeMethod = native_method! {
 };
 const _REGISTER_FINISH: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",
-    static extern fn NativeBridge::native_webauthn_register_finish(handle: jlong, credential_json: JString) -> JString,
+    static extern fn NativeBridge::native_webauthn_register_finish(handle: jlong, credential_json: JString, correlation_id: JString) -> JString,
     fn = native_webauthn_register_finish,
 };
 const _LOGIN_START: jni::NativeMethod = native_method! {
@@ -679,7 +689,7 @@ const _LOGIN_START: jni::NativeMethod = native_method! {
 };
 const _LOGIN_FINISH: jni::NativeMethod = native_method! {
     java_type = "ai.choosh.NativeBridge",
-    static extern fn NativeBridge::native_webauthn_login_finish(handle: jlong, credential_json: JString) -> JString,
+    static extern fn NativeBridge::native_webauthn_login_finish(handle: jlong, credential_json: JString, correlation_id: JString) -> JString,
     fn = native_webauthn_login_finish,
 };
 const _CONNECT: jni::NativeMethod = native_method! {

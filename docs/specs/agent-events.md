@@ -70,18 +70,46 @@ posture is unchanged.
 Status: `starting`, `busy`, `waiting`, `stopped`, or `failed`. Failure
 details are bounded and redacted.
 
-### `auth_required`
+### `resource_reauth_required`
 
-A headless devhost detected a device-code SSO/cloud-CLI auth flow (`aws sso
-login`, `gcloud auth login`, `az login`, `gh auth login`) with no local
-browser to hand off to (see [ssh-bridge-and-zed.md](ssh-bridge-and-zed.md)'s
-sibling concerns around headless-vs-local-display detection are out of
-scope for this file; `choosh-hostd`'s provisioning behavior owns that
-decision). Payload is exactly:
+Superseded from the earlier, narrower `auth_required` event (a fixed
+`provider` enum of `aws|gcp|azure|github`, device-code-only) by the
+generalized **Resource** entity — see
+[resources-and-reauth.md](resources-and-reauth.md) for the full design and
+`rust/choosh-hostd/src/resource_reauth.rs` for the implementation. A
+Resource's re-auth was either passively detected in a PTY (pattern `a`
+only — `choosh-hostd`'s `auth_detect.rs`) or explicitly triggered
+(patterns `b`/`c`/`d`, always as a `choosh-hostd`-managed subprocess, never
+PTY injection). Payload
+(`choosh_protocol::relay::WireAgentEvent::ResourceReauthRequired`) is:
 
 ```json
-{ "provider": "aws|gcp|azure|github", "user_code": "WDJB-MJHT", "verification_uri": "https://..." }
+{
+  "resource_id": "res-...",
+  "display_name": "Prod AWS SSO",
+  "resource_kind": "aws-sso",
+  "pattern": "a",
+  "verification_uri": "https://...",
+  "user_code": "WDJB-MJHT",
+  "fetch_instructions": null,
+  "mobile_profile": "work"
+}
 ```
+
+`resource_kind` is a built-in kind (`aws-sso`, `aws-iam-key`, `aws-sts-mfa`,
+`gcloud`, `firebase`, `github`, `azure`) or `custom` — a plain string, not a
+closed wire enum, so a new provider is a new data row rather than a
+recompile. `pattern` (`a`/`b`/`c`/`d`) selects which of `verification_uri`
+(populated for a/b/d), `user_code` (a only — see
+`resource_reauth.rs`'s doc comment for why pattern b never populates this
+despite superficially resembling a), and `fetch_instructions` (c only) are
+set; the rest are `null`. `mobile_profile` (`personal|work|ask`) is new
+relative to `auth_required` — it names which Android profile the re-auth
+should be attempted in. Unlike every other normalized event here, this one
+carries no `workspace_id`/`item_id` (`WireAgentEvent::workspace_id` returns
+`None` for it) since a Resource is devhost-scoped, not workspace-scoped —
+it is delivered live but not sequenced or retained in the per-workspace
+replay spool described below.
 
 No token, credential, or session identifier MUST ever appear in this event.
 
@@ -153,7 +181,9 @@ the persistence a genuine multi-day event history would need.
 
 Notification behavior (redaction, dedup, delivery mechanism) is specified
 in full in [notifications.md](notifications.md). In short: only
-`input_required` and `auth_required` produce a notification; both are keyed
-by `(host_id, workspace_id, item_id)` and updated in place; tapping
-connects if necessary, opens the workspace, ensures the relevant item is
-pinned, focuses it, and acknowledges the notification.
+`input_required` and `resource_reauth_required` produce a notification;
+`input_required` is keyed by `(host_id, workspace_id, item_id)` and updated
+in place, tapping connects if necessary, opens the workspace, ensures the
+relevant item is pinned, focuses it, and acknowledges the notification —
+see notifications.md for `resource_reauth_required`'s own (devhost/resource
+scoped, not workspace scoped) dedup key and tap behavior.

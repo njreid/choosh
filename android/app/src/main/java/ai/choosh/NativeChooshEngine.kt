@@ -77,14 +77,18 @@ class NativeChooshEngine : ChooshEngine {
     override suspend fun webauthnRegisterStart(bootstrapSecret: String): String =
         withContext(Dispatchers.IO) { NativeBridge.nativeWebauthnRegisterStart(handle, bootstrapSecret) }
 
-    override suspend fun webauthnRegisterFinish(credentialJson: String): WebauthnResult =
-        withContext(Dispatchers.IO) { decodeWebauthnResult(NativeBridge.nativeWebauthnRegisterFinish(handle, credentialJson)) }
+    override suspend fun webauthnRegisterFinish(credentialJson: String, correlationId: String): WebauthnResult =
+        withContext(Dispatchers.IO) {
+            decodeWebauthnResult(NativeBridge.nativeWebauthnRegisterFinish(handle, credentialJson, correlationId))
+        }
 
     override suspend fun webauthnLoginStart(): String =
         withContext(Dispatchers.IO) { NativeBridge.nativeWebauthnLoginStart(handle) }
 
-    override suspend fun webauthnLoginFinish(credentialJson: String): WebauthnResult =
-        withContext(Dispatchers.IO) { decodeWebauthnResult(NativeBridge.nativeWebauthnLoginFinish(handle, credentialJson)) }
+    override suspend fun webauthnLoginFinish(credentialJson: String, correlationId: String): WebauthnResult =
+        withContext(Dispatchers.IO) {
+            decodeWebauthnResult(NativeBridge.nativeWebauthnLoginFinish(handle, credentialJson, correlationId))
+        }
 
     override suspend fun connect(sessionCredential: String): ConnectResult =
         withContext(Dispatchers.IO) { decodeConnectResult(NativeBridge.nativeConnect(handle, sessionCredential)) }
@@ -277,9 +281,9 @@ private object NativeBridge {
     // from the operator's pairing QR code — see ChooshEngine.webauthnRegisterStart's
     // doc comment for the full "why" and the "never persisted" contract.
     @JvmStatic external fun nativeWebauthnRegisterStart(handle: Long, bootstrapSecret: String): String
-    @JvmStatic external fun nativeWebauthnRegisterFinish(handle: Long, credentialJson: String): String
+    @JvmStatic external fun nativeWebauthnRegisterFinish(handle: Long, credentialJson: String, correlationId: String): String
     @JvmStatic external fun nativeWebauthnLoginStart(handle: Long): String
-    @JvmStatic external fun nativeWebauthnLoginFinish(handle: Long, credentialJson: String): String
+    @JvmStatic external fun nativeWebauthnLoginFinish(handle: Long, credentialJson: String, correlationId: String): String
     @JvmStatic external fun nativeConnect(handle: Long, sessionCredential: String): String
     @JvmStatic external fun nativeListDevhosts(handle: Long): String
     @JvmStatic external fun nativeRegisterFcmToken(handle: Long, fcmToken: String): Boolean

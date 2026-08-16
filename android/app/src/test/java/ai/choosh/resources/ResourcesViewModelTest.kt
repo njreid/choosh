@@ -1,17 +1,25 @@
 package ai.choosh.resources
 
+import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.FakeChooshEngine
 import ai.choosh.engine.MobileProfile
+import ai.choosh.engine.Resource
 import ai.choosh.engine.ResourcePattern
 import ai.choosh.fleet.MainDispatcherRule
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
+
+/** [ChooshEngine] wrapper that always fails `resource.list`, delegating everything else to [FakeChooshEngine] — mirrors [ai.choosh.fleet.DevHostWorkspacesViewModelTest]'s `FailingDevHostWorkspaceListChooshEngine` precedent for exercising [ResourcesViewModel.refresh]'s `loadInto` failure branch, which [FakeChooshEngine.resourceList] itself has no flag to simulate (unlike `resourcePropose`/`resourceConfirm`'s `simulateResourceRpcFailure`). */
+private class FailingResourceListChooshEngine(private val delegate: ChooshEngine = FakeChooshEngine()) : ChooshEngine by delegate {
+    override suspend fun resourceList(deviceId: String): List<Resource> = error("simulated resource.list failure")
+}
 
 /**
  * [ResourcesViewModel] against [FakeChooshEngine] — covers `resource.list`'s
@@ -40,6 +48,17 @@ class ResourcesViewModelTest {
         assertNull(state.error)
         assertTrue("expected at least one fixture resource", state.resources.isNotEmpty())
         assertTrue("expected at least one non-reauth (pattern = null) fixture resource", state.resources.any { it.pattern == null })
+    }
+
+    @Test
+    fun `a resource_list failure surfaces as an error state, not a crash`() = runTest(mainDispatcherRule.dispatcher) {
+        val viewModel = ResourcesViewModel(FailingResourceListChooshEngine(), deviceId)
+        advanceUntilIdle()
+
+        val state = viewModel.state.value
+        assertTrue(!state.isLoading)
+        assertNotNull("a failed resource.list must populate an error message, not throw", state.error)
+        assertTrue("a failed refresh must not leave stale rows", state.resources.isEmpty())
     }
 
     @Test

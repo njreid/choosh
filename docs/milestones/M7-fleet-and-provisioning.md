@@ -12,10 +12,14 @@ keeps a fleet's tooling current without hand-maintenance.
 - `dev-exec --host=<id> <cmd>`: cross-host task offload, brokered by
   `relayd`, running against a matching `jj` revision in an ephemeral
   workspace on the target host.
-- SSO/cloud-CLI device-code bridge: `hostd` detects a headless device-code
-  flow (`aws sso login` etc.), emits `auth_required` over the relay event
-  bus, phone opens the verification URL; on a devhost with a local
-  browser, the flow stays local and never touches the relay.
+- SSO/cloud-CLI re-authentication bridge: `hostd` either detects a headless
+  device-code flow (`aws sso login` etc., pattern a) or explicitly runs a
+  Resource's re-auth as a managed subprocess (patterns b/c/d — no PTY
+  injection), emits `resource_reauth_required` over the relay event bus,
+  phone completes the pattern-appropriate step; on a devhost with a local
+  browser, the flow stays local and never touches the relay. Generalized
+  beyond the original fixed four-provider design into the `Resource`
+  entity — see [resources-and-reauth.md](../specs/resources-and-reauth.md).
 - Two-tier `mise` provisioning end-to-end (§10): project-pinned toolchains
   via `mise.toml` on workspace registration; host-managed tools (`jj`,
   `zellij`, `zed-remote-server`) kept current by `hostd` at their natural
@@ -27,9 +31,9 @@ keeps a fleet's tooling current without hand-maintenance.
   two different AWS accounts with no shared credentials between them.
 - `dev-exec` against a heavier host completes a real build/test command
   and streams output back to the originating agent's terminal.
-- A device-code SSO flow on a headless cloud devhost completes via the
-  phone with no command, token, or prompt text leaking into the
-  notification.
+- A Resource re-auth flow (device-code SSO or otherwise) on a headless
+  cloud devhost completes via the phone with no command, token, or prompt
+  text leaking into the notification.
 - A workspace registered against a Project with no `mise.toml` still gets
   a working `jj`/`zellij` environment; one with a `mise.toml` pinning an
   older runtime never gets silently upgraded.

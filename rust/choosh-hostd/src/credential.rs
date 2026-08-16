@@ -214,6 +214,27 @@ mod tests {
         }
     }
 
+    /// Distinct from `truncated_signing_key_is_corrupt_not_silently_accepted`
+    /// below: that test's `signing_key_b64` is valid base64 that decodes to
+    /// the wrong *length*; this one is not valid base64 at all, exercising
+    /// [`Credential::signing_key`]'s other, separate `map_err` branch (the
+    /// `BASE64.decode` failure itself, not the subsequent `try_into::<[u8;
+    /// 32]>()` length check) — both must land on the same `Corrupt` variant,
+    /// not panic or silently degrade to some default key.
+    #[test]
+    fn non_base64_signing_key_is_corrupt_not_silently_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device-credential.json");
+        let mut credential = sample_credential();
+        credential.signing_key_b64 = "not valid base64! @@@".to_string();
+        fs::write(&path, serde_json::to_vec(&credential).unwrap()).unwrap();
+
+        match load(&path) {
+            Err(CredentialError::Corrupt(_)) => {}
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
     #[test]
     fn truncated_signing_key_is_corrupt_not_silently_accepted() {
         let dir = tempfile::tempdir().unwrap();

@@ -892,4 +892,159 @@ mod tests {
             "id"
         );
     }
+
+    // The `Resource*` family (`docs/specs/resources-and-reauth.md`) landed
+    // after the two `request_id` coverage sweeps above and was missed by
+    // both — this crate has a known history of exactly this gap (see the
+    // `part_one`/`part_two` doc comments), so it gets its own explicit
+    // sweep rather than trusting `impl_request_id!`'s compile-checked
+    // exhaustiveness to stand in for a runtime assertion.
+    #[test]
+    fn every_resource_rpc_request_variant_carries_request_id() {
+        assert_eq!(RpcRequest::ResourceList { request_id: "id".to_string() }.request_id(), "id");
+        assert_eq!(
+            RpcRequest::ResourcePropose {
+                request_id: "id".to_string(),
+                display_name: "Prod AWS SSO".to_string(),
+                resource_kind: "aws-sso".to_string(),
+                pattern: Some(crate::relay::WireResourcePattern::A),
+                reauth_command: Some("aws sso login --profile prod --no-browser".to_string()),
+                mobile_profile: crate::relay::WireMobileProfile::Work,
+            }
+            .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::ResourceConfirm { request_id: "id".to_string(), resource_id: "res-1".to_string(), approve: true }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::ResourceReauthStart { request_id: "id".to_string(), resource_id: "res-1".to_string() }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcRequest::ResourceReauthComplete {
+                request_id: "id".to_string(),
+                resource_id: "res-1".to_string(),
+                value: "123456".to_string(),
+            }
+            .request_id(),
+            "id"
+        );
+    }
+
+    #[test]
+    fn every_resource_rpc_response_variant_carries_request_id() {
+        assert_eq!(
+            RpcResponse::ResourceListOk { request_id: "id".to_string(), resources: vec![] }.request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::ResourceProposeOk { request_id: "id".to_string(), resource_id: "res-1".to_string() }
+                .request_id(),
+            "id"
+        );
+        assert_eq!(
+            RpcResponse::ResourceConfirmOk { request_id: "id".to_string(), resource: None }.request_id(),
+            "id"
+        );
+        assert_eq!(RpcResponse::ResourceReauthStartOk { request_id: "id".to_string() }.request_id(), "id");
+        assert_eq!(
+            RpcResponse::ResourceReauthCompleteOk { request_id: "id".to_string(), verified: false }.request_id(),
+            "id"
+        );
+    }
+
+    #[test]
+    fn resource_list_request_and_response_round_trip_with_a_full_wire_resource() {
+        let request = RpcRequest::ResourceList { request_id: "id".to_string() };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"type\":\"resource-list\""));
+        assert_eq!(serde_json::from_str::<RpcRequest>(&json).unwrap(), request);
+
+        let resource = WireResource {
+            resource_id: "res-1".to_string(),
+            display_name: "Prod AWS SSO".to_string(),
+            resource_kind: "aws-sso".to_string(),
+            pattern: Some(crate::relay::WireResourcePattern::A),
+            mobile_profile: crate::relay::WireMobileProfile::Work,
+            created_by: "operator".to_string(),
+            last_used_at: Some("2026-08-16T00:00:00Z".to_string()),
+            last_verified_at: None,
+        };
+        let response = RpcResponse::ResourceListOk { request_id: "id".to_string(), resources: vec![resource.clone()] };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"resource-list-ok\""));
+        assert_eq!(serde_json::from_str::<RpcResponse>(&json).unwrap(), response);
+
+        // A non-reauth Resource (a second EC2 test host): `pattern: None`,
+        // per the spec's "one shared entity" decision.
+        let non_reauth = WireResource { pattern: None, ..resource };
+        let json = serde_json::to_string(&non_reauth).unwrap();
+        assert!(json.contains("\"pattern\":null"));
+        assert_eq!(serde_json::from_str::<WireResource>(&json).unwrap(), non_reauth);
+    }
+
+    #[test]
+    fn resource_propose_and_confirm_round_trip_including_the_non_reauth_pattern_none_shape() {
+        // `pattern: None`/`reauth_command: None` is the non-reauth-Resource
+        // shape (e.g. "another EC2 host for testing") per the spec's
+        // "one shared entity" decision — not just an unpopulated default.
+        let propose = RpcRequest::ResourcePropose {
+            request_id: "id".to_string(),
+            display_name: "Second EC2 test host".to_string(),
+            resource_kind: "custom".to_string(),
+            pattern: None,
+            reauth_command: None,
+            mobile_profile: crate::relay::WireMobileProfile::Ask,
+        };
+        let json = serde_json::to_string(&propose).unwrap();
+        assert!(json.contains("\"type\":\"resource-propose\""));
+        assert!(json.contains("\"pattern\":null"));
+        assert_eq!(serde_json::from_str::<RpcRequest>(&json).unwrap(), propose);
+
+        let confirm = RpcRequest::ResourceConfirm {
+            request_id: "id".to_string(),
+            resource_id: "res-pending-1".to_string(),
+            approve: true,
+        };
+        let json = serde_json::to_string(&confirm).unwrap();
+        assert!(json.contains("\"type\":\"resource-confirm\""));
+        assert_eq!(serde_json::from_str::<RpcRequest>(&json).unwrap(), confirm);
+
+        // `approve: false` carries no `resource` back — the proposal was
+        // simply discarded, nothing was persisted.
+        let declined_ok = RpcResponse::ResourceConfirmOk { request_id: "id".to_string(), resource: None };
+        let json = serde_json::to_string(&declined_ok).unwrap();
+        assert!(json.contains("\"resource\":null"));
+        assert_eq!(serde_json::from_str::<RpcResponse>(&json).unwrap(), declined_ok);
+    }
+
+    #[test]
+    fn resource_reauth_start_and_complete_round_trip_with_kebab_case_wire_tags() {
+        let start = RpcRequest::ResourceReauthStart { request_id: "id".to_string(), resource_id: "res-1".to_string() };
+        let json = serde_json::to_string(&start).unwrap();
+        assert!(json.contains("\"type\":\"resource-reauth-start\""));
+        assert_eq!(serde_json::from_str::<RpcRequest>(&json).unwrap(), start);
+
+        // `value` carries a phone-supplied secret (pattern b/d code, or a
+        // pattern-c fetched value) — never valid for pattern a, but the
+        // wire type itself doesn't encode that constraint, so this just
+        // confirms the plain string round-trips untouched.
+        let complete = RpcRequest::ResourceReauthComplete {
+            request_id: "id".to_string(),
+            resource_id: "res-1".to_string(),
+            value: "123456".to_string(),
+        };
+        let json = serde_json::to_string(&complete).unwrap();
+        assert!(json.contains("\"type\":\"resource-reauth-complete\""));
+        assert_eq!(serde_json::from_str::<RpcRequest>(&json).unwrap(), complete);
+
+        let complete_ok = RpcResponse::ResourceReauthCompleteOk { request_id: "id".to_string(), verified: true };
+        let json = serde_json::to_string(&complete_ok).unwrap();
+        assert!(json.contains("\"type\":\"resource-reauth-complete-ok\""));
+        assert_eq!(serde_json::from_str::<RpcResponse>(&json).unwrap(), complete_ok);
+    }
 }

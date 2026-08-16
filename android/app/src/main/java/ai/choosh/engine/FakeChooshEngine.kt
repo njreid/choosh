@@ -47,20 +47,24 @@ class FakeChooshEngine : ChooshEngine {
         // CreateCredentialException — if a required field like `user.name` is missing. Found via a real
         // on-device tap of "Set up with a passkey", which crashed the whole app; see
         // docs/accessibility-device-report.md.
-        return """{"challenge":"ZmFrZS1jaGFsbGVuZ2U","rp":{"id":"choosh.local","name":"Choosh"},"user":{"id":"ZmFrZS11c2VyLWlk","name":"fake-user","displayName":"Fake User"},"pubKeyCredParams":[{"type":"public-key","alg":-7}],"timeout":60000,"attestation":"none"}"""
+        // "correlation_id" included alongside the creation options, matching
+        // relayd's real with_correlation_id merge — a fake caller that (like
+        // the real one) parses this out and threads it into
+        // webauthnRegisterFinish should find it here too.
+        return """{"challenge":"ZmFrZS1jaGFsbGVuZ2U","rp":{"id":"choosh.local","name":"Choosh"},"user":{"id":"ZmFrZS11c2VyLWlk","name":"fake-user","displayName":"Fake User"},"pubKeyCredParams":[{"type":"public-key","alg":-7}],"timeout":60000,"attestation":"none","correlation_id":"fake-correlation-id"}"""
     }
 
-    override suspend fun webauthnRegisterFinish(credentialJson: String): WebauthnResult {
+    override suspend fun webauthnRegisterFinish(credentialJson: String, correlationId: String): WebauthnResult {
         delay(FAKE_LATENCY_MS)
         return WebauthnResult.Success(sessionCredential = "fake-session-credential")
     }
 
     override suspend fun webauthnLoginStart(): String {
         delay(FAKE_LATENCY_MS)
-        return """{"challenge":"fake-challenge"}"""
+        return """{"challenge":"fake-challenge","correlation_id":"fake-correlation-id"}"""
     }
 
-    override suspend fun webauthnLoginFinish(credentialJson: String): WebauthnResult {
+    override suspend fun webauthnLoginFinish(credentialJson: String, correlationId: String): WebauthnResult {
         delay(FAKE_LATENCY_MS)
         return WebauthnResult.Success(sessionCredential = "fake-session-credential")
     }

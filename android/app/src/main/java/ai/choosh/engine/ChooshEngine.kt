@@ -32,14 +32,21 @@ interface ChooshEngine {
      */
     suspend fun webauthnRegisterStart(bootstrapSecret: String): String
 
-    /** Finishes registration with the Credential Manager response JSON; returns a [WebauthnResult]. */
-    suspend fun webauthnRegisterFinish(credentialJson: String): WebauthnResult
+    /**
+     * Finishes registration with the Credential Manager response JSON;
+     * returns a [WebauthnResult]. `correlationId` MUST be the
+     * `"correlation_id"` field [webauthnRegisterStart]'s own response JSON
+     * carried alongside the creation options — `relayd` looks up its
+     * per-ceremony state by this id and rejects the request outright
+     * without it (`rust/choosh-relayd/src/webauthn.rs`'s `CeremonyQuery`).
+     */
+    suspend fun webauthnRegisterFinish(credentialJson: String, correlationId: String): WebauthnResult
 
     /** Starts a WebAuthn passkey login (assertion) ceremony. Returns request-options JSON. */
     suspend fun webauthnLoginStart(): String
 
-    /** Finishes login with the Credential Manager response JSON; returns a [WebauthnResult]. */
-    suspend fun webauthnLoginFinish(credentialJson: String): WebauthnResult
+    /** Finishes login with the Credential Manager response JSON; returns a [WebauthnResult]. See [webauthnRegisterFinish]'s doc comment — the same `correlationId` requirement applies here, sourced from [webauthnLoginStart]'s own response. */
+    suspend fun webauthnLoginFinish(credentialJson: String, correlationId: String): WebauthnResult
 
     /**
      * Opens the persistent relay connection using a stored session

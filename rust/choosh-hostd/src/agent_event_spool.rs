@@ -159,7 +159,7 @@ impl AgentEventSpool {
 
     /// Records `event` into its workspace's spool and returns the sequence
     /// it was assigned, or `None` if `event.workspace_id()` is `None` (only
-    /// [`WireAgentEvent::AuthRequired`] — not sequenced, not retained, per
+    /// [`WireAgentEvent::ResourceReauthRequired`] — not sequenced, not retained, per
     /// `WireAgentEvent::workspace_id`'s doc comment). Idempotent-adjacent
     /// caller contract: call this exactly once per event, at the single
     /// point `serve.rs` reads it off `agent_event_rx` — a second call for

@@ -1,9 +1,10 @@
 //! Persistent Project/Workspace registry for this devhost, per
 //! `docs/specs/host-rpc.md`'s "Registry RPCs" and
 //! `docs/milestones/M1-workspace-and-jj.md`. Explicit registration only —
-//! never filesystem discovery. Persisted atomically (write-then-rename,
-//! same discipline as `credential.rs`) so a `choosh-hostd` restart doesn't
-//! forget what's registered; the M0 `relayd` fork left its analogous
+//! never filesystem discovery. Persisted atomically via
+//! `fs_util::atomic_write` (write-then-rename, same discipline as
+//! `credential.rs`) so a `choosh-hostd` restart doesn't forget what's
+//! registered; the M0 `relayd` fork left its analogous
 //! registry in-memory-only as an explicit, noted gap — this one doesn't
 //! repeat it, since a devhost losing track of its own workspaces on
 //! restart would be a real regression, not a nice-to-have.
@@ -178,15 +179,9 @@ impl Registry {
             RegistryError::Io(io::Error::new(io::ErrorKind::InvalidInput, "registry path has no parent directory"))
         })?;
         fs::create_dir_all(parent)?;
-        let tmp_path = parent.join(format!(
-            ".{}.tmp-{}",
-            self.path.file_name().and_then(|n| n.to_str()).unwrap_or("workspaces.json"),
-            std::process::id()
-        ));
         let json = serde_json::to_vec_pretty(&self.state)
             .map_err(|error| RegistryError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-        fs::write(&tmp_path, &json)?;
-        fs::rename(&tmp_path, &self.path)?;
+        crate::fs_util::atomic_write(&self.path, &json, None)?;
         Ok(())
     }
 

@@ -28,11 +28,16 @@ interoperate. RFC 2119 terms are normative here; DESIGN.md's prose is not.
   representation, and one-workspace-per-agent.
 - [agent-events.md](agent-events.md) — the observational hook adapter
   contract and normalized event set (`input_required`, `turn_completed`,
-  `files_changed`, `agent_status`, `auth_required`, `editor_attached`/
-  `editor_detached`).
+  `files_changed`, `agent_status`, `resource_reauth_required`,
+  `editor_attached`/`editor_detached`).
 - [notifications.md](notifications.md) — FCM delivery, redaction, and
   dedup rules for those events once they need to reach a backgrounded
   phone.
+- [resources-and-reauth.md](resources-and-reauth.md) — the `Resource`
+  entity (named, typed, devhost-attached references to external
+  infrastructure needing occasional re-authentication), the re-auth
+  interaction patterns (a/b/c/d) it generalizes, and the
+  `resource_reauth_required` event above.
 - [service-tunnels.md](service-tunnels.md) — explicit dev-service launch
   and the `WebService` tunnel, including the Zellij-web-client break-glass
   path.

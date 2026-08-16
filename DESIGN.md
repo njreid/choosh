@@ -255,14 +255,21 @@ Single Rust binary, two modes.
   the compiler/runtime versions it needs. `mise`, `zellij`, and `jj` are
   themselves bootstrapped by the platform install script (§10), not by
   `mise` recursively.
-- **SSO/cloud-CLI auth bridge.** When an agent or the user runs `aws sso
-  login` / `gcloud auth login` / `az login` / `gh auth login` on a headless
-  devhost, `hostd` detects the device-code flow, emits an `auth_required`
-  event over the same event bus as agent lifecycle events (relay-delivered,
-  FCM-woken if the phone is backgrounded), and the phone opens the
-  verification URL in a Custom Tab. On a devhost with its own display (a
-  Mac at a desk), `hostd` just lets the local browser handle it — the relay
-  round-trip only happens when there's no local browser to hand off to.
+- **Resource re-authentication bridge.** Generalizes the original
+  four-provider SSO/cloud-CLI device-code bridge into a first-class
+  **Resource** entity (see `docs/specs/resources-and-reauth.md`): a named,
+  typed, devhost-attached reference to something needing occasional
+  human-in-the-loop re-auth — `aws sso login`, `gcloud auth login`,
+  `az login`, `gh auth login`, and static-secret/resume-command flows alike.
+  `hostd` either detects the flow passively in a PTY (pattern a only) or
+  runs it as an explicitly-triggered, `hostd`-managed subprocess (patterns
+  b/c/d — no PTY injection), emits a `resource_reauth_required` event over
+  the same event bus as agent lifecycle events (relay-delivered, FCM-woken
+  if the phone is backgrounded), and the phone completes the pattern-
+  appropriate step (opening a verification URL in a Custom Tab, or showing
+  fetch instructions). On a devhost with its own display (a Mac at a desk),
+  `hostd` just lets the local browser handle it — the relay round-trip only
+  happens when there's no local browser to hand off to.
 - **Self-update.** `relayd` can push an `UPDATE_BINARY` control frame
   (triggered from the Android app). `hostd` downloads the new binary
   alongside the running one, `chmod +x`, atomic `rename()`, then re-execs or

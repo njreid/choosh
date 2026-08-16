@@ -84,4 +84,38 @@ mod tests {
         let b = render_pairing_qr("secret-two").unwrap();
         assert_ne!(a, b);
     }
+
+    #[test]
+    fn renders_successfully_for_an_empty_secret() {
+        // `main.rs::pair()` already refuses to call this at all when
+        // `CHOOSH_RELAYD_BOOTSTRAP_SECRET` is unset/empty, but this function
+        // itself takes a bare `&str` and has no such guard — an empty
+        // secret is just a 15-byte `choosh-pair:v1:` payload, well within
+        // QR capacity, so it must still render rather than erroring or
+        // panicking if ever called directly (e.g. from a future caller
+        // that doesn't share `main.rs`'s guard).
+        let rendered = render_pairing_qr("").unwrap();
+        assert!(rendered.contains(&format!("Payload: {PAIRING_PAYLOAD_PREFIX}")));
+    }
+
+    #[test]
+    fn returns_a_qr_error_rather_than_panicking_when_the_secret_is_too_long_to_encode() {
+        // A real bootstrap secret is `openssl rand -hex 32` (64 chars), but
+        // this function has no length guard of its own — an oversized
+        // input (e.g. a misconfigured env var) must surface as the
+        // documented `Err(QrError)`, not a panic.
+        let secret = "a".repeat(5_000);
+        let result = render_pairing_qr(&secret);
+        assert!(matches!(result, Err(qrcode::types::QrError::DataTooLong)), "got: {result:?}");
+    }
+
+    #[test]
+    fn renders_successfully_for_a_secret_with_non_hex_and_non_ascii_characters() {
+        // Real secrets are hex, but this function has no such restriction
+        // — it encodes whatever bytes it's given. Confirm punctuation and
+        // multi-byte UTF-8 don't trip up encoding or the payload line.
+        let secret = "not-hex! ünïcödé 🔑 (){}[]";
+        let rendered = render_pairing_qr(secret).unwrap();
+        assert!(rendered.contains(&format!("Payload: {PAIRING_PAYLOAD_PREFIX}{secret}")));
+    }
 }

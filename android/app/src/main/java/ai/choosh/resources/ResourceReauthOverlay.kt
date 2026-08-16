@@ -85,12 +85,40 @@ fun ResourceEventOverlay(engine: ChooshEngine, resourceEventTracker: ResourceEve
 }
 
 /**
- * One [ResourceReauthPrompt], per [ResourcePattern]:
- * - **a**: [ResourceReauthPrompt.verificationUri] + [ResourceReauthPrompt.userCode]
- *   shown large/copyable; no submit field — pattern a resolves on its own.
- * - **b/d**: same url/code display, plus a submit field.
- * - **c**: [ResourceReauthPrompt.fetchInstructions] shown as plain text
- *   instead of a URL/code, plus a submit field.
+ * Which affordances [ResourceReauthDialog] shows for a given [ResourcePattern] —
+ * pulled out of the composable as pure state, per this project's
+ * "pure derivation, unit-tested directly" precedent
+ * ([ai.choosh.connection.describeCreateCredentialFailure],
+ * [ai.choosh.webservice.deriveWebServiceUiState]), since Compose branching
+ * inline in the composable itself has no unit-test surface — the dialog's
+ * per-pattern shape (fetch instructions vs. URL/code, submit field or not)
+ * is exactly the "distinct UI-state derivation" a typo in the `==`/`!=`
+ * checks below would otherwise silently get wrong for one pattern with no
+ * test catching it.
+ *
+ * - **a**: [showsUrlAndCode], no [showsValueField] — pattern a resolves on
+ *   its own; no value is ever typed back, per resources-and-reauth.md's
+ *   taxonomy.
+ * - **b/d**: [showsUrlAndCode] + [showsValueField].
+ * - **c**: [showsFetchInstructions] instead of [showsUrlAndCode], plus
+ *   [showsValueField].
+ */
+internal data class ResourceReauthDialogSections(
+    val showsFetchInstructions: Boolean,
+    val showsUrlAndCode: Boolean,
+    val showsValueField: Boolean,
+)
+
+internal fun resourceReauthDialogSections(pattern: ResourcePattern): ResourceReauthDialogSections = ResourceReauthDialogSections(
+    showsFetchInstructions = pattern == ResourcePattern.C,
+    showsUrlAndCode = pattern != ResourcePattern.C,
+    showsValueField = pattern != ResourcePattern.A,
+)
+
+/**
+ * One [ResourceReauthPrompt], per [ResourcePattern] — see
+ * [resourceReauthDialogSections]'s own doc comment for exactly which
+ * sections each pattern shows.
  *
  * The "Open" button always fires a plain `ACTION_VIEW` Intent and lets
  * Android's own resolver do whatever cross-profile handoff it's going to do
@@ -108,6 +136,7 @@ private fun ResourceReauthDialog(prompt: ResourceReauthPrompt, onSubmit: suspend
     var submitting by remember(prompt.resourceId) { mutableStateOf(false) }
     var result by remember(prompt.resourceId) { mutableStateOf<Boolean?>(null) }
     val scope = rememberCoroutineScope()
+    val sections = resourceReauthDialogSections(prompt.pattern)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -117,12 +146,12 @@ private fun ResourceReauthDialog(prompt: ResourceReauthPrompt, onSubmit: suspend
             Column {
                 Text(prompt.resourceKind, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
-                if (prompt.pattern == ResourcePattern.C) {
+                if (sections.showsFetchInstructions) {
                     Text(
                         prompt.fetchInstructions ?: "Fetch the required value, then submit it below.",
                         modifier = Modifier.padding(top = 8.dp).testTag("resource-reauth-fetch-instructions"),
                     )
-                } else {
+                } else if (sections.showsUrlAndCode) {
                     prompt.verificationUri?.let { uri ->
                         Text(uri, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 8.dp).testTag("resource-reauth-uri"))
                         Row(Modifier.padding(top = 4.dp)) {
@@ -146,9 +175,7 @@ private fun ResourceReauthDialog(prompt: ResourceReauthPrompt, onSubmit: suspend
                     }
                 }
 
-                // Pattern a resolves on its own — no value is ever typed
-                // back, per resources-and-reauth.md's taxonomy.
-                if (prompt.pattern != ResourcePattern.A) {
+                if (sections.showsValueField) {
                     OutlinedTextField(
                         value = value,
                         onValueChange = { value = it },
@@ -166,7 +193,7 @@ private fun ResourceReauthDialog(prompt: ResourceReauthPrompt, onSubmit: suspend
             }
         },
         confirmButton = {
-            if (prompt.pattern != ResourcePattern.A) {
+            if (sections.showsValueField) {
                 TextButton(
                     enabled = !submitting && value.isNotBlank(),
                     onClick = {

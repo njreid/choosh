@@ -138,16 +138,28 @@ impl Engine {
         self.post_passthrough("/webauthn/register/start", None, Some((BOOTSTRAP_SECRET_HEADER, bootstrap_secret))).await
     }
 
-    pub async fn webauthn_register_finish(&self, credential_json: &str) -> String {
-        self.post_passthrough("/webauthn/register/finish", Some(credential_json), None).await
+    /// `correlation_id` MUST be the value `webauthn_register_start`'s own
+    /// response carried alongside the creation options (`relayd`'s
+    /// `webauthn.rs::with_correlation_id` merges it into that JSON) —
+    /// `relayd`'s `register_finish` looks up its per-ceremony state by this
+    /// id (`CeremonyQuery`) and rejects the request outright if it's
+    /// missing or doesn't match an in-flight ceremony. `relayd`'s own
+    /// `generate_correlation_id` produces URL-safe-base64-without-padding
+    /// (`A-Za-z0-9-_` only), so this is embedded directly in the query
+    /// string with no percent-encoding needed.
+    pub async fn webauthn_register_finish(&self, credential_json: &str, correlation_id: &str) -> String {
+        self.post_passthrough(&format!("/webauthn/register/finish?correlation_id={correlation_id}"), Some(credential_json), None).await
     }
 
     pub async fn webauthn_login_start(&self) -> String {
         self.post_passthrough("/webauthn/login/start", None, None).await
     }
 
-    pub async fn webauthn_login_finish(&self, credential_json: &str) -> String {
-        self.post_passthrough("/webauthn/login/finish", Some(credential_json), None).await
+    /// See [`Self::webauthn_register_finish`]'s doc comment — the same
+    /// `correlation_id` requirement applies here, sourced from
+    /// `webauthn_login_start`'s own response.
+    pub async fn webauthn_login_finish(&self, credential_json: &str, correlation_id: &str) -> String {
+        self.post_passthrough(&format!("/webauthn/login/finish?correlation_id={correlation_id}"), Some(credential_json), None).await
     }
 
     /// Establishes the persistent relay connection, per auth-and-enrollment.md's
@@ -1249,20 +1261,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_finish_posts_the_credential_json_and_returns_the_session() {
+    async fn register_finish_posts_the_credential_json_and_sends_the_correlation_id_query_param() {
         let (listener, base_url) = bind_fake_relayd_http().await;
         let app = axum::Router::new().route(
             "/webauthn/register/finish",
-            post(|body: String| async move {
-                let received: Value = serde_json::from_str(&body).unwrap();
-                assert_eq!(received["id"], "cred-1");
-                Json(json!({ "session_credential": "sess-abc", "expires_at": 123 }))
-            }),
+            post(
+                |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>, body: String| async move {
+                    // The real bug this guards: relayd's register_finish looks up its
+                    // in-flight ceremony state by this query param and rejects the
+                    // request outright if it's missing — see
+                    // Engine::webauthn_register_finish's doc comment.
+                    assert_eq!(query.get("correlation_id").map(String::as_str), Some("corr-xyz"));
+                    let received: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(received["id"], "cred-1");
+                    Json(json!({ "session_credential": "sess-abc", "expires_at": 123 }))
+                },
+            ),
         );
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let engine = Engine::new(base_url, "ws://unused".to_string());
-        let body = engine.webauthn_register_finish(r#"{"id":"cred-1"}"#).await;
+        let body = engine.webauthn_register_finish(r#"{"id":"cred-1"}"#, "corr-xyz").await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["session_credential"], "sess-abc");
     }
@@ -2192,6 +2211,25 @@ mod tests {
         let body = engine.resource_propose("dev-1", "Test EC2 host", "custom", "", "", "ask").await;
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["resource_id"], "res-pending-2");
+    }
+
+    /// A well-formed `pattern`/`mobile_profile` still reaches `hostd`, which
+    /// can reject the proposal on its own terms (e.g. an unknown
+    /// `resource_kind`) — distinct from `resource_propose`'s two
+    /// before-touching-the-connection local-validation tests above, which
+    /// never reach this arm at all. Same posture as
+    /// `item_create_reports_a_hostd_side_rejection`.
+    #[tokio::test]
+    async fn resource_propose_reports_a_hostd_side_rejection() {
+        let engine = connect_and_serve_one_rpc(|request| {
+            let RpcRequest::ResourcePropose { request_id, .. } = request else { panic!("expected resource.propose") };
+            RpcResponse::Error { request_id, code: "invalid_argument".to_string(), message: "unknown resource_kind 'bogus-kind'".to_string() }
+        })
+        .await;
+
+        let body = engine.resource_propose("dev-1", "x", "bogus-kind", "", "", "ask").await;
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"], "invalid_argument: unknown resource_kind 'bogus-kind'", "{body}");
     }
 
     /// `resource.confirm`'s `approve: true` path — the now-listed

@@ -32,7 +32,7 @@ use serde_json::Value;
 
 /// Converts a validated [`NormalizedAgentEvent`] to its serde-friendly wire
 /// sibling, per `choosh_protocol::relay::WireAgentEvent`'s own doc comment
-/// ("`choosh-hostd` is responsible for producing one of these"). `AuthRequired`/
+/// ("`choosh-hostd` is responsible for producing one of these"). `ResourceReauthRequired`/
 /// `EditorAttached`/`EditorDetached` aren't reachable from
 /// [`AgentEventKind`] (they're M6/M7 concerns with their own producers, not
 /// hook-derived) so this conversion is total over the M2 event set.

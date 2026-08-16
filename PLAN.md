@@ -175,6 +175,14 @@ Not blocking, but real and worth tracking rather than leaving implicit:
   logging receipt. Real unit tests cover construction, dedup, and (mirroring
   `choosh-hostd::auth_detect`'s no-leakage tests) that no token/session/
   credential text can reach a rendered notification.
+  **Now stale relative to the wire protocol**: this description (and the
+  Android classes named in it) predate the `auth_required` →
+  `resource_reauth_required` rename and the generalized Resource system
+  built later this session (see `docs/specs/resources-and-reauth.md`);
+  `choosh-protocol`'s `WireAgentEvent::AuthRequired` no longer exists, but
+  `AuthNotificationIntent`/`FcmNotificationParser` were never migrated off
+  it — see `docs/specs/notifications.md`'s "Implementation status" for the
+  specific gap. Not fixed in this docs pass; a real code follow-up.
   **Credential-availability finding, checked directly in this environment**:
   a real Firebase project (`choosh`) exists and `firebase projects:list`
   authenticates; its OAuth2 token is even `cloud-platform`-scoped. But no
@@ -353,9 +361,17 @@ Not blocking, but real and worth tracking rather than leaving implicit:
   real, structurally different flow (no short code printed at all) —
   concluded genuinely unrepresentable in the current event shape and
   removed entirely, with negative tests proving no false positives.
-  `WireAuthProvider::Gcp` remains defined on the wire for a future,
-  differently-shaped detector; `auth_detect.rs`'s module doc comment
-  documents this reasoning in full.
+  At the time, `WireAuthProvider::Gcp` remained defined on the wire for a
+  future, differently-shaped detector; that whole `WireAuthProvider`/
+  `auth_required` wire shape has since been removed and replaced by the
+  generalized Resource system (`WireAgentEvent::ResourceReauthRequired`,
+  `docs/specs/resources-and-reauth.md`) — `"gcloud"` is now a valid
+  built-in `resource_kind` (pattern b, per that spec's provider survey),
+  never a passively-detected `DetectedProvider`; `auth_detect.rs`'s module
+  doc comment documents the underlying gcloud-detection reasoning in full,
+  and `resource_reauth.rs` documents how pattern b is actually run today
+  (an explicitly-triggered, `choosh-hostd`-managed subprocess, not passive
+  PTY detection).
 - **Claude Code's hook-config JSON schema (`hooks.rs`'s `install_claude_hooks`
   and the `emit`-payload-parsing heuristic in `extract_candidate_paths`) was
   never verified against a live payload** — this development environment's

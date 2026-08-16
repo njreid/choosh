@@ -16,12 +16,16 @@ that hit a wall and asked), then reused: every later re-auth reuses the
 same declaration instead of re-deriving "how does this CLI's flow work"
 from scratch.
 
-This spec does not change `auth_detect.rs`'s existing four-provider
-detector today — it defines the shape a generalized version should take,
-grounded in what real re-auth flows actually look like (see "Provider
+This spec originally did not change `auth_detect.rs`'s existing
+four-provider detector — it defined the shape a generalized version should
+take, grounded in what real re-auth flows actually look like (see "Provider
 survey" below, which corrects some assumptions the current detector's own
-doc comments already flag as unverified). Implementation is intentionally
-out of scope; see "Open questions" at the end.
+doc comments already flag as unverified). **Since implemented**: `auth_detect.rs`
+now returns a `DetectedProvider`/`resource_kind()` pair rather than a fixed
+`WireAuthProvider`, feeding `resources.rs::event_for_pattern_a_detection`
+for pattern a, and patterns b/c/d run as `choosh-hostd`-managed subprocesses
+in `resource_reauth.rs` — see "Open questions" below, now updated with what
+actually landed for each.
 
 ## Decisions
 
@@ -390,32 +394,72 @@ verified (reauth_command's own exit code / a follow-up
   "Prod AWS SSO" is operator/agent-chosen text and MUST NOT be trusted
   as proof of where the link actually goes.
 
-## Open questions (deliberately not decided here)
+## Open questions — now resolved by the shipped implementation
 
 The four design forks (build scope, wire format, agent-declared-resource
-confirmation, shared-vs-separate entity) are settled — see "Decisions"
-above. What's left is implementation mechanics, not design:
+confirmation, shared-vs-separate entity) were settled — see "Decisions"
+above — before any of this section was written. What was left at the time
+was implementation mechanics, not design; all of it has since been built,
+in each case differently than this section originally sketched:
 
-- **PTY injection for pattern b**: today's `pty:<item_id>` tunnel already
-  carries human keystrokes into a live session, so the raw mechanism
-  exists — the open part is identifying *which* still-running PTY a
-  `detect` match came from once the phone hands a value back, especially
-  if the human has since navigated away from that terminal item's screen.
-  Needs its own design pass; per "Decisions," this is built and tested
-  last within the v1 pass, once A/C/D have proven the surrounding
-  plumbing.
-- **Storage**: a new `registry.rs`-style JSON store on `choosh-hostd`,
-  mirroring how `Workspace`s are persisted today, is the obvious shape —
-  not designed here.
-- **RPC surface**: `resource.create`/`resource.list`/`resource.reauth`-
-  shaped RPCs, added to `host_rpc.rs` alongside the existing
-  `workspace.*`/`item.*`/`project.*` families — not designed here. Note
-  that "propose" (agent-initiated, pending confirmation) and "create"
-  (the human-confirmed, actually-persisted write) are likely two distinct
-  RPCs or a two-phase one, per the confirmation-gate decision above — not
-  fully worked out here.
-- **Android UI**: where Resources live in the app (a new top-level list?
-  hung off the devhost/fleet view?), and the actual profile-picker/
-  copy-fallback UI for `mobile_profile` — not designed here, and the
-  platform capability itself needs verifying against a real dual-profile
-  device before committing to specific UI copy.
+- **PTY injection for pattern b — sidestepped entirely, not solved as
+  originally framed.** The question as posed here ("identifying *which*
+  still-running PTY a `detect` match came from") assumed pattern b would be
+  passively detected in an arbitrary, human-attached PTY the same way
+  pattern a is. That is not what got built:
+  `rust/choosh-hostd/src/resource_reauth.rs`'s module doc comment is
+  explicit that **patterns b/c/d are always explicitly triggered** (via
+  `resource.reauth_start`/`resource.reauth_complete`), never passively
+  detected — `choosh-hostd` spawns each one as a real child process it
+  fully owns (`tokio::process::Command`, piped stdin/stdout), so pattern
+  b's "manual code paste-back" completes by writing the phone-supplied
+  value straight into that same still-open child's `ChildStdin`
+  (`resource_reauth.rs`'s `write_value_and_await_exit`). There is no PTY,
+  no device file, and no "which terminal was this" ambiguity to resolve,
+  because nothing is ever typed into a human's PTY session for b/c/d at
+  all. Only pattern a remains passively detected, unchanged, via
+  `auth_detect.rs` + `resources.rs::event_for_pattern_a_detection`.
+- **Storage**: `rust/choosh-hostd/src/resources.rs`'s `ResourceRegistry` —
+  a JSON-backed load/save store mirroring `registry.rs`'s discipline, as
+  guessed here. One addition beyond what this section anticipated:
+  confirmed Resources and an agent's pending, unapproved proposals are
+  held as two separate pools (`ResourceRegistry::propose`/`::confirm`),
+  and only the confirmed pool is ever persisted to disk — a restart
+  forgets any not-yet-approved proposal, which is fine since the
+  `input_required` round trip that surfaced it doesn't survive a restart
+  either.
+- **RPC surface**: `rust/choosh-protocol/src/host_rpc.rs`'s
+  `RpcRequest`/`RpcResponse` gained `ResourceList`, `ResourcePropose`/
+  `ResourceConfirm` (the two-phase split this section predicted — propose
+  is the agent-initiated, pending-confirmation write; confirm is the
+  human-decided, actually-persisted one), and `ResourceReauthStart`/
+  `ResourceReauthComplete` (start/complete rather than a single
+  `resource.reauth`, matching `resource_reauth.rs`'s managed-subprocess
+  lifecycle: start spawns and watches for a URL/prompt, complete injects
+  the phone-supplied value and awaits exit) — sitting alongside the
+  existing `workspace.*`/`item.*`/`project.*` families anticipated here.
+- **Android UI**: Resources live hung off the devhost/fleet view, per one
+  of the two shapes this section floated — `ai.choosh.fleet.DevHostWorkspacesScreen`
+  has a "Resources" entry point routing to `ai.choosh.resources.ResourcesScreen`
+  (`ai.choosh.resources.ResourcesViewModel`). Live, already-connected
+  re-auth/proposal prompts render as a dialog overlay
+  (`ai.choosh.resources.ResourceReauthOverlay`'s `ResourceEventOverlay`,
+  owned by the composition root alongside the other agent-event trackers,
+  so it's visible regardless of which screen is on top — matching "re-auth
+  is devhost-scoped, not screen-scoped" above). The profile-picker/
+  copy-fallback UI for `mobile_profile` was built exactly as this
+  section's "Mobile platform targeting" section speculated it would have
+  to be, given the platform constraint described there: a label-only
+  button (`openLabel`: "Open in Work profile" / "Open in Personal
+  profile" / "Open") firing a normal `ACTION_VIEW` Intent, plus an
+  always-present copy-to-clipboard action for both the URL and the code
+  (`ResourceReauthOverlay.kt`'s `copyToClipboard` call sites). **Still
+  genuinely unverified**: the underlying platform-capability claim (can
+  Android's own resolver actually offer a cross-profile handoff here) has
+  not been checked against a real dual-profile device, exactly as flagged
+  in "Mobile profile targeting" above — that verification gap is real and
+  unchanged by the UI work landing.
+  **Not yet migrated**: the FCM-backgrounded-notification path for
+  `resource_reauth_required` (as opposed to this live, in-app overlay) is
+  a separate, still-unmigrated gap — see
+  [notifications.md](notifications.md)'s "Implementation status".

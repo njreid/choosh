@@ -735,6 +735,9 @@ async fn handle_resource_reauth_start(ctx: &RpcContext, request_id: String, reso
             error(request_id, "invalid_argument", "this resource's pattern does not support resource.reauth_start (pattern a is only ever passively detected; a non-reauth resource has no pattern at all)")
         }
         Err(ReauthError::MissingCommand) => error(request_id, "invalid_argument", "this resource has no command configured for its pattern"),
+        Err(ReauthError::AlreadyInProgress) => {
+            error(request_id, "conflict", "a reauth is already in progress for this resource; call resource.reauth_complete or wait for it to time out")
+        }
         Err(other) => error(request_id, "internal", other.to_string()),
     }
 }
@@ -3030,5 +3033,57 @@ mod tests {
 
         let start = dispatch(&ctx, RpcRequest::ResourceReauthStart { request_id: "r3".to_string(), resource_id: resource.resource_id }).await;
         assert!(matches!(&start, RpcResponse::Error { code, .. } if code == "invalid_argument"), "expected invalid_argument, got {start:?}");
+    }
+
+    /// An unknown `resource_id` must be a clean `not_found` `RpcResponse`
+    /// through `handle_resource_reauth_start`, never a panic — this was
+    /// untested before this review even though the two sibling `resource.*`
+    /// RPCs (`resource.confirm`'s `ProposalNotFound` case) already had
+    /// coverage.
+    #[tokio::test]
+    async fn resource_reauth_start_of_an_unknown_resource_is_not_found() {
+        let (_dir, ctx) = ctx_with_tempdir();
+        let response = dispatch(&ctx, RpcRequest::ResourceReauthStart { request_id: "r1".to_string(), resource_id: "res-does-not-exist".to_string() }).await;
+        assert!(matches!(&response, RpcResponse::Error { code, .. } if code == "not_found"), "expected not_found, got {response:?}");
+    }
+
+    /// Same gap as above, for `resource.reauth_complete`.
+    #[tokio::test]
+    async fn resource_reauth_complete_of_an_unknown_resource_is_not_found() {
+        let (_dir, ctx) = ctx_with_tempdir();
+        let response =
+            dispatch(&ctx, RpcRequest::ResourceReauthComplete { request_id: "r1".to_string(), resource_id: "res-does-not-exist".to_string(), value: "x".to_string() }).await;
+        assert!(matches!(&response, RpcResponse::Error { code, .. } if code == "not_found"), "expected not_found, got {response:?}");
+    }
+
+    /// End-to-end (through `dispatch`, not `ReauthProcesses` directly)
+    /// regression coverage for the concurrent-start race fixed in this
+    /// review: a second `resource.reauth_start` for a resource that
+    /// already has one in flight must come back as a `conflict` error, not
+    /// silently replace the first attempt.
+    #[tokio::test]
+    async fn resource_reauth_start_twice_for_the_same_resource_is_a_conflict() {
+        let (_dir, ctx) = ctx_with_tempdir();
+        let propose = dispatch(
+            &ctx,
+            RpcRequest::ResourcePropose {
+                request_id: "r1".to_string(),
+                display_name: "Blocking thing".to_string(),
+                resource_kind: "custom".to_string(),
+                pattern: Some(WireResourcePattern::B),
+                reauth_command: Some("echo 'https://example.com/device'; sleep 30".to_string()),
+                mobile_profile: WireMobileProfile::Ask,
+            },
+        )
+        .await;
+        let RpcResponse::ResourceProposeOk { resource_id: proposal_id, .. } = propose else { panic!("expected ResourceProposeOk") };
+        let confirm = dispatch(&ctx, RpcRequest::ResourceConfirm { request_id: "r2".to_string(), resource_id: proposal_id, approve: true }).await;
+        let RpcResponse::ResourceConfirmOk { resource: Some(resource), .. } = confirm else { panic!("expected ResourceConfirmOk with a resource") };
+
+        let first = dispatch(&ctx, RpcRequest::ResourceReauthStart { request_id: "r3".to_string(), resource_id: resource.resource_id.clone() }).await;
+        assert!(matches!(first, RpcResponse::ResourceReauthStartOk { .. }), "expected ResourceReauthStartOk, got {first:?}");
+
+        let second = dispatch(&ctx, RpcRequest::ResourceReauthStart { request_id: "r4".to_string(), resource_id: resource.resource_id }).await;
+        assert!(matches!(&second, RpcResponse::Error { code, .. } if code == "conflict"), "expected conflict, got {second:?}");
     }
 }
