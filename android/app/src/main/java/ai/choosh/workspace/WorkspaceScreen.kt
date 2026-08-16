@@ -1,6 +1,7 @@
 package ai.choosh.workspace
 
 import ai.choosh.agentevents.AgentStatusTracker
+import ai.choosh.engine.ChangedPath
 import ai.choosh.engine.ChooshEngine
 import ai.choosh.explorer.ExplorerNavigationEvent
 import ai.choosh.explorer.ExplorerScreen
@@ -140,19 +141,10 @@ fun WorkspaceScreen(
         if (rememberWindowWidthSizeClass() == WindowWidthSizeClass.EXPANDED) {
             var detailTab by remember { mutableIntStateOf(WorkspaceTab.DIFF.ordinal) }
             Row(Modifier.fillMaxSize().testTag("workspace-expanded-master-detail")) {
-                val explorerState by explorerViewModel.state.collectAsState()
-                ExplorerScreen(
-                    state = explorerState,
+                ExplorerPane(
+                    explorerViewModel = explorerViewModel,
                     onFileClick = { detailTab = WorkspaceTab.DIFF.ordinal },
-                    onRefresh = explorerViewModel::refresh,
-                    onAgentClick = { row -> handleExplorerNavigation(explorerViewModel.onAgentTapped(row)) },
-                    onCreateAgent = explorerViewModel::createAgent,
-                    onServiceClick = { row -> handleExplorerNavigation(explorerViewModel.onServiceTapped(row)) },
-                    onCreateService = explorerViewModel::createService,
-                    onTreeEntryClick = { entry -> handleExplorerNavigation(explorerViewModel.onTreeEntryTapped(entry)) },
-                    onTreeSearchResultClick = { path -> handleExplorerNavigation(explorerViewModel.onTreeSearchResultTapped(path)) },
-                    onTreeSearchQueryChanged = explorerViewModel::onTreeSearchQueryChanged,
-                    onTreeNavigateUp = explorerViewModel::onTreeNavigateUp,
+                    onNavigate = ::handleExplorerNavigation,
                     modifier = Modifier.width(360.dp).fillMaxHeight().testTag("workspace-master-pane"),
                 )
                 HorizontalDivider(modifier = Modifier.fillMaxHeight().width(1.dp))
@@ -168,21 +160,8 @@ fun WorkspaceScreen(
                         }
                     }
                     when (WorkspaceTab.entries[detailTab]) {
-                        WorkspaceTab.DIFF -> {
-                            val state by diffViewModel.state.collectAsState()
-                            JjDiffScreen(state = state, onFromChange = diffViewModel::setFrom, onToChange = diffViewModel::setTo, onLoad = diffViewModel::load, modifier = Modifier.weight(1f))
-                        }
-                        else -> {
-                            val state by graphViewModel.state.collectAsState()
-                            JjChangeGraphScreen(
-                                state = state,
-                                onNodeTap = graphViewModel::selectChange,
-                                onDismissSelection = graphViewModel::dismissSelection,
-                                onUndoMostRecent = graphViewModel::undoMostRecentOperation,
-                                onRestore = graphViewModel::restore,
-                                modifier = Modifier.weight(1f),
-                            )
-                        }
+                        WorkspaceTab.DIFF -> DiffPane(diffViewModel, modifier = Modifier.weight(1f))
+                        else -> GraphPane(graphViewModel, modifier = Modifier.weight(1f))
                     }
                 }
             }
@@ -199,47 +178,76 @@ fun WorkspaceScreen(
             }
 
             when (WorkspaceTab.entries[tab]) {
-                WorkspaceTab.EXPLORER -> {
-                    val state by explorerViewModel.state.collectAsState()
-                    ExplorerScreen(
-                        state = state,
-                        onFileClick = { tab = WorkspaceTab.DIFF.ordinal },
-                        onRefresh = explorerViewModel::refresh,
-                        onAgentClick = { row -> handleExplorerNavigation(explorerViewModel.onAgentTapped(row)) },
-                        onCreateAgent = explorerViewModel::createAgent,
-                        onServiceClick = { row -> handleExplorerNavigation(explorerViewModel.onServiceTapped(row)) },
-                        onCreateService = explorerViewModel::createService,
-                        onTreeEntryClick = { entry -> handleExplorerNavigation(explorerViewModel.onTreeEntryTapped(entry)) },
-                        onTreeSearchResultClick = { path -> handleExplorerNavigation(explorerViewModel.onTreeSearchResultTapped(path)) },
-                        onTreeSearchQueryChanged = explorerViewModel::onTreeSearchQueryChanged,
-                        onTreeNavigateUp = explorerViewModel::onTreeNavigateUp,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
+                WorkspaceTab.EXPLORER -> ExplorerPane(
+                    explorerViewModel = explorerViewModel,
+                    onFileClick = { tab = WorkspaceTab.DIFF.ordinal },
+                    onNavigate = ::handleExplorerNavigation,
+                    modifier = Modifier.weight(1f),
+                )
 
-                WorkspaceTab.DIFF -> {
-                    val state by diffViewModel.state.collectAsState()
-                    JjDiffScreen(
-                        state = state,
-                        onFromChange = diffViewModel::setFrom,
-                        onToChange = diffViewModel::setTo,
-                        onLoad = diffViewModel::load,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
+                WorkspaceTab.DIFF -> DiffPane(diffViewModel, modifier = Modifier.weight(1f))
 
-                WorkspaceTab.GRAPH -> {
-                    val state by graphViewModel.state.collectAsState()
-                    JjChangeGraphScreen(
-                        state = state,
-                        onNodeTap = graphViewModel::selectChange,
-                        onDismissSelection = graphViewModel::dismissSelection,
-                        onUndoMostRecent = graphViewModel::undoMostRecentOperation,
-                        onRestore = graphViewModel::restore,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
+                WorkspaceTab.GRAPH -> GraphPane(graphViewModel, modifier = Modifier.weight(1f))
             }
         }
     }
+}
+
+/**
+ * The Explorer pane, shared verbatim by both the compact (single-pane tab)
+ * and expanded (master-detail) layouts in [WorkspaceScreen] — the two
+ * previously differed only in [onFileClick] (which tab-state variable a tap
+ * advances) and in [modifier] (full-weight vs. a fixed-width master column).
+ * [onFileClick] ignores which [ChangedPath] was tapped in both call sites,
+ * same as before this extraction — not fixed here, see the caller.
+ */
+@Composable
+private fun ExplorerPane(
+    explorerViewModel: ExplorerViewModel,
+    onFileClick: (ChangedPath) -> Unit,
+    onNavigate: (ExplorerNavigationEvent?) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val state by explorerViewModel.state.collectAsState()
+    ExplorerScreen(
+        state = state,
+        onFileClick = onFileClick,
+        onRefresh = explorerViewModel::refresh,
+        onAgentClick = { row -> onNavigate(explorerViewModel.onAgentTapped(row)) },
+        onCreateAgent = explorerViewModel::createAgent,
+        onServiceClick = { row -> onNavigate(explorerViewModel.onServiceTapped(row)) },
+        onCreateService = explorerViewModel::createService,
+        onTreeEntryClick = { entry -> onNavigate(explorerViewModel.onTreeEntryTapped(entry)) },
+        onTreeSearchResultClick = { path -> onNavigate(explorerViewModel.onTreeSearchResultTapped(path)) },
+        onTreeSearchQueryChanged = explorerViewModel::onTreeSearchQueryChanged,
+        onTreeNavigateUp = explorerViewModel::onTreeNavigateUp,
+        modifier = modifier,
+    )
+}
+
+/** The Diff pane, shared verbatim by both [WorkspaceScreen] layouts. */
+@Composable
+private fun DiffPane(diffViewModel: JjDiffViewModel, modifier: Modifier = Modifier) {
+    val state by diffViewModel.state.collectAsState()
+    JjDiffScreen(
+        state = state,
+        onFromChange = diffViewModel::setFrom,
+        onToChange = diffViewModel::setTo,
+        onLoad = diffViewModel::load,
+        modifier = modifier,
+    )
+}
+
+/** The Graph pane, shared verbatim by both [WorkspaceScreen] layouts. */
+@Composable
+private fun GraphPane(graphViewModel: JjChangeGraphViewModel, modifier: Modifier = Modifier) {
+    val state by graphViewModel.state.collectAsState()
+    JjChangeGraphScreen(
+        state = state,
+        onNodeTap = graphViewModel::selectChange,
+        onDismissSelection = graphViewModel::dismissSelection,
+        onUndoMostRecent = graphViewModel::undoMostRecentOperation,
+        onRestore = graphViewModel::restore,
+        modifier = modifier,
+    )
 }

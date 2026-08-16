@@ -657,6 +657,58 @@ struct TunnelOutput {
     bytes: Vec<u8>,
 }
 
+/// Every per-tunnel-purpose tracking collection [`handle_control_push`] and
+/// [`handle_tunnel_frame`] both need, bundled into one struct passed by
+/// `&mut` rather than threaded through as six separate parameters — a
+/// future new tunnel purpose only needs to touch this struct's own
+/// definition and the one dedicated field it adds, not every function
+/// signature along `serve_dispatch`'s dispatch path. Constructed once per
+/// connection attempt by [`serve_dispatch`] ([`TunnelState::new`]) and
+/// deliberately does not survive a reconnect, per relay-protocol.md's
+/// reconnect-discontinuity rule — same scoping every field already had as a
+/// standalone local before this bundling.
+struct TunnelState {
+    /// `rpc`-purpose tunnels offered on this connection.
+    rpc_tunnels: HashSet<[u8; TUNNEL_ID_BYTES]>,
+    /// `"agent-events"`-purpose tunnels (`agent-events.md`'s resume/replay
+    /// mechanism, `crate::agent_event_spool`): tracked exactly like
+    /// `rpc_tunnels` above, just answered from `agent_event_spool` instead
+    /// of `crate::rpc::dispatch` — see `relay.rs`'s module doc comment for
+    /// why this is its own tunnel purpose rather than a new `RpcRequest`
+    /// variant.
+    agent_event_resume_tunnels: HashSet<[u8; TUNNEL_ID_BYTES]>,
+    pty_tunnels: HashMap<[u8; TUNNEL_ID_BYTES], PtyWriteHalf>,
+    web_tunnels: HashMap<[u8; TUNNEL_ID_BYTES], WebWriteHalf>,
+    /// M7's `dev-exec` cross-host offload (`"offload"`-purpose tunnels):
+    /// holds a `tunnel_id` from the moment its `tunnel-offered` push arrives
+    /// until its first (and only) tunnel-data frame — the JSON
+    /// `OffloadRequest` — is parsed; [`Self::offload_active`] holds it from
+    /// there until the spawned command's output/exit has finished streaming
+    /// back, so `serve_dispatch`'s `tunnel_output_rx` branch knows to
+    /// forward its background task's output rather than dropping it (the
+    /// same role `pty_tunnels`/`web_tunnels`'s map membership plays for
+    /// their own output). Two separate sets rather than one because this
+    /// field tracks "no write-half/background-task exists yet" while
+    /// `offload_active` tracks "one now does" — unlike pty/web, an offload
+    /// tunnel has no write half at all (the client only ever sends the one
+    /// initial request frame, never further input).
+    offload_pending: HashSet<[u8; TUNNEL_ID_BYTES]>,
+    offload_active: HashSet<[u8; TUNNEL_ID_BYTES]>,
+}
+
+impl TunnelState {
+    fn new() -> Self {
+        Self {
+            rpc_tunnels: HashSet::new(),
+            agent_event_resume_tunnels: HashSet::new(),
+            pty_tunnels: HashMap::new(),
+            web_tunnels: HashMap::new(),
+            offload_pending: HashSet::new(),
+            offload_active: HashSet::new(),
+        }
+    }
+}
+
 /// Idle-read timeout for a web/TCP-bridge tunnel's background reader task
 /// (both the `web:<item_id>` registered-service path and the `zellij-web`
 /// break-glass path): if the local process/server this bridges to sends
@@ -701,37 +753,14 @@ async fn serve_dispatch(
     agent_event_tx: &tokio::sync::mpsc::Sender<WireAgentEvent>,
     agent_event_spool: &std::sync::Arc<crate::agent_event_spool::AgentEventSpool>,
 ) {
-    // `rpc`-purpose tunnels offered on this connection are tracked here;
-    // per relay-protocol.md's reconnect-discontinuity rule, tunnels never
-    // survive a reconnect, so this set is deliberately scoped to one
-    // connection attempt, not `connect_loop`'s outer state. Same for
-    // `pty_tunnels`/`web_tunnels`/`agent_event_resume_tunnels` and the
-    // output-forwarding channel below.
-    let mut rpc_tunnels: HashSet<[u8; TUNNEL_ID_BYTES]> = HashSet::new();
-    // `"agent-events"`-purpose tunnels (`agent-events.md`'s resume/replay
-    // mechanism, `crate::agent_event_spool`): tracked exactly like
-    // `rpc_tunnels` above, just answered from `agent_event_spool` instead
-    // of `crate::rpc::dispatch` — see `relay.rs`'s module doc comment for
-    // why this is its own tunnel purpose rather than a new `RpcRequest`
-    // variant.
-    let mut agent_event_resume_tunnels: HashSet<[u8; TUNNEL_ID_BYTES]> = HashSet::new();
-    let mut pty_tunnels: HashMap<[u8; TUNNEL_ID_BYTES], PtyWriteHalf> = HashMap::new();
-    let mut web_tunnels: HashMap<[u8; TUNNEL_ID_BYTES], WebWriteHalf> = HashMap::new();
-    // M7's `dev-exec` cross-host offload (`"offload"`-purpose tunnels):
-    // `offload_pending` holds a tunnel_id from the moment its
-    // `tunnel-offered` push arrives until its first (and only) tunnel-data
-    // frame — the JSON `OffloadRequest` — is parsed; `offload_active` holds
-    // it from there until the spawned command's output/exit has finished
-    // streaming back, so the `tunnel_output_rx` branch below knows to
-    // forward its background task's output rather than dropping it (the
-    // same role `pty_tunnels`/`web_tunnels`'s map membership plays for
-    // their own output). Two separate sets rather than one because
-    // `offload_pending` tracks "no write-half/background-task exists yet"
-    // while `offload_active` tracks "one now does" — unlike pty/web, an
-    // offload tunnel has no write half at all (the client only ever sends
-    // the one initial request frame, never further input).
-    let mut offload_pending: HashSet<[u8; TUNNEL_ID_BYTES]> = HashSet::new();
-    let mut offload_active: HashSet<[u8; TUNNEL_ID_BYTES]> = HashSet::new();
+    // Every per-tunnel-purpose tracking collection [`handle_control_push`]/
+    // [`handle_tunnel_frame`] need, bundled into one struct — see
+    // [`TunnelState`]'s own doc comment for the per-field reasoning. Per
+    // relay-protocol.md's reconnect-discontinuity rule, tunnels never
+    // survive a reconnect, so this (like the output-forwarding channel
+    // below) is deliberately scoped to one connection attempt, not
+    // `connect_loop`'s outer state.
+    let mut tunnel_state = TunnelState::new();
     let (tunnel_output_tx, mut tunnel_output_rx) = tokio::sync::mpsc::channel::<TunnelOutput>(64);
 
     loop {
@@ -770,15 +799,15 @@ async fn serve_dispatch(
             }
 
             Some(output) = tunnel_output_rx.recv() => {
-                let is_web = web_tunnels.contains_key(&output.tunnel_id);
-                let is_offload = offload_active.contains(&output.tunnel_id);
+                let is_web = tunnel_state.web_tunnels.contains_key(&output.tunnel_id);
+                let is_offload = tunnel_state.offload_active.contains(&output.tunnel_id);
                 // `rpc_tunnels` membership is this purpose's own liveness
                 // tracking — see `spawn_rpc_dispatch`'s doc comment for why
                 // a backgrounded `rpc::dispatch` response also arrives on
                 // this same channel now, rather than being sent inline by
                 // `handle_tunnel_frame`.
-                let is_rpc = rpc_tunnels.contains(&output.tunnel_id);
-                if !pty_tunnels.contains_key(&output.tunnel_id) && !is_web && !is_offload && !is_rpc {
+                let is_rpc = tunnel_state.rpc_tunnels.contains(&output.tunnel_id);
+                if !tunnel_state.pty_tunnels.contains_key(&output.tunnel_id) && !is_web && !is_offload && !is_rpc {
                     continue; // the tunnel closed after this output was already queued; drop it.
                 }
                 let mut payload = Vec::with_capacity(TUNNEL_ID_BYTES + output.bytes.len());
@@ -796,23 +825,23 @@ async fn serve_dispatch(
                     // subsequently-arriving phone-originated frame for
                     // this tunnel_id is cleanly treated as "unknown tunnel"
                     // rather than writing into an already-dead socket.
-                    web_tunnels.remove(&output.tunnel_id);
+                    tunnel_state.web_tunnels.remove(&output.tunnel_id);
                 }
                 if is_offload && output.bytes.is_empty() {
                     // The offload background task's own proactive close
                     // (sent right after its Exit frame, or right after an
                     // Error frame) — same "stop treating this tunnel_id as
                     // live" bookkeeping the web-tunnel branch above does.
-                    offload_active.remove(&output.tunnel_id);
+                    tunnel_state.offload_active.remove(&output.tunnel_id);
                 }
             }
 
             frame = channel.recv_raw() => match frame {
                 Ok((FRAME_CLASS_CONTROL, body)) => {
-                    handle_control_push(&body, rpc_context, &tunnel_output_tx, &mut rpc_tunnels, &mut agent_event_resume_tunnels, &mut pty_tunnels, &mut web_tunnels, &mut offload_pending, ssh_port, agent_event_tx).await;
+                    handle_control_push(&body, rpc_context, &tunnel_output_tx, &mut tunnel_state, ssh_port, agent_event_tx).await;
                 }
                 Ok((FRAME_CLASS_TUNNEL, body)) => {
-                    if handle_tunnel_frame(&body, channel, rpc_context, &tunnel_output_tx, &mut rpc_tunnels, &mut agent_event_resume_tunnels, &mut pty_tunnels, &mut web_tunnels, &mut offload_pending, &mut offload_active, agent_event_spool).await == FrameOutcome::Disconnect {
+                    if handle_tunnel_frame(&body, channel, rpc_context, &tunnel_output_tx, &mut tunnel_state, agent_event_spool).await == FrameOutcome::Disconnect {
                         return;
                     }
                 }
@@ -879,23 +908,18 @@ fn decode_tunnel_id_or_warn(tunnel_id: &str) -> Option<[u8; TUNNEL_ID_BYTES]> {
     decoded
 }
 
-#[allow(clippy::too_many_arguments)] // one tracking collection per tunnel purpose this dispatch handles, per this doc comment; a params struct would just move the count, not reduce it, for a single call site.
 async fn handle_control_push(
     body: &[u8],
     rpc_context: &RpcContext,
     tunnel_output_tx: &tokio::sync::mpsc::Sender<TunnelOutput>,
-    rpc_tunnels: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
-    agent_event_resume_tunnels: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
-    pty_tunnels: &mut HashMap<[u8; TUNNEL_ID_BYTES], PtyWriteHalf>,
-    web_tunnels: &mut HashMap<[u8; TUNNEL_ID_BYTES], WebWriteHalf>,
-    offload_pending: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
+    tunnel_state: &mut TunnelState,
     ssh_port: Option<u16>,
     agent_event_tx: &tokio::sync::mpsc::Sender<WireAgentEvent>,
 ) {
     match serde_json::from_slice::<ServerPush>(body) {
         Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose == "rpc" => {
             if let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) {
-                rpc_tunnels.insert(id);
+                tunnel_state.rpc_tunnels.insert(id);
             }
         }
         // `agent-events.md`'s "Delivery and replay" resume mechanism (see
@@ -905,7 +929,7 @@ async fn handle_control_push(
         // devhost that owns the workspace it wants to resume.
         Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose == "agent-events" => {
             if let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) {
-                agent_event_resume_tunnels.insert(id);
+                tunnel_state.agent_event_resume_tunnels.insert(id);
             }
         }
         Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose.starts_with("pty:") => {
@@ -913,7 +937,7 @@ async fn handle_control_push(
             let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) else { return };
             match open_pty_tunnel(rpc_context, item_id, id, tunnel_output_tx.clone(), agent_event_tx.clone()).await {
                 Ok(write_half) => {
-                    pty_tunnels.insert(id, write_half);
+                    tunnel_state.pty_tunnels.insert(id, write_half);
                 }
                 Err(error) => tracing::warn!(%error, item_id, "failed to attach pty for offered tunnel"),
             }
@@ -923,7 +947,7 @@ async fn handle_control_push(
             let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) else { return };
             match open_web_tunnel(rpc_context, item_id, id, tunnel_output_tx.clone()).await {
                 Ok(write_half) => {
-                    web_tunnels.insert(id, write_half);
+                    tunnel_state.web_tunnels.insert(id, write_half);
                 }
                 Err(error) => tracing::warn!(%error, item_id, "failed to attach web tunnel for offered tunnel"),
             }
@@ -951,7 +975,7 @@ async fn handle_control_push(
             };
             match open_tcp_bridge_tunnel(port, id, tunnel_output_tx.clone()).await {
                 Ok(write_half) => {
-                    web_tunnels.insert(id, write_half);
+                    tunnel_state.web_tunnels.insert(id, write_half);
                 }
                 Err(error) => tracing::warn!(%error, "failed to bridge offered ssh tunnel to the loopback SSH server"),
             }
@@ -977,13 +1001,13 @@ async fn handle_control_push(
                 tracing::warn!("refusing offload-purpose tunnel-offered with no requester identity");
                 return;
             }
-            offload_pending.insert(id);
+            tunnel_state.offload_pending.insert(id);
         }
         Ok(ServerPush::TunnelOffered { tunnel_id, purpose, .. }) if purpose == "zellij-web" => {
             let Some(id) = decode_tunnel_id_or_warn(&tunnel_id) else { return };
             match open_zellij_web_tunnel(id, tunnel_output_tx.clone()).await {
                 Ok(write_half) => {
-                    web_tunnels.insert(id, write_half);
+                    tunnel_state.web_tunnels.insert(id, write_half);
                 }
                 Err(error) => tracing::warn!(%error, "failed to attach zellij-web break-glass tunnel"),
             }
@@ -1014,6 +1038,81 @@ async fn handle_control_push(
     }
 }
 
+/// Decodes a tunnel-data frame's payload (already split from its leading
+/// `tunnel_id`) as an inner `FRAME_CLASS_CONTROL` frame carrying a
+/// JSON-encoded `T` — the wire shape both the `"agent-events"`-tunnel resume
+/// request and the `rpc`-tunnel `host-rpc.md` request share
+/// (relay-protocol.md), and the one decode step [`handle_tunnel_frame`]'s
+/// two branches for those purposes previously duplicated line for line.
+/// Warns and returns `None` for either failure mode (an unexpected inner
+/// frame class, or a body that doesn't decode as `T`) — `kind` names the
+/// tunnel purpose in the log line so the two call sites stay distinguishable
+/// despite sharing this one implementation. The `payload.split_first()`
+/// `None` case (an empty payload) is unreachable from either call site today
+/// — both already return earlier on `payload.is_empty()` — but is handled
+/// the same defensive way the pre-extraction code did, rather than
+/// `unwrap`ing.
+fn decode_inner_control_frame<T: serde::de::DeserializeOwned>(payload: &[u8], kind: &str) -> Option<T> {
+    let (inner_class, inner_body) = payload.split_first()?;
+    if *inner_class != FRAME_CLASS_CONTROL {
+        tracing::warn!(kind, "tunnel payload used an unexpected inner frame class");
+        return None;
+    }
+    match serde_json::from_slice(inner_body) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::warn!(%error, kind, "malformed request on tunnel");
+            None
+        }
+    }
+}
+
+/// Encodes `response` as an inner `FRAME_CLASS_CONTROL` frame: a leading
+/// class byte followed by its JSON body — the counterpart encoding step to
+/// [`decode_inner_control_frame`], shared by the two places that build this
+/// exact shape for a tunnel-scoped response: [`handle_tunnel_frame`]'s
+/// `"agent-events"` branch (via [`send_tunnel_control_response`], sent
+/// directly over `channel`) and [`spawn_rpc_dispatch`]'s backgrounded
+/// `rpc::dispatch` response (sent later, through `tunnel_output_tx`, by
+/// `serve_dispatch`'s own `tunnel_output_rx` branch). Logs and returns
+/// `None` on a serialization failure — there is nothing to retry either
+/// caller can do about that.
+fn encode_control_frame_response(response: &impl serde::Serialize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(1 + 128);
+    bytes.push(FRAME_CLASS_CONTROL);
+    if let Err(error) = serde_json::to_writer(&mut bytes, response) {
+        tracing::error!(%error, "failed to serialize control-frame tunnel response");
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Sends `response` as a `FRAME_CLASS_TUNNEL` frame's payload — `tunnel_id`
+/// followed by [`encode_control_frame_response`]'s encoding of `response` —
+/// directly over `channel`. Returns [`FrameOutcome::Disconnect`] on a send
+/// failure (per relay-protocol.md, an unrecoverable state for this
+/// connection) and [`FrameOutcome::Continue`] otherwise, including on a
+/// serialization failure (already logged by the encode step; nothing left
+/// to retry). [`handle_tunnel_frame`]'s `"agent-events"` resume-response
+/// branch is this function's only caller: the `rpc`-tunnel's analogous
+/// response is backgrounded (`spawn_rpc_dispatch`) and reaches the wire
+/// later, through `tunnel_output_tx`/`serve_dispatch`'s own
+/// `tunnel_output_rx` branch, which is why that path shares only
+/// [`encode_control_frame_response`], not this whole send.
+async fn send_tunnel_control_response(channel: &mut WsChannel, tunnel_id: [u8; TUNNEL_ID_BYTES], response: &impl serde::Serialize) -> FrameOutcome {
+    let Some(response_bytes) = encode_control_frame_response(response) else {
+        return FrameOutcome::Continue;
+    };
+    let mut payload = Vec::with_capacity(TUNNEL_ID_BYTES + response_bytes.len());
+    payload.extend_from_slice(&tunnel_id);
+    payload.extend_from_slice(&response_bytes);
+    if let Err(error) = channel.send_bytes(FRAME_CLASS_TUNNEL, &payload).await {
+        tracing::warn!(%error, "failed to send tunnel control response");
+        return FrameOutcome::Disconnect;
+    }
+    FrameOutcome::Continue
+}
+
 /// Handles one `FRAME_CLASS_TUNNEL` frame: routes to an active pty or web
 /// tunnel's write half, or dispatches as an `rpc`-tunnel `host-rpc.md`
 /// request or an `agent-events`-tunnel resume request (`agent-events.md`'s
@@ -1022,19 +1121,13 @@ async fn handle_control_push(
 /// why). Returns [`FrameOutcome::Disconnect`] only for a malformed frame or
 /// a send failure that per relay-protocol.md means the connection itself is
 /// unrecoverable — every other outcome is [`FrameOutcome::Continue`].
-#[allow(clippy::too_many_arguments)] // one tracking collection per tunnel purpose this dispatch routes, per this doc comment; a params struct would just move the count, not reduce it, for a single call site.
 #[allow(clippy::too_many_lines)] // one self-contained branch per tunnel purpose (pty/web/agent-events/rpc), each already as short as its own protocol allows; splitting further would just move the line count into more functions, not reduce it.
 async fn handle_tunnel_frame(
     body: &[u8],
     channel: &mut WsChannel,
     rpc_context: &RpcContext,
     tunnel_output_tx: &tokio::sync::mpsc::Sender<TunnelOutput>,
-    rpc_tunnels: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
-    agent_event_resume_tunnels: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
-    pty_tunnels: &mut HashMap<[u8; TUNNEL_ID_BYTES], PtyWriteHalf>,
-    web_tunnels: &mut HashMap<[u8; TUNNEL_ID_BYTES], WebWriteHalf>,
-    offload_pending: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
-    offload_active: &mut HashSet<[u8; TUNNEL_ID_BYTES]>,
+    tunnel_state: &mut TunnelState,
     agent_event_spool: &std::sync::Arc<crate::agent_event_spool::AgentEventSpool>,
 ) -> FrameOutcome {
     if body.len() < TUNNEL_ID_BYTES {
@@ -1045,7 +1138,7 @@ async fn handle_tunnel_frame(
     let mut tunnel_id = [0u8; TUNNEL_ID_BYTES];
     tunnel_id.copy_from_slice(id_bytes);
 
-    if offload_pending.remove(&tunnel_id) {
+    if tunnel_state.offload_pending.remove(&tunnel_id) {
         // The tunnel's first (and only) inbound data frame: the JSON
         // `OffloadRequest`. A zero-length payload here would be
         // relay-protocol.md's close signal, not a real request — the
@@ -1053,11 +1146,11 @@ async fn handle_tunnel_frame(
         if payload.is_empty() {
             return FrameOutcome::Continue;
         }
-        handle_offload_request_frame(payload, channel, rpc_context, tunnel_output_tx, tunnel_id, offload_active).await;
+        handle_offload_request_frame(payload, channel, rpc_context, tunnel_output_tx, tunnel_id, &mut tunnel_state.offload_active).await;
         return FrameOutcome::Continue;
     }
 
-    if let Some(mut write_half) = pty_tunnels.remove(&tunnel_id) {
+    if let Some(mut write_half) = tunnel_state.pty_tunnels.remove(&tunnel_id) {
         if payload.is_empty() {
             return FrameOutcome::Continue; // zero-payload close signal — dropping write_half above already kills the attached client (PtyWriteHalf::drop).
         }
@@ -1065,11 +1158,11 @@ async fn handle_tunnel_frame(
             tracing::debug!(%error, "pty write failed, tunnel is presumably closing");
             return FrameOutcome::Continue; // do not re-insert; the tunnel is done.
         }
-        pty_tunnels.insert(tunnel_id, write_half);
+        tunnel_state.pty_tunnels.insert(tunnel_id, write_half);
         return FrameOutcome::Continue;
     }
 
-    if let Some(mut write_half) = web_tunnels.remove(&tunnel_id) {
+    if let Some(mut write_half) = tunnel_state.web_tunnels.remove(&tunnel_id) {
         if payload.is_empty() {
             return FrameOutcome::Continue; // zero-payload close signal — dropping write_half above shuts down the TCP connection's write side (tokio::net::tcp::OwnedWriteHalf::drop).
         }
@@ -1077,35 +1170,25 @@ async fn handle_tunnel_frame(
             tracing::debug!(%error, "web tunnel write failed, tunnel is presumably closing");
             return FrameOutcome::Continue; // do not re-insert; the tunnel is done.
         }
-        web_tunnels.insert(tunnel_id, write_half);
+        tunnel_state.web_tunnels.insert(tunnel_id, write_half);
         return FrameOutcome::Continue;
     }
 
-    if agent_event_resume_tunnels.contains(&tunnel_id) {
+    if tunnel_state.agent_event_resume_tunnels.contains(&tunnel_id) {
         if payload.is_empty() {
             // Zero-length payload is the tunnel close signal.
-            agent_event_resume_tunnels.remove(&tunnel_id);
+            tunnel_state.agent_event_resume_tunnels.remove(&tunnel_id);
             return FrameOutcome::Continue;
         }
-        let Some((inner_class, inner_body)) = payload.split_first() else {
+        // Matches the `rpc`-tunnel branch below's own posture: a malformed
+        // request on this tunnel purpose gets no reply and no disconnect,
+        // just a dropped frame — the caller's own request/response
+        // correlation (`request_id`) means it will simply time out and can
+        // retry, exactly as an unparseable `host-rpc.md` request already
+        // does. See [`decode_inner_control_frame`]'s doc comment for the
+        // shared decode step this shares with that branch.
+        let Some(request) = decode_inner_control_frame::<choosh_protocol::relay::AgentEventsResumeRequest>(payload, "agent-events") else {
             return FrameOutcome::Continue;
-        };
-        if *inner_class != FRAME_CLASS_CONTROL {
-            tracing::warn!("agent-events tunnel payload used an unexpected inner frame class");
-            return FrameOutcome::Continue;
-        }
-        let request: choosh_protocol::relay::AgentEventsResumeRequest = match serde_json::from_slice(inner_body) {
-            Ok(request) => request,
-            Err(error) => {
-                // Matches the `rpc`-tunnel branch below's own posture: a
-                // malformed request on this tunnel purpose gets no reply
-                // and no disconnect, just a dropped frame — the caller's
-                // own request/response correlation (`request_id`) means it
-                // will simply time out and can retry, exactly as an
-                // unparseable `host-rpc.md` request already does.
-                tracing::warn!(%error, "malformed agent-events resume request on agent-events tunnel");
-                return FrameOutcome::Continue;
-            }
         };
         let response = match agent_event_spool.resume(&request.workspace_id, request.after_sequence) {
             crate::agent_event_spool::ResumeOutcome::Replay { events, latest_sequence } => {
@@ -1118,42 +1201,20 @@ async fn handle_tunnel_frame(
                 }
             }
         };
-        let mut response_payload = Vec::with_capacity(TUNNEL_ID_BYTES + 1 + 128);
-        response_payload.extend_from_slice(&tunnel_id);
-        response_payload.push(FRAME_CLASS_CONTROL);
-        if let Err(error) = serde_json::to_writer(&mut response_payload, &response) {
-            tracing::error!(%error, "failed to serialize agent-events resume response");
-            return FrameOutcome::Continue;
-        }
-        if let Err(error) = channel.send_bytes(FRAME_CLASS_TUNNEL, &response_payload).await {
-            tracing::warn!(%error, "failed to send agent-events resume response over tunnel");
-            return FrameOutcome::Disconnect;
-        }
-        return FrameOutcome::Continue;
+        return send_tunnel_control_response(channel, tunnel_id, &response).await;
     }
 
-    if !rpc_tunnels.contains(&tunnel_id) {
+    if !tunnel_state.rpc_tunnels.contains(&tunnel_id) {
         tracing::debug!("tunnel frame for an unknown/non-rpc/non-agent-events/non-pty/non-web tunnel id, ignoring");
         return FrameOutcome::Continue;
     }
     if payload.is_empty() {
         // Zero-length payload is the tunnel close signal.
-        rpc_tunnels.remove(&tunnel_id);
+        tunnel_state.rpc_tunnels.remove(&tunnel_id);
         return FrameOutcome::Continue;
     }
-    let Some((inner_class, inner_body)) = payload.split_first() else {
+    let Some(request) = decode_inner_control_frame::<choosh_protocol::host_rpc::RpcRequest>(payload, "rpc") else {
         return FrameOutcome::Continue;
-    };
-    if *inner_class != FRAME_CLASS_CONTROL {
-        tracing::warn!("rpc tunnel payload used an unexpected inner frame class");
-        return FrameOutcome::Continue;
-    }
-    let request: choosh_protocol::host_rpc::RpcRequest = match serde_json::from_slice(inner_body) {
-        Ok(request) => request,
-        Err(error) => {
-            tracing::warn!(%error, "malformed host-rpc request on rpc tunnel");
-            return FrameOutcome::Continue;
-        }
     };
     // Backgrounded, not awaited inline: `rpc::dispatch` can perform real,
     // slow I/O (`workspace.create`'s `jj clone` over the network,
@@ -1235,12 +1296,9 @@ fn spawn_rpc_dispatch(
 ) {
     tokio::task::spawn_blocking(move || {
         let response = tokio::runtime::Handle::current().block_on(rpc::dispatch(&rpc_context, request));
-        let mut bytes = Vec::with_capacity(1 + 128);
-        bytes.push(FRAME_CLASS_CONTROL);
-        if let Err(error) = serde_json::to_writer(&mut bytes, &response) {
-            tracing::error!(%error, "failed to serialize rpc response");
+        let Some(bytes) = encode_control_frame_response(&response) else {
             return;
-        }
+        };
         // `tunnel_output_tx`'s receiver is `serve_dispatch`'s own loop,
         // which only stops draining it once that connection has ended —
         // a send failure here means the connection is already gone, in
@@ -1394,6 +1452,37 @@ async fn handle_offload_request_frame(
     spawn_offload_process(child, tunnel_id, workspace_root, ephemeral_name, ephemeral_dest, tunnel_output_tx.clone());
 }
 
+/// Streams one of an offloaded child's stdout/stderr pipes into `output_tx`
+/// as `tunnel_id`-tagged [`TunnelOutput`]s, encoding each chunk with
+/// `encode_frame` — a plain `fn` item, either
+/// [`choosh_protocol::offload::encode_stdout_frame`] or
+/// [`encode_stderr_frame`] — the only way [`spawn_offload_process`]'s two
+/// reader tasks otherwise differ; extracted here so that difference is the
+/// only thing left at each call site. Returns once the pipe hits EOF, a
+/// read error, or `output_tx`'s receiver (`serve_dispatch`'s loop) is gone —
+/// the same three exits both original inline reader loops had.
+///
+/// [`encode_stderr_frame`]: choosh_protocol::offload::encode_stderr_frame
+async fn stream_offload_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    tunnel_id: [u8; TUNNEL_ID_BYTES],
+    output_tx: tokio::sync::mpsc::Sender<TunnelOutput>,
+    encode_frame: fn(&[u8]) -> Vec<u8>,
+) {
+    let mut buf = [0u8; WEB_TUNNEL_READ_BUF_SIZE];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                let bytes = encode_frame(&buf[..n]);
+                if output_tx.send(TunnelOutput { tunnel_id, bytes }).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Streams `child`'s stdout/stderr back as [`OFFLOAD_FRAME_STDOUT`]/
 /// [`OFFLOAD_FRAME_STDERR`]-tagged [`TunnelOutput`]s, then its exit code as
 /// one [`OFFLOAD_FRAME_EXIT`] frame, then the ordinary zero-payload
@@ -1419,46 +1508,17 @@ fn spawn_offload_process(
     output_tx: tokio::sync::mpsc::Sender<TunnelOutput>,
 ) {
     tokio::spawn(async move {
-        let Some(mut stdout) = child.stdout.take() else {
+        let Some(stdout) = child.stdout.take() else {
             tracing::error!("offloaded child had no stdout pipe; this should be unreachable given Stdio::piped()");
             return;
         };
-        let Some(mut stderr) = child.stderr.take() else {
+        let Some(stderr) = child.stderr.take() else {
             tracing::error!("offloaded child had no stderr pipe; this should be unreachable given Stdio::piped()");
             return;
         };
 
-        let stdout_tx = output_tx.clone();
-        let stdout_task = tokio::spawn(async move {
-            let mut buf = [0u8; WEB_TUNNEL_READ_BUF_SIZE];
-            loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        let bytes = choosh_protocol::offload::encode_stdout_frame(&buf[..n]);
-                        if stdout_tx.send(TunnelOutput { tunnel_id, bytes }).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-
-        let stderr_tx = output_tx.clone();
-        let stderr_task = tokio::spawn(async move {
-            let mut buf = [0u8; WEB_TUNNEL_READ_BUF_SIZE];
-            loop {
-                match stderr.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        let bytes = choosh_protocol::offload::encode_stderr_frame(&buf[..n]);
-                        if stderr_tx.send(TunnelOutput { tunnel_id, bytes }).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
+        let stdout_task = tokio::spawn(stream_offload_output(stdout, tunnel_id, output_tx.clone(), choosh_protocol::offload::encode_stdout_frame));
+        let stderr_task = tokio::spawn(stream_offload_output(stderr, tunnel_id, output_tx.clone(), choosh_protocol::offload::encode_stderr_frame));
 
         let status = child.wait().await;
         // Wait for both readers to finish draining before sending the exit

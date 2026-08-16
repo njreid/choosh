@@ -2,6 +2,7 @@ package ai.choosh.fleet
 
 import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.WorkspaceSummary
+import ai.choosh.viewmodel.loadInto
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,10 +36,12 @@ class DevHostWorkspacesViewModel(private val engine: ChooshEngine, private val d
 
     fun refresh() {
         viewModelScope.launch {
-            _state.value = _state.value.copy(isLoading = true, error = null)
-            runCatching { engine.workspaceList(deviceId) }
-                .onSuccess { workspaces -> _state.value = _state.value.copy(workspaces = workspaces, isLoading = false, error = null) }
-                .onFailure { failure -> _state.value = _state.value.copy(isLoading = false, error = failure.message ?: "failed to load workspaces") }
+            _state.loadInto(
+                setLoading = { it.copy(isLoading = true, error = null) },
+                call = { engine.workspaceList(deviceId) },
+                onSuccess = { state, workspaces -> state.copy(workspaces = workspaces, isLoading = false, error = null) },
+                onFailure = { state, failure -> state.copy(isLoading = false, error = failure.message ?: "failed to load workspaces") },
+            )
         }
     }
 }

@@ -18,7 +18,12 @@ use tokio::sync::Mutex;
 /// an `"error"` key, exactly like `relayd`'s own HTTP error responses
 /// already do (see `rust/choosh-relayd/src/webauthn.rs`), so Kotlin has one
 /// error shape to handle across both the HTTP and native-bridge layers.
-fn error_json(message: &str) -> String {
+///
+/// `pub(crate)` so `lib.rs`'s own native methods (which need the identical
+/// `{"error": ...}` shape for an unknown/absent engine handle, before this
+/// module's `Engine` is even reachable) reuse this instead of hand-rolling
+/// their own — the two used to be independent, identical definitions.
+pub(crate) fn error_json(message: &str) -> String {
     json!({ "error": message }).to_string()
 }
 
@@ -162,7 +167,7 @@ impl Engine {
             return error_json("not connected: call nativeConnect first");
         };
         match connection.list_devhosts().await {
-            Ok(devhosts) => devhosts_json(&devhosts),
+            Ok(devhosts) => to_json(&devhosts),
             Err(error) => {
                 // A failed call on a stale/dropped connection: drop it so
                 // the next attempt doesn't reuse a known-broken channel,
@@ -498,27 +503,6 @@ impl Engine {
         }
     }
 
-    /// Opens a `"pty:<item_id>"`-purpose tunnel for the terminal renderer.
-    ///
-    /// # Errors
-    ///
-    /// A message describing why: not connected yet, or the tunnel-open
-    /// call itself failed (see [`CallError`]).
-    ///
-    /// Only called from `terminal_jni.rs`, which is
-    /// `#[cfg(target_os = "android")]`-gated — see `crate::with_connection_engine`
-    /// and `terminal_renderer.rs`'s module doc for why a host build
-    /// legitimately never calls this despite it being real, tested (via
-    /// this crate's Android-target build) production code.
-    ///
-    /// (`#[cfg_attr(not(target_os = "android"), allow(dead_code))]` lives on
-    /// [`Self::open_pty_tunnel`] itself, just below — it was previously
-    /// misplaced here, where it silently attached to [`Self::project_list`]
-    /// instead of this method, per Rust's "an attribute binds to the next
-    /// item" rule applying to the whole doc-comment/attribute run as one
-    /// unit; a host (non-Android) `cargo clippy` build surfaced the
-    /// resulting `dead_code` warning on this method once `project_list`
-    /// stopped being the only android-only-callsite method nearby.)
     /// Returns `project.list`'s `projects` array (`Vec<ProjectSummary>`) as
     /// a bare JSON array — the fleet drawer's Project-mode data source
     /// (`host-rpc.md`'s `project.list`). Each entry's `active` is computed
@@ -556,6 +540,27 @@ impl Engine {
         }
     }
 
+    /// Opens a `"pty:<item_id>"`-purpose tunnel for the terminal renderer.
+    ///
+    /// # Errors
+    ///
+    /// A message describing why: not connected yet, or the tunnel-open
+    /// call itself failed (see [`CallError`]).
+    ///
+    /// Only called from `terminal_jni.rs`, which is
+    /// `#[cfg(target_os = "android")]`-gated — see `crate::with_connection_engine`
+    /// and `terminal_renderer.rs`'s module doc for why a host build
+    /// legitimately never calls this despite it being real, tested (via
+    /// this crate's Android-target build) production code.
+    ///
+    /// (`#[cfg_attr(not(target_os = "android"), allow(dead_code))]` lives on
+    /// [`Self::open_pty_tunnel`] itself, just below — it was previously
+    /// misplaced here, where it silently attached to [`Self::project_list`]
+    /// instead of this method, per Rust's "an attribute binds to the next
+    /// item" rule applying to the whole doc-comment/attribute run as one
+    /// unit; a host (non-Android) `cargo clippy` build surfaced the
+    /// resulting `dead_code` warning on this method once `project_list`
+    /// stopped being the only android-only-callsite method nearby.)
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub async fn open_pty_tunnel(&self, target_device_id: &str, item_id: &str) -> Result<PtyTunnelHandle, String> {
         let mut guard = self.connection.lock().await;
@@ -1029,10 +1034,6 @@ fn unexpected_or_error_json(rpc_name: &str, response: &RpcResponse) -> String {
         RpcResponse::Error { code, message, .. } => json!({ "error": format!("{code}: {message}") }).to_string(),
         other => error_json(&format!("unexpected response to {rpc_name}: {other:?}")),
     }
-}
-
-fn devhosts_json<T: Serialize>(devhosts: &[T]) -> String {
-    serde_json::to_string(devhosts).unwrap_or_else(|error| error_json(&format!("failed to encode devhosts: {error}")))
 }
 
 #[cfg(test)]

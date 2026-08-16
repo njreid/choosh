@@ -437,26 +437,43 @@ pub enum ControlRequest {
     },
 }
 
-impl ControlRequest {
+/// Generates a `request_id(&self) -> &str` accessor for a wire-protocol enum
+/// whose variants are all struct variants carrying a `request_id` field.
+/// Expands to a real, non-wildcard `match` over exactly the variants named
+/// in the invocation — so this keeps the same compile-time safety net a
+/// hand-written exhaustive match gives: a variant added to `$Enum` without
+/// also being added to the matching macro invocation is a compile error (an
+/// uncovered `match` arm), not a silently-skipped one. Shared with
+/// [`crate::host_rpc`]'s `RpcRequest`/`RpcResponse`, which have the
+/// identical shape.
+macro_rules! impl_request_id {
+    (
+        $(#[$meta:meta])*
+        impl $Enum:ident { $($Variant:ident),+ $(,)? }
+    ) => {
+        impl $Enum {
+            $(#[$meta])*
+            #[must_use]
+            pub fn request_id(&self) -> &str {
+                match self {
+                    $(Self::$Variant { request_id, .. } => request_id,)+
+                }
+            }
+        }
+    };
+}
+pub(crate) use impl_request_id;
+
+impl_request_id! {
     /// Every variant carries a client-generated `request_id`, echoed back in
     /// the matching [`ControlResponse`] (see [`ControlResponse::request_id`])
     /// per relay-protocol.md's "Control frames" section. Used by `relayd`
     /// to attach a caller's own `request_id` to an error it needs to send
     /// before a request has been fully dispatched (e.g. a per-Identity
     /// rate-limit rejection).
-    #[must_use]
-    pub fn request_id(&self) -> &str {
-        match self {
-            Self::Enroll { request_id, .. }
-            | Self::RequestEnrollmentToken { request_id, .. }
-            | Self::ListDevhosts { request_id, .. }
-            | Self::ListDevhostSshEndpoints { request_id, .. }
-            | Self::OpenTunnel { request_id, .. }
-            | Self::AgentEvent { request_id, .. }
-            | Self::RegisterFcmToken { request_id, .. }
-            | Self::RevokeDevice { request_id, .. }
-            | Self::RevokePhoneSession { request_id, .. } => request_id,
-        }
+    impl ControlRequest {
+        Enroll, RequestEnrollmentToken, ListDevhosts, ListDevhostSshEndpoints,
+        OpenTunnel, AgentEvent, RegisterFcmToken, RevokeDevice, RevokePhoneSession,
     }
 }
 
@@ -519,21 +536,11 @@ pub enum ControlResponse {
     },
 }
 
-impl ControlResponse {
-    #[must_use]
-    pub fn request_id(&self) -> &str {
-        match self {
-            Self::EnrollOk { request_id, .. }
-            | Self::RequestEnrollmentTokenOk { request_id, .. }
-            | Self::ListDevhostsOk { request_id, .. }
-            | Self::ListDevhostSshEndpointsOk { request_id, .. }
-            | Self::OpenTunnelOk { request_id, .. }
-            | Self::AgentEventOk { request_id, .. }
-            | Self::RegisterFcmTokenOk { request_id, .. }
-            | Self::RevokeDeviceOk { request_id, .. }
-            | Self::RevokePhoneSessionOk { request_id, .. }
-            | Self::Error { request_id, .. } => request_id,
-        }
+impl_request_id! {
+    impl ControlResponse {
+        EnrollOk, RequestEnrollmentTokenOk, ListDevhostsOk, ListDevhostSshEndpointsOk,
+        OpenTunnelOk, AgentEventOk, RegisterFcmTokenOk, RevokeDeviceOk, RevokePhoneSessionOk,
+        Error,
     }
 }
 

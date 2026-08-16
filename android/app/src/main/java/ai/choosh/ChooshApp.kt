@@ -289,6 +289,15 @@ fun ChooshApp(
     val agentEventPollScope = rememberCoroutineScope()
     LaunchedEffect(subscription) { subscription.startPolling(agentEventPollScope) }
 
+    // Real connection handle, per this file's `buildEngine` comment
+    // (`NativeChooshEngine` is the real default now) — `null` only when
+    // running against `FakeChooshEngine` (no real relay connection to
+    // attach a PTY tunnel/gateway through). Hoisted once here rather than
+    // re-derived at each of the three sites below that need it
+    // (Terminal/WebService/MarkdownPreview all attach to the same
+    // process-wide connection).
+    val connectionHandle = remember(engine) { (engine as? NativeChooshEngine)?.connectionHandle }
+
     MaterialTheme {
         Surface(modifier = Modifier.fillMaxSize()) {
             when (val current = screen) {
@@ -442,14 +451,11 @@ fun ChooshApp(
                     deviceId = current.deviceId,
                     itemId = current.itemId,
                     itemName = current.itemName,
-                    // Real connection handle, per this file's `buildEngine`
-                    // comment (`NativeChooshEngine` is the real default now)
-                    // — `null` only when running against `FakeChooshEngine`
-                    // (no real relay connection to attach a PTY tunnel
-                    // through), in which case the extra-keys bar's demo
-                    // output buttons remain the only way to see anything
-                    // render, exactly as documented on that button.
-                    connectionHandle = (engine as? NativeChooshEngine)?.connectionHandle,
+                    // `null` only when running against `FakeChooshEngine`, in
+                    // which case the extra-keys bar's demo output buttons
+                    // remain the only way to see anything render, exactly as
+                    // documented on that button.
+                    connectionHandle = connectionHandle,
                     onBack = { backStack.pop() },
                 )
 
@@ -462,7 +468,7 @@ fun ChooshApp(
                                 current.deviceId,
                                 current.workspaceId,
                                 itemId = current.itemId,
-                                connectionHandle = (engine as? NativeChooshEngine)?.connectionHandle,
+                                connectionHandle = connectionHandle,
                             )
                         },
                     )
@@ -478,7 +484,7 @@ fun ChooshApp(
                     val viewModel: MarkdownViewModel = viewModel(
                         key = "markdown-preview:${current.deviceId}:${current.workspaceId}:${current.path}",
                         factory = singleInstanceFactory {
-                            MarkdownViewModel(current.deviceId, current.workspaceId, current.path, (engine as? NativeChooshEngine)?.connectionHandle)
+                            MarkdownViewModel(current.deviceId, current.workspaceId, current.path, connectionHandle)
                         },
                     )
                     // Explicitly stops this document's local gateway when the

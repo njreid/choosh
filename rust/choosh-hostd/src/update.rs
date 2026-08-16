@@ -227,9 +227,7 @@ fn save_state(path: &Path, state: &UpdateState) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_vec_pretty(state).unwrap_or_default();
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)
+    crate::fs_util::atomic_write(path, &json, None)
 }
 
 /// Drains and returns any pending self-update failure report at

@@ -3,6 +3,7 @@ package ai.choosh.jj
 import ai.choosh.engine.ChangeGraphNode
 import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.OperationLogEntry
+import ai.choosh.viewmodel.loadInto
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,16 +42,16 @@ class JjChangeGraphViewModel(
 
     fun refresh() {
         viewModelScope.launch {
-            _state.value = _state.value.copy(isLoading = true, error = null)
-            runCatching {
-                val nodes = engine.workspaceLog(deviceId, workspaceId)
-                val operations = engine.workspaceOpLog(deviceId, workspaceId)
-                nodes to operations
-            }.onSuccess { (nodes, operations) ->
-                _state.value = _state.value.copy(nodes = nodes, operations = operations, isLoading = false, error = null)
-            }.onFailure { failure ->
-                _state.value = _state.value.copy(isLoading = false, error = failure.message ?: "failed to load change graph")
-            }
+            _state.loadInto(
+                setLoading = { it.copy(isLoading = true, error = null) },
+                call = {
+                    val nodes = engine.workspaceLog(deviceId, workspaceId)
+                    val operations = engine.workspaceOpLog(deviceId, workspaceId)
+                    nodes to operations
+                },
+                onSuccess = { state, (nodes, operations) -> state.copy(nodes = nodes, operations = operations, isLoading = false, error = null) },
+                onFailure = { state, failure -> state.copy(isLoading = false, error = failure.message ?: "failed to load change graph") },
+            )
         }
     }
 

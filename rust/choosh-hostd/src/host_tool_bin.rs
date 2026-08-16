@@ -48,28 +48,51 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-static JJ_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-static ZELLIJ_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Process-wide record of the most recently mise-resolved directory for
+/// each host-managed tool this module tracks (`"jj"`, `"zellij"` — just two
+/// entries ever, hence a plain `Vec` rather than a `HashMap`), keyed by tool
+/// name rather than one static per tool. `set_jj_dir`/`set_zellij_dir` and
+/// `apply_jj_path`/`apply_zellij_path` stay as the small, tool-specific
+/// public surface every other module's call sites already use; only the
+/// storage behind them is shared.
+static RESOLVED_TOOL_DIRS: Mutex<Vec<(&'static str, PathBuf)>> = Mutex::new(Vec::new());
+
+fn set_resolved_dir(tool: &'static str, dir: Option<PathBuf>) {
+    let mut entries = RESOLVED_TOOL_DIRS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    entries.retain(|(name, _)| *name != tool);
+    if let Some(dir) = dir {
+        entries.push((tool, dir));
+    }
+}
+
+fn resolved_dir(tool: &str) -> Option<PathBuf> {
+    RESOLVED_TOOL_DIRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(name, _)| *name == tool)
+        .map(|(_, dir)| dir.clone())
+}
 
 /// Records `dir` (the parent directory of the binary path
 /// [`crate::mise_ops::ensure_jj`] most recently resolved) as the directory
 /// every subsequent `jj_ops.rs` `Command::new("jj")` should prefer via
 /// `PATH`. `None` reverts to ordinary, unmodified `$PATH` resolution.
 pub(crate) fn set_jj_dir(dir: Option<PathBuf>) {
-    *JJ_DIR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = dir;
+    set_resolved_dir("jj", dir);
 }
 
 /// The `zellij` sibling of [`set_jj_dir`].
 pub(crate) fn set_zellij_dir(dir: Option<PathBuf>) {
-    *ZELLIJ_DIR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = dir;
+    set_resolved_dir("zellij", dir);
 }
 
 fn jj_dir() -> Option<PathBuf> {
-    JJ_DIR.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    resolved_dir("jj")
 }
 
 fn zellij_dir() -> Option<PathBuf> {
-    ZELLIJ_DIR.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    resolved_dir("zellij")
 }
 
 /// This process's own `PATH`, with `dir` prepended when `Some` — mirrors

@@ -29,16 +29,15 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use choosh_protocol::relay::{
-    AuthResult, ClientAuth, ControlRequest, ControlResponse, DeviceAuth, DevhostSshEndpoint, FRAME_CLASS_CONTROL, FRAME_CLASS_TUNNEL,
-    IdentityClass, ServerHello, TUNNEL_ID_BYTES, decode_tunnel_id_hex,
+    ControlRequest, ControlResponse, DevhostSshEndpoint, FRAME_CLASS_CONTROL, FRAME_CLASS_TUNNEL, IdentityClass, ServerHello,
+    TUNNEL_ID_BYTES, decode_tunnel_id_hex,
 };
 use ed25519_dalek::SigningKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::credential::{self, Credential, CredentialError};
-use crate::frame_channel::{ChannelError, FrameChannel};
-
-const DEFAULT_RELAYD_URL: &str = "ws://127.0.0.1:7443/connect";
+use crate::frame_channel::ChannelError;
+use crate::relay_client::{self, RelayClientError, WsChannel};
 
 #[derive(Debug)]
 pub enum ProxyError {
@@ -100,8 +99,14 @@ impl From<crate::ssh_keys::SshKeyError> for ProxyError {
     }
 }
 
-fn relay_url() -> String {
-    std::env::var("CHOOSH_RELAYD_URL").unwrap_or_else(|_| DEFAULT_RELAYD_URL.to_string())
+impl From<RelayClientError> for ProxyError {
+    fn from(error: RelayClientError) -> Self {
+        match error {
+            RelayClientError::Transport(reason) => Self::Transport(reason),
+            RelayClientError::AuthFailed(reason) => Self::AuthFailed(reason),
+            RelayClientError::Credential(error) => Self::Credential(error),
+        }
+    }
 }
 
 /// The laptop-proxy credential's own file, distinct from a devhost's own
@@ -143,36 +148,6 @@ fn home_dir() -> Result<PathBuf, ProxyError> {
     std::env::var("HOME").map(PathBuf::from).map_err(|_| ProxyError::Io(io::Error::other("$HOME is not set")))
 }
 
-type WsChannel = FrameChannel<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>;
-
-async fn dial(relay_url: &str) -> Result<WsChannel, ProxyError> {
-    let (stream, _response) = tokio_tungstenite::connect_async(relay_url).await.map_err(|error| ProxyError::Transport(error.to_string()))?;
-    Ok(FrameChannel::new(stream))
-}
-
-/// Dials `relay_url` and authenticates with the stored laptop-proxy
-/// credential — `proxy connect`/`proxy sync`'s shared step 1, per
-/// ssh-bridge-and-zed.md.
-async fn connect_authenticated(relay_url: &str, credential: &Credential) -> Result<WsChannel, ProxyError> {
-    let mut channel = dial(relay_url).await?;
-    let hello: ServerHello = channel.recv().await?;
-    let signature = credential.sign(hello.nonce.as_bytes())?;
-    let auth = ClientAuth::Device(DeviceAuth {
-        device_id: credential.device_id.clone(),
-        certificate: credential.certificate.clone(),
-        signature: base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()),
-    });
-    channel.send(FRAME_CLASS_CONTROL, &auth).await?;
-    match channel.recv().await? {
-        AuthResult::Ok(_) => Ok(channel),
-        AuthResult::Failed(failed) => Err(ProxyError::AuthFailed(failed.reason)),
-    }
-}
-
-fn new_request_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 /// `choosh-hostd proxy enroll --token <token>`. Exchanges `token` for this
 /// laptop's own `LaptopProxy` device credential, persists it, then runs
 /// [`sync`] once and installs a periodic trigger for it — both required by
@@ -190,10 +165,10 @@ pub async fn enroll(token: &str) -> Result<(), ProxyError> {
     let signing_key = SigningKey::generate(&mut rand::rng());
     let public_key_b64 = base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().to_bytes());
 
-    let mut channel = dial(&relay_url()).await?;
+    let mut channel = relay_client::dial(&relay_client::relay_url()).await?;
     let _hello: ServerHello = channel.recv().await?;
 
-    let request_id = new_request_id();
+    let request_id = relay_client::new_request_id();
     channel
         .send(
             FRAME_CLASS_CONTROL,
@@ -243,7 +218,7 @@ pub async fn enroll(token: &str) -> Result<(), ProxyError> {
 /// any byte of `stdout` is touched (see `connect_with_io`'s structure).
 pub async fn connect(host_id: &str) -> Result<(), ProxyError> {
     let credential = credential::load(&credential_path()?)?.ok_or(ProxyError::NotEnrolled)?;
-    Box::pin(connect_with_io(host_id, &relay_url(), &credential, tokio::io::stdin(), tokio::io::stdout())).await
+    Box::pin(connect_with_io(host_id, &relay_client::relay_url(), &credential, tokio::io::stdin(), tokio::io::stdout())).await
 }
 
 /// The testable core of `proxy connect`: authenticate, resolve `host_id`
@@ -264,12 +239,12 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut channel = connect_authenticated(relay_url, credential).await?;
+    let mut channel = relay_client::connect_authenticated(relay_url, credential).await?;
 
     let endpoints = fetch_ssh_endpoints(&mut channel).await?;
     let target = endpoints.iter().find(|endpoint| endpoint.alias == host_id).ok_or_else(|| ProxyError::UnknownHost(host_id.to_string()))?;
 
-    let request_id = new_request_id();
+    let request_id = relay_client::new_request_id();
     channel
         .send(FRAME_CLASS_CONTROL, &ControlRequest::OpenTunnel { request_id, target_device_id: target.device_id.clone(), purpose: "ssh".to_string() })
         .await?;
@@ -287,7 +262,7 @@ where
 }
 
 async fn fetch_ssh_endpoints(channel: &mut WsChannel) -> Result<Vec<DevhostSshEndpoint>, ProxyError> {
-    let request_id = new_request_id();
+    let request_id = relay_client::new_request_id();
     channel.send(FRAME_CLASS_CONTROL, &ControlRequest::ListDevhostSshEndpoints { request_id }).await?;
     match channel.recv().await? {
         ControlResponse::ListDevhostSshEndpointsOk { endpoints, .. } => Ok(endpoints),
@@ -362,7 +337,7 @@ where
 /// See [`sync_with_paths`].
 pub async fn sync() -> Result<(), ProxyError> {
     let credential = credential::load(&credential_path()?)?.ok_or(ProxyError::NotEnrolled)?;
-    sync_with_paths(&relay_url(), &credential, &known_hosts_path()?, &ssh_config_path()?).await
+    sync_with_paths(&relay_client::relay_url(), &credential, &known_hosts_path()?, &ssh_config_path()?).await
 }
 
 /// The testable core of `proxy sync`: fetch the restricted fleet read,
@@ -375,7 +350,7 @@ pub async fn sync() -> Result<(), ProxyError> {
 /// dial/authenticate, [`ProxyError::RelayError`] if the restricted fleet
 /// read itself is rejected, [`ProxyError::Io`] for a file I/O failure.
 pub(crate) async fn sync_with_paths(relay_url: &str, credential: &Credential, known_hosts_path: &Path, ssh_config_path: &Path) -> Result<(), ProxyError> {
-    let mut channel = connect_authenticated(relay_url, credential).await?;
+    let mut channel = relay_client::connect_authenticated(relay_url, credential).await?;
     let endpoints = fetch_ssh_endpoints(&mut channel).await?;
 
     let mut sorted = endpoints;
@@ -476,9 +451,7 @@ fn write_if_changed(path: &Path, content: &[u8]) -> Result<(), ProxyError> {
     }
     let parent = path.parent().ok_or_else(|| ProxyError::Io(io::Error::new(io::ErrorKind::InvalidInput, "path has no parent directory")))?;
     std::fs::create_dir_all(parent)?;
-    let tmp_path = parent.join(format!(".{}.tmp-{}", path.file_name().and_then(|n| n.to_str()).unwrap_or("sync-output"), std::process::id()));
-    std::fs::write(&tmp_path, content)?;
-    std::fs::rename(&tmp_path, path)?;
+    crate::fs_util::atomic_write(path, content, None)?;
     Ok(())
 }
 
@@ -578,7 +551,7 @@ impl AsyncWrite for RecordingWriter {
 mod tests {
     use super::*;
     use choosh_protocol::framing::{FrameDecoder, FrameLimits, encode_frame};
-    use choosh_protocol::relay::{AuthOk, MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES};
+    use choosh_protocol::relay::{AuthOk, AuthResult, MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES};
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{Arc, Mutex};
     use tokio_tungstenite::tungstenite::Message;

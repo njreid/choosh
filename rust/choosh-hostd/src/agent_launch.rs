@@ -19,19 +19,13 @@
 
 use choosh_protocol::host_rpc::AgentKind;
 
-/// The real executable name each `AgentKind` launches. `codex` and `claude`
+/// The real executable name each `AgentKind` launches — also reused as-is
+/// for `CHOOSH_AGENT`'s value (`agent_launch_argv`), since both mappings
+/// happen to be the same string for every variant today: `codex`/`claude`
 /// are confirmed present on `PATH` in this environment; `opencode` is not
 /// installed here and its argv construction is untested against a real
 /// binary, unlike the other two — a real gap, not silently assumed away.
 fn executable(agent: AgentKind) -> &'static str {
-    match agent {
-        AgentKind::Codex => "codex",
-        AgentKind::Claude => "claude",
-        AgentKind::Opencode => "opencode",
-    }
-}
-
-fn agent_env_value(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Codex => "codex",
         AgentKind::Claude => "claude",
@@ -52,7 +46,7 @@ pub fn agent_launch_argv(agent: AgentKind, workspace_id: &str, item_id: &str, ro
         format!("CHOOSH_WORKSPACE_ID={workspace_id}"),
         format!("CHOOSH_ITEM_ID={item_id}"),
         format!("CHOOSH_ROOT={root}"),
-        format!("CHOOSH_AGENT={}", agent_env_value(agent)),
+        format!("CHOOSH_AGENT={}", executable(agent)),
     ];
     argv.extend(mise_env.iter().map(|(key, value)| format!("{key}={value}")));
     argv.push(executable(agent).to_string());

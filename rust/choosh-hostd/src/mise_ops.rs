@@ -145,12 +145,12 @@ pub async fn ensure_zed_remote_server(mise_bin: &str, version: &str, host_tools_
 async fn resolve_host_managed_tool(mise_bin: &str, host_tools_dir: &Path, spec: &str, binary_name: &str) -> Result<PathBuf, MiseError> {
     tokio::fs::create_dir_all(host_tools_dir).await.map_err(MiseError::Spawn)?;
 
-    let install_output = run_mise(mise_bin, host_tools_dir, &["install", "--yes", spec]).await?;
+    let install_output = run_mise(mise_bin, host_tools_dir, host_tools_dir, &["install", "--yes", spec]).await?;
     if !install_output.status.success() {
         return Err(MiseError::InstallFailed { stderr: bounded_stderr(&install_output.stderr) });
     }
 
-    let where_output = run_mise(mise_bin, host_tools_dir, &["where", spec]).await?;
+    let where_output = run_mise(mise_bin, host_tools_dir, host_tools_dir, &["where", spec]).await?;
     if !where_output.status.success() {
         return Err(MiseError::WhereFailed { stderr: bounded_stderr(&where_output.stderr) });
     }
@@ -164,13 +164,30 @@ async fn resolve_host_managed_tool(mise_bin: &str, host_tools_dir: &Path, spec: 
     Err(MiseError::BinaryNotFound(install_dir))
 }
 
-async fn run_mise(mise_bin: &str, host_tools_dir: &Path, args: &[&str]) -> Result<std::process::Output, MiseError> {
+/// Shared by every `mise` invocation in this module (both tiers —
+/// `resolve_host_managed_tool` for the host-managed tier,
+/// [`ensure_project_toolchain`]/[`project_env`] for the project-pinned
+/// tier): same three `MISE_DATA_DIR`/`MISE_CONFIG_DIR`/`MISE_CACHE_DIR`
+/// overrides scoped to `tools_dir`, same `stdin(Stdio::null())`. The two
+/// tiers differ only in what `cwd` and `tools_dir` actually are: the
+/// host-managed tier passes the same `host_tools_dir` for both (nothing
+/// ever runs there with a workspace as its current directory, per this
+/// module's doc comment), while the project-pinned tier passes a
+/// workspace's own `workspace_root` as `cwd` (so `mise` discovers *that*
+/// directory's `mise.toml` via its ordinary upward config search —
+/// confirmed against the real binary that `MISE_CONFIG_DIR`, which governs
+/// `mise`'s *global* config, does not affect this local discovery) and the
+/// shared `project_tools_dir` as `tools_dir`. This pair of facts — `cwd`
+/// possibly distinct from `tools_dir`, and `tools_dir` always one of two
+/// entirely separate trees — is what gives project-pinned resolution its
+/// isolation from host-managed resolution (see this module's doc comment).
+async fn run_mise(mise_bin: &str, cwd: &Path, tools_dir: &Path, args: &[&str]) -> Result<std::process::Output, MiseError> {
     Command::new(mise_bin)
         .args(args)
-        .current_dir(host_tools_dir)
-        .env("MISE_DATA_DIR", host_tools_dir.join("data"))
-        .env("MISE_CONFIG_DIR", host_tools_dir.join("config"))
-        .env("MISE_CACHE_DIR", host_tools_dir.join("cache"))
+        .current_dir(cwd)
+        .env("MISE_DATA_DIR", tools_dir.join("data"))
+        .env("MISE_CONFIG_DIR", tools_dir.join("config"))
+        .env("MISE_CACHE_DIR", tools_dir.join("cache"))
         .stdin(Stdio::null())
         .output()
         .await
@@ -221,7 +238,7 @@ pub fn has_mise_toml(workspace_root: &Path) -> bool {
 /// `mise_bin` can't even be executed.
 pub async fn ensure_project_toolchain(mise_bin: &str, workspace_root: &Path, project_tools_dir: &Path) -> Result<(), MiseError> {
     tokio::fs::create_dir_all(project_tools_dir).await.map_err(MiseError::Spawn)?;
-    let install_output = run_mise_project(mise_bin, workspace_root, project_tools_dir, &["install", "--yes"]).await?;
+    let install_output = run_mise(mise_bin, workspace_root, project_tools_dir, &["install", "--yes"]).await?;
     if !install_output.status.success() {
         return Err(MiseError::InstallFailed { stderr: bounded_stderr(&install_output.stderr) });
     }
@@ -251,36 +268,13 @@ pub async fn ensure_project_toolchain(mise_bin: &str, workspace_root: &Path, pro
 /// `{"KEY": "VALUE", ...}` object `--json` documents, and
 /// [`MiseError::Spawn`] if `mise_bin` can't even be executed.
 pub async fn project_env(mise_bin: &str, workspace_root: &Path, project_tools_dir: &Path) -> Result<Vec<(String, String)>, MiseError> {
-    let env_output = run_mise_project(mise_bin, workspace_root, project_tools_dir, &["env", "--json"]).await?;
+    let env_output = run_mise(mise_bin, workspace_root, project_tools_dir, &["env", "--json"]).await?;
     if !env_output.status.success() {
         return Err(MiseError::EnvFailed { stderr: bounded_stderr(&env_output.stderr) });
     }
     let map: std::collections::BTreeMap<String, String> =
         serde_json::from_slice(&env_output.stdout).map_err(|error| MiseError::EnvParseFailed(error.to_string()))?;
     Ok(map.into_iter().collect())
-}
-
-/// The project-pinned-tier sibling of [`run_mise`]: current directory is
-/// `workspace_root` itself (so `mise` discovers *that* directory's own
-/// `mise.toml` via its ordinary upward config search — confirmed against
-/// the real binary that overriding `MISE_CONFIG_DIR`, which governs
-/// `mise`'s *global* config, does not affect this local discovery), while
-/// `MISE_DATA_DIR`/`MISE_CONFIG_DIR`/`MISE_CACHE_DIR` point at
-/// `project_tools_dir`, a tree entirely separate from any host-managed
-/// tool's `host_tools_dir` — this pair of facts is what gives
-/// project-pinned resolution its isolation from host-managed resolution
-/// (see this module's doc comment).
-async fn run_mise_project(mise_bin: &str, workspace_root: &Path, project_tools_dir: &Path, args: &[&str]) -> Result<std::process::Output, MiseError> {
-    Command::new(mise_bin)
-        .args(args)
-        .current_dir(workspace_root)
-        .env("MISE_DATA_DIR", project_tools_dir.join("data"))
-        .env("MISE_CONFIG_DIR", project_tools_dir.join("config"))
-        .env("MISE_CACHE_DIR", project_tools_dir.join("cache"))
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(MiseError::Spawn)
 }
 
 // ---------------------------------------------------------------------

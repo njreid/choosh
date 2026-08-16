@@ -20,6 +20,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::relay::impl_request_id;
+
 /// Either half of `workspace.create`'s `project_source` field
 /// (`host-rpc.md`): untagged because the wire shape is literally
 /// `{"clone_url": "..."}` or `{"existing_path": "..."}` with no separate
@@ -166,27 +168,12 @@ pub enum RpcRequest {
     },
 }
 
-impl RpcRequest {
-    #[must_use]
-    pub fn request_id(&self) -> &str {
-        match self {
-            Self::WorkspaceCreate { request_id, .. }
-            | Self::WorkspaceList { request_id }
-            | Self::WorkspaceStatus { request_id, .. }
-            | Self::WorkspaceTreeList { request_id, .. }
-            | Self::WorkspaceFileRead { request_id, .. }
-            | Self::ItemCreate { request_id, .. }
-            | Self::ItemList { request_id, .. }
-            | Self::ItemStop { request_id, .. }
-            | Self::WorkspaceDiff { request_id, .. }
-            | Self::WorkspaceLog { request_id, .. }
-            | Self::WorkspaceOpLog { request_id, .. }
-            | Self::WorkspaceOpUndo { request_id, .. }
-            | Self::WorkspaceOpRestore { request_id, .. }
-            | Self::WorkspaceFileWrite { request_id, .. }
-            | Self::ProjectList { request_id }
-            | Self::ProjectSetPrimaryWorkspace { request_id, .. } => request_id,
-        }
+impl_request_id! {
+    impl RpcRequest {
+        WorkspaceCreate, WorkspaceList, WorkspaceStatus, WorkspaceTreeList, WorkspaceFileRead,
+        ItemCreate, ItemList, ItemStop, WorkspaceDiff, WorkspaceLog, WorkspaceOpLog,
+        WorkspaceOpUndo, WorkspaceOpRestore, WorkspaceFileWrite, ProjectList,
+        ProjectSetPrimaryWorkspace,
     }
 }
 
@@ -459,29 +446,13 @@ pub enum RpcResponse {
     },
 }
 
-impl RpcResponse {
-    #[must_use]
-    pub fn request_id(&self) -> &str {
-        match self {
-            Self::WorkspaceCreateOk { request_id, .. }
-            | Self::WorkspaceListOk { request_id, .. }
-            | Self::WorkspaceStatusOk { request_id, .. }
-            | Self::WorkspaceTreeListOk { request_id, .. }
-            | Self::WorkspaceFileReadOk { request_id, .. }
-            | Self::ItemCreateOk { request_id, .. }
-            | Self::ItemListOk { request_id, .. }
-            | Self::ItemStopOk { request_id, .. }
-            | Self::WorkspaceDiffOk { request_id, .. }
-            | Self::WorkspaceLogOk { request_id, .. }
-            | Self::WorkspaceOpLogOk { request_id, .. }
-            | Self::WorkspaceOpUndoOk { request_id, .. }
-            | Self::WorkspaceOpRestoreOk { request_id, .. }
-            | Self::WorkspaceFileWriteOk { request_id, .. }
-            | Self::WorkspaceFileWriteStale { request_id, .. }
-            | Self::ProjectListOk { request_id, .. }
-            | Self::ProjectSetPrimaryWorkspaceOk { request_id, .. }
-            | Self::Error { request_id, .. } => request_id,
-        }
+impl_request_id! {
+    impl RpcResponse {
+        WorkspaceCreateOk, WorkspaceListOk, WorkspaceStatusOk, WorkspaceTreeListOk,
+        WorkspaceFileReadOk, ItemCreateOk, ItemListOk, ItemStopOk, WorkspaceDiffOk,
+        WorkspaceLogOk, WorkspaceOpLogOk, WorkspaceOpUndoOk, WorkspaceOpRestoreOk,
+        WorkspaceFileWriteOk, WorkspaceFileWriteStale, ProjectListOk,
+        ProjectSetPrimaryWorkspaceOk, Error,
     }
 }
 

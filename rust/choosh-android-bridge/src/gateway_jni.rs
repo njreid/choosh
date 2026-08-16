@@ -13,19 +13,15 @@
 //! `block_on`, see that function's doc comment) so a gateway's own
 //! per-connection async tasks never re-enter the connection's `Runtime`.
 
+use crate::jni_support::{HandleRegistry, jstring_to_string};
 use crate::markdown_gateway::{self, FetchError, FetchedFile, FileFetcher, MarkdownGatewayCaps};
 use crate::web_gateway::{self, GatewayCaps, RealUpstream, Upstream, UpstreamOpener};
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jlong};
 use jni::{Env, native_method};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use tokio::runtime::Runtime;
-
-fn jstring_to_string(env: &Env<'_>, value: &JString<'_>) -> String {
-    value.mutf8_chars(env).map(|chars| chars.to_string()).unwrap_or_default()
-}
 
 // --- WebGatewayBridge ----------------------------------------------------
 
@@ -34,8 +30,7 @@ struct WebGatewaySession {
     runtime: Runtime,
 }
 
-static WEB_GATEWAYS: LazyLock<Mutex<HashMap<i64, WebGatewaySession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static NEXT_WEB_GATEWAY_HANDLE: AtomicI64 = AtomicI64::new(1);
+static WEB_GATEWAYS: LazyLock<HandleRegistry<WebGatewaySession>> = LazyLock::new(HandleRegistry::new);
 
 /// Starts a `WebService` loopback gateway for `item_id`, tunneling through
 /// the live connection behind `connection_handle`. Returns `0` if not
@@ -78,25 +73,16 @@ fn native_web_gateway_start<'local>(
         }
     };
 
-    let handle = NEXT_WEB_GATEWAY_HANDLE.fetch_add(1, Ordering::Relaxed);
-    WEB_GATEWAYS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(handle, WebGatewaySession { gateway, runtime });
-    Ok(handle)
+    Ok(WEB_GATEWAYS.insert(WebGatewaySession { gateway, runtime }))
 }
 
 #[allow(clippy::unnecessary_wraps)]
 fn native_web_gateway_port(_env: &mut Env<'_>, _class: JClass<'_>, handle: jlong) -> Result<jint, jni::errors::Error> {
-    let sessions = WEB_GATEWAYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(sessions.get(&handle).map_or(0, |session| jint::from(session.gateway.port)))
+    Ok(WEB_GATEWAYS.get(handle, 0, |session| jint::from(session.gateway.port)))
 }
 
 fn native_web_gateway_token<'local>(env: &mut Env<'local>, _class: JClass<'local>, handle: jlong) -> Result<JString<'local>, jni::errors::Error> {
-    let token = {
-        let sessions = WEB_GATEWAYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        sessions.get(&handle).map(|session| session.gateway.token.clone()).unwrap_or_default()
-    };
+    let token = WEB_GATEWAYS.get(handle, String::new(), |session| session.gateway.token.clone());
     JString::new(env, token)
 }
 
@@ -107,7 +93,7 @@ fn native_web_gateway_token<'local>(env: &mut Env<'local>, _class: JClass<'local
 /// ends, the devhost process is untouched.
 #[allow(clippy::unnecessary_wraps)]
 fn native_web_gateway_stop(_env: &mut Env<'_>, _class: JClass<'_>, handle: jlong) -> Result<(), jni::errors::Error> {
-    if let Some(session) = WEB_GATEWAYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&handle) {
+    if let Some(session) = WEB_GATEWAYS.remove(handle) {
         session.runtime.block_on(session.gateway.stop());
     }
     Ok(())
@@ -141,8 +127,7 @@ struct MarkdownGatewaySession {
     runtime: Runtime,
 }
 
-static MARKDOWN_GATEWAYS: LazyLock<Mutex<HashMap<i64, MarkdownGatewaySession>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static NEXT_MARKDOWN_GATEWAY_HANDLE: AtomicI64 = AtomicI64::new(1);
+static MARKDOWN_GATEWAYS: LazyLock<HandleRegistry<MarkdownGatewaySession>> = LazyLock::new(HandleRegistry::new);
 
 /// Starts a Markdown loopback gateway for `(workspace_id, doc_path)`,
 /// fetching content over the live connection's `"rpc"`-purpose tunnel
@@ -192,18 +177,12 @@ fn native_markdown_gateway_start<'local>(
         }
     };
 
-    let handle = NEXT_MARKDOWN_GATEWAY_HANDLE.fetch_add(1, Ordering::Relaxed);
-    MARKDOWN_GATEWAYS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(handle, MarkdownGatewaySession { gateway, runtime });
-    Ok(handle)
+    Ok(MARKDOWN_GATEWAYS.insert(MarkdownGatewaySession { gateway, runtime }))
 }
 
 #[allow(clippy::unnecessary_wraps)]
 fn native_markdown_gateway_port(_env: &mut Env<'_>, _class: JClass<'_>, handle: jlong) -> Result<jint, jni::errors::Error> {
-    let sessions = MARKDOWN_GATEWAYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(sessions.get(&handle).map_or(0, |session| jint::from(session.gateway.port)))
+    Ok(MARKDOWN_GATEWAYS.get(handle, 0, |session| jint::from(session.gateway.port)))
 }
 
 fn native_markdown_gateway_token<'local>(
@@ -211,16 +190,13 @@ fn native_markdown_gateway_token<'local>(
     _class: JClass<'local>,
     handle: jlong,
 ) -> Result<JString<'local>, jni::errors::Error> {
-    let token = {
-        let sessions = MARKDOWN_GATEWAYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        sessions.get(&handle).map(|session| session.gateway.token.clone()).unwrap_or_default()
-    };
+    let token = MARKDOWN_GATEWAYS.get(handle, String::new(), |session| session.gateway.token.clone());
     JString::new(env, token)
 }
 
 #[allow(clippy::unnecessary_wraps)]
 fn native_markdown_gateway_stop(_env: &mut Env<'_>, _class: JClass<'_>, handle: jlong) -> Result<(), jni::errors::Error> {
-    if let Some(session) = MARKDOWN_GATEWAYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&handle) {
+    if let Some(session) = MARKDOWN_GATEWAYS.remove(handle) {
         session.runtime.block_on(session.gateway.stop());
     }
     Ok(())
@@ -283,12 +259,7 @@ fn native_markdown_gateway_start_fixture(_env: &mut Env<'_>, _class: JClass<'_>)
     else {
         return Ok(0);
     };
-    let handle = NEXT_MARKDOWN_GATEWAY_HANDLE.fetch_add(1, Ordering::Relaxed);
-    MARKDOWN_GATEWAYS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(handle, MarkdownGatewaySession { gateway, runtime });
-    Ok(handle)
+    Ok(MARKDOWN_GATEWAYS.insert(MarkdownGatewaySession { gateway, runtime }))
 }
 
 const _MARKDOWN_GATEWAY_START: jni::NativeMethod = native_method! {

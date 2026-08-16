@@ -20,6 +20,8 @@ mod web_gateway;
 #[cfg(target_os = "android")]
 mod gateway_jni;
 #[cfg(target_os = "android")]
+mod jni_support;
+#[cfg(target_os = "android")]
 mod terminal_jni;
 // `pub` only so `examples/dev_cli.rs` (a separate compilation target) can
 // reach `dev_passkey::register` directly — every real call site inside
@@ -30,7 +32,7 @@ mod terminal_jni;
 #[cfg(feature = "dev-passkey")]
 pub mod dev_passkey;
 
-use engine::Engine;
+use engine::{Engine, error_json};
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jlong};
 use jni::{Env, native_method};
@@ -46,10 +48,6 @@ struct EngineHandle {
 
 static ENGINES: LazyLock<Mutex<HashMap<i64, EngineHandle>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
-
-fn error_json(message: &str) -> String {
-    serde_json::json!({ "error": message }).to_string()
-}
 
 fn jstring_to_string(env: &Env<'_>, value: &JString<'_>) -> Result<String, jni::errors::Error> {
     Ok(value.mutf8_chars(env)?.to_string())

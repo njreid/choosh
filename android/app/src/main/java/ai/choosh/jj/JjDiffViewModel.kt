@@ -2,6 +2,7 @@ package ai.choosh.jj
 
 import ai.choosh.engine.ChooshEngine
 import ai.choosh.engine.DiffFileEntry
+import ai.choosh.viewmodel.loadInto
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,14 +47,12 @@ class JjDiffViewModel(
 
     fun load() {
         viewModelScope.launch {
-            _state.value = _state.value.copy(isLoading = true, error = null)
-            runCatching {
-                engine.workspaceDiff(deviceId, workspaceId, _state.value.from.ifBlank { null }, _state.value.to.ifBlank { null })
-            }.onSuccess { files ->
-                _state.value = _state.value.copy(files = files, isLoading = false, error = null)
-            }.onFailure { failure ->
-                _state.value = _state.value.copy(isLoading = false, error = failure.message ?: "failed to load diff")
-            }
+            _state.loadInto(
+                setLoading = { it.copy(isLoading = true, error = null) },
+                call = { engine.workspaceDiff(deviceId, workspaceId, _state.value.from.ifBlank { null }, _state.value.to.ifBlank { null }) },
+                onSuccess = { state, files -> state.copy(files = files, isLoading = false, error = null) },
+                onFailure = { state, failure -> state.copy(isLoading = false, error = failure.message ?: "failed to load diff") },
+            )
         }
     }
 }

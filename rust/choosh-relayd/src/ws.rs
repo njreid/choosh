@@ -24,6 +24,8 @@ use crate::wire::{decode_control, encode_control, new_decoder};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as base64_engine;
 use choosh_protocol::relay::{
     AuthFailed, AuthOk, AuthResult, ClientAuth, ConnectionState, ControlRequest, ControlResponse,
     DevHostPresence, FRAME_CLASS_CONTROL, FRAME_CLASS_TUNNEL, IdentityClass, ServerHello,
@@ -96,7 +98,7 @@ async fn handle_connection(mut socket: WebSocket, state: Arc<AppState>) {
 async fn send_hello(socket: &mut WebSocket) -> Option<String> {
     let mut nonce_bytes = [0u8; 32];
     crate::rng::os_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
+    let nonce = base64_engine.encode(nonce_bytes);
     let hello = ServerHello { nonce: nonce.clone() };
     let frame = match encode_control(&hello) {
         Ok(frame) => frame,
@@ -196,13 +198,11 @@ async fn authenticate_device(
             .map_err(|_| "malformed public key".to_string())?,
     )
     .map_err(|_| "malformed public key".to_string())?;
-    let signature_bytes: [u8; 64] = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &device_auth.signature,
-    )
-    .map_err(|_| "malformed signature".to_string())?
-    .try_into()
-    .map_err(|_| "malformed signature".to_string())?;
+    let signature_bytes: [u8; 64] = base64_engine
+        .decode(&device_auth.signature)
+        .map_err(|_| "malformed signature".to_string())?
+        .try_into()
+        .map_err(|_| "malformed signature".to_string())?;
     let signature = Signature::from_bytes(&signature_bytes);
     verifying_key
         .verify(nonce.as_bytes(), &signature)
@@ -663,6 +663,22 @@ fn not_permitted(request_id: &str, method: &str) -> ControlResponse {
     }
 }
 
+/// The `if authenticated.identity_class != want { return not_permitted(...) }`
+/// idiom every single-Identity-class capability in [`dispatch`] (and its
+/// split-out `handle_*`/`list_*` helpers) starts with, factored out so each
+/// site is a one-line `?`-early-return instead of a repeated four-line `if`.
+fn require_identity_class(
+    authenticated: &Authenticated,
+    want: IdentityClass,
+    method: &str,
+    request_id: &str,
+) -> Result<(), ControlResponse> {
+    if authenticated.identity_class != want {
+        return Err(not_permitted(request_id, method));
+    }
+    Ok(())
+}
+
 async fn dispatch(
     state: &AppState,
     authenticated: &Authenticated,
@@ -670,8 +686,10 @@ async fn dispatch(
 ) -> ControlResponse {
     match request {
         ControlRequest::RequestEnrollmentToken { request_id, identity_class } => {
-            if authenticated.identity_class != IdentityClass::Phone {
-                return not_permitted(&request_id, "request-enrollment-token");
+            if let Err(response) =
+                require_identity_class(authenticated, IdentityClass::Phone, "request-enrollment-token", &request_id)
+            {
+                return response;
             }
             let token = generate_token();
             let expires_at_unix = now_unix() + ENROLLMENT_TOKEN_VALIDITY_SECONDS;
@@ -686,34 +704,21 @@ async fn dispatch(
             }
         }
         ControlRequest::ListDevhosts { request_id } => {
-            if authenticated.identity_class != IdentityClass::Phone {
-                return not_permitted(&request_id, "list-devhosts");
+            if let Err(response) =
+                require_identity_class(authenticated, IdentityClass::Phone, "list-devhosts", &request_id)
+            {
+                return response;
             }
-            let devices = state.registry.devices.read().await;
-            let online = state.registry.online_devices.read().await;
-            let devhosts = devices
-                .iter()
-                .filter(|(_, device)| device.identity_class == IdentityClass::Devhost && !device.revoked)
-                .map(|(device_id, device)| DevHostPresence {
-                    device_id: device_id.clone(),
-                    alias: device.alias.clone(),
-                    platform: device.platform.clone().unwrap_or_default(),
-                    account_label: device.account_label.clone(),
-                    connection_state: if online.contains_key(device_id) {
-                        ConnectionState::Online
-                    } else {
-                        ConnectionState::Offline
-                    },
-                    last_seen: online
-                        .get(device_id)
-                        .map_or_else(String::new, |seen| format_unix(*seen)),
-                })
-                .collect();
-            ControlResponse::ListDevhostsOk { request_id, devhosts }
+            handle_list_devhosts(state, request_id).await
         }
         ControlRequest::ListDevhostSshEndpoints { request_id } => {
-            if authenticated.identity_class != IdentityClass::LaptopProxy {
-                return not_permitted(&request_id, "list-devhost-ssh-endpoints");
+            if let Err(response) = require_identity_class(
+                authenticated,
+                IdentityClass::LaptopProxy,
+                "list-devhost-ssh-endpoints",
+                &request_id,
+            ) {
+                return response;
             }
             list_devhost_ssh_endpoints(state, request_id).await
         }
@@ -721,15 +726,19 @@ async fn dispatch(
             handle_open_tunnel(state, authenticated, request_id, target_device_id, purpose).await
         }
         ControlRequest::AgentEvent { request_id, event, sequence } => {
-            if authenticated.identity_class != IdentityClass::Devhost {
-                return not_permitted(&request_id, "agent-event");
+            if let Err(response) =
+                require_identity_class(authenticated, IdentityClass::Devhost, "agent-event", &request_id)
+            {
+                return response;
             }
             route_agent_event(state, &authenticated.device_id, event, sequence).await;
             ControlResponse::AgentEventOk { request_id }
         }
         ControlRequest::RegisterFcmToken { request_id, fcm_token } => {
-            if authenticated.identity_class != IdentityClass::Phone {
-                return not_permitted(&request_id, "register-fcm-token");
+            if let Err(response) =
+                require_identity_class(authenticated, IdentityClass::Phone, "register-fcm-token", &request_id)
+            {
+                return response;
             }
             // Replaces, never duplicates: `insert` on an existing key
             // overwrites, per relay-protocol.md's "at most one FCM token
@@ -802,17 +811,15 @@ async fn handle_revoke_device(
     request_id: String,
     device_id: String,
 ) -> ControlResponse {
-    if authenticated.identity_class != IdentityClass::Phone {
-        return not_permitted(&request_id, "revoke-device");
+    if let Err(response) =
+        require_identity_class(authenticated, IdentityClass::Phone, "revoke-device", &request_id)
+    {
+        return response;
     }
-    if !revoke_device(state, &device_id).await {
-        return ControlResponse::Error {
-            request_id,
-            code: "unknown_device".to_string(),
-            message: "no enrolled device with this device_id".to_string(),
-        };
-    }
-    ControlResponse::RevokeDeviceOk { request_id, device_id }
+    let found = revoke_device(state, &device_id).await;
+    revoke_response(found, "no enrolled device with this device_id", request_id, device_id, |request_id, device_id| {
+        ControlResponse::RevokeDeviceOk { request_id, device_id }
+    })
 }
 
 /// [`handle_revoke_device`]'s sibling for `revoke-phone-session`. Phone-only,
@@ -823,17 +830,39 @@ async fn handle_revoke_phone_session(
     request_id: String,
     device_id: String,
 ) -> ControlResponse {
-    if authenticated.identity_class != IdentityClass::Phone {
-        return not_permitted(&request_id, "revoke-phone-session");
+    if let Err(response) =
+        require_identity_class(authenticated, IdentityClass::Phone, "revoke-phone-session", &request_id)
+    {
+        return response;
     }
-    if !revoke_phone_session(state, &device_id).await {
+    let found = revoke_phone_session(state, &device_id).await;
+    revoke_response(found, "no phone session recorded for this device_id", request_id, device_id, |request_id, device_id| {
+        ControlResponse::RevokePhoneSessionOk { request_id, device_id }
+    })
+}
+
+/// The `unknown_device`-or-`*Ok` response shape shared by `revoke-device` and
+/// `revoke-phone-session`, once permission-checking (`require_identity_class`)
+/// and the registry-specific revoke logic (`revoke_device`/
+/// `revoke_phone_session`) are factored out separately: both capabilities
+/// report the same `unknown_device` error code (with an operation-specific
+/// message) when `found` is `false`, and otherwise hand `request_id`/
+/// `device_id` to `ok` to build their own distinct `*Ok` response variant.
+fn revoke_response(
+    found: bool,
+    not_found_message: &str,
+    request_id: String,
+    device_id: String,
+    ok: impl FnOnce(String, String) -> ControlResponse,
+) -> ControlResponse {
+    if !found {
         return ControlResponse::Error {
             request_id,
             code: "unknown_device".to_string(),
-            message: "no phone session recorded for this device_id".to_string(),
+            message: not_found_message.to_string(),
         };
     }
-    ControlResponse::RevokePhoneSessionOk { request_id, device_id }
+    ok(request_id, device_id)
 }
 
 /// Sets `EnrolledDevice.revoked = true` for `device_id` and disconnects its
@@ -886,6 +915,32 @@ async fn kill_connection(state: &AppState, device_id: &str) {
     }
 }
 
+/// The `list-devhosts` capability body, split out of [`dispatch`] purely to
+/// keep that function's line count reasonable — permission-checking stays in
+/// `dispatch` itself, alongside every other capability's own check, so this
+/// is only ever called after that's already passed.
+async fn handle_list_devhosts(state: &AppState, request_id: String) -> ControlResponse {
+    let devices = state.registry.devices.read().await;
+    let online = state.registry.online_devices.read().await;
+    let devhosts = devices
+        .iter()
+        .filter(|(_, device)| device.identity_class == IdentityClass::Devhost && !device.revoked)
+        .map(|(device_id, device)| DevHostPresence {
+            device_id: device_id.clone(),
+            alias: device.alias.clone(),
+            platform: device.platform.clone().unwrap_or_default(),
+            account_label: device.account_label.clone(),
+            connection_state: if online.contains_key(device_id) {
+                ConnectionState::Online
+            } else {
+                ConnectionState::Offline
+            },
+            last_seen: online.get(device_id).map_or_else(String::new, |seen| format_unix(*seen)),
+        })
+        .collect();
+    ControlResponse::ListDevhostsOk { request_id, devhosts }
+}
+
 /// The `list-devhost-ssh-endpoints` capability body, split out of
 /// [`dispatch`] purely to keep that function's line count reasonable —
 /// permission-checking stays in `dispatch` itself, alongside every other
@@ -902,7 +957,7 @@ async fn list_devhost_ssh_endpoints(state: &AppState, request_id: String) -> Con
             Some(choosh_protocol::relay::DevhostSshEndpoint {
                 device_id: device_id.clone(),
                 alias: device.alias.clone(),
-                ssh_host_public_key: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, host_key),
+                ssh_host_public_key: base64_engine.encode(host_key),
             })
         })
         .collect();
@@ -1007,9 +1062,7 @@ async fn handle_enroll(state: &AppState, request: ControlRequest, socket: &mut W
         .await;
     }
 
-    let Ok(public_key_bytes) =
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &public_key)
-    else {
+    let Ok(public_key_bytes) = base64_engine.decode(&public_key) else {
         return respond(socket, ControlResponse::Error {
             request_id,
             code: "invalid_public_key".to_string(),
@@ -1025,7 +1078,7 @@ async fn handle_enroll(state: &AppState, request: ControlRequest, socket: &mut W
     // MUST NOT.
     let host_ssh_public_key_bytes = match (identity_class, host_ssh_public_key) {
         (IdentityClass::Devhost, Some(encoded)) => {
-            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded) {
+            match base64_engine.decode(&encoded) {
                 Ok(bytes) if bytes.len() == 32 => Some(bytes),
                 _ => {
                     return respond(socket, ControlResponse::Error {
@@ -1100,7 +1153,7 @@ async fn consume_token(
 fn generate_token() -> String {
     let mut bytes = [0u8; 24];
     crate::rng::os_rng().fill_bytes(&mut bytes);
-    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn format_unix(unix_seconds: u64) -> String {

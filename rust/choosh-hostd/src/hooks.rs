@@ -206,9 +206,7 @@ pub fn install_claude_hooks(settings_path: &Path, hostd_binary: &str) -> Result<
     let json = serde_json::to_vec_pretty(&root).map_err(HookInstallError::InvalidJson)?;
     // Same atomic write-then-rename discipline as credential.rs/registry.rs
     // — this is real user configuration, never leave it half-written.
-    let tmp_path = settings_path.with_extension("choosh-tmp");
-    std::fs::write(&tmp_path, &json)?;
-    std::fs::rename(&tmp_path, settings_path)?;
+    crate::fs_util::atomic_write(settings_path, &json, None)?;
     Ok(())
 }
 

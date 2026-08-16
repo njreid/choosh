@@ -16,6 +16,7 @@
 //! genuinely flaky (the server didn't reliably outlive the crashed client
 //! across consecutive `list-sessions` calls) and is replaced entirely here.
 
+use std::future::Future;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -171,11 +172,12 @@ pub async fn create_session(session_name: &str, cwd: &Path) -> Result<(), Zellij
         // silently masking a genuinely lost creation as "just needs more
         // time" — a real loss gets a fresh, independent retry instead,
         // which is what actually fixes it (see above).
-        for _ in 0..20 {
-            if list_sessions().await?.iter().any(|name| name == session_name) {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let confirmed = poll_until(20, Duration::from_millis(100), || async {
+            Ok(list_sessions().await?.iter().any(|name| name == session_name))
+        })
+        .await?;
+        if confirmed {
+            return Ok(());
         }
         tracing::warn!(session_name, attempt, "zellij session not confirmed yet, retrying creation");
     }
@@ -233,11 +235,12 @@ pub async fn new_tab(session_name: &str, tab_name: &str, cwd: &Path, initial_com
         wait_bounded(child).await;
     }
 
-    for _ in 0..20 {
-        if list_tabs(session_name).await?.iter().any(|name| name == tab_name) {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let confirmed = poll_until(20, Duration::from_millis(100), || async {
+        Ok(list_tabs(session_name).await?.iter().any(|name| name == tab_name))
+    })
+    .await?;
+    if confirmed {
+        return Ok(());
     }
     Err(ZellijError::NotConfirmed)
 }
@@ -437,6 +440,29 @@ async fn run_zellij_client(args: &[&str], session_name: Option<&str>) -> Result<
     Ok(())
 }
 
+/// Shared by [`create_session`]'s post-spawn confirmation loop, [`new_tab`]'s,
+/// and [`ensure_web_server_running`]'s: call `predicate` up to `attempts`
+/// times, sleeping `delay` between misses, returning `Ok(true)` as soon as it
+/// reports success and `Ok(false)` if every attempt is exhausted without one —
+/// propagating `Err` immediately (no further attempts) if `predicate` itself
+/// fails, exactly as each site's own hand-rolled loop did before this existed.
+/// Each of the three call sites picked its own `attempts`/`delay` empirically
+/// (see each site's own comment for why); this only shares the polling
+/// mechanism, never those tuned values.
+async fn poll_until<F, Fut, E>(attempts: u32, delay: Duration, predicate: F) -> Result<bool, E>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<bool, E>>,
+{
+    for _ in 0..attempts {
+        if predicate().await? {
+            return Ok(true);
+        }
+        tokio::time::sleep(delay).await;
+    }
+    Ok(false)
+}
+
 /// Waits up to 5s for `child` to exit, force-killing it if it overruns.
 /// `zellij` client processes have been observed, in this environment under
 /// concurrent load, to occasionally never exit on their own regardless of
@@ -484,11 +510,8 @@ pub async fn ensure_web_server_running() -> Result<u16, ZellijError> {
 
     run_zellij_client(&["web", "--start", "-d"], None).await?;
 
-    for _ in 0..20 {
-        if web_server_status_online().await? {
-            return Ok(ZELLIJ_WEB_DEFAULT_PORT);
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    if poll_until(20, Duration::from_millis(200), web_server_status_online).await? {
+        return Ok(ZELLIJ_WEB_DEFAULT_PORT);
     }
     Err(ZellijError::NotConfirmed)
 }

@@ -12,13 +12,32 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, SigningKey, Signer};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Credential {
     pub device_id: String,
     /// Base64-encoded certificate `relayd` issued at enrollment.
     pub certificate: String,
     /// Base64-encoded 32-byte Ed25519 secret key.
     signing_key_b64: String,
+}
+
+/// Redacts both `signing_key_b64` (the raw private key material) and
+/// `certificate` — not because `certificate` is known to embed a secret,
+/// but because this crate would rather redact something that turns out to
+/// be safe than risk ever printing a private key via a derived `Debug`, a
+/// `{:?}`/`format!("{credential:?}")` in a log line, an error message, or
+/// a future field added without updating this impl. `device_id` is left
+/// visible since it's routinely logged elsewhere in this crate (e.g.
+/// `tracing::info!(device_id = %..., ...)` at enrollment) and isn't secret
+/// on its own.
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credential")
+            .field("device_id", &self.device_id)
+            .field("certificate", &"[redacted]")
+            .field("signing_key_b64", &"[redacted]")
+            .finish()
+    }
 }
 
 impl Credential {
@@ -138,27 +157,9 @@ pub fn save(path: &Path, credential: &Credential) -> Result<(), CredentialError>
     })?;
     fs::create_dir_all(parent)?;
 
-    let tmp_path = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("device-credential.json"),
-        std::process::id()
-    ));
     let json = serde_json::to_vec_pretty(credential)
         .map_err(|error| CredentialError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
-    fs::write(&tmp_path, &json)?;
-    set_owner_only_permissions(&tmp_path)?;
-    fs::rename(&tmp_path, path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_only_permissions(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_owner_only_permissions(_path: &Path) -> io::Result<()> {
+    crate::fs_util::atomic_write(path, &json, Some(0o600))?;
     Ok(())
 }
 
@@ -236,5 +237,25 @@ mod tests {
         let signature = credential.sign(message).unwrap();
         let verifying_key = credential.signing_key().unwrap().verifying_key();
         assert!(verifying_key.verify(message, &signature).is_ok());
+    }
+
+    /// A raw `{:?}`/`format!("{credential:?}")` — e.g. from an accidental
+    /// `tracing::debug!(?credential, ...)`, a `.unwrap()` panic message, or
+    /// any other place this crate's careful redaction discipline could
+    /// lapse — must never leak the private key material, nor the
+    /// `certificate` field (see `Debug`'s own doc comment for why that one
+    /// is redacted defensively rather than because it's known-secret).
+    /// `device_id` is the one field expected to still be visible.
+    #[test]
+    fn debug_format_redacts_the_signing_key_and_certificate_but_keeps_the_device_id() {
+        let credential = Credential::new("dev-debug-test".to_string(), "cert-bytes-that-must-not-leak".to_string(), &SigningKey::generate(&mut rand::rng()));
+        let raw_key_b64 = credential.signing_key_b64.clone();
+
+        let debug_output = format!("{credential:?}");
+
+        assert!(debug_output.contains("dev-debug-test"), "device_id should still be visible in Debug output: {debug_output}");
+        assert!(!debug_output.contains(&raw_key_b64), "the raw signing key must never appear in Debug output: {debug_output}");
+        assert!(!debug_output.contains("cert-bytes-that-must-not-leak"), "the certificate must not appear in Debug output: {debug_output}");
+        assert!(debug_output.contains("[redacted]"), "expected a redaction marker in Debug output: {debug_output}");
     }
 }

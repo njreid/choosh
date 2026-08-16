@@ -105,11 +105,24 @@ fn error(request_id: String, code: &str, message: impl Into<String>) -> RpcRespo
     RpcResponse::Error { request_id, code: code.to_string(), message: message.into() }
 }
 
-fn valid_workspace_name(name: &str) -> bool {
+/// Shared validity rule behind both `workspace_name` (`workspace.create`)
+/// and item `name` (`item.create`): non-empty, at most 64 bytes,
+/// alphanumeric/-/_ only, and starting with an alphanumeric character (so
+/// neither can start with `-`/`_`, keeping both unambiguous as a single
+/// shell/path token). One shared implementation — `valid_workspace_name`
+/// and `valid_item_name` used to duplicate this exact body byte for byte —
+/// kept as two thin, semantically named wrappers since each call site reads
+/// better naming the *kind* of identifier it's validating than the generic
+/// rule itself.
+fn valid_identifier(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         && name.chars().next().is_some_and(char::is_alphanumeric)
+}
+
+fn valid_workspace_name(name: &str) -> bool {
+    valid_identifier(name)
 }
 
 async fn handle_create(
@@ -177,8 +190,12 @@ async fn handle_create_after_reservation(
         // response with an empty placeholder `request_id` — they have no
         // way to know the real one at their own call sites deep inside a
         // helper — so it MUST be filled in here before this reaches the
-        // caller, the same way every other early-return error path in this
-        // module (`lookup_root`'s callers, etc.) uses `with_request_id`.
+        // caller, via `with_request_id`. Unlike `lookup_root` (which now
+        // takes `request_id` directly and builds an already-correctly-
+        // addressed response itself), these helpers are called from two
+        // different sites each with a different real `request_id` in
+        // scope, so there's no single helper call site to thread it
+        // through at.
         Err(response) => return with_request_id(response, request_id),
     };
 
@@ -369,9 +386,9 @@ async fn handle_list(ctx: &RpcContext, request_id: String) -> RpcResponse {
 }
 
 async fn handle_status(ctx: &RpcContext, request_id: String, workspace_id: &str) -> RpcResponse {
-    let root_path = match lookup_root(ctx, workspace_id).await {
+    let root_path = match lookup_root(ctx, &request_id, workspace_id).await {
         Ok(path) => path,
-        Err(response) => return with_request_id(response, request_id),
+        Err(response) => return response,
     };
     match jj_ops::status(&root_path).await {
         Ok(entries) => {
@@ -398,9 +415,9 @@ async fn handle_tree_list(
     if let Some(response) = reject_non_live_revision(&request_id, revision) {
         return response;
     }
-    let root_path = match lookup_root(ctx, workspace_id).await {
+    let root_path = match lookup_root(ctx, &request_id, workspace_id).await {
         Ok(path) => path,
-        Err(response) => return with_request_id(response, request_id),
+        Err(response) => return response,
     };
     match fs_ops::list_dir(&root_path, path_prefix, cursor, MAX_TREE_LIST_PAGE) {
         Ok((entries, next_cursor)) => RpcResponse::WorkspaceTreeListOk { request_id, entries, next_cursor },
@@ -419,9 +436,9 @@ async fn handle_file_read(
     if let Some(response) = reject_non_live_revision(&request_id, revision) {
         return response;
     }
-    let root_path = match lookup_root(ctx, workspace_id).await {
+    let root_path = match lookup_root(ctx, &request_id, workspace_id).await {
         Ok(path) => path,
-        Err(response) => return with_request_id(response, request_id),
+        Err(response) => return response,
     };
     let range_tuple = range.map(|r| (r.offset, r.length));
     match fs_ops::read_file_range(&root_path, path, range_tuple, MAX_FILE_READ_RANGE_BYTES) {
@@ -463,9 +480,9 @@ async fn handle_file_write(
     content_base64: &str,
 ) -> RpcResponse {
     use base64::Engine;
-    let root_path = match lookup_root(ctx, workspace_id).await {
+    let root_path = match lookup_root(ctx, &request_id, workspace_id).await {
         Ok(path) => path,
-        Err(response) => return with_request_id(response, request_id),
+        Err(response) => return response,
     };
     let Ok(content) = base64::engine::general_purpose::STANDARD.decode(content_base64) else {
         return error(request_id, "invalid_argument", "content_base64 is not valid base64");
@@ -573,10 +590,7 @@ async fn handle_project_set_primary_workspace(
 }
 
 fn valid_item_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        && name.chars().next().is_some_and(char::is_alphanumeric)
+    valid_identifier(name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -664,49 +678,42 @@ async fn handle_item_create_after_reservation(
         Vec::new()
     };
 
-    // For `AgentTerminal`, only validate `agent` here — the real argv needs
-    // this call's freshly reserved `item_id` (see the comment below), so
-    // building it twice (once with a throwaway placeholder ID, once for
-    // real) would just be wasted work with the exact same validation
-    // already done here.
-    let initial_command: Vec<String> = match item_type {
-        ItemType::AgentTerminal => {
-            if agent.is_none() {
-                return error(request_id, "invalid_argument", "item_type AgentTerminal requires agent");
-            }
-            Vec::new()
+    // Validate this item_type's own required fields — by reference only, so
+    // nothing here needs to move `agent`/`command` out early — before
+    // generating `item_id` or touching Zellij at all.
+    if item_type == ItemType::AgentTerminal && agent.is_none() {
+        return error(request_id, "invalid_argument", "item_type AgentTerminal requires agent");
+    }
+    if item_type == ItemType::WebService {
+        match &command {
+            None => return error(request_id, "invalid_argument", "item_type WebService requires command"),
+            Some(command) if command.is_empty() => return error(request_id, "invalid_argument", "command must not be empty"),
+            Some(_) => {}
         }
-        ItemType::Shell => shell_launch_argv(&mise_env),
-        ItemType::WebService => {
-            let Some(command) = command else {
-                return error(request_id, "invalid_argument", "item_type WebService requires command");
-            };
-            if command.is_empty() {
-                return error(request_id, "invalid_argument", "command must not be empty");
-            }
-            prefix_with_mise_env(&mise_env, command)
+        if port.is_none() {
+            return error(request_id, "invalid_argument", "item_type WebService requires port");
         }
-    };
-    if item_type == ItemType::WebService && port.is_none() {
-        return error(request_id, "invalid_argument", "item_type WebService requires port");
     }
 
-    let item_id = format!("item-{}", uuid::Uuid::new_v4());
     // The launched agent's CHOOSH_ITEM_ID must be this item_id, but the
     // item_id doesn't exist until after a successful tab creation — a
     // chicken-and-egg problem inherent to "the ID identifies the tab, but
     // the tab's own launch command needs to know its ID". Resolved by
     // reserving the ID first (it's only ever used as an opaque env var
     // value, never checked against the registry until after this call
-    // returns) and building the real launch argv with it here, the only
-    // place `AgentTerminal`'s `initial_command` is ever actually built.
-    let initial_command = if item_type == ItemType::AgentTerminal {
-        let Some(root_str) = root_path.to_str() else {
-            return error(request_id, "internal", "workspace root is not valid UTF-8");
-        };
-        agent_launch_argv(agent.expect("checked above"), workspace_id, &item_id, root_str, &mise_env)
-    } else {
-        initial_command
+    // returns) and building every item type's real launch argv with it
+    // already in hand — one single build per item type, not `AgentTerminal`
+    // built once as a throwaway placeholder and then again for real.
+    let item_id = format!("item-{}", uuid::Uuid::new_v4());
+    let initial_command: Vec<String> = match item_type {
+        ItemType::AgentTerminal => {
+            let Some(root_str) = root_path.to_str() else {
+                return error(request_id, "internal", "workspace root is not valid UTF-8");
+            };
+            agent_launch_argv(agent.expect("validated above"), workspace_id, &item_id, root_str, &mise_env)
+        }
+        ItemType::Shell => shell_launch_argv(&mise_env),
+        ItemType::WebService => prefix_with_mise_env(&mise_env, command.expect("validated above")),
     };
 
     if let Err(zellij_error) = zellij_ops::new_tab(&workspace_name, &name, &root_path, &initial_command).await {
@@ -865,9 +872,9 @@ async fn handle_diff(
     from: Option<&str>,
     to: Option<&str>,
 ) -> RpcResponse {
-    let root_path = match lookup_root(ctx, workspace_id).await {
+    let root_path = match lookup_root(ctx, &request_id, workspace_id).await {
         Ok(path) => path,
-        Err(response) => return with_request_id(response, request_id),
+        Err(response) => return response,
     };
     match jj_ops::diff(&root_path, from, to).await {
         Ok(entries) => RpcResponse::WorkspaceDiffOk { request_id, files: entries.into_iter().map(to_wire_diff_file_entry).collect() },
@@ -885,9 +892,9 @@ async fn handle_log(
     revset: Option<&str>,
     limit: usize,
 ) -> RpcResponse {
-    let root_path = match lookup_root(ctx, workspace_id).await {
+    let root_path = match lookup_root(ctx, &request_id, workspace_id).await {
         Ok(path) => path,
-        Err(response) => return with_request_id(response, request_id),
+        Err(response) => return response,
     };
     match jj_ops::log(&root_path, revset, limit).await {
         Ok(changes) => RpcResponse::WorkspaceLogOk { request_id, changes: changes.into_iter().map(to_wire_change_graph_node).collect() },
@@ -898,9 +905,9 @@ async fn handle_log(
 }
 
 async fn handle_op_log(ctx: &RpcContext, request_id: String, workspace_id: &str, limit: usize) -> RpcResponse {
-    let root_path = match lookup_root(ctx, workspace_id).await {
+    let root_path = match lookup_root(ctx, &request_id, workspace_id).await {
         Ok(path) => path,
-        Err(response) => return with_request_id(response, request_id),
+        Err(response) => return response,
     };
     match jj_ops::op_log(&root_path, limit).await {
         Ok(operations) => {
@@ -914,9 +921,9 @@ async fn handle_op_undo(ctx: &RpcContext, request_id: String, workspace_id: &str
     if op_id.is_empty() {
         return error(request_id, "invalid_argument", "op_id must not be empty");
     }
-    let root_path = match lookup_root(ctx, workspace_id).await {
+    let root_path = match lookup_root(ctx, &request_id, workspace_id).await {
         Ok(path) => path,
-        Err(response) => return with_request_id(response, request_id),
+        Err(response) => return response,
     };
     match jj_ops::op_undo(&root_path, op_id).await {
         Ok(new_op_id) => RpcResponse::WorkspaceOpUndoOk { request_id, new_op_id },
@@ -931,9 +938,9 @@ async fn handle_op_restore(ctx: &RpcContext, request_id: String, workspace_id: &
     if op_id.is_empty() {
         return error(request_id, "invalid_argument", "op_id must not be empty");
     }
-    let root_path = match lookup_root(ctx, workspace_id).await {
+    let root_path = match lookup_root(ctx, &request_id, workspace_id).await {
         Ok(path) => path,
-        Err(response) => return with_request_id(response, request_id),
+        Err(response) => return response,
     };
     match jj_ops::op_restore(&root_path, op_id).await {
         Ok(new_op_id) => RpcResponse::WorkspaceOpRestoreOk { request_id, new_op_id },
@@ -956,12 +963,18 @@ fn reject_non_live_revision(request_id: &str, revision: Option<&str>) -> Option<
     }
 }
 
-async fn lookup_root(ctx: &RpcContext, workspace_id: &str) -> Result<PathBuf, RpcResponse> {
+/// Resolves `workspace_id` to its root path, or an already-correctly-
+/// addressed `not_found` error response — takes `request_id` directly
+/// (rather than building the error with an empty placeholder id, as every
+/// other helper in this module keyed off a would-be-later `with_request_id`
+/// fixup does) so every call site can just `return response` straight
+/// through on `Err`, with no `with_request_id` boilerplate of its own.
+async fn lookup_root(ctx: &RpcContext, request_id: &str, workspace_id: &str) -> Result<PathBuf, RpcResponse> {
     let registry = ctx.registry.lock().await;
     registry
         .find_workspace(workspace_id)
         .map(|w| w.root_path.clone())
-        .ok_or_else(|| error(String::new(), "not_found", "workspace_id is not registered on this host"))
+        .ok_or_else(|| error(request_id.to_string(), "not_found", "workspace_id is not registered on this host"))
 }
 
 fn with_request_id(response: RpcResponse, request_id: String) -> RpcResponse {
@@ -1022,6 +1035,19 @@ fn jj_error_response(request_id: String, cause: &JjError) -> RpcResponse {
     error(request_id, "internal", format!("jj operation failed: {cause}"))
 }
 
+/// Shared shape behind [`jj_revision_error_response`] and
+/// [`jj_op_id_error_response`]: both map `JjError::Spawn`/
+/// `UnparseableOutput` to `internal` (a host-side fault, not anything the
+/// caller supplied) and differ only in which code a `CommandFailed`
+/// deserves — parametrized here as `command_failed_code` so that one
+/// distinction is the only thing either wrapper needs to spell out.
+fn jj_error_response_with_command_failed_code(request_id: String, cause: &JjError, command_failed_code: &str) -> RpcResponse {
+    match cause {
+        JjError::CommandFailed { .. } => error(request_id, command_failed_code, format!("jj operation failed: {cause}")),
+        JjError::Spawn(_) | JjError::UnparseableOutput(_) => error(request_id, "internal", format!("jj operation failed: {cause}")),
+    }
+}
+
 /// For `workspace.diff`/`workspace.log`: once a workspace's root is known
 /// good, the only caller-supplied input left that a `jj diff`/`jj log`
 /// invocation can fail on is `from`/`to`/`revset` — a revision or revset
@@ -1031,10 +1057,7 @@ fn jj_error_response(request_id: String, cause: &JjError) -> RpcResponse {
 /// caller (where a `CommandFailed` more plausibly reflects something wrong
 /// on the host side, not a bad caller argument).
 fn jj_revision_error_response(request_id: String, cause: &JjError) -> RpcResponse {
-    match cause {
-        JjError::CommandFailed { .. } => error(request_id, "invalid_argument", format!("jj operation failed: {cause}")),
-        JjError::Spawn(_) | JjError::UnparseableOutput(_) => error(request_id, "internal", format!("jj operation failed: {cause}")),
-    }
+    jj_error_response_with_command_failed_code(request_id, cause, "invalid_argument")
 }
 
 /// For `workspace.op.undo`/`workspace.op.restore`: the only caller-supplied
@@ -1043,10 +1066,7 @@ fn jj_revision_error_response(request_id: String, cause: &JjError) -> RpcRespons
 /// (verified against real `jj 0.44.0` output: `Error: No operation ID
 /// matching "..."`), which is `not_found`, not `internal`.
 fn jj_op_id_error_response(request_id: String, cause: &JjError) -> RpcResponse {
-    match cause {
-        JjError::CommandFailed { .. } => error(request_id, "not_found", format!("jj operation failed: {cause}")),
-        JjError::Spawn(_) | JjError::UnparseableOutput(_) => error(request_id, "internal", format!("jj operation failed: {cause}")),
-    }
+    jj_error_response_with_command_failed_code(request_id, cause, "not_found")
 }
 
 fn fs_error_response(request_id: String, cause: &FsError) -> RpcResponse {

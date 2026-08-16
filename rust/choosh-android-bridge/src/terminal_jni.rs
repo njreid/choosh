@@ -10,14 +10,13 @@
 //! registry, PTY tunnel wiring) is new, built on
 //! [`choosh_terminal_engine::Engine`] and [`crate::terminal_renderer::Renderer`].
 
+use crate::jni_support::{HandleRegistry, jstring_to_string};
 use crate::terminal_renderer::{RawDisplay, RawWindow, Renderer};
 use choosh_terminal_engine::{Engine as TerminalEngine, Key, Modifiers, MouseAction, MouseButton, MouseEvent};
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
 use jni::{Env, native_method};
 use raw_window_handle::{AndroidDisplayHandle, AndroidNdkWindowHandle, RawDisplayHandle, RawWindowHandle};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -64,16 +63,10 @@ struct SessionHandle {
     runtime: Arc<Runtime>,
 }
 
-static SESSIONS: LazyLock<Mutex<HashMap<i64, SessionHandle>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
-
-fn jstring_to_string(env: &Env<'_>, value: &JString<'_>) -> String {
-    value.mutf8_chars(env).map(|chars| chars.to_string()).unwrap_or_default()
-}
+static SESSIONS: LazyLock<HandleRegistry<SessionHandle>> = LazyLock::new(HandleRegistry::new);
 
 fn with_session<T>(handle: jlong, absent: T, present: impl FnOnce(&SessionHandle) -> T) -> T {
-    let sessions = SESSIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    sessions.get(&handle).map_or(absent, present)
+    SESSIONS.get(handle, absent, present)
 }
 
 /// Redraws the surface if a renderer exists — the one place every mutation
@@ -120,11 +113,7 @@ fn native_terminal_create(_env: &mut Env<'_>, _class: JClass<'_>, cols: jint, ro
     let rows = u16::try_from(rows.max(1)).unwrap_or(u16::MAX);
     let Ok(runtime) = Runtime::new() else { return Ok(0) };
     let session = TerminalSession { engine: TerminalEngine::new(cols, rows), renderer: None, pty_tx: None, pending_size: None };
-    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    SESSIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(handle, SessionHandle { session: Arc::new(Mutex::new(session)), runtime: Arc::new(runtime) });
+    let handle = SESSIONS.insert(SessionHandle { session: Arc::new(Mutex::new(session)), runtime: Arc::new(runtime) });
     Ok(handle)
 }
 
@@ -508,7 +497,7 @@ fn native_terminal_get_text<'local>(env: &mut Env<'local>, _class: JClass<'local
 
 #[allow(clippy::unnecessary_wraps)]
 fn native_terminal_destroy(_env: &mut Env<'_>, _class: JClass<'_>, handle: jlong) -> Result<(), jni::errors::Error> {
-    if let Some(removed) = SESSIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&handle) {
+    if let Some(removed) = SESSIONS.remove(handle) {
         // Dropping `pty_tx` closes the write side of the attach_pty
         // background task's channel; its `tokio::select!` loop then sees
         // `write_rx.recv() => None` (or the tunnel itself ends first) and

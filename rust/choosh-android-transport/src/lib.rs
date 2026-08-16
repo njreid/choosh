@@ -382,12 +382,13 @@ impl PhoneConnection {
     /// Opens a fresh `"agent-events"`-purpose tunnel, sends one
     /// [`AgentEventsResumeRequest`], awaits its
     /// [`AgentEventsResumeResponse`], then proactively closes the tunnel —
-    /// the exact same fresh-tunnel-per-call shape [`Self::call_rpc`] uses
-    /// for `"rpc"`-purpose tunnels (see that method's doc comment for the
-    /// design rationale), just carrying `agent-events.md`'s resume/replay
-    /// wire types instead of [`RpcRequest`]/[`RpcResponse`] — per
-    /// `choosh_protocol::relay`'s module doc comment, this rides its own
-    /// tunnel purpose rather than a `host-rpc.md` RPC method.
+    /// via [`Self::control_tunnel_call`], the exact same fresh-tunnel-per-call
+    /// shape [`Self::call_rpc`] uses for `"rpc"`-purpose tunnels (see that
+    /// helper's doc comment for the design rationale), just carrying
+    /// `agent-events.md`'s resume/replay wire types instead of
+    /// [`RpcRequest`]/[`RpcResponse`] — per `choosh_protocol::relay`'s
+    /// module doc comment, this rides its own tunnel purpose rather than a
+    /// `host-rpc.md` RPC method.
     ///
     /// # Errors
     ///
@@ -401,38 +402,14 @@ impl PhoneConnection {
         workspace_id: &str,
         after_sequence: Option<u64>,
     ) -> Result<AgentEventsResumeResponse, CallError> {
-        let (tunnel_id, mut response_rx) =
-            self.open_tunnel(target_device_id, "agent-events".to_string(), RPC_TUNNEL_CHANNEL_CAPACITY).await?;
-
         let request_id = new_request_id();
         let request = AgentEventsResumeRequest { request_id: request_id.clone(), workspace_id: workspace_id.to_string(), after_sequence };
-        let mut payload = Vec::with_capacity(1 + 96);
-        payload.push(FRAME_CLASS_CONTROL);
-        serde_json::to_writer(&mut payload, &request).map_err(|error| CallError::Transport(ChannelError::from(error)))?;
-        self.command_tx
-            .send(IoCommand::SendTunnelBytes { tunnel_id, payload, ack: None })
-            .map_err(|_| CallError::Transport(ChannelError::Closed))?;
-
-        let response_payload = response_rx.recv().await.ok_or(CallError::Transport(ChannelError::Closed))?;
-        // Fresh-tunnel-per-call, same as call_rpc: done after exactly one
-        // response, close now rather than leaking it for its idle timeout.
-        let _ = self.command_tx.send(IoCommand::CloseTunnel { tunnel_id });
-
-        let (inner_class, inner_body) = response_payload.split_first().ok_or(CallError::UnexpectedResponse)?;
-        if *inner_class != FRAME_CLASS_CONTROL {
-            return Err(CallError::UnexpectedResponse);
-        }
-        let response: AgentEventsResumeResponse =
-            serde_json::from_slice(inner_body).map_err(|error| CallError::Transport(ChannelError::from(error)))?;
-        let response_request_id = match &response {
+        self.control_tunnel_call(target_device_id, "agent-events".to_string(), &request_id, &request, |response| match response {
             AgentEventsResumeResponse::Replayed { request_id, .. } | AgentEventsResumeResponse::SnapshotRequired { request_id, .. } => {
                 request_id
             }
-        };
-        if response_request_id != &request_id {
-            return Err(CallError::UnexpectedResponse);
-        }
-        Ok(response)
+        })
+        .await
     }
 
     /// Opens a tunnel of the given `purpose` and, on success, returns its
@@ -459,9 +436,17 @@ impl PhoneConnection {
         open_rx.await.map_err(|_| CallError::Transport(ChannelError::Closed))?
     }
 
-    /// Opens a fresh `"rpc"`-purpose tunnel, sends exactly one
-    /// [`RpcRequest`], awaits its [`RpcResponse`], then proactively closes
-    /// the tunnel.
+    /// Shared one-shot control-tunnel pattern behind [`Self::call_rpc`] and
+    /// [`Self::resume_agent_events`]: open a fresh tunnel of the given
+    /// `purpose`, prepend [`FRAME_CLASS_CONTROL`] and send `request` as its
+    /// JSON body, await exactly one response, proactively close the tunnel,
+    /// then decode and validate that response — the shape every
+    /// fresh-tunnel-per-call control exchange in this crate follows,
+    /// factored out once two independent callers needed it verbatim (unlike
+    /// [`Self::send_control`]'s thinner wrappers elsewhere in this file,
+    /// which stay separate because each carries genuinely distinct
+    /// `ControlRequest`/`ControlResponse` variants, not a repeated tunnel
+    /// dance).
     ///
     /// **Design choice: fresh tunnel per call, not one reused tunnel per
     /// devhost.** A reused tunnel would save the `open-tunnel` round trip on
@@ -469,34 +454,52 @@ impl PhoneConnection {
     /// tunnel state that has to be invalidated on devhost
     /// disconnect/reconnect (relay-protocol.md's reconnect-discontinuity
     /// rule: tunnels never survive either side reconnecting) and
-    /// interleaving multiple concurrent RPCs' responses on one tunnel ID
-    /// (fine, since `host-rpc.md` requests are ordered per-tunnel and
-    /// request-ID-tagged — but still more bookkeeping). Fresh-per-call is
-    /// simpler, has no invalidation problem, and matches this crate's
-    /// existing one-shot-request style for every other method here; its
-    /// cost — one extra `open-tunnel` round trip per call — is a reasonable
-    /// trade at M1's call volume (RPCs triggered by explicit user action,
-    /// not a hot loop). A terminal/diff UI that turns out to hammer
-    /// `call_rpc` in a loop is the point at which reusing a tunnel would be
-    /// worth revisiting.
+    /// interleaving multiple concurrent calls' responses on one tunnel ID
+    /// (fine, since both `host-rpc.md` requests and
+    /// [`AgentEventsResumeRequest`]s are request-ID-tagged — but still more
+    /// bookkeeping). Fresh-per-call is simpler, has no invalidation problem,
+    /// and matches this crate's existing one-shot-request style for every
+    /// other method here; its cost — one extra `open-tunnel` round trip per
+    /// call — is a reasonable trade at M1's call volume (RPCs triggered by
+    /// explicit user action, not a hot loop). A terminal/diff UI that turns
+    /// out to hammer `call_rpc` in a loop is the point at which reusing a
+    /// tunnel would be worth revisiting.
+    ///
+    /// `request_id` is the caller-supplied ID this exchange is keyed on:
+    /// checked against whatever `response_request_id` extracts from the
+    /// decoded response, so a response for a stale/foreign `request_id` (which
+    /// should never happen given the fresh-tunnel-per-call design, but is
+    /// cheap to guard regardless) is rejected as [`CallError::UnexpectedResponse`]
+    /// rather than handed to the caller as if it matched.
     ///
     /// # Errors
     ///
-    /// See [`CallError`]. An [`RpcResponse::Error`] from `hostd` is NOT a
-    /// `CallError` — it comes back as `Ok(RpcResponse::Error { .. })` for
-    /// the caller to inspect, since it's an application-level outcome
-    /// (`host-rpc.md`'s fixed error codes), not a transport failure.
-    pub async fn call_rpc(&mut self, target_device_id: &str, request: RpcRequest) -> Result<RpcResponse, CallError> {
-        let (tunnel_id, mut response_rx) =
-            self.open_tunnel(target_device_id, "rpc".to_string(), RPC_TUNNEL_CHANNEL_CAPACITY).await?;
+    /// See [`CallError`]. Does NOT interpret an application-level error
+    /// payload inside `Resp` itself (e.g. `RpcResponse::Error`) — that's the
+    /// caller's job, since those are documented, well-formed outcomes for
+    /// the caller to inspect, not transport failures.
+    async fn control_tunnel_call<Req, Resp>(
+        &self,
+        target_device_id: &str,
+        purpose: String,
+        request_id: &str,
+        request: &Req,
+        response_request_id: impl Fn(&Resp) -> &str,
+    ) -> Result<Resp, CallError>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let (tunnel_id, mut response_rx) = self.open_tunnel(target_device_id, purpose, RPC_TUNNEL_CHANNEL_CAPACITY).await?;
 
-        // The rpc-tunnel wire shape per host-rpc.md/relay-protocol.md: the
-        // tunnel payload carries its own inner class byte, which MUST be
-        // FRAME_CLASS_CONTROL, followed directly by the RpcRequest's JSON —
-        // no further length-prefixing inside.
+        // The rpc-tunnel wire shape per host-rpc.md/relay-protocol.md (and,
+        // for the "agent-events" purpose, agent-events.md's "Delivery and
+        // replay" section): the tunnel payload carries its own inner class
+        // byte, which MUST be FRAME_CLASS_CONTROL, followed directly by the
+        // request's JSON — no further length-prefixing inside.
         let mut payload = Vec::with_capacity(1 + 128);
         payload.push(FRAME_CLASS_CONTROL);
-        serde_json::to_writer(&mut payload, &request).map_err(|error| CallError::Transport(ChannelError::from(error)))?;
+        serde_json::to_writer(&mut payload, request).map_err(|error| CallError::Transport(ChannelError::from(error)))?;
         self.command_tx
             .send(IoCommand::SendTunnelBytes { tunnel_id, payload, ack: None })
             .map_err(|_| CallError::Transport(ChannelError::Closed))?;
@@ -511,12 +514,30 @@ impl PhoneConnection {
         if *inner_class != FRAME_CLASS_CONTROL {
             return Err(CallError::UnexpectedResponse);
         }
-        let response: RpcResponse =
+        let response: Resp =
             serde_json::from_slice(inner_body).map_err(|error| CallError::Transport(ChannelError::from(error)))?;
-        if response.request_id() != request.request_id() {
+        if response_request_id(&response) != request_id {
             return Err(CallError::UnexpectedResponse);
         }
         Ok(response)
+    }
+
+    /// Opens a fresh `"rpc"`-purpose tunnel, sends exactly one
+    /// [`RpcRequest`], awaits its [`RpcResponse`], then proactively closes
+    /// the tunnel — see [`Self::control_tunnel_call`], which does the actual
+    /// work (including this method's fresh-tunnel-per-call design
+    /// rationale, documented there since [`Self::resume_agent_events`]
+    /// shares it too).
+    ///
+    /// # Errors
+    ///
+    /// See [`CallError`]. An [`RpcResponse::Error`] from `hostd` is NOT a
+    /// `CallError` — it comes back as `Ok(RpcResponse::Error { .. })` for
+    /// the caller to inspect, since it's an application-level outcome
+    /// (`host-rpc.md`'s fixed error codes), not a transport failure.
+    pub async fn call_rpc(&mut self, target_device_id: &str, request: RpcRequest) -> Result<RpcResponse, CallError> {
+        let request_id = request.request_id().to_string();
+        self.control_tunnel_call(target_device_id, "rpc".to_string(), &request_id, &request, RpcResponse::request_id).await
     }
 
     /// Opens a `"pty:<item_id>"`-purpose tunnel and returns a duplex handle
@@ -534,7 +555,7 @@ impl PhoneConnection {
     pub async fn open_pty_tunnel(&mut self, target_device_id: &str, item_id: &str) -> Result<PtyTunnelHandle, CallError> {
         let (tunnel_id, output_rx) =
             self.open_tunnel(target_device_id, format!("pty:{item_id}"), PTY_TUNNEL_CHANNEL_CAPACITY).await?;
-        Ok(PtyTunnelHandle { tunnel_id, command_tx: self.command_tx.clone(), output_rx })
+        Ok(PtyTunnelHandle { io: TunnelIo { tunnel_id, command_tx: self.command_tx.clone(), output_rx } })
     }
 
     /// Opens a `"web:<item_id>"`-purpose tunnel and returns a duplex handle
@@ -560,7 +581,7 @@ impl PhoneConnection {
     pub async fn open_web_tunnel(&mut self, target_device_id: &str, item_id: &str) -> Result<WebTunnelHandle, CallError> {
         let (tunnel_id, output_rx) =
             self.open_tunnel(target_device_id, format!("web:{item_id}"), WEB_TUNNEL_CHANNEL_CAPACITY).await?;
-        Ok(WebTunnelHandle { tunnel_id, command_tx: self.command_tx.clone(), output_rx })
+        Ok(WebTunnelHandle { io: TunnelIo { tunnel_id, command_tx: self.command_tx.clone(), output_rx } })
     }
 
     /// Blocks until the background I/O task ends (connection drop, a
@@ -573,6 +594,44 @@ impl PhoneConnection {
             return ChannelError::Closed;
         };
         io_task.await.unwrap_or(ChannelError::Closed)
+    }
+}
+
+/// Shared plumbing behind [`PtyTunnelHandle`] and [`WebTunnelHandle`]: the
+/// tunnel ID, the command channel into the parent [`PhoneConnection`]'s
+/// background I/O task, and the inbound-payload receiver that task's read
+/// loop populates for this tunnel ID. [`Self::read`]/[`Self::close`] are
+/// byte-for-byte identical between the two handle types, so they live here
+/// once; each handle type keeps its own `write`/`send_chunk` (genuinely
+/// different: [`PtyTunnelHandle::write`] is a synchronous, fire-and-forget
+/// send, [`WebTunnelHandle::write`] is async and awaits a per-chunk ack for
+/// real backpressure — see each type's own doc comment), so this
+/// deliberately does NOT try to unify `write` too.
+struct TunnelIo {
+    tunnel_id: TunnelId,
+    command_tx: mpsc::UnboundedSender<IoCommand>,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+}
+
+impl TunnelIo {
+    /// Waits for the next chunk of inbound tunnel payload. Returns `None`
+    /// once the tunnel has closed — either end sent the zero-length close
+    /// signal, the underlying connection ended, or (for a `"web:"`-purpose
+    /// tunnel specifically, per [`WEB_TUNNEL_CHANNEL_CAPACITY`]) this
+    /// tunnel's inbound channel was dropped for falling too far behind — a
+    /// clean end-of-stream in every case, not an error a caller needs to
+    /// branch on separately.
+    async fn read(&mut self) -> Option<Vec<u8>> {
+        self.output_rx.recv().await
+    }
+
+    /// Proactively sends the tunnel-close signal. Not required before
+    /// dropping the handle (relayd's 300s idle timeout, and the devhost's
+    /// own attachment teardown on a close signal it never gets, both
+    /// eventually cover an ungracefully-dropped handle), but this avoids
+    /// waiting on that timeout when the caller already knows it's done.
+    fn close(self) {
+        let _ = self.command_tx.send(IoCommand::CloseTunnel { tunnel_id: self.tunnel_id });
     }
 }
 
@@ -595,9 +654,7 @@ impl PhoneConnection {
 /// handle's own bounded channel, populated independently by that task's
 /// read loop as frames for this tunnel ID arrive.
 pub struct PtyTunnelHandle {
-    tunnel_id: TunnelId,
-    command_tx: mpsc::UnboundedSender<IoCommand>,
-    output_rx: mpsc::Receiver<Vec<u8>>,
+    io: TunnelIo,
 }
 
 impl PtyTunnelHandle {
@@ -649,26 +706,28 @@ impl PtyTunnelHandle {
     /// single-frame primitive, factored out so both its unchunked
     /// fast path and its multi-chunk loop share the same send call.
     fn send_chunk(&self, payload: &[u8]) -> Result<(), CallError> {
-        self.command_tx
-            .send(IoCommand::SendTunnelBytes { tunnel_id: self.tunnel_id, payload: payload.to_vec(), ack: None })
+        self.io
+            .command_tx
+            .send(IoCommand::SendTunnelBytes { tunnel_id: self.io.tunnel_id, payload: payload.to_vec(), ack: None })
             .map_err(|_| CallError::Transport(ChannelError::Closed))
     }
 
     /// Waits for the next chunk of devhost PTY output. Returns `None` once
     /// the tunnel has closed — either end sent the zero-length close
     /// signal, or the underlying connection ended — a clean end-of-stream,
-    /// not an error.
+    /// not an error. See [`TunnelIo::read`].
     pub async fn read(&mut self) -> Option<Vec<u8>> {
-        self.output_rx.recv().await
+        self.io.read().await
     }
 
     /// Proactively sends the tunnel-close signal. Not required before
     /// dropping the handle (relayd's 300s idle timeout, and the devhost's
     /// own PTY-attachment teardown on a close signal it never gets, both
     /// eventually cover an ungracefully-dropped handle), but this avoids
-    /// waiting on that timeout when the caller already knows it's done.
+    /// waiting on that timeout when the caller already knows it's done. See
+    /// [`TunnelIo::close`].
     pub fn close(self) {
-        let _ = self.command_tx.send(IoCommand::CloseTunnel { tunnel_id: self.tunnel_id });
+        self.io.close();
     }
 }
 
@@ -695,9 +754,7 @@ impl PtyTunnelHandle {
 /// propagates all the way to the WebSocket write, not just a local buffer
 /// cap.
 pub struct WebTunnelHandle {
-    tunnel_id: TunnelId,
-    command_tx: mpsc::UnboundedSender<IoCommand>,
-    output_rx: mpsc::Receiver<Vec<u8>>,
+    io: TunnelIo,
 }
 
 impl WebTunnelHandle {
@@ -756,8 +813,9 @@ impl WebTunnelHandle {
     /// call, preserving order between chunks of one logical write.
     async fn send_chunk(&self, payload: &[u8]) -> Result<(), CallError> {
         let (ack, ack_rx) = oneshot::channel();
-        self.command_tx
-            .send(IoCommand::SendTunnelBytes { tunnel_id: self.tunnel_id, payload: payload.to_vec(), ack: Some(ack) })
+        self.io
+            .command_tx
+            .send(IoCommand::SendTunnelBytes { tunnel_id: self.io.tunnel_id, payload: payload.to_vec(), ack: Some(ack) })
             .map_err(|_| CallError::Transport(ChannelError::Closed))?;
         ack_rx.await.map_err(|_| CallError::Transport(ChannelError::Closed))
     }
@@ -767,16 +825,18 @@ impl WebTunnelHandle {
     /// signal, the underlying connection ended, or this tunnel's inbound
     /// channel was dropped for falling too far behind (see
     /// [`WEB_TUNNEL_CHANNEL_CAPACITY`]) — a clean end-of-stream in every
-    /// case, not an error a caller needs to branch on separately.
+    /// case, not an error a caller needs to branch on separately. See
+    /// [`TunnelIo::read`].
     pub async fn read(&mut self) -> Option<Vec<u8>> {
-        self.output_rx.recv().await
+        self.io.read().await
     }
 
     /// Proactively sends the tunnel-close signal — the gateway calls this
     /// the moment its client connection ends, so the devhost-side upstream
-    /// TCP connection doesn't linger for the full idle timeout.
+    /// TCP connection doesn't linger for the full idle timeout. See
+    /// [`TunnelIo::close`].
     pub fn close(self) {
-        let _ = self.command_tx.send(IoCommand::CloseTunnel { tunnel_id: self.tunnel_id });
+        self.io.close();
     }
 }
 

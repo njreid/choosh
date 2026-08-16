@@ -89,17 +89,13 @@
 //!    any other subprocess's output would.
 
 use choosh_protocol::offload::{OffloadError, OffloadFrame, OffloadRequest, encode_request_frame};
-use choosh_protocol::relay::{
-    AuthResult, ClientAuth, ControlRequest, ControlResponse, DeviceAuth, FRAME_CLASS_CONTROL, FRAME_CLASS_TUNNEL, ServerHello,
-    TUNNEL_ID_BYTES, decode_tunnel_id_hex,
-};
+use choosh_protocol::relay::{ControlRequest, ControlResponse, FRAME_CLASS_CONTROL, FRAME_CLASS_TUNNEL, TUNNEL_ID_BYTES, decode_tunnel_id_hex};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::credential::{self, Credential, CredentialError};
-use crate::frame_channel::{ChannelError, FrameChannel};
+use crate::frame_channel::ChannelError;
 use crate::jj_ops::JjError;
-
-const DEFAULT_RELAYD_URL: &str = "ws://127.0.0.1:7443/connect";
+use crate::relay_client::{self, RelayClientError};
 
 #[derive(Debug)]
 pub enum DevExecError {
@@ -152,41 +148,14 @@ impl From<ChannelError> for DevExecError {
     }
 }
 
-fn relay_url() -> String {
-    std::env::var("CHOOSH_RELAYD_URL").unwrap_or_else(|_| DEFAULT_RELAYD_URL.to_string())
-}
-
-type WsChannel = FrameChannel<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>;
-
-async fn dial(relay_url: &str) -> Result<WsChannel, DevExecError> {
-    let (stream, _response) = tokio_tungstenite::connect_async(relay_url).await.map_err(|error| DevExecError::Transport(error.to_string()))?;
-    Ok(FrameChannel::new(stream))
-}
-
-/// Dials `relay_url` and authenticates with this devhost's own persisted
-/// device credential — mirrors `proxy.rs`'s `connect_authenticated`
-/// exactly, duplicated rather than shared for the same reason documented
-/// there: `serve.rs`'s own dial/auth logic is private and built around
-/// `serve`'s devhost-specific state, and this is a small, independently
-/// testable amount of logic.
-async fn connect_authenticated(relay_url: &str, credential: &Credential) -> Result<WsChannel, DevExecError> {
-    let mut channel = dial(relay_url).await?;
-    let hello: ServerHello = channel.recv().await?;
-    let signature = credential.sign(hello.nonce.as_bytes()).map_err(DevExecError::Credential)?;
-    let auth = ClientAuth::Device(DeviceAuth {
-        device_id: credential.device_id.clone(),
-        certificate: credential.certificate.clone(),
-        signature: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.to_bytes()),
-    });
-    channel.send(FRAME_CLASS_CONTROL, &auth).await?;
-    match channel.recv().await? {
-        AuthResult::Ok(_) => Ok(channel),
-        AuthResult::Failed(failed) => Err(DevExecError::AuthFailed(failed.reason)),
+impl From<RelayClientError> for DevExecError {
+    fn from(error: RelayClientError) -> Self {
+        match error {
+            RelayClientError::Transport(reason) => Self::Transport(reason),
+            RelayClientError::AuthFailed(reason) => Self::AuthFailed(reason),
+            RelayClientError::Credential(error) => Self::Credential(error),
+        }
     }
-}
-
-fn new_request_id() -> String {
-    uuid::Uuid::new_v4().to_string()
 }
 
 /// `choosh-hostd dev-exec --host=<host_id> --workspace=<workspace_name>
@@ -217,7 +186,7 @@ pub async fn run(host_id: &str, workspace_name: &str, argv: Vec<String>) -> Resu
     let commit_id = crate::jj_ops::current_commit_id(&root_path).await.map_err(DevExecError::Jj)?;
 
     let request = OffloadRequest { workspace_name: workspace_name.to_string(), commit_id, argv };
-    Box::pin(run_with_io(host_id, &relay_url(), &credential, request, tokio::io::stdout(), tokio::io::stderr())).await
+    Box::pin(run_with_io(host_id, &relay_client::relay_url(), &credential, request, tokio::io::stdout(), tokio::io::stderr())).await
 }
 
 /// The testable core of `dev-exec`: authenticate, open an `"offload"`-purpose
@@ -248,9 +217,9 @@ where
     WOut: AsyncWrite + Unpin,
     WErr: AsyncWrite + Unpin,
 {
-    let mut channel = connect_authenticated(relay_url, credential).await?;
+    let mut channel = relay_client::connect_authenticated(relay_url, credential).await?;
 
-    let request_id = new_request_id();
+    let request_id = relay_client::new_request_id();
     channel
         .send(FRAME_CLASS_CONTROL, &ControlRequest::OpenTunnel { request_id, target_device_id: host_id.to_string(), purpose: "offload".to_string() })
         .await?;
@@ -308,7 +277,7 @@ where
 mod tests {
     use super::*;
     use choosh_protocol::framing::{FrameDecoder, FrameLimits, encode_frame};
-    use choosh_protocol::relay::{AuthOk, IdentityClass, MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES};
+    use choosh_protocol::relay::{AuthOk, AuthResult, IdentityClass, MAX_CONTROL_FRAME_BYTES, MAX_TUNNEL_FRAME_BYTES, ServerHello};
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{Arc, Mutex};
     use tokio_tungstenite::tungstenite::Message;
